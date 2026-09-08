@@ -865,6 +865,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The headroom hint is a conservative guess, and a big export makes it
+    /// guess wrong. It has to stay wrong in that direction — counting distinct
+    /// keys would mean hashing every request on the hot path — so what matters
+    /// is that the guess is never mistaken for the real ceiling.
+    ///
+    /// `pipeline::flusher` relies on exactly this: on an empty block it skips
+    /// the hint and appends, because the hint saying no is not evidence that the
+    /// data does not fit.
+    #[test]
+    fn a_large_export_the_headroom_hint_rejects_still_fits_one_block() {
+        // 20k records x 4 attributes = 80,000 attribute rows, past DICT_CAP,
+        // from a grand total of five distinct keys.
+        let mut req = request("checkout", 20_000, 1_000);
+        for r in &mut req.resource_logs[0].scope_logs[0].log_records {
+            r.attributes = vec![
+                kv("http.method", "GET"),
+                kv("http.route", "/checkout"),
+                kv("net.peer.name", "db"),
+                kv("http.scheme", "https"),
+            ];
+        }
+
+        let mut b = logs::LogsBuilder::new();
+        assert!(
+            !b.has_headroom_for(&req),
+            "the hint is expected to be conservative here; if it stopped being \
+             so, this test is no longer testing anything"
+        );
+        // ...and yet.
+        assert_eq!(b.append_request(&req).unwrap(), 20_000);
+        let sealed = b.finish().unwrap();
+        assert_eq!(sealed.num_rows, 20_000);
+        assert_eq!(sealed.table("log_attrs").unwrap().num_rows(), 80_000);
+    }
+
     #[test]
     fn corrupt_body_is_caught_not_returned_as_data() {
         let dir = std::env::temp_dir().join(format!("mira-crc-{}", std::process::id()));

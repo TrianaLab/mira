@@ -179,9 +179,26 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
         jobs.append(&mut batch);
         let mut dict_full = false;
         for job in jobs {
+            // On an empty block the headroom hint is deliberately not consulted.
+            //
+            // The hint assumes every attribute in the request introduces a new
+            // dictionary key, because counting the distinct ones would mean
+            // hashing the whole request on the hot path to answer a question
+            // that is almost always "yes, plenty of room". That estimate is the
+            // right one when it decides *whether to seal first* — being wrong
+            // costs a slightly small block. It is the wrong one when the block
+            // is already empty, because then it is not choosing between two
+            // blocks, it is rejecting the export outright: a single batch of
+            // ~13k records at five attributes each exceeds 65536 attribute rows
+            // and used to be NACKed permanently, retry included, for data whose
+            // real key cardinality is a few dozen.
+            //
+            // Sealing cannot help a block with nothing in it, so the only honest
+            // test left is the append itself.
+            let empty = builder.is_empty();
             // Once one job has been deferred, every job after it must be too, or
             // the block would acknowledge exports out of arrival order.
-            if dict_full || !builder.has_headroom_for(&job.req) {
+            if !empty && (dict_full || !builder.has_headroom_for(&job.req)) {
                 dict_full = true;
                 carry.push(job);
                 continue;
@@ -195,21 +212,20 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
             match builder.append_request(&job.req) {
                 Ok(_) => waiters.push(job.ack),
                 Err(e) => {
+                    // The append can fail part-way through, having already
+                    // written some of the request's rows. The client will retry
+                    // the whole export, so publishing those rows would
+                    // guarantee duplicates. Discarding the builder is only safe
+                    // — and only necessary — when this job started on an empty
+                    // block, which is exactly the case that skipped the hint
+                    // above; anything else passed a conservative check and
+                    // cannot overflow.
+                    if empty {
+                        let _ = builder.finish();
+                    }
                     let _ = job.ack.send(Err(e.to_string()));
                 }
             }
-        }
-
-        if dict_full && builder.is_empty() {
-            // One request alone cannot fit an empty block: it carries more than
-            // 65536 distinct attribute keys. Sealing would not help, so fail it
-            // rather than carry it forever.
-            for job in carry.drain(..) {
-                let _ = job
-                    .ack
-                    .send(Err("request exceeds one block's dictionary capacity".into()));
-            }
-            dict_full = false;
         }
 
         let full = dict_full || builder.approx_bytes() >= cfg.target_block_bytes;
