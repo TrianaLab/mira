@@ -18,7 +18,11 @@ mira-proto = { path = "crates/mira-proto" }
 # get is unreadable. See docs/ARCHITECTURE.md "Arrow version pin".
 arrow-array = "59.3"
 arrow-buffer = "59.3"
-arrow-ipc = { version = "59.3", default-features = false }
+# `zstd` for the cold tier (§11). Hot blocks stay uncompressed so they can be
+# read out of the mapping with no copy; a compressed buffer has to be
+# decompressed into a fresh allocation, which is a trade only worth making once
+# a block has stopped being queried.
+arrow-ipc = { version = "59.3", default-features = false, features = ["zstd", "lz4"] }
 arrow-schema = "59.3"
 arrow-select = "59.3"
 

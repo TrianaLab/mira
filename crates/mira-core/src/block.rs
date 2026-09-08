@@ -113,16 +113,66 @@ impl<W: Write> Write for CrcWriter<W> {
 /// Write one table as a self-contained, checksummed, 64-byte-aligned IPC file
 /// and fsync it. Uncompressed on purpose: IPC body compression forces the reader
 /// to decompress into fresh allocations, which is mutually exclusive with the
-/// zero-copy mmap read path. Cold-tier compression is a separate, later decision.
+/// zero-copy mmap read path.
+///
+/// Never point this at a path some reader may have mapped. It truncates, and a
+/// mapping over a truncated file is a SIGBUS on the next page touched, not an
+/// error anyone can catch. Replacing a published table means staging a new file
+/// and renaming, which is what [`compact`] does.
 pub fn write_table(path: &Path, batch: &RecordBatch) -> Result<()> {
+    write_table_with(path, std::slice::from_ref(batch), None)
+}
+
+/// The same file, ZSTD-compressed per buffer.
+///
+/// Only for the cold tier (§11): a compressed block cannot be read out of its
+/// mapping, so this trades the zero-copy property for bytes. The retention
+/// worker applies it to blocks old enough that nothing is scanning them, which
+/// is where the trade is free.
+///
+/// The reader needs no flag — the IPC metadata records the codec per batch, so
+/// a directory can hold both tiers at once and does, mid-rewrite.
+pub fn write_table_zstd(path: &Path, batch: &RecordBatch) -> Result<()> {
+    write_table_with(
+        path,
+        std::slice::from_ref(batch),
+        Some(arrow_ipc::CompressionType::ZSTD),
+    )
+}
+
+/// The same again as LZ4_FRAME, so the `tier` example can price the pure-Rust
+/// alternative against the C one on real blocks. Nothing in the engine writes
+/// LZ4; see the decisions table in `docs/ARCHITECTURE.md`.
+pub fn write_table_lz4(path: &Path, batch: &RecordBatch) -> Result<()> {
+    write_table_with(
+        path,
+        std::slice::from_ref(batch),
+        Some(arrow_ipc::CompressionType::LZ4_FRAME),
+    )
+}
+
+fn write_table_with(
+    path: &Path,
+    batches: &[RecordBatch],
+    codec: Option<arrow_ipc::CompressionType>,
+) -> Result<()> {
+    let Some(first) = batches.first() else {
+        return Ok(());
+    };
     let file = File::create(path).ctx(path)?;
     let opts = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)?;
+    let opts = match codec {
+        Some(c) => opts.try_with_compression(Some(c))?,
+        None => opts,
+    };
     let mut w = FileWriter::try_new_with_options(
         CrcWriter::new(BufWriter::new(file)),
-        &batch.schema(),
+        &first.schema(),
         opts,
     )?;
-    w.write(batch)?;
+    for batch in batches {
+        w.write(batch)?;
+    }
 
     // Everything written so far is the body; the footer is emitted by finish().
     let (len, crc) = w.get_ref().checksum();
@@ -338,6 +388,91 @@ pub fn expire(root: &Path, signal: &str, cutoff_ns: i64) -> Result<usize> {
     Ok(dropped)
 }
 
+/// The cold-tier marker. Its presence means every table in the block is already
+/// ZSTD-encoded, so a sweep can skip the directory without opening a file.
+const COLD_MARKER: &str = "cold";
+
+/// A block goes cold once it has aged out of the hour it was partitioned into.
+///
+/// Reusing the partition width means the tier boundary is derived rather than
+/// configured: the same instant that stops new rows landing next to this block
+/// is the one that stops queries with a default window from reaching it.
+pub const COLD_AFTER_NS: i64 = NANOS_PER_HOUR;
+
+/// ponytail: a flat cap per sweep, so the first pass over an existing volume
+/// drains at a few hundred MB a minute instead of saturating the disk for an
+/// hour. Make it adaptive when a real deployment says the backlog matters.
+const MAX_COMPACT_PER_SWEEP: usize = 8;
+
+/// Rewrite aged blocks ZSTD-compressed, in place.
+///
+/// Measured on real blocks (`cargo run --release -p mira-core --example tier`):
+/// 0.127 of the plain size for logs, 0.142 for traces, at ~900 MiB/s on one
+/// core. Reads of the compressed block came back *faster* than of the plain one
+/// — 8× fewer pages to fault and 8× fewer bytes to CRC more than pays for the
+/// decompression — so the tier costs the read path nothing except the zero-copy
+/// property, and that only for data old enough that nothing is scanning it.
+///
+/// Crash safety is the trick `publish` already uses: write beside the target,
+/// then rename. A crash leaves a directory with some tables compressed and some
+/// not, which reads correctly — the codec is per-batch IPC metadata, not a
+/// property of the directory — and the absent marker makes the next sweep
+/// finish the job.
+pub fn compact(root: &Path, signal: &str, node: u32, cutoff_ns: i64) -> Result<usize> {
+    let mut done = 0;
+    for block in scan(root, signal)? {
+        if done == MAX_COMPACT_PER_SWEEP {
+            break;
+        }
+        if block.max_ts >= cutoff_ns || block.dir.join(COLD_MARKER).exists() {
+            continue;
+        }
+        match compact_block(&block.dir, node) {
+            Ok(()) => done += 1,
+            // Expired out from under the sweep, by this node's own retention or
+            // another replica's. Nothing to compact is not a failure.
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
+fn compact_block(dir: &Path, node: u32) -> Result<()> {
+    // Collected before rewriting: entries created during an open `read_dir` may
+    // or may not be returned, and one of these renames lands on a name the
+    // iterator has not reached yet.
+    let mut tables = Vec::new();
+    for entry in fs::read_dir(dir).ctx(dir)? {
+        let path = entry.ctx(dir)?.path();
+        if path.extension().is_some_and(|e| e == "arrow") {
+            tables.push(path);
+        }
+    }
+
+    for path in tables {
+        let table = open_table(&path)?;
+        // The staging name carries the node for the same reason `publish`'s
+        // does: two replicas sharing this volume both see this block go cold,
+        // and one truncating the other's half-written file would put garbage
+        // under the rename.
+        let tmp = path.with_extension(format!("{node:08x}.tmp"));
+        write_table_with(&tmp, &table.batches, Some(arrow_ipc::CompressionType::ZSTD))?;
+        // Rename rather than rewrite in place. A reader that already mapped the
+        // old inode keeps reading it — POSIX holds an unlinked file open under
+        // its mappings — which is the same guarantee `expire` depends on and
+        // what keeps `open_table`'s immutability claim true.
+        fs::rename(&tmp, &path).ctx(&path)?;
+    }
+
+    // Marker last, so a crash mid-rewrite is retried rather than declared done.
+    File::create(dir.join(COLD_MARKER))
+        .ctx(dir)?
+        .sync_all()
+        .ctx(dir)?;
+    fsync_dir(dir)
+}
+
 /// A table read straight out of its mapping.
 ///
 /// The `RecordBatch` buffers point into the mmap; the mapping is kept alive by
@@ -356,6 +491,9 @@ impl MappedTable {
     /// Walks every buffer of every column including child data, so a partially
     /// copied nested array shows up. `require_alignment(true)` should already
     /// make a copy impossible; this is the assertion that says so out loud.
+    ///
+    /// A cold block (see [`compact`]) reports 0/n on purpose: decompression has
+    /// to allocate. Only the hot tier is held to `inside == total`.
     pub fn zero_copy_ratio(&self) -> (usize, usize) {
         let (mut inside, mut total) = (0, 0);
         for batch in &self.batches {
@@ -398,9 +536,12 @@ pub fn open_table_opt(path: &Path) -> Result<Option<MappedTable>> {
 /// dedicated reader pool.
 pub fn open_table(path: &Path) -> Result<MappedTable> {
     let file = File::open(path).ctx(path)?;
-    // SAFETY: published blocks are immutable — never rewritten, never truncated,
-    // and removed only by unlink, which POSIX guarantees leaves live mappings
-    // valid. So the bytes under this mapping cannot change for its lifetime.
+    // SAFETY: published blocks are immutable — never written to again, never
+    // truncated, and removed only by unlink, which POSIX guarantees leaves live
+    // mappings valid. `compact` replaces a table by renaming a new file over the
+    // name, which unlinks the old inode rather than modifying it, so it lands on
+    // the same side of that guarantee. The bytes under this mapping cannot
+    // change for its lifetime.
     let mmap = unsafe { Mmap::map(&file) }.ctx(path)?;
     // Every open CRCs the whole body, so every page is touched. Faulting them in
     // one at a time caps a cold scan at fault latency; asking for the file up

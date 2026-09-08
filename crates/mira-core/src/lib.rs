@@ -1085,6 +1085,134 @@ mod tests {
         assert_eq!(sealed.table("log_attrs").unwrap().num_rows(), 80_000);
     }
 
+    /// The cold tier: an aged block is rewritten compressed in place, and every
+    /// read path keeps working over a directory that is mid-rewrite.
+    #[test]
+    fn compaction_shrinks_aged_blocks_without_changing_what_they_answer() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // One block an hour and a half old, one from a minute ago.
+        let now = 4 * block::COLD_AFTER_NS;
+        let old = (now - 90 * 60 * 1_000_000_000) as u64;
+        let new = (now - 60 * 1_000_000_000) as u64;
+        let mut dirs = Vec::new();
+        for (seq, base) in [old, new].into_iter().enumerate() {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request("checkout", 500, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            let node = block::node_id("a");
+            dirs.push(
+                block::publish(&root, "logs", node, seq as u64, &sealed)
+                    .unwrap()
+                    .dir,
+            );
+        }
+        let size = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "arrow"))
+                .map(|e| e.metadata().unwrap().len())
+                .sum::<u64>()
+        };
+        let before = size(&dirs[0]);
+
+        // A crash between two tables leaves a directory holding both tiers. The
+        // codec is per-batch IPC metadata, so that has to read, and the next
+        // sweep has to finish rather than skip it.
+        let partial = dirs[0].join("log_attrs.arrow");
+        let staged = dirs[0].join("log_attrs.staged");
+        let batch = block::open_table(&partial).unwrap().batches[0].clone();
+        // Staged then renamed, not written over the live name: `batch` still
+        // points into the mapping of `partial`, and truncating a mapped file is
+        // a SIGBUS on the next page touched. This is the constraint `compact`
+        // is built around, not a detail of the test.
+        block::write_table_zstd(&staged, &batch).unwrap();
+        drop(batch);
+        std::fs::rename(&staged, &partial).unwrap();
+        assert!(block::open_table(&dirs[0].join("logs.arrow")).is_ok());
+
+        let n = block::compact(
+            &root,
+            "logs",
+            block::node_id("a"),
+            now - block::COLD_AFTER_NS,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "only the aged block is cold");
+        assert!(dirs[0].join("cold").exists());
+        assert!(!dirs[1].join("cold").exists(), "the fresh block is hot");
+        assert!(
+            size(&dirs[0]) * 2 < before,
+            "{} -> {} is not a compression tier",
+            before,
+            size(&dirs[0])
+        );
+
+        // Idempotent: the marker means the second sweep does no IO at all.
+        let stamp = std::fs::metadata(dirs[0].join("logs.arrow"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            block::compact(
+                &root,
+                "logs",
+                block::node_id("a"),
+                now - block::COLD_AFTER_NS
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(dirs[0].join("logs.arrow"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp
+        );
+
+        // The trade, stated: the cold block gives up zero-copy, the hot one does
+        // not. Nothing else about either read changes.
+        let cold = block::open_table(&dirs[0].join("logs.arrow")).unwrap();
+        let (inside, total) = cold.zero_copy_ratio();
+        assert_eq!(cold.batches[0].num_rows(), 500);
+        // Not zero: arrow leaves an empty buffer — an all-valid null mask — as a
+        // zero-length slice of the mapping rather than allocating nothing.
+        assert!(
+            inside < total,
+            "{inside}/{total} — a decompressed buffer is a copy"
+        );
+        let hot = block::open_table(&dirs[1].join("logs.arrow")).unwrap();
+        let (inside, total) = hot.zero_copy_ratio();
+        assert_eq!(inside, total, "the hot tier stays zero-copy");
+
+        // And the answer is the same one the plain block gave: both blocks, both
+        // attribute levels, through the sidecars that compaction left alone.
+        let r = query::search(
+            &root,
+            &Search {
+                signal: Signal::Logs,
+                from: 0,
+                to: i64::MAX,
+                terms: vec![Term {
+                    target: Target::Attr("service.name".into()),
+                    op: Op::Eq,
+                    value: QV::Str("checkout".into()),
+                }],
+                limit: 2_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 1_000);
+        assert_eq!(r.stats.blocks_scanned, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn corrupt_body_is_caught_not_returned_as_data() {
         let dir = std::env::temp_dir().join(format!("mira-crc-{}", std::process::id()));

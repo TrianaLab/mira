@@ -42,12 +42,20 @@ build. The block directory is the only state; the filesystem is the manifest.
   after the export.
 - **Retention by unlink.** TTL drops whole block directories; in-flight readers
   keep working, guaranteed by POSIX.
+- **Two tiers of one format.** A block is written uncompressed so it can be read
+  out of its mapping; an hour later the retention sweep rewrites it
+  ZSTD-compressed to **0.13** of its size. The codec is per-batch IPC metadata,
+  so nothing has to be told which tier it is reading, and an interrupted rewrite
+  leaves a directory holding both — which reads correctly and gets finished on
+  the next sweep.
 - **SIGTERM drains.** Stop accepting, let in-flight exports reach their ack, seal
   and publish the open blocks, exit. A rolling restart costs neither the data nor
   the duplicates a reset-then-retry would have written.
 - **Two active replicas on one volume** need no coordination: the block name
   carries a node id derived from the replica's own name.
-- 4.0 MB, 110 crates, no `protoc`, no node toolchain to build.
+- 4.5 MB, 113 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
+  one C dependency and it vendors its own source, so it needs a `cc` — which the
+  linker already required — and nothing installed.
 
 Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 --example loadgen`:
@@ -61,7 +69,7 @@ Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 | every span of one trace, 25M spans on disk | 14.3 ms — 1 block of 86 |
 | metric names | 5.5 ms |
 | no time bound, no filter that prunes | 1.9 s — 69 blocks, 25.2M rows, 4.56 GB |
-| bytes on disk per byte on the wire | 1.31 |
+| bytes on disk per byte on the wire | 1.31 hot, 0.17 once compacted |
 
 Ack latency is the block sealing, not the queue: an export is acknowledged when
 its block is durable, so under light load it waits out `max_block_age`.
@@ -77,10 +85,15 @@ faulting in 16 KB at a time: since every block open reads the whole body to chec
 its CRC, one `madvise(MADV_WILLNEED)` took the unprunable full scan from 10.1 s
 to 1.9 s.
 
-1.31 bytes per byte is four times the target and the honest weak spot — blocks
-are written uncompressed. `zstd -3` over a real block gets 8.2×, which would put
-it at 0.16; why that is a tiering decision rather than a flag is
-[§11](docs/ARCHITECTURE.md).
+A block is written uncompressed so it can be read out of its mapping, and 1.31
+bytes per byte is what that costs. An hour later the retention sweep rewrites it
+ZSTD-compressed: measured over 8 real blocks per signal, **0.127** of the plain
+size for logs and **0.142** for traces, which takes the stored figure to about
+0.17. The surprise was the read side — a compacted block opens *faster* than a
+plain one, in every run, because it is 8× fewer pages to fault and 8× fewer
+bytes to CRC and that beats the decompression. Reproduce with `cargo run
+--release -p mira-core --example tier -- <partition dir>`; it prints LZ4_FRAME
+beside ZSTD, which is how the one C dependency in the tree got justified.
 
 ## What is not true yet
 
@@ -88,11 +101,6 @@ it at 0.16; why that is a tiering decision rather than a flag is
   `prost` memcpies every string, unconditionally. The ingest goal is
   allocation-lean: one unavoidable copy of the request body, then no per-field
   heap allocation.
-- **No compression tier**, and it is the largest gap between design and
-  measurement. Arrow IPC compresses per buffer and a compressed buffer has to be
-  inflated into the heap, so switching it on would end the zero-copy story
-  wholesale. The answer is aged blocks rewritten compressed, hot blocks left
-  mapped — not built.
 - No block cache: every query re-opens and re-CRCs each block it touches. This
   looked like the next big win until it was measured — it is worth a few
   milliseconds of a 14 ms query, not the 10× that page-fault behaviour was.

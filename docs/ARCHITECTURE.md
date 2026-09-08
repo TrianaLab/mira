@@ -23,7 +23,7 @@ outside.
 | **4317 and 4318 both served by tonic** | 4318 is not gRPC. Per the OTLP spec it is plain HTTP/1.1 POST of protobuf or JSON to `/v1/{traces,metrics,logs}`. | Two listeners: tonic on 4317, axum on 4318. axum is already in the tree via tonic's `router` feature, so it costs no dependency. |
 | **A reflective proto3-JSON decoder for OTLP/HTTP JSON** | OTLP JSON is *not* canonical proto3 JSON. Ids are hex where every other `bytes` field is base64 — and a 32-character hex string is itself valid base64, so a generic decoder does not fail, it silently yields 24 bytes of nonsense for every `trace_id`. 64-bit integers are strings. Field names may be either dialect within one document. | `crates/mira/src/json.rs`: a hand-written decoder over the YAML 1.2 loader already in the tree (`api::parse`; YAML 1.2 is a superset of JSON, so KYAML bodies work for free — §1). No new dependency, and the two deviations are handled where they occur rather than configured around. |
 
-Two more, less structural but worth stating:
+Three more, less structural but worth stating:
 
 - **`partial_success` is not a backpressure signal.** The OTLP spec says the
   client MUST NOT retry a partial success. Reporting overload that way
@@ -39,6 +39,18 @@ Two more, less structural but worth stating:
   adopts the OTAP *data model* as its storage layout from day one, and will add
   the OTAP *wire protocol* as a second receiver — but the architecture must not
   assume OTAP is how data arrives.
+- **The cold tier is worth one C dependency.** `zstd-sys` vendors its own source
+  and builds it with `cc`, which is a real dent in "nothing to install to build
+  Mira" — though a linker was already required, so the practical delta is a
+  vendored C compile, not a new prerequisite. The pure-Rust alternative is
+  LZ4_FRAME via `lz4_flex`, which Arrow IPC supports and which would have kept
+  the tree C-free. Measured against each other on the same blocks (§11), LZ4
+  also clears the 0.35 target — 0.221 on logs, 0.200 on traces — so this was not
+  the walkover it looked like. ZSTD wins on both axes at once: 1.7× smaller
+  *and* faster to write on traces (989 vs 534 MiB/s), because LZ4's speed
+  advantage is a decompression property and the compress side of the ratio it is
+  being asked for is not where it is strong. 3 crates and 0.5 MB of binary for
+  another 1.7× on disk, with no throughput given up, is worth the `cc`.
 
 ### One correctness hazard worth naming on its own
 
@@ -331,9 +343,27 @@ Hot blocks are **uncompressed**, and this is forced, not preferred. Arrow IPC
 body compression makes the reader decompress into fresh allocations —
 `read_buffer` returns a slice of the mmap when the codec is `None` and calls
 `decompress_to_buffer` when it is not. There is no in-place path. Compression and
-mmap zero-copy are mutually exclusive; you pick one per tier. Cold-tier
-compression (filesystem-transparent zstd, which mmap survives, or Parquet) is a
-later decision and does not affect the hot format.
+mmap zero-copy are mutually exclusive; you pick one per tier.
+
+So there are two tiers of the same format. An hour after a block's newest row —
+`block::COLD_AFTER_NS`, which is the partition width, so the boundary is derived
+rather than configured — the retention sweep rewrites each of its tables
+ZSTD-compressed and drops a `cold` marker in the directory. Nothing else
+changes: the codec is per-batch IPC metadata, so the reader needs no flag and a
+directory holding both tiers reads correctly, which it does whenever a rewrite
+is interrupted. The marker is written last, so an interrupted block has no
+marker and the next sweep finishes it.
+
+Two constraints shape the rewrite. It stages each table beside its target and
+`rename`s, never truncating in place: a reader may have the old file mapped, and
+truncating under a mapping is a `SIGBUS` on the next page touched, not an error
+anyone can catch. Unlinking by rename is the same guarantee `expire` already
+depends on. And the staged name carries the node id, because two replicas
+sharing a volume both see the block go cold and would otherwise write the same
+temporary file.
+
+§11 has the measurement: 0.127 of plain size on logs, 0.142 on traces, and reads
+that come back *faster* than uncompressed ones.
 
 ---
 
@@ -757,9 +787,6 @@ observable. *Not yet implemented.*
   returns its exemplars, so both out-edges of §7.1 are readable — but the caller
   follows them itself. `by_link`, `by_exemplar` and `peers` as one-call
   operations are not here.
-- **A compression tier.** Blocks are written uncompressed. §11 is where this
-  shows up, and it is currently the largest single gap between design and
-  measurement.
 - **A block cache.** Every query re-opens and re-CRCs every block it touches. The
   fix is a process-local `Arc<MappedTable>` map invalidated by `expire`. This was
   assumed to be the next big win and it is not: §11 measures the per-block cost as
@@ -811,8 +838,8 @@ call repeated. The gap between them is virtual-memory work, not I/O.
 | Query: trace by id | ≤ 10 ms | **84 ms** first, **14.3 ms** steady, 1 of 86 blocks | ~ |
 | Query: metric names | — | **28 ms** first, **5.5 ms** steady | — |
 | Query: field predicate, no time bound | — | **2.9 s** first, **1.9 s** steady, 69 of 69 blocks, 25.2 M rows | see below |
-| Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** | ✗ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.0 MB** / 110 crates | ✓ |
+| Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** hot, **~0.17 B/B** compacted | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.5 MB** / 113 crates | ✓ |
 
 Reading these honestly:
 
@@ -841,45 +868,73 @@ Reading these honestly:
   lever and the measurement says otherwise: what it saves is the `open` and the
   CRC, and those are the small part of a ~14 ms single-block query. It stays on
   the §10 list, but as a small win, not the missing 10×.
-- **Cost per GB misses by 4×, and the reason is that blocks are uncompressed.**
-  Not the sidecars: all 189 `attr.idx` files together are 12.9 KB, and the trace
-  filters are 5.5 MB against 8.4 GB.
-  Two things inflate them. The `ATTRS` table carries six typed value columns and
-  writes all six for every row, so a string attribute pays 8 bytes for a null
-  `int`, 8 for a null `double` and 4-byte offsets each for null `bytes`/`ser` —
-  roughly 24 bytes of padding per attribute row. And nothing anywhere is
-  compressed. Measured on one 19.3 MB block, `zstd -3`:
+- **Cost per GB is 1.31 B/B while a block is hot and about 0.17 once it is
+  compacted.** Not the sidecars either way: all 189 `attr.idx` files together are
+  12.9 KB, and the trace filters are 5.5 MB against 8.4 GB. What inflates the hot
+  number is the `ATTRS` table, which carries six typed value columns and writes
+  all six for every row — a string attribute pays 8 bytes for a null `int`, 8 for
+  a null `double` and 4-byte offsets each for null `bytes`/`ser`, roughly 24
+  bytes of padding per attribute row.
 
-  | | on disk | compressed | |
+  That padding is also almost free to compress, which is what the cold tier
+  (§3.5) collects. Measured by `cargo run --release -p mira-core --example tier`
+  over 8 real blocks per signal — not a `zstd` CLI estimate, the actual
+  `write_table_zstd` path:
+
+  | | plain | zstd | ratio | lz4 | ratio |
+  |---|---|---|---|---|---|
+  | `log_attrs.arrow` | 258.3 MiB | 19.7 MiB | 0.076 | 36.9 MiB | 0.143 |
+  | `logs.arrow` | 283.9 MiB | 49.3 MiB | 0.174 | 82.9 MiB | 0.292 |
+  | **logs, 8 blocks** | **542.3 MiB** | **69.1 MiB** | **0.127** | 119.9 MiB | 0.221 |
+  | `span_attrs.arrow` | 205.6 MiB | 14.9 MiB | 0.073 | 27.8 MiB | 0.135 |
+  | `spans.arrow` | 194.1 MiB | 41.7 MiB | 0.215 | 52.0 MiB | 0.268 |
+  | **traces, 8 blocks** | **399.8 MiB** | **56.7 MiB** | **0.142** | 79.9 MiB | 0.200 |
+  | metrics, 8 blocks | 1.2 MiB | 0.3 MiB | 0.271 | — | — |
+
+  1.31 B/B × ~0.13 is **~0.17 B/B**, comfortably under the 0.35 target. The
+  metrics ratio is worse only because that corpus is 1.2 MiB — too small for
+  per-buffer framing to disappear into the payload. The tiny `resources` and
+  `scope_attrs` tables sit near 1.0 for the same reason and are not worth the
+  rewrite; compaction does them anyway because skipping them is more code than
+  it saves bytes.
+
+  Compression runs at **1160 MiB/s** on logs and **989 MiB/s** on traces, one
+  core, so a block is a few tens of milliseconds on a path already inside
+  `spawn_blocking` and off the ingest critical path entirely — it is the
+  retention sweep, an hour after the data landed. The `MAX_COMPACT_PER_SWEEP`
+  cap of 8 blocks a minute exists for the first pass over an existing volume,
+  not for the steady state.
+
+  **The open question from the previous revision is answered, and the answer is
+  the opposite of what the design assumed.** The worry was that inflating a
+  compressed buffer into the heap would cost more latency than the pages it
+  saves, and that the age threshold would therefore have to be conservative.
+  Measured over the same 8 blocks, opening the compacted copy is *faster*:
+
+  | | read plain | read zstd | |
   |---|---|---|---|
-  | `log_attrs.arrow` | 9.17 MB | 0.70 MB | 13.1× |
-  | `logs.arrow` | 10.08 MB | 1.65 MB | 6.1× |
-  | block total | 19.26 MB | 2.35 MB | **8.2×** |
+  | logs, cold cache | 0.68 s | **0.54 s** | 8 blocks, 542 MiB |
+  | logs, warm | 0.33 s | **0.26 s** | same 8 blocks |
+  | traces, cold cache | 0.58 s | **0.26 s** | 8 blocks, 400 MiB |
+  | traces, warm | 0.23 s | **0.19 s** | same 8 blocks |
 
-  8.3 GiB at that ratio is ~1.0 GiB, or **0.16 B/B** — the target is reachable and
-  then some. (Synthetic data compresses better than real; 4-6× is the number to
-  plan on. Still clears 0.35.) Compression costs ~22 ms for 9 MB, ≈420 MB/s on one
-  core, which at 68 MiB/s of ingest is 16% of a core on a path already on
-  `spawn_blocking`.
-
-  **The reason it is not simply switched on**: Arrow IPC compresses per buffer,
-  and a compressed buffer must be inflated into the heap. Turning on
-  `CompressionType::ZSTD` in the writer deletes the zero-copy read property that
-  §3 is built around — the two are mutually exclusive in the format, not merely in
-  this implementation. So the fix is a **tier**, not a flag: recent blocks stay
-  uncompressed and mmap'd, aged blocks are rewritten compressed by the retention
-  worker and read into the heap. Queries are overwhelmingly recent, so this buys
-  the storage ratio at the cost of latency on exactly the queries that were going
-  to be slow anyway.
-
-  One caveat on "cost of latency", to be measured rather than assumed: the last
-  table row is bounded by faulting 4.56 GB of uncompressed pages, and a
-  compressed block is 8× fewer pages to fault. Whether inflating into the heap
-  costs more than the pages it saves is an open question, and the answer decides
-  whether the age threshold should be aggressive or conservative.
+  The absolute numbers move with how much of the corpus is resident — this
+  machine has 36 GB of page cache against 8.4 GiB of bench data, so there is no
+  genuinely cold measurement here — but the sign does not: compressed is faster
+  in every run. Both the page-fault path (§3.3's `MADV_WILLNEED` over 8× fewer
+  pages) and the CRC32 (over 8× fewer bytes) shrink with the file, and together
+  they more than pay for decompression. So the cold tier costs the read path nothing measurable
+  — only the zero-copy property, which is an allocation cost, not a latency one.
+  The threshold is set at one hour for the reason in §3.5, which is that it is
+  the partition width and therefore not a knob; nothing in the measurement argues
+  for waiting longer.
 
 Two invariants guard the design rather than the numbers, and both are already
-tests: n/n buffers zero-copy on read, and a corrupted body never returns as data.
+tests: n/n buffers zero-copy on read of a hot block, and a corrupted body never
+returns as data. The cold tier is held to the second and deliberately not the
+first — `compaction_shrinks_aged_blocks_without_changing_what_they_answer`
+asserts that a compacted block gives up zero-copy while the block beside it,
+still hot, keeps it.
 
 The honest headline for the README is **"zero-copy queries over immutable Arrow
 blocks, allocation-lean OTLP ingest."** Not "zero-copy ingestion" — that claim

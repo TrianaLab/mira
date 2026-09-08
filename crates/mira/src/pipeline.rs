@@ -296,9 +296,10 @@ async fn retention(cfg: Arc<Config>) {
         tick.tick().await;
         let dir = cfg.data_dir.clone();
         let ttl = cfg.retention;
-        let dropped = tokio::task::spawn_blocking(move || {
-            // Wall clock is only used to place the retention horizon; block
-            // timestamps themselves come from the data, never from this clock.
+        let node = cfg.node;
+        let swept = tokio::task::spawn_blocking(move || {
+            // Wall clock is only used to place the horizons; block timestamps
+            // themselves come from the data, never from this clock.
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -306,16 +307,27 @@ async fn retention(cfg: Arc<Config>) {
             let cutoff = now - ttl.as_nanos() as i64;
             // One signal failing must not skip the others; a full disk is
             // exactly when the remaining sweeps matter most.
-            SIGNALS.map(|s| (s, block::expire(&dir, s, cutoff)))
+            SIGNALS.map(|s| {
+                let dropped = block::expire(&dir, s, cutoff);
+                // Expire first: compressing a block this sweep is about to
+                // delete is pure wasted bandwidth.
+                let cold = block::compact(&dir, s, node, now - block::COLD_AFTER_NS);
+                (s, dropped, cold)
+            })
         })
         .await;
-        match dropped {
+        match swept {
             Ok(results) => {
-                for (signal, r) in results {
-                    match r {
+                for (signal, dropped, cold) in results {
+                    match dropped {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(signal, blocks = n, "retention dropped blocks"),
                         Err(e) => tracing::warn!(signal, error = %e, "retention failed"),
+                    }
+                    match cold {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(signal, blocks = n, "compacted blocks to zstd"),
+                        Err(e) => tracing::warn!(signal, error = %e, "compaction failed"),
                     }
                 }
             }
