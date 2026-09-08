@@ -21,8 +21,10 @@ pub mod attrs;
 pub mod block;
 pub mod error;
 pub mod identity;
+pub mod json;
 pub mod logs;
 pub mod metrics;
+pub mod query;
 pub mod schema;
 pub mod signal;
 pub mod traces;
@@ -705,6 +707,161 @@ mod tests {
         // Nothing in this request had exemplar attributes, so that table is
         // absent rather than 2.5 KB of framing.
         assert!(!published.dir.join("exemplar_attrs.arrow").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The read path end to end: publish two blocks, then filter on a resource
+    /// attribute, a record attribute, a dictionary column and a raw field, and
+    /// check that pruning actually skips work rather than merely returning the
+    /// right rows by scanning everything.
+    #[test]
+    fn search_filters_across_attribute_levels_and_prunes_by_time() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Two blocks, two services, disjoint time ranges. Block 1 is older.
+        for (seq, (service, base)) in [("checkout", 1_000u64), ("payments", 5_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request(service, 10, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            block::publish(
+                &root,
+                "logs",
+                block::node_id("a"),
+                seq as u64,
+                sealed.min_ts,
+                sealed.max_ts,
+                &sealed.refs(),
+            )
+            .unwrap();
+        }
+
+        let q = |terms: Vec<Term>, from: i64, to: i64, limit: usize| Search {
+            signal: Signal::Logs,
+            from,
+            to,
+            terms,
+            limit,
+        };
+        let attr = |k: &str, v: &str| Term {
+            target: Target::Attr(k.into()),
+            op: Op::Eq,
+            value: QV::Str(v.into()),
+        };
+        let field = |c: &str, op: Op, v: QV| Term {
+            target: Target::Field(c.into()),
+            op,
+            value: v,
+        };
+
+        // service.name is a *resource* attribute; the user does not know that
+        // and should not have to. It resolves through resources -> resource_id.
+        let r = query::search(&root, &q(vec![attr("service.name", "payments")], 0, i64::MAX, 100))
+            .unwrap();
+        assert_eq!(r.stats.rows_matched, 10);
+        assert!(r.json.contains("\"service.name\":\"payments\""));
+        assert!(!r.json.contains("checkout"));
+        // Both blocks were opened — the filter is not a time filter — but only
+        // one contributed.
+        assert_eq!(r.stats.blocks_scanned, 2);
+
+        // http.method is a *record* attribute, on every row of both blocks.
+        let r = query::search(&root, &q(vec![attr("http.method", "GET")], 0, i64::MAX, 100))
+            .unwrap();
+        assert_eq!(r.stats.rows_matched, 20);
+
+        // A key that exists nowhere matches nothing rather than erroring.
+        let r = query::search(&root, &q(vec![attr("nope", "x")], 0, i64::MAX, 100)).unwrap();
+        assert_eq!(r.stats.rows_matched, 0);
+        assert_eq!(r.json, "[]");
+
+        // Time pruning happens on the directory name, before any file is
+        // opened: the older block is never touched.
+        let r = query::search(&root, &q(vec![], 5_000, 9_000, 100)).unwrap();
+        assert_eq!(r.stats.blocks_total, 2);
+        assert_eq!(r.stats.blocks_scanned, 1, "the 1_000-range block must prune");
+        assert_eq!(r.stats.rows_matched, 10);
+
+        // Dictionary column, substring op: resolved once against the dictionary
+        // and then matched on u16 codes.
+        let r = query::search(
+            &root,
+            &q(
+                vec![field("severity_text", Op::Contains, QV::Str("NF".into()))],
+                0,
+                i64::MAX,
+                100,
+            ),
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 20);
+
+        // A numeric field given as a string, which is what a browser and an LLM
+        // both send. Coercion happens once the column's type is known.
+        let r = query::search(
+            &root,
+            &q(
+                vec![field("severity_number", Op::Gte, QV::Str("9".into()))],
+                0,
+                i64::MAX,
+                100,
+            ),
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 20);
+
+        // FixedSizeBinary queried as hex.
+        let r = query::search(
+            &root,
+            &q(
+                vec![field("trace_id", Op::Eq, QV::Str("07".repeat(16)))],
+                0,
+                i64::MAX,
+                100,
+            ),
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 20);
+        // ...and a malformed one matches nothing instead of a prefix.
+        let r = query::search(
+            &root,
+            &q(vec![field("trace_id", Op::Eq, QV::Str("07".into()))], 0, i64::MAX, 100),
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 0);
+
+        // Terms are AND-ed.
+        let r = query::search(
+            &root,
+            &q(
+                vec![attr("service.name", "checkout"), attr("http.method", "GET")],
+                0,
+                i64::MAX,
+                100,
+            ),
+        )
+        .unwrap();
+        assert_eq!(r.stats.rows_matched, 10);
+
+        // THE early exit: with a limit satisfied by the newest block, the older
+        // one is never opened even though it overlaps the window.
+        let r = query::search(&root, &q(vec![], 0, i64::MAX, 5)).unwrap();
+        assert_eq!(r.stats.blocks_scanned, 1);
+        assert_eq!(r.json.matches("\"body\"").count(), 5);
+        // Newest first.
+        assert!(r.json.starts_with("[{\"time_unix_nano\":5009,"));
+        // Block-local plumbing never reaches the caller.
+        assert!(!r.json.contains("resource_id"));
+        assert!(!r.json.contains("\"id\""));
+        // Scope name is synthesised into scope_attrs at ingest and merges in
+        // here, so all three attribute levels are present on one row.
+        assert!(r.json.contains("\"otel.scope.name\":\"test\""));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
