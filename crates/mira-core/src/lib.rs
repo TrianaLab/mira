@@ -8,7 +8,8 @@
 //! * [`attrs`] — the attribute tables and Resource-Scope preamble every signal
 //!   shares.
 //! * [`signal`] — the one shape every signal's encoder presents to the flusher.
-//! * [`logs`] — OTLP protobuf into those schemas, with block-local id rebasing.
+//! * [`logs`] / [`traces`] — OTLP protobuf into those schemas, with block-local
+//!   id rebasing.
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
 //!   mmap reads back out of them.
 //!
@@ -23,6 +24,7 @@ pub mod identity;
 pub mod logs;
 pub mod schema;
 pub mod signal;
+pub mod traces;
 
 pub use error::{Error, Result};
 pub use signal::{Sealed, SignalBuilder};
@@ -266,6 +268,187 @@ mod tests {
             .collect();
         assert!(!small.has_headroom_for(&wide));
         assert!(small.has_headroom_for(&request("checkout", 10, 1)));
+    }
+
+    /// Spans are the only signal with grandchildren: an event belongs to a span
+    /// and its attributes belong to the event. Both hops are block-local ids, and
+    /// getting either wrong turns a join into a cross product that still returns
+    /// plausible-looking rows.
+    #[test]
+    fn span_events_and_links_are_child_tables_with_their_own_ids() {
+        use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
+        use mira_proto::trace::v1::span::{Event, Link};
+        use mira_proto::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status::StatusCode};
+
+        // Two spans, the second with two events and one link, so a bug that
+        // parents events to the wrong span shows up as a wrong parent_id rather
+        // than as a coincidentally-correct zero.
+        let span = |i: u64, events: usize, links: usize| Span {
+            trace_id: vec![1u8; 16].into(),
+            span_id: vec![i as u8; 8].into(),
+            name: "GET /checkout".into(),
+            kind: 2,
+            start_time_unix_nano: 10_000 + i,
+            end_time_unix_nano: 10_000 + i + 500,
+            attributes: vec![kv("http.method", "GET")],
+            status: Some(Status {
+                code: StatusCode::Error as i32,
+                message: "boom".into(),
+            }),
+            events: (0..events)
+                .map(|e| Event {
+                    time_unix_nano: 10_100 + e as u64,
+                    name: "exception".into(),
+                    attributes: vec![kv("exception.type", "IOError")],
+                    ..Default::default()
+                })
+                .collect(),
+            links: (0..links)
+                .map(|_| Link {
+                    trace_id: vec![9u8; 16].into(),
+                    span_id: vec![8u8; 8].into(),
+                    attributes: vec![kv("rel", "follows_from")],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let mut b = traces::TracesBuilder::new();
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        kv("service.name", "checkout"),
+                        kv("service.instance.id", "7f3a"),
+                    ],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "test".into(),
+                        ..Default::default()
+                    }),
+                    spans: vec![span(0, 0, 0), span(1, 2, 1)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert!(b.has_headroom_for(&req));
+        assert_eq!(b.append_request(&req).unwrap(), 2);
+
+        let sealed = b.finish().unwrap();
+        assert_eq!(sealed.num_rows, 2);
+        assert_eq!(
+            sealed.tables.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            schema::TRACES_BLOCK_TABLES
+        );
+        // The block's range spans start..end, not start..start: a query for the
+        // instant a long span ended has to find it.
+        assert_eq!(sealed.min_ts, 10_000);
+        assert_eq!(sealed.max_ts, 10_501);
+
+        let rows = |t: &str| sealed.table(t).unwrap().num_rows();
+        assert_eq!(rows("span_events"), 2);
+        assert_eq!(rows("span_links"), 1);
+        assert_eq!(rows("span_event_attrs"), 2);
+        assert_eq!(rows("span_link_attrs"), 1);
+        assert_eq!(rows("span_attrs"), 2);
+
+        let u32col = |t: &str, c: &str| {
+            sealed
+                .table(t)
+                .unwrap()
+                .column_by_name(c)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .clone()
+        };
+        // Both events hang off span 1, and they carry ids 0 and 1 of their own —
+        // the ids span_event_attrs.parent_id refers to. Sharing the span's id
+        // here is the bug this test exists to catch.
+        assert_eq!(u32col("span_events", "parent_id").values(), &[1, 1]);
+        assert_eq!(u32col("span_events", "id").values(), &[0, 1]);
+        assert_eq!(u32col("span_event_attrs", "parent_id").values(), &[0, 1]);
+        assert_eq!(u32col("span_links", "parent_id").values(), &[1]);
+
+        let spans = sealed.table("spans").unwrap();
+        let durations = spans
+            .column_by_name("duration_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(durations.values(), &[500, 500]);
+
+        // Links point out of the block, so their ids stay raw. Rebasing these
+        // would silently repoint a link at a local row.
+        let lt = sealed.table("span_links").unwrap();
+        let lt = lt
+            .column_by_name("trace_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(lt.value(0), &[9u8; 16]);
+    }
+
+    /// A span with a zero start time is malformed; folding it into the block's
+    /// range would make the directory name claim to cover the epoch, and every
+    /// temporal query would then have to open the block to find nothing.
+    #[test]
+    fn malformed_span_times_do_not_widen_the_block_range() {
+        use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
+        use mira_proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let mut b = traces::TracesBuilder::new();
+        b.append_request(&ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![
+                        Span {
+                            name: "no-clock".into(),
+                            ..Default::default()
+                        },
+                        Span {
+                            name: "backwards".into(),
+                            start_time_unix_nano: 5_000,
+                            end_time_unix_nano: 4_000,
+                            ..Default::default()
+                        },
+                        Span {
+                            name: "fine".into(),
+                            start_time_unix_nano: 6_000,
+                            end_time_unix_nano: 6_100,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+
+        let sealed = b.finish().unwrap();
+        assert_eq!(
+            sealed.num_rows, 3,
+            "malformed spans are stored, not dropped"
+        );
+        assert_eq!(sealed.min_ts, 5_000);
+        assert_eq!(sealed.max_ts, 6_100);
+        // end < start saturates to zero rather than wrapping to 584 years.
+        let d = sealed.table("spans").unwrap();
+        let d = d
+            .column_by_name("duration_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(d.values(), &[0, 0, 100]);
     }
 
     #[test]

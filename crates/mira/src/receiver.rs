@@ -4,25 +4,35 @@
 //! by tonic. 4318 is OTLP/HTTP — a plain HTTP/1.1 POST of protobuf to
 //! `/v1/{traces,metrics,logs}` — which tonic cannot serve; that one is axum,
 //! already in the tree via tonic's `router` feature, so it costs no dependency.
+//!
+//! Metrics is deliberately absent rather than stubbed on the gRPC side: tonic
+//! answers an unregistered service with `UNIMPLEMENTED`, which is exactly the
+//! right thing and exactly what a hand-written stub would have to say.
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::http::{StatusCode, header};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use prost::Message;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Status};
 use tonic_types::{ErrorDetails, StatusExt};
 
 use mira_proto::collector::logs::v1::logs_service_server::{LogsService, LogsServiceServer};
 use mira_proto::collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse};
+use mira_proto::collector::trace::v1::trace_service_server::{TraceService, TraceServiceServer};
+use mira_proto::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 
 use crate::pipeline::{Ingest, Rejected};
 
-/// The logs write handle. Traces and metrics get their own once their encoders
-/// exist; the type parameter is what keeps a metrics request from being handed
-/// to the logs flusher.
-type LogsIngest = Ingest<ExportLogsServiceRequest>;
+/// Both write handles. The type parameter is what keeps a metrics request from
+/// being handed to the logs flusher; `Ingest` is generic precisely so that the
+/// mistake is a compile error rather than a corrupt block.
+#[derive(Clone)]
+pub struct Receivers {
+    pub logs: Ingest<ExportLogsServiceRequest>,
+    pub traces: Ingest<ExportTraceServiceRequest>,
+}
 
 /// Map a rejection onto a gRPC status.
 ///
@@ -44,46 +54,76 @@ fn status_for(r: Rejected) -> Status {
     }
 }
 
-pub struct Grpc {
-    ingest: LogsIngest,
-}
-
-impl Grpc {
-    pub fn server(ingest: LogsIngest) -> LogsServiceServer<Self> {
-        LogsServiceServer::new(Self { ingest })
+impl Receivers {
+    pub fn logs_server(&self) -> LogsServiceServer<Self> {
+        LogsServiceServer::new(self.clone())
+    }
+    pub fn traces_server(&self) -> TraceServiceServer<Self> {
+        TraceServiceServer::new(self.clone())
     }
 }
 
 #[tonic::async_trait]
-impl LogsService for Grpc {
+impl LogsService for Receivers {
     async fn export(
         &self,
         request: Request<ExportLogsServiceRequest>,
-    ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        self.ingest
+    ) -> Result<tonic::Response<ExportLogsServiceResponse>, Status> {
+        self.logs
             .submit(request.into_inner())
             .await
             .map_err(status_for)?;
         // No partial_success: everything we accepted is durable by now, and
         // anything we could not accept was reported as a status above.
-        Ok(Response::new(ExportLogsServiceResponse::default()))
+        Ok(tonic::Response::new(ExportLogsServiceResponse::default()))
+    }
+}
+
+#[tonic::async_trait]
+impl TraceService for Receivers {
+    async fn export(
+        &self,
+        request: Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Response<ExportTraceServiceResponse>, Status> {
+        self.traces
+            .submit(request.into_inner())
+            .await
+            .map_err(status_for)?;
+        Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
     }
 }
 
 /// OTLP/HTTP on 4318.
-pub fn http_router(ingest: LogsIngest) -> Router {
+pub fn http_router(r: Receivers) -> Router {
     Router::new()
-        .route("/v1/logs", post(export_logs))
-        .route("/v1/traces", post(unimplemented))
+        .route(
+            "/v1/logs",
+            post(
+                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
+                    export(&r.logs, b, ExportLogsServiceResponse::default()).await
+                },
+            ),
+        )
+        .route(
+            "/v1/traces",
+            post(
+                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
+                    export(&r.traces, b, ExportTraceServiceResponse::default()).await
+                },
+            ),
+        )
         .route("/v1/metrics", post(unimplemented))
-        .with_state(ingest)
+        .with_state(r)
 }
 
-async fn export_logs(
-    axum::extract::State(ingest): axum::extract::State<LogsIngest>,
+/// Decode, submit, and answer. Generic over the signal because the three
+/// endpoints differ only in which two protobuf types they name.
+async fn export<R: Message + Default, T: Message>(
+    ingest: &Ingest<R>,
     body: Bytes,
-) -> impl IntoResponse {
-    let req = match ExportLogsServiceRequest::decode(body) {
+    ok: T,
+) -> Response {
+    let req = match R::decode(body) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
@@ -91,7 +131,7 @@ async fn export_logs(
         Ok(()) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-protobuf")],
-            ExportLogsServiceResponse::default().encode_to_vec(),
+            ok.encode_to_vec(),
         )
             .into_response(),
         Err(Rejected::Busy) => (
@@ -108,6 +148,6 @@ async fn export_logs(
 async fn unimplemented() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
-        "only /v1/logs is wired up so far",
+        "metrics ingest is not wired up yet",
     )
 }

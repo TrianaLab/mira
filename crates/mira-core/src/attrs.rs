@@ -29,6 +29,57 @@ use crate::error::{Error, Result};
 use crate::identity::resource_key;
 use crate::schema::{ATTRS, AttrType, DICT_CAP, RESOURCES};
 
+/// A `Dictionary<UInt16, Utf8>` column that knows how full it is.
+///
+/// `StringDictionaryBuilder` does not expose its cardinality and returns the
+/// overflow as an error from `append`, which is too late: the seal decision has
+/// to be made before the append, because a builder cannot be rolled back. Every
+/// enumerable string column in the engine — severity text, span name, event
+/// name, metric name and unit — needs exactly this, so it is one type.
+pub struct DictColumn {
+    label: &'static str,
+    b: StringDictionaryBuilder<UInt16Type>,
+    n: usize,
+}
+
+impl DictColumn {
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            b: StringDictionaryBuilder::new(),
+            n: 0,
+        }
+    }
+
+    /// Whether `n` more *distinct* values fit. Callers pass the total number of
+    /// values they are about to append, because deduplicating them first would
+    /// cost more than the occasional block sealed a little early.
+    pub fn has_headroom(&self, n: usize) -> bool {
+        self.n + n <= DICT_CAP
+    }
+
+    /// Empty becomes null rather than a dictionary entry. proto3 cannot
+    /// distinguish an unset string from an empty one, so every span without a
+    /// `trace_state` would otherwise burn a slot and a validity bit to say so.
+    pub fn append(&mut self, v: &str) -> Result<()> {
+        if v.is_empty() {
+            self.b.append_null();
+            return Ok(());
+        }
+        let k = self
+            .b
+            .append(v)
+            .map_err(|_| Error::DictionaryFull(self.label))?;
+        self.n = self.n.max(k as usize + 1);
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> ArrayRef {
+        self.n = 0;
+        Arc::new(self.b.finish())
+    }
+}
+
 /// Builder for one attribute table — log, span, event, link, data point,
 /// exemplar, resource or scope. They are all the same nine columns.
 pub struct AttrsBuilder {

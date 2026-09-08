@@ -11,10 +11,9 @@
 //! `logs` root table and nothing else.
 
 use arrow_array::builder::{
-    BinaryBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder, StringDictionaryBuilder,
-    TimestampNanosecondBuilder, UInt16Builder, UInt32Builder,
+    BinaryBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder, TimestampNanosecondBuilder,
+    UInt16Builder, UInt32Builder,
 };
-use arrow_array::types::UInt16Type;
 use arrow_array::{ArrayRef, RecordBatch};
 use prost::Message;
 use std::sync::Arc;
@@ -22,9 +21,9 @@ use std::sync::Arc;
 use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
 use mira_proto::common::v1::any_value::Value;
 
-use crate::attrs::{AttrsBuilder, ResourceScope, resource_kv, scope_kv};
-use crate::error::{Error, Result};
-use crate::schema::{DICT_CAP, LOGS};
+use crate::attrs::{AttrsBuilder, DictColumn, ResourceScope, resource_kv, scope_kv};
+use crate::error::Result;
+use crate::schema::LOGS;
 use crate::signal::{Sealed, SignalBuilder};
 
 pub struct LogsBuilder {
@@ -32,10 +31,9 @@ pub struct LogsBuilder {
     time: TimestampNanosecondBuilder,
     observed: TimestampNanosecondBuilder,
     sev_num: Int32Builder,
-    sev_text: StringDictionaryBuilder<UInt16Type>,
-    /// Distinct entries in `sev_text`. Twenty-four in practice, unbounded from a
-    /// hostile client, so it is counted like any other dictionary.
-    n_sev: usize,
+    /// Twenty-four distinct values in practice, unbounded from a hostile
+    /// client, so it is counted like any other dictionary.
+    sev_text: DictColumn,
     body: StringBuilder,
     body_ser: BinaryBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -66,8 +64,7 @@ impl LogsBuilder {
             time: TimestampNanosecondBuilder::new(),
             observed: TimestampNanosecondBuilder::new(),
             sev_num: Int32Builder::new(),
-            sev_text: StringDictionaryBuilder::new(),
-            n_sev: 0,
+            sev_text: DictColumn::new("logs.severity_text"),
             body: StringBuilder::new(),
             body_ser: BinaryBuilder::new(),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -136,7 +133,7 @@ impl LogsBuilder {
         }
         self.rs.has_headroom(resources, scopes, res_kv, sc_kv)
             && self.log_attrs.has_headroom(log_kv)
-            && self.n_sev + records <= DICT_CAP
+            && self.sev_text.has_headroom(records)
     }
 
     /// Absorb one OTLP export request. Returns the number of log records added.
@@ -152,15 +149,7 @@ impl LogsBuilder {
                     // overflow cannot leave a half-row behind and poison the
                     // block. It also runs before `next_id` moves, so ids stay
                     // dense — the whole join story rests on that.
-                    if !rec.severity_text.is_empty() {
-                        let k = self
-                            .sev_text
-                            .append(&rec.severity_text)
-                            .map_err(|_| Error::DictionaryFull("logs.severity_text"))?;
-                        self.n_sev = self.n_sev.max(k as usize + 1);
-                    } else {
-                        self.sev_text.append_null();
-                    }
+                    self.sev_text.append(&rec.severity_text)?;
 
                     let id = self.next_id;
                     self.next_id += 1;
@@ -236,7 +225,7 @@ impl LogsBuilder {
             Arc::new(self.time.finish()),
             Arc::new(self.observed.finish()),
             Arc::new(self.sev_num.finish()),
-            Arc::new(self.sev_text.finish()),
+            self.sev_text.finish(),
             Arc::new(self.body.finish()),
             Arc::new(self.body_ser.finish()),
             Arc::new(self.trace_id.finish()),

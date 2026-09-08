@@ -115,10 +115,103 @@ pub static RESOURCES: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// SPANS root table.
+///
+/// One deviation from the wire format, and it is the only one: OTLP sends
+/// `start_time_unix_nano` and `end_time_unix_nano`; we store the start and a
+/// `duration_nano`. Two reasons, and end time is recoverable exactly from the
+/// pair either way.
+///
+/// Duration is what trace search actually filters on — "spans slower than
+/// 500ms" is the query every tracing UI opens with — so it deserves to be a
+/// column rather than a subtraction across two others. And it compresses:
+/// durations are small integers clustered near zero, absolute nanosecond
+/// timestamps are 19-digit numbers that share only their high bytes.
+///
+/// `name` is a dictionary because the semantic conventions require span names
+/// to be low-cardinality; if an instrumentation library violates that badly
+/// enough to fill 65536 slots, the block seals early and nothing is lost.
+pub static SPANS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("trace_id", DataType::FixedSizeBinary(16), true),
+        Field::new("span_id", DataType::FixedSizeBinary(8), true),
+        Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
+        Field::new("trace_state", DataType::Utf8, true),
+        Field::new("flags", DataType::UInt32, true),
+        Field::new("name", dict_u16_utf8(), true),
+        // SpanKind is 0..=5 on the wire in an Int32 field. UInt8 with the
+        // out-of-range case clamped to UNSPECIFIED costs 3 bytes a span.
+        Field::new("kind", DataType::UInt8, false),
+        Field::new("start_time_unix_nano", ts(), false),
+        Field::new("duration_nano", DataType::UInt64, false),
+        // Status. Split out of the nested message because `code` is the second
+        // most-filtered column in the table ("show me the errors") and burying
+        // it in a struct costs a child-array indirection on every scan.
+        Field::new("status_code", DataType::UInt8, false),
+        Field::new("status_message", DataType::Utf8, true),
+        Field::new("dropped_attributes_count", DataType::UInt32, false),
+        Field::new("dropped_events_count", DataType::UInt32, false),
+        Field::new("dropped_links_count", DataType::UInt32, false),
+        Field::new("resource_id", DataType::UInt16, false),
+        Field::new("scope_id", DataType::UInt16, false),
+    ]))
+});
+
+/// SPAN_EVENTS — a child table, not a `List<Struct>` column.
+///
+/// Events carry attributes, and attributes already live in their own EAV table
+/// keyed by `parent_id`. A list-of-struct column would need a second, different
+/// mechanism to hang attributes off list *elements*; a child table with its own
+/// dense `id` reuses the one that exists.
+///
+/// `id` is this table's own block-local id, distinct from `parent_id`, which
+/// points at the span. `span_event_attrs.parent_id` refers to `id` here.
+pub static SPAN_EVENTS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("parent_id", DataType::UInt32, false),
+        Field::new("time_unix_nano", ts(), false),
+        Field::new("name", dict_u16_utf8(), true),
+        Field::new("dropped_attributes_count", DataType::UInt32, false),
+    ]))
+});
+
+/// SPAN_LINKS — same child-table reasoning as [`SPAN_EVENTS`].
+///
+/// A link's `trace_id`/`span_id` point *out* of this block, usually out of this
+/// node entirely, so they stay raw ids and are not rebased. That is the
+/// distinction the whole id scheme rests on: `parent_id` is block-local because
+/// it names a row here, `trace_id` is not because it names something elsewhere.
+pub static SPAN_LINKS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("parent_id", DataType::UInt32, false),
+        Field::new("trace_id", DataType::FixedSizeBinary(16), true),
+        Field::new("span_id", DataType::FixedSizeBinary(8), true),
+        Field::new("trace_state", DataType::Utf8, true),
+        Field::new("flags", DataType::UInt32, true),
+        Field::new("dropped_attributes_count", DataType::UInt32, false),
+    ]))
+});
+
 /// The tables a logs block is made of, in publish order.
 pub const LOGS_BLOCK_TABLES: [&str; 5] = [
     "logs",
     "log_attrs",
+    "resources",
+    "resource_attrs",
+    "scope_attrs",
+];
+
+/// The tables a traces block is made of, in publish order.
+pub const TRACES_BLOCK_TABLES: [&str; 9] = [
+    "spans",
+    "span_attrs",
+    "span_events",
+    "span_event_attrs",
+    "span_links",
+    "span_link_attrs",
     "resources",
     "resource_attrs",
     "scope_attrs",
