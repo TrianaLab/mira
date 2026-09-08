@@ -83,12 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recv = receiver::Receivers {
         logs: pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone()),
         traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(pcfg.clone()),
+        metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(pcfg.clone()),
     };
     pipeline::spawn_retention(pcfg);
 
     let grpc = tonic::transport::Server::builder()
         .add_service(recv.logs_server())
         .add_service(recv.traces_server())
+        .add_service(recv.metrics_server())
         .serve(grpc_addr);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;

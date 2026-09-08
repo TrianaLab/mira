@@ -8,8 +8,8 @@
 //! * [`attrs`] — the attribute tables and Resource-Scope preamble every signal
 //!   shares.
 //! * [`signal`] — the one shape every signal's encoder presents to the flusher.
-//! * [`logs`] / [`traces`] — OTLP protobuf into those schemas, with block-local
-//!   id rebasing.
+//! * [`logs`] / [`traces`] / [`metrics`] — OTLP protobuf into those schemas,
+//!   with block-local id rebasing.
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
 //!   mmap reads back out of them.
 //!
@@ -22,6 +22,7 @@ pub mod block;
 pub mod error;
 pub mod identity;
 pub mod logs;
+pub mod metrics;
 pub mod schema;
 pub mod signal;
 pub mod traces;
@@ -478,6 +479,233 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(d.values(), &[0, 0, 100]);
+    }
+
+    /// All five metric types through one request, because the layout's whole
+    /// premise is that they go to different tables while sharing one point id
+    /// space — and a shared counter is exactly the kind of thing that works for
+    /// one type and silently collides for four.
+    #[test]
+    fn every_metric_type_lands_in_its_own_table_from_one_id_space() {
+        use arrow_array::{Float64Array, ListArray, UInt8Array};
+        use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+        use mira_proto::metrics::v1::metric::Data;
+        use mira_proto::metrics::v1::number_data_point::Value as NumValue;
+        use mira_proto::metrics::v1::summary_data_point::ValueAtQuantile;
+        use mira_proto::metrics::v1::{
+            AggregationTemporality, Exemplar, ExponentialHistogram,
+            ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint, Metric,
+            NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
+            exponential_histogram_data_point::Buckets,
+        };
+
+        let number = |t: u64, v: i64| NumberDataPoint {
+            attributes: vec![kv("route", "/checkout")],
+            time_unix_nano: t,
+            start_time_unix_nano: 1, // process start: must not widen the block
+            value: Some(NumValue::AsInt(v)),
+            ..Default::default()
+        };
+        // Two histogram points sharing one bounds array, so the interning is
+        // actually exercised rather than merely present.
+        let hist = |t: u64| HistogramDataPoint {
+            time_unix_nano: t,
+            count: 3,
+            sum: Some(1.5),
+            bucket_counts: vec![1, 1, 1],
+            explicit_bounds: vec![0.1, 0.5],
+            exemplars: vec![Exemplar {
+                time_unix_nano: t,
+                trace_id: vec![4u8; 16].into(),
+                span_id: vec![5u8; 8].into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let metrics = vec![
+            Metric {
+                name: "http.server.request.count".into(),
+                unit: "{request}".into(),
+                data: Some(Data::Sum(Sum {
+                    data_points: vec![number(1_000, 7), number(2_000, 9)],
+                    aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                    is_monotonic: true,
+                })),
+                metadata: vec![kv("owner", "checkout-team")],
+                ..Default::default()
+            },
+            Metric {
+                name: "process.memory".into(),
+                data: Some(Data::Gauge(Gauge {
+                    data_points: vec![number(1_500, 42)],
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "http.server.duration".into(),
+                data: Some(Data::Histogram(Histogram {
+                    data_points: vec![hist(1_100), hist(2_100)],
+                    aggregation_temporality: AggregationTemporality::Delta as i32,
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "rpc.duration".into(),
+                data: Some(Data::ExponentialHistogram(ExponentialHistogram {
+                    data_points: vec![ExponentialHistogramDataPoint {
+                        time_unix_nano: 1_200,
+                        count: 4,
+                        scale: 3,
+                        zero_count: 1,
+                        positive: Some(Buckets {
+                            offset: 2,
+                            bucket_counts: vec![1, 2],
+                        }),
+                        ..Default::default()
+                    }],
+                    aggregation_temporality: AggregationTemporality::Delta as i32,
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "legacy.latency".into(),
+                data: Some(Data::Summary(Summary {
+                    data_points: vec![SummaryDataPoint {
+                        time_unix_nano: 3_000,
+                        count: 10,
+                        sum: 5.0,
+                        quantile_values: vec![
+                            ValueAtQuantile {
+                                quantile: 0.5,
+                                value: 0.4,
+                            },
+                            ValueAtQuantile {
+                                quantile: 0.99,
+                                value: 0.9,
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                })),
+                ..Default::default()
+            },
+        ];
+
+        let mut b = metrics::MetricsBuilder::new();
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv("service.name", "checkout")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert!(b.has_headroom_for(&req));
+        // 3 number + 2 histogram + 1 exponential + 1 summary.
+        assert_eq!(b.append_request(&req).unwrap(), 7);
+
+        let sealed = b.finish().unwrap();
+        assert_eq!(sealed.num_rows, 7);
+        assert_eq!(
+            sealed.tables.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            schema::METRICS_BLOCK_TABLES
+        );
+        let rows = |t: &str| sealed.table(t).unwrap().num_rows();
+        assert_eq!(rows("metrics"), 5);
+        assert_eq!(rows("number_dp"), 3);
+        assert_eq!(rows("hist_dp"), 2);
+        assert_eq!(rows("exp_hist_dp"), 1);
+        assert_eq!(rows("summary_dp"), 1);
+        assert_eq!(rows("exemplars"), 2);
+        assert_eq!(rows("metric_attrs"), 1);
+        // Two histogram points, one bounds row: the interning is the reason
+        // hist_dp measured 1.67x smaller.
+        assert_eq!(rows("hist_bounds"), 1);
+
+        // start_time_unix_nano is process start and must not widen the block —
+        // otherwise every cumulative metric makes its block match every query.
+        assert_eq!(sealed.min_ts, 1_000);
+        assert_eq!(sealed.max_ts, 3_000);
+
+        let u32col = |t: &str, c: &str| {
+            sealed
+                .table(t)
+                .unwrap()
+                .column_by_name(c)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .clone()
+        };
+        // THE invariant of this layout: one id space across four tables. Sum
+        // takes 0-1, gauge 2, histogram 3-4, exponential 5, summary 6 — never
+        // the same number twice, which is what lets dp_attrs and exemplars key
+        // on a point without a table discriminant.
+        assert_eq!(u32col("number_dp", "id").values(), &[0, 1, 2]);
+        assert_eq!(u32col("hist_dp", "id").values(), &[3, 4]);
+        assert_eq!(u32col("exp_hist_dp", "id").values(), &[5]);
+        assert_eq!(u32col("summary_dp", "id").values(), &[6]);
+        assert_eq!(u32col("exemplars", "parent_id").values(), &[3, 4]);
+        // Only the three number points carry attributes here, and dp_attrs
+        // points straight at them.
+        assert_eq!(u32col("dp_attrs", "parent_id").values(), &[0, 1, 2]);
+        // Both histogram points share bounds row 0.
+        assert_eq!(u32col("hist_dp", "bounds_id").values(), &[0, 0]);
+
+        // Temporality and monotonicity live on the descriptor, not on 300,000
+        // points that would each repeat them.
+        let kinds = sealed.table("metrics").unwrap();
+        let kind = kinds
+            .column_by_name("kind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        assert_eq!(kind.values(), &[2, 1, 3, 4, 5]);
+
+        // Quantiles round-trip as two parallel lists.
+        let sd = sealed.table("summary_dp").unwrap();
+        let q = sd
+            .column_by_name("quantile")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let q = q.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(q.values(), &[0.5, 0.99]);
+
+        // And the whole thing survives a publish/mmap round trip. A List column
+        // has three buffers of its own; if any of them were copied, this drops
+        // below n/n.
+        let root = std::env::temp_dir().join(format!("mira-me-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let published = block::publish(
+            &root,
+            "metrics",
+            block::node_id("a"),
+            1,
+            sealed.min_ts,
+            sealed.max_ts,
+            &sealed.refs(),
+        )
+        .unwrap();
+        for t in ["number_dp", "hist_dp", "hist_bounds", "summary_dp"] {
+            let m = block::open_table(&published.dir.join(format!("{t}.arrow"))).unwrap();
+            let (inside, total) = m.zero_copy_ratio();
+            assert_eq!(inside, total, "{t}: {inside}/{total} buffers zero-copy");
+        }
+        // Nothing in this request had exemplar attributes, so that table is
+        // absent rather than 2.5 KB of framing.
+        assert!(!published.dir.join("exemplar_attrs.arrow").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

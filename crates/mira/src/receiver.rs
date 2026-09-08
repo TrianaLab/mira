@@ -4,10 +4,6 @@
 //! by tonic. 4318 is OTLP/HTTP — a plain HTTP/1.1 POST of protobuf to
 //! `/v1/{traces,metrics,logs}` — which tonic cannot serve; that one is axum,
 //! already in the tree via tonic's `router` feature, so it costs no dependency.
-//!
-//! Metrics is deliberately absent rather than stubbed on the gRPC side: tonic
-//! answers an unregistered service with `UNIMPLEMENTED`, which is exactly the
-//! right thing and exactly what a hand-written stub would have to say.
 
 use axum::Router;
 use axum::body::Bytes;
@@ -20,18 +16,25 @@ use tonic_types::{ErrorDetails, StatusExt};
 
 use mira_proto::collector::logs::v1::logs_service_server::{LogsService, LogsServiceServer};
 use mira_proto::collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse};
+use mira_proto::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+};
+use mira_proto::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 use mira_proto::collector::trace::v1::trace_service_server::{TraceService, TraceServiceServer};
 use mira_proto::collector::trace::v1::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 
 use crate::pipeline::{Ingest, Rejected};
 
-/// Both write handles. The type parameter is what keeps a metrics request from
-/// being handed to the logs flusher; `Ingest` is generic precisely so that the
-/// mistake is a compile error rather than a corrupt block.
+/// One write handle per signal. The type parameter is what keeps a metrics
+/// request from being handed to the logs flusher; `Ingest` is generic precisely
+/// so that the mistake is a compile error rather than a corrupt block.
 #[derive(Clone)]
 pub struct Receivers {
     pub logs: Ingest<ExportLogsServiceRequest>,
     pub traces: Ingest<ExportTraceServiceRequest>,
+    pub metrics: Ingest<ExportMetricsServiceRequest>,
 }
 
 /// Map a rejection onto a gRPC status.
@@ -60,6 +63,9 @@ impl Receivers {
     }
     pub fn traces_server(&self) -> TraceServiceServer<Self> {
         TraceServiceServer::new(self.clone())
+    }
+    pub fn metrics_server(&self) -> MetricsServiceServer<Self> {
+        MetricsServiceServer::new(self.clone())
     }
 }
 
@@ -93,6 +99,20 @@ impl TraceService for Receivers {
     }
 }
 
+#[tonic::async_trait]
+impl MetricsService for Receivers {
+    async fn export(
+        &self,
+        request: Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, Status> {
+        self.metrics
+            .submit(request.into_inner())
+            .await
+            .map_err(status_for)?;
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
 /// OTLP/HTTP on 4318.
 pub fn http_router(r: Receivers) -> Router {
     Router::new()
@@ -112,7 +132,14 @@ pub fn http_router(r: Receivers) -> Router {
                 },
             ),
         )
-        .route("/v1/metrics", post(unimplemented))
+        .route(
+            "/v1/metrics",
+            post(
+                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
+                    export(&r.metrics, b, ExportMetricsServiceResponse::default()).await
+                },
+            ),
+        )
         .with_state(r)
 }
 
@@ -143,11 +170,4 @@ async fn export<R: Message + Default, T: Message>(
         Err(Rejected::Closed) => (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response(),
         Err(Rejected::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-}
-
-async fn unimplemented() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "metrics ingest is not wired up yet",
-    )
 }
