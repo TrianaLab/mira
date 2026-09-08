@@ -35,7 +35,7 @@ use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
 use mira_proto::common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList};
 use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use mira_proto::metrics::v1::{
-    ExponentialHistogram, ExponentialHistogramDataPoint, Exemplar, Gauge, Histogram,
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
     HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
     SummaryDataPoint, exponential_histogram_data_point, metric, number_data_point,
     summary_data_point,
@@ -85,7 +85,9 @@ fn int(y: &Yaml, what: &'static str) -> R<i64> {
         Yaml::BadValue | Yaml::Null => Ok(0),
         Yaml::Integer(n) => Ok(*n),
         Yaml::String(t) if t.is_empty() => Ok(0),
-        Yaml::String(t) => t.parse().map_err(|_| format!("{what}: {t:?} is not an integer")),
+        Yaml::String(t) => t
+            .parse()
+            .map_err(|_| format!("{what}: {t:?} is not an integer")),
         other => Err(format!("{what}: expected an integer, got {other:?}")),
     }
 }
@@ -96,9 +98,9 @@ fn int(y: &Yaml, what: &'static str) -> R<i64> {
 fn uint(y: &Yaml, what: &'static str) -> R<u64> {
     match y {
         Yaml::Integer(n) if *n >= 0 => Ok(*n as u64),
-        Yaml::String(t) if !t.is_empty() => {
-            t.parse().map_err(|_| format!("{what}: {t:?} is not an unsigned integer"))
-        }
+        Yaml::String(t) if !t.is_empty() => t
+            .parse()
+            .map_err(|_| format!("{what}: {t:?} is not an unsigned integer")),
         _ => Ok(int(y, what)?.try_into().unwrap_or_default()),
     }
 }
@@ -124,7 +126,9 @@ fn float(y: &Yaml, what: &'static str) -> R<f64> {
             "Infinity" => Ok(f64::INFINITY),
             "-Infinity" => Ok(f64::NEG_INFINITY),
             "" => Ok(0.0),
-            _ => t.parse().map_err(|_| format!("{what}: {t:?} is not a number")),
+            _ => t
+                .parse()
+                .map_err(|_| format!("{what}: {t:?} is not a number")),
         },
         other => Err(format!("{what}: expected a number, got {other:?}")),
     }
@@ -434,7 +438,11 @@ fn span(sp: &Yaml) -> R<Span> {
             "endTimeUnixNano",
         )?,
         attributes: key_values(&sp["attributes"])?,
-        dropped_attributes_count: dropped(sp, "droppedAttributesCount", "dropped_attributes_count")?,
+        dropped_attributes_count: dropped(
+            sp,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
         events: list(&sp["events"])
             .iter()
             .map(|e| {
@@ -584,11 +592,7 @@ fn exemplars(p: &Yaml) -> R<Vec<Exemplar>> {
         .iter()
         .map(|e| {
             Ok(Exemplar {
-                filtered_attributes: key_values(f(
-                    e,
-                    "filteredAttributes",
-                    "filtered_attributes",
-                ))?,
+                filtered_attributes: key_values(f(e, "filteredAttributes", "filtered_attributes"))?,
                 time_unix_nano: uint(f(e, "timeUnixNano", "time_unix_nano"), "timeUnixNano")?,
                 value: number_value(e, "exemplar")?.map(|v| match v {
                     number_data_point::Value::AsDouble(d) => {

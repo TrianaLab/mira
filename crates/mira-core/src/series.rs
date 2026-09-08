@@ -90,7 +90,20 @@ struct Series {
     /// missing its spike because the engine quietly truncated is the failure
     /// mode this exists to prevent.
     dropped: usize,
+    /// The trace ids behind the points: `(time, rendered object)`, rendered
+    /// here because the block they were read from is unmapped before the
+    /// response is written.
+    exemplars: Vec<(i64, String)>,
 }
+
+/// Exemplars kept per series.
+///
+/// An exemplar is one sampled measurement per collection interval per bucket,
+/// so a well-behaved exporter sends few — but nothing in OTLP bounds it, and an
+/// unbounded array here would make one misconfigured SDK able to inflate every
+/// chart response. ponytail: a flat cap, not a reservoir sample; the first ones
+/// in a window are as good a sample as any until someone proves otherwise.
+const MAX_EXEMPLARS: usize = 64;
 
 /// One attribute as `(key, rendered JSON value)`. Rendered once and carried as
 /// a string because the same value is written into both the grouping key and
@@ -159,6 +172,19 @@ pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
                         });
                     }
                 });
+                // The answer to "which trace made this spike". Omitted rather
+                // than emitted empty, because most series have none and this is
+                // the response a chart polls.
+                if !s.exemplars.is_empty() {
+                    let mut ex = s.exemplars.clone();
+                    ex.sort_unstable_by_key(|e| e.0);
+                    j.key("exemplars");
+                    j.arr(|j| {
+                        for (_, rendered) in &ex {
+                            j.raw(rendered);
+                        }
+                    });
+                }
             });
         }
     });
@@ -238,6 +264,30 @@ fn load(bref: &BlockRef, name: &str) -> Result<Option<RecordBatch>> {
     Ok(block::open_table_opt(&path)?.and_then(|t| t.batches.first().cloned()))
 }
 
+/// Child rows grouped by `parent_id`, indexed by it.
+///
+/// Ids are rebased dense from zero per block, so the parent id *is* the slot —
+/// no hash map, and the whole thing is one pass over a `u32` buffer.
+fn index_by_parent(b: &RecordBatch) -> Vec<Vec<u32>> {
+    let Some(col) = b.column_by_name("parent_id") else {
+        return Vec::new();
+    };
+    let parents = col.as_primitive::<UInt32Type>().values();
+    let mut out: Vec<Vec<u32>> =
+        vec![Vec::new(); parents.iter().copied().max().unwrap_or(0) as usize + 1];
+    for (r, &p) in parents.iter().enumerate() {
+        out[p as usize].push(r as u32);
+    }
+    out
+}
+
+fn exemplar_time(b: &RecordBatch, row: u32) -> i64 {
+    b.column_by_name("time_unix_nano").map_or(0, |c| {
+        c.as_primitive::<TimestampNanosecondType>()
+            .value(row as usize)
+    })
+}
+
 fn dict_str<'a>(b: &'a RecordBatch, col: &str, row: usize) -> Option<&'a str> {
     let c = b.column_by_name(col)?;
     let d = c.as_dictionary::<UInt16Type>();
@@ -270,6 +320,11 @@ fn collect_block(
     let n_metrics = metrics.num_rows();
     let metric_attrs = load(bref, "metric_attrs")?;
     let dp_attrs = load(bref, "dp_attrs")?;
+    // Data point ids are one dense space across all four point tables, so one
+    // list indexed by id serves every table below — the same property that lets
+    // `dp_attrs` carry no discriminant.
+    let exemplars = load(bref, "exemplars")?;
+    let by_point = exemplars.as_ref().map(index_by_parent).unwrap_or_default();
     let resource_attrs = load(bref, "resource_attrs")?;
     let scope_attrs = load(bref, "scope_attrs")?;
 
@@ -410,11 +465,25 @@ fn collect_block(
                     attrs: attrs.clone(),
                     points: Vec::new(),
                     dropped: 0,
+                    exemplars: Vec::new(),
                 });
                 if s.points.len() >= q.max_points {
                     s.dropped += 1;
                 } else {
                     s.points.push((time[r], v));
+                }
+                // A histogram yields two derived series from one point, and its
+                // exemplars belong to both: whichever of `.count` and `.sum` is
+                // charted, the spike in it points at the same traces.
+                if let (Some(ex), Some(rows)) = (&exemplars, by_point.get(d)) {
+                    for &er in rows {
+                        if s.exemplars.len() >= MAX_EXEMPLARS {
+                            break;
+                        }
+                        let mut j = Json::new();
+                        j.obj(|j| crate::query::emit_fields(j, ex, er));
+                        s.exemplars.push((exemplar_time(ex, er), j.into_string()));
+                    }
                 }
             }
         }

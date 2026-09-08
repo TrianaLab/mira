@@ -428,6 +428,33 @@ struct Block {
     attrs: Option<RecordBatch>,
     resource_attrs: Option<RecordBatch>,
     scope_attrs: Option<RecordBatch>,
+    /// Rows that hang off a root row rather than being one: a span's events and
+    /// its links. Empty for logs.
+    children: Vec<Child>,
+}
+
+/// A child table and the attribute table keyed by its `id`.
+struct Child {
+    /// What the array is called in the emitted row.
+    label: &'static str,
+    rows: RecordBatch,
+    attrs: Option<RecordBatch>,
+}
+
+/// The child tables of each signal: emitted name, row table, attribute table.
+///
+/// Links are the *out*-edge of the correlation graph — a link's `trace_id`
+/// points at another trace, usually one this node never saw — so returning them
+/// is the whole point of storing them. Events are a span's log lines and are
+/// what a waterfall shows when a row is expanded.
+fn child_tables(signal: Signal) -> &'static [(&'static str, &'static str, &'static str)] {
+    match signal {
+        Signal::Logs => &[],
+        Signal::Traces => &[
+            ("events", "span_events", "span_event_attrs"),
+            ("links", "span_links", "span_link_attrs"),
+        ],
+    }
 }
 
 impl Block {
@@ -446,11 +473,25 @@ impl Block {
         let Some(root) = load(signal.root())? else {
             return Ok(None);
         };
+        let mut children = Vec::new();
+        for &(label, table, attrs) in child_tables(signal) {
+            // A block whose spans carried no events writes no `span_events`
+            // file at all (`publish` skips empty tables), which is absence, not
+            // damage.
+            if let Some(rows) = load(table)? {
+                children.push(Child {
+                    label,
+                    rows,
+                    attrs: load(attrs)?,
+                });
+            }
+        }
         Ok(Some(Block {
             signal,
             attrs: load(signal.attrs())?,
             resource_attrs: load("resource_attrs")?,
             scope_attrs: load("scope_attrs")?,
+            children,
             root,
         }))
     }
@@ -550,52 +591,60 @@ impl Block {
         out
     }
 
-    /// Write one root row as a JSON object, attributes merged in.
+    /// Write one root row as a JSON object, attributes merged in and child rows
+    /// nested under it.
     fn emit_row(&self, j: &mut Json, row: u32) {
         j.obj(|j| {
-            for (i, f) in self.root.schema().fields().iter().enumerate() {
-                // Internal plumbing. The caller asked for a log line, not for
-                // the block-local ids that found it.
-                if matches!(f.name().as_str(), "id" | "resource_id" | "scope_id") {
-                    continue;
-                }
-                let col = self.root.column(i);
-                if col.is_null(row as usize) {
-                    continue;
-                }
-                j.key(f.name());
-                emit_value(j, col.as_ref(), row as usize);
-            }
-
+            emit_fields(j, &self.root, row);
             j.key("attributes");
-            j.obj(|j| {
-                let levels = [
+            emit_attrs(
+                j,
+                &[
                     (&self.resource_attrs, self.fk(row, "resource_id")),
                     (&self.scope_attrs, self.fk(row, "scope_id")),
                     (&self.attrs, Some(row)),
-                ];
-                let mut merged: Vec<(&str, &RecordBatch, usize)> = Vec::new();
-                for (table, parent) in levels {
-                    let (Some(a), Some(parent)) = (table, parent) else {
-                        continue;
-                    };
-                    let parents = a.column(0).as_primitive::<UInt32Type>().values();
-                    for r in (0..a.num_rows()).filter(|&r| parents[r] == parent) {
-                        merged.push((attr_key(a, r), a, r));
-                    }
-                }
-                // Sorted so output is deterministic, and stably so that within
-                // one key the last level pushed — the most specific one — is
-                // the entry that survives the dedup below.
-                merged.sort_by_key(|(k, _, _)| *k);
-                for (i, &(k, a, r)) in merged.iter().enumerate() {
-                    if merged.get(i + 1).is_some_and(|nxt| nxt.0 == k) {
-                        continue;
-                    }
-                    j.key(k);
-                    emit_attr(j, a, r);
-                }
-            });
+                ],
+            );
+            for c in &self.children {
+                self.emit_children(j, c, row);
+            }
+        });
+    }
+
+    /// The `events` / `links` array of one span.
+    ///
+    /// ponytail: a linear pass over the child table per emitted row. Bounded by
+    /// `limit` root rows, and the alternative — a parent_id→rows index built per
+    /// block — costs more than it saves until `limit` is in the thousands.
+    fn emit_children(&self, j: &mut Json, c: &Child, row: u32) {
+        let Some(parents) = c.rows.column_by_name("parent_id") else {
+            return;
+        };
+        let parents = parents.as_primitive::<UInt32Type>().values();
+        let hits: Vec<usize> = (0..c.rows.num_rows())
+            .filter(|&r| parents[r] == row)
+            .collect();
+        // No key at all rather than an empty array: most spans have neither
+        // events nor links, and two empty arrays per span is most of the
+        // response.
+        if hits.is_empty() {
+            return;
+        }
+        j.key(c.label);
+        j.arr(|j| {
+            for r in hits {
+                j.obj(|j| {
+                    emit_fields(j, &c.rows, r as u32);
+                    // The child's own `id`, which its attribute table keys on —
+                    // not the span's row number.
+                    let id = c
+                        .rows
+                        .column_by_name("id")
+                        .map(|col| col.as_primitive::<UInt32Type>().value(r));
+                    j.key("attributes");
+                    emit_attrs(j, &[(&c.attrs, id)]);
+                });
+            }
         });
     }
 
@@ -604,6 +653,54 @@ impl Block {
             .column_by_name(name)
             .map(|c| c.as_primitive::<UInt16Type>().value(row as usize) as u32)
     }
+}
+
+/// Every non-null column of one row, by name.
+///
+/// The block-local ids are skipped: the caller asked for a log line or a span
+/// event, not for the row numbers that found it.
+pub(crate) fn emit_fields(j: &mut Json, b: &RecordBatch, row: u32) {
+    for (i, f) in b.schema().fields().iter().enumerate() {
+        if matches!(
+            f.name().as_str(),
+            "id" | "parent_id" | "resource_id" | "scope_id"
+        ) {
+            continue;
+        }
+        let col = b.column(i);
+        if col.is_null(row as usize) {
+            continue;
+        }
+        j.key(f.name());
+        emit_value(j, col.as_ref(), row as usize);
+    }
+}
+
+/// One `{...}` merging the attributes of several levels, most specific last.
+fn emit_attrs(j: &mut Json, levels: &[(&Option<RecordBatch>, Option<u32>)]) {
+    j.obj(|j| {
+        let mut merged: Vec<(&str, &RecordBatch, usize)> = Vec::new();
+        for &(table, parent) in levels {
+            let (Some(a), Some(parent)) = (table, parent) else {
+                continue;
+            };
+            let parents = a.column(0).as_primitive::<UInt32Type>().values();
+            for r in (0..a.num_rows()).filter(|&r| parents[r] == parent) {
+                merged.push((attr_key(a, r), a, r));
+            }
+        }
+        // Sorted so output is deterministic, and stably so that within one key
+        // the last level pushed — the most specific one — is the entry that
+        // survives the dedup below.
+        merged.sort_by_key(|(k, _, _)| *k);
+        for (i, &(k, a, r)) in merged.iter().enumerate() {
+            if merged.get(i + 1).is_some_and(|nxt| nxt.0 == k) {
+                continue;
+            }
+            j.key(k);
+            emit_attr(j, a, r);
+        }
+    });
 }
 
 /// `parent_id`s of the attribute rows whose key matches and whose value

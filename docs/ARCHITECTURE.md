@@ -753,12 +753,10 @@ observable. *Not yet implemented.*
 
 ## 10. What is deliberately not here
 
-- **Anything that reads `span_links` or `exemplars`.** Both are real tables with
-  real rows — links carry their `trace_id`/`span_id`, and metric exemplars keep
-  theirs, which is the thing backends usually drop and then cannot answer "which
-  trace made this spike". Nothing in the query layer follows either edge yet, so
-  the §7.1 correlation obligation is paid on the write side and unpaid on the
-  read side.
+- **The frame expanders of §7.3.** A span query returns its links and a series
+  returns its exemplars, so both out-edges of §7.1 are readable — but the caller
+  follows them itself. `by_link`, `by_exemplar` and `peers` as one-call
+  operations are not here.
 - **A compression tier.** Blocks are written uncompressed. §11 is where this
   shows up, and it is currently the largest single gap between design and
   measurement.

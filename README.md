@@ -25,6 +25,10 @@ build. The block directory is the only state; the filesystem is the manifest.
 - **MCP on `/mcp`.** Four tools over JSON-RPC, no session id, so any replica can
   answer any call. A model asks the same four questions the UI does, through the
   same read path.
+- **Correlation edges are readable, not just stored.** A span comes back with its
+  events and its links; a metric series comes back with the exemplars that name
+  the traces behind it. "Which trace made this spike" is one query, not a second
+  system.
 - **Zero-copy queries.** Blocks are read straight out of their mapping —
   asserted, not assumed: a test walks every buffer of every column and requires
   all of them to point inside the mapping.

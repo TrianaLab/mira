@@ -472,6 +472,79 @@ async fn a_metric_series_survives_being_split_across_two_blocks() {
     assert!(hist.contains("[9000,1234.5]"), "{hist}");
 }
 
+/// The metric-to-trace edge, which is the one correlation other backends drop.
+///
+/// An exemplar hangs off a data point, and a histogram point produces *two*
+/// derived series, so the assertion that matters is that both of them carry it:
+/// whichever of `.count` and `.sum` is on screen, the spike in it has to point
+/// at the same trace.
+#[tokio::test]
+async fn a_histogram_carries_its_exemplars_into_both_derived_series() {
+    use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use mira_proto::metrics::v1::metric::Data;
+    use mira_proto::metrics::v1::{
+        AggregationTemporality, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics,
+    };
+
+    let (app, _root) = boot("exemplars");
+    otlp(
+        &app,
+        "/v1/metrics",
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "rpc.duration".into(),
+                        unit: "ms".into(),
+                        data: Some(Data::Histogram(mira_proto::metrics::v1::Histogram {
+                            aggregation_temporality: AggregationTemporality::Delta as i32,
+                            data_points: vec![HistogramDataPoint {
+                                time_unix_nano: 9_000,
+                                count: 3,
+                                sum: Some(30.0),
+                                explicit_bounds: vec![10.0],
+                                bucket_counts: vec![2, 1],
+                                exemplars: vec![mira_proto::metrics::v1::Exemplar {
+                                    time_unix_nano: 8_900,
+                                    trace_id: vec![0xab; 16].into(),
+                                    span_id: vec![0xcd; 8].into(),
+                                    value: Some(
+                                        mira_proto::metrics::v1::exemplar::Value::AsDouble(29.5),
+                                    ),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        },
+    )
+    .await;
+
+    let (_, hist) = post(
+        &app,
+        "/api/v1/metrics/query",
+        "application/json",
+        br#"{"name":"rpc.duration","from":0,"to":100000}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        hist.matches(r#""trace_id":"abababababababababababababababab""#)
+            .count(),
+        2,
+        "{hist}"
+    );
+    assert!(hist.contains(r#""span_id":"cdcdcdcdcdcdcdcd""#), "{hist}");
+    assert!(hist.contains(r#""double":29.5"#), "{hist}");
+    // The exemplar's own timestamp, not the point's.
+    assert!(hist.contains(r#""time_unix_nano":8900"#), "{hist}");
+}
+
 /// A bad query has to fail as JSON with a usable message. The caller is often a
 /// model, and "400 Bad Request" with an empty body teaches it nothing.
 #[tokio::test]
@@ -722,6 +795,15 @@ async fn otlp_json_bodies_decode_with_the_deviations_the_spec_requires() {
     // An absent parent is null — not eight bytes of zero, which would join to a
     // real span, and not an error.
     assert!(!spans.contains("parent_span_id"), "{spans}");
+    // Events and links come back nested under the span. A link's ids point out
+    // of this block — that is what makes it a link — so they are the one place
+    // the reader must not rebase.
+    assert!(spans.contains(r#""events":[{"#), "{spans}");
+    assert!(spans.contains(r#""name":"cache.miss""#), "{spans}");
+    assert!(
+        spans.contains(r#""links":[{"trace_id":"99887766554433221100ffeeddccbbaa""#),
+        "{spans}"
+    );
 
     // Metrics: an int-valued gauge point, which is the shape that would silently
     // become a double if the oneof were decoded by value rather than by key.
