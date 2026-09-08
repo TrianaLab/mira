@@ -19,6 +19,11 @@ use mira_proto::collector::logs::v1::{ExportLogsServiceRequest, ExportLogsServic
 
 use crate::pipeline::{Ingest, Rejected};
 
+/// The logs write handle. Traces and metrics get their own once their encoders
+/// exist; the type parameter is what keeps a metrics request from being handed
+/// to the logs flusher.
+type LogsIngest = Ingest<ExportLogsServiceRequest>;
+
 /// Map a rejection onto a gRPC status.
 ///
 /// Overload is never a partial success: the OTLP spec says the client MUST NOT
@@ -40,11 +45,11 @@ fn status_for(r: Rejected) -> Status {
 }
 
 pub struct Grpc {
-    ingest: Ingest,
+    ingest: LogsIngest,
 }
 
 impl Grpc {
-    pub fn server(ingest: Ingest) -> LogsServiceServer<Self> {
+    pub fn server(ingest: LogsIngest) -> LogsServiceServer<Self> {
         LogsServiceServer::new(Self { ingest })
     }
 }
@@ -66,7 +71,7 @@ impl LogsService for Grpc {
 }
 
 /// OTLP/HTTP on 4318.
-pub fn http_router(ingest: Ingest) -> Router {
+pub fn http_router(ingest: LogsIngest) -> Router {
     Router::new()
         .route("/v1/logs", post(export_logs))
         .route("/v1/traces", post(unimplemented))
@@ -75,7 +80,7 @@ pub fn http_router(ingest: Ingest) -> Router {
 }
 
 async fn export_logs(
-    axum::extract::State(ingest): axum::extract::State<Ingest>,
+    axum::extract::State(ingest): axum::extract::State<LogsIngest>,
     body: Bytes,
 ) -> impl IntoResponse {
     let req = match ExportLogsServiceRequest::decode(body) {

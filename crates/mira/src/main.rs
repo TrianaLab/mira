@@ -72,19 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (grpc_addr, http_addr) = (cfg.grpc, cfg.http);
     let peers = cfg.peers.len();
 
-    let ingest = pipeline::spawn(pipeline::Config {
+    let pcfg = std::sync::Arc::new(pipeline::Config {
         data_dir: cfg.data_dir,
         node,
         retention: cfg.retention,
         ..Default::default()
     });
+    let logs = pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
+    pipeline::spawn_retention(pcfg);
 
     let grpc = tonic::transport::Server::builder()
-        .add_service(receiver::Grpc::server(ingest.clone()))
+        .add_service(receiver::Grpc::server(logs.clone()))
         .serve(grpc_addr);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    let http = axum::serve(listener, receiver::http_router(ingest));
+    let http = axum::serve(listener, receiver::http_router(logs));
 
     // The node id is logged because it is the only externally visible thing that
     // distinguishes two replicas' blocks, and a collision is diagnosed here.

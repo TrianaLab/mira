@@ -21,9 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mira_core::SignalBuilder;
 use mira_core::block;
-use mira_core::logs::LogsBuilder;
-use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
@@ -58,14 +57,24 @@ impl Default for Config {
     }
 }
 
-pub struct Job {
-    pub req: ExportLogsServiceRequest,
-    pub ack: oneshot::Sender<Result<(), String>>,
+struct Job<R> {
+    req: R,
+    ack: oneshot::Sender<Result<(), String>>,
 }
 
-#[derive(Clone)]
-pub struct Ingest {
-    tx: mpsc::Sender<Job>,
+/// The write handle for one signal. `R` is that signal's OTLP export request.
+pub struct Ingest<R> {
+    tx: mpsc::Sender<Job<R>>,
+}
+
+// Derived `Clone` would demand `R: Clone`, which no export request is. Only the
+// `Sender` is cloned, and that is unconditional.
+impl<R> Clone for Ingest<R> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 /// Why an export could not be admitted. Neither of these is a partial success:
@@ -80,10 +89,10 @@ pub enum Rejected {
     Failed(String),
 }
 
-impl Ingest {
+impl<R> Ingest<R> {
     /// Enqueue and wait for durability. Returns as soon as the block containing
     /// this request has been fsynced and renamed into place.
-    pub async fn submit(&self, req: ExportLogsServiceRequest) -> Result<(), Rejected> {
+    pub async fn submit(&self, req: R) -> Result<(), Rejected> {
         let (ack, wait) = oneshot::channel();
         // try_reserve, not send().await: shedding before the decode work is the
         // difference between a fast NACK and an unbounded latency tail.
@@ -101,16 +110,28 @@ impl Ingest {
     }
 }
 
-/// Start the ingest pipeline. Returns the handle the receivers push into.
-pub fn spawn(cfg: Config) -> Ingest {
+/// Every signal that has an on-disk directory. Retention sweeps all of them;
+/// [`block::scan`] treats a missing one as empty, so listing a signal before its
+/// encoder exists is harmless.
+pub const SIGNALS: [&str; 3] = ["logs", "traces", "metrics"];
+
+/// Start one signal's ingest pipeline. Returns the handle its receivers push
+/// into. Each signal gets its own channel, flusher task and block sequence, so a
+/// slow flush on one cannot stall another.
+pub fn spawn<B: SignalBuilder>(cfg: Arc<Config>) -> Ingest<B::Request> {
     let (tx, rx) = mpsc::channel(128);
-    let cfg = Arc::new(cfg);
-    tokio::spawn(flusher(rx, cfg.clone()));
-    tokio::spawn(retention(cfg));
+    tokio::spawn(flusher::<B>(rx, cfg));
     Ingest { tx }
 }
 
-async fn flusher(mut rx: mpsc::Receiver<Job>, cfg: Arc<Config>) {
+/// One sweep for all signals, not one per signal: retention is IO against the
+/// directory tree, and three tasks waking on the same minute boundary to unlink
+/// from the same volume is contention for nothing.
+pub fn spawn_retention(cfg: Arc<Config>) {
+    tokio::spawn(retention(cfg));
+}
+
+async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg: Arc<Config>) {
     // Resume the sequence past whatever is already on disk so block directory
     // names stay unique across restarts. This is the entirety of crash recovery.
     //
@@ -119,20 +140,20 @@ async fn flusher(mut rx: mpsc::Receiver<Job>, cfg: Arc<Config>) {
     // whenever a restart follows a backlog replay. Reusing a sequence makes the
     // next `rename` land on an existing directory and the node never publishes
     // again.
-    let mut seq = match block::scan(&cfg.data_dir, "logs") {
+    let mut seq = match block::scan(&cfg.data_dir, B::SIGNAL) {
         Ok(blocks) => blocks.iter().map(|b| b.seq).max().map_or(0, |s| s + 1),
         Err(e) => {
-            tracing::error!(error = %e, "cannot scan data directory");
+            tracing::error!(signal = B::SIGNAL, error = %e, "cannot scan data directory");
             return;
         }
     };
 
-    let mut builder = LogsBuilder::new();
+    let mut builder = B::default();
     let mut waiters: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
     let mut batch = Vec::with_capacity(64);
     // Jobs that did not fit the open block. They go into the next one, so a full
     // dictionary costs a slightly small block and never costs a caller its data.
-    let mut carry: Vec<Job> = Vec::new();
+    let mut carry: Vec<Job<B::Request>> = Vec::new();
     let mut deadline = Instant::now() + cfg.max_block_age;
     let mut open = true;
 
@@ -208,12 +229,9 @@ async fn flusher(mut rx: mpsc::Receiver<Job>, cfg: Arc<Config>) {
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(msg.clone()));
                 }
-                // `finish` resets column builders as it goes, so a failure part
-                // way through leaves this one unusable. Keeping it would make
-                // every subsequent seal fail the same way and the node would
-                // reject everything until restarted.
-                builder = LogsBuilder::new();
-                tracing::error!(error = %msg, "block discarded; builder reset");
+                // `finish` leaves a fresh builder behind even when it fails, so
+                // there is nothing to repair here — see `SignalBuilder::finish`.
+                tracing::error!(signal = B::SIGNAL, error = %msg, "block discarded");
                 continue;
             }
         };
@@ -222,16 +240,16 @@ async fn flusher(mut rx: mpsc::Receiver<Job>, cfg: Arc<Config>) {
         let node = cfg.node;
         let this_seq = seq;
         seq += 1;
-        let rows = sealed.num_rows();
+        let rows = sealed.num_rows;
         let result = tokio::task::spawn_blocking(move || {
             block::publish(
                 &dir,
-                "logs",
+                B::SIGNAL,
                 node,
                 this_seq,
                 sealed.min_ts,
                 sealed.max_ts,
-                &sealed.tables(),
+                &sealed.refs(),
             )
             .map(|b| b.dir)
         })
@@ -239,7 +257,7 @@ async fn flusher(mut rx: mpsc::Receiver<Job>, cfg: Arc<Config>) {
 
         let outcome = match result {
             Ok(Ok(path)) => {
-                tracing::info!(rows, seq = this_seq, path = %path.display(), "block published");
+                tracing::info!(signal = B::SIGNAL, rows, seq = this_seq, path = %path.display(), "block published");
                 Ok(())
             }
             Ok(Err(e)) => Err(e.to_string()),
@@ -265,13 +283,22 @@ async fn retention(cfg: Arc<Config>) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as i64;
-            block::expire(&dir, "logs", now - ttl.as_nanos() as i64)
+            let cutoff = now - ttl.as_nanos() as i64;
+            // One signal failing must not skip the others; a full disk is
+            // exactly when the remaining sweeps matter most.
+            SIGNALS.map(|s| (s, block::expire(&dir, s, cutoff)))
         })
         .await;
         match dropped {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => tracing::info!(blocks = n, "retention dropped blocks"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "retention failed"),
+            Ok(results) => {
+                for (signal, r) in results {
+                    match r {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(signal, blocks = n, "retention dropped blocks"),
+                        Err(e) => tracing::warn!(signal, error = %e, "retention failed"),
+                    }
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "retention task panicked"),
         }
     }

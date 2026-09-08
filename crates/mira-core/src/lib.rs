@@ -5,6 +5,7 @@
 //! * [`schema`] — the OTAP-shaped Arrow schemas that are simultaneously the
 //!   in-memory and the on-disk layout. There is no translation step.
 //! * [`identity`] — the stable entity key that correlation joins on.
+//! * [`signal`] — the one shape every signal's encoder presents to the flusher.
 //! * [`logs`] — OTLP protobuf into those schemas, with block-local id rebasing.
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
 //!   mmap reads back out of them.
@@ -18,8 +19,10 @@ pub mod error;
 pub mod identity;
 pub mod logs;
 pub mod schema;
+pub mod signal;
 
 pub use error::{Error, Result};
+pub use signal::{Sealed, SignalBuilder};
 
 #[cfg(test)]
 mod tests {
@@ -124,19 +127,26 @@ mod tests {
         );
 
         let sealed = b.finish().unwrap();
-        assert_eq!(sealed.num_rows(), 1200);
+        assert_eq!(sealed.num_rows, 1200);
         assert_eq!(sealed.min_ts, 1_000);
         assert_eq!(sealed.max_ts, 3_199);
+        // Every table the on-disk format promises, named exactly as its file.
+        assert_eq!(
+            sealed.tables.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            schema::LOGS_BLOCK_TABLES
+        );
+        let rows = |t: &str| sealed.table(t).unwrap().num_rows();
         // checkout(2 attrs) + checkout-with-node(3) + payments(2).
-        assert_eq!(sealed.resources.num_rows(), 3);
-        assert_eq!(sealed.resource_attrs.num_rows(), 7);
-        assert_eq!(sealed.scope_attrs.num_rows(), 1);
-        assert_eq!(sealed.log_attrs.num_rows(), 1200);
+        assert_eq!(rows("resources"), 3);
+        assert_eq!(rows("resource_attrs"), 7);
+        assert_eq!(rows("scope_attrs"), 1);
+        assert_eq!(rows("log_attrs"), 1200);
 
         // The load-bearing correlation invariant: attribute drift does not fork
         // an entity. Three resource rows, two entities.
         let keys = sealed
-            .resources
+            .table("resources")
+            .unwrap()
             .column_by_name("key")
             .unwrap()
             .as_any()
@@ -157,7 +167,7 @@ mod tests {
             1,
             sealed.min_ts,
             sealed.max_ts,
-            &sealed.tables(),
+            &sealed.refs(),
         )
         .unwrap();
         assert_eq!(published.node, node);
@@ -264,7 +274,7 @@ mod tests {
         let mut b = logs::LogsBuilder::new();
         b.append_request(&request("checkout", 64, 1_000)).unwrap();
         let sealed = b.finish().unwrap();
-        block::write_table(&path, &sealed.logs).unwrap();
+        block::write_table(&path, sealed.table("logs").unwrap()).unwrap();
         assert!(block::open_table(&path).is_ok());
 
         // Flip one bit deep in the body. Arrow's own reader would decode this

@@ -24,6 +24,7 @@ use mira_proto::common::v1::{AnyValue, KeyValue, any_value::Value};
 use crate::error::{Error, Result};
 use crate::identity::resource_key;
 use crate::schema::{ATTRS, AttrType, LOGS, RESOURCES};
+use crate::signal::{Sealed, SignalBuilder};
 
 /// How many distinct values a `UInt16` dictionary can hold. Reaching it is a
 /// signal to seal the block, never to fail an export — see
@@ -176,34 +177,6 @@ impl AttrsBuilder {
             Arc::new(self.ser.finish()),
         ];
         Ok(RecordBatch::try_new(ATTRS.clone(), cols)?)
-    }
-}
-
-/// A sealed logs block: the Arrow batches plus the pruning keys that go into
-/// the block's directory name.
-pub struct LogsBlock {
-    pub logs: RecordBatch,
-    pub log_attrs: RecordBatch,
-    pub resources: RecordBatch,
-    pub resource_attrs: RecordBatch,
-    pub scope_attrs: RecordBatch,
-    pub min_ts: i64,
-    pub max_ts: i64,
-}
-
-impl LogsBlock {
-    pub fn tables(&self) -> [(&'static str, &RecordBatch); 5] {
-        [
-            ("logs", &self.logs),
-            ("log_attrs", &self.log_attrs),
-            ("resources", &self.resources),
-            ("resource_attrs", &self.resource_attrs),
-            ("scope_attrs", &self.scope_attrs),
-        ]
-    }
-
-    pub fn num_rows(&self) -> usize {
-        self.logs.num_rows()
     }
 }
 
@@ -483,7 +456,18 @@ impl LogsBuilder {
     }
 
     /// Seal the accumulated rows into a block and reset for the next one.
-    pub fn finish(&mut self) -> Result<LogsBlock> {
+    ///
+    /// The reset happens on the error path too. `seal` calls `finish` on each
+    /// column builder as it goes, so a failure part way through leaves this one
+    /// holding columns of unequal length; reusing it would make every subsequent
+    /// seal fail identically and the node would reject exports until restarted.
+    pub fn finish(&mut self) -> Result<Sealed> {
+        let out = self.seal();
+        *self = Self::new();
+        out
+    }
+
+    fn seal(&mut self) -> Result<Sealed> {
         let cols: Vec<ArrayRef> = vec![
             Arc::new(self.id.finish()),
             Arc::new(self.time.finish()),
@@ -507,12 +491,15 @@ impl LogsBuilder {
                 Arc::new(self.res_dropped.finish()),
             ],
         )?;
-        let block = LogsBlock {
-            logs: RecordBatch::try_new(LOGS.clone(), cols)?,
-            log_attrs: self.log_attrs.finish()?,
-            resources,
-            resource_attrs: self.resource_attrs.finish()?,
-            scope_attrs: self.scope_attrs.finish()?,
+        Ok(Sealed {
+            num_rows: self.next_id as usize,
+            tables: vec![
+                ("logs", RecordBatch::try_new(LOGS.clone(), cols)?),
+                ("log_attrs", self.log_attrs.finish()?),
+                ("resources", resources),
+                ("resource_attrs", self.resource_attrs.finish()?),
+                ("scope_attrs", self.scope_attrs.finish()?),
+            ],
             min_ts: if self.min_ts == i64::MAX {
                 0
             } else {
@@ -523,9 +510,28 @@ impl LogsBuilder {
             } else {
                 self.max_ts
             },
-        };
-        *self = Self::new();
-        Ok(block)
+        })
+    }
+}
+
+impl SignalBuilder for LogsBuilder {
+    type Request = ExportLogsServiceRequest;
+    const SIGNAL: &'static str = "logs";
+
+    fn has_headroom_for(&self, req: &Self::Request) -> bool {
+        LogsBuilder::has_headroom_for(self, req)
+    }
+    fn append_request(&mut self, req: &Self::Request) -> Result<usize> {
+        LogsBuilder::append_request(self, req)
+    }
+    fn approx_bytes(&self) -> usize {
+        LogsBuilder::approx_bytes(self)
+    }
+    fn is_empty(&self) -> bool {
+        LogsBuilder::is_empty(self)
+    }
+    fn finish(&mut self) -> Result<Sealed> {
+        LogsBuilder::finish(self)
     }
 }
 
