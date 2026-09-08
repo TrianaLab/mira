@@ -19,7 +19,9 @@ build. The block directory is the only state; the filesystem is the manifest.
 ## What is true today
 
 - **Logs, traces and metrics**, stored in their own layouts, over **OTLP/gRPC
-  4317** and **OTLP/HTTP 4318**, protobuf or JSON.
+  4317** and **OTLP/HTTP 4318**, protobuf or JSON, plain or gzipped — which is
+  what a stock collector sends, since both its OTLP exporters compress by
+  default.
 - **The UI is in the binary.** Open `http://localhost:4318/` — records, trace
   waterfalls and metric charts, served from `include_bytes!`. Nothing to deploy
   beside it.
@@ -65,9 +67,10 @@ build. The block directory is the only state; the filesystem is the manifest.
   nothing to catch. A `statfs` at startup names the filesystem and says what to
   point `--data-dir` at instead. FUSE is a warning rather than a refusal,
   because the magic number cannot tell `gcsfuse` from a local one.
-- 4.6 MB, 113 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
+- 4.7 MB, 117 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
   one C dependency and it vendors its own source, so it needs a `cc` — which the
-  linker already required — and nothing installed.
+  linker already required — and nothing installed. `flate2` is on its pure-Rust
+  backend so gzip did not change that.
 
 Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 --example loadgen`:

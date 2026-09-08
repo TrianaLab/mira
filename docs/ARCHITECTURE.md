@@ -377,6 +377,26 @@ HTTP 4318 (axum) ──┘         │                                        �
                              └────────── oneshot ack ─────────────────┘
 ```
 
+**gzip on both listeners, because the spec says MUST and the exporter says
+default.** Every OTLP server component must accept `none` and `gzip`, and both
+of the collector's OTLP exporters compress by default — so a receiver that only
+speaks plain bodies does not degrade, it rejects the first batch of every stock
+deployment. The failure is worse than it looks: uncompressed protobuf fed a gzip
+stream is a `400 invalid wire type`, and OTLP classes 400 as permanent, so the
+exporter drops the data rather than retrying it. 4317 is
+`accept_compressed(Gzip)` on each service; 4318 reads `Content-Encoding` and
+inflates before it decodes, answering an encoding it does not implement with
+`415` — the exporter needs to be told to stop offering it, not handed a parse
+error that reads like corruption.
+
+Inflation is capped at **64 MiB**, separately from the request body limit. The
+body limit bounds what arrives; a few kilobytes of gzipped zeros expand past any
+memory the process has, and the decoder will allocate every byte if asked. The
+cap is absolute rather than a ratio because a real OTLP batch — the same
+attribute keys over and over — reaches about 35:1, so no ratio separates it from
+a bomb. 64 MiB of OTLP protobuf is on the order of a million records in one
+export.
+
 `submit` uses `try_reserve`, not `send().await`: shedding *before* the decode
 work is the difference between a fast NACK and an unbounded latency tail. A full
 queue returns `UNAVAILABLE` with `RetryInfo(250ms)`.
@@ -777,7 +797,7 @@ a second thing.
 waterfall in the terminal. Three decisions:
 
 **No TUI framework.** ratatui is the obvious answer and costs **61 crates** —
-against a tree of 113, whose size is a stated property of the product (§1). What
+against a tree of 117, whose size is a stated property of the product (§1). What
 it buys is a constraint-solving layout engine and a damage-tracked cell buffer;
 this UI has fixed panes and repaints one screenful per keystroke. So `termios` for
 raw mode, `TIOCGWINSZ` for the size, `poll(2)` for input, ANSI for the rest — on
@@ -904,7 +924,7 @@ call repeated. The gap between them is virtual-memory work, not I/O.
 | Query: metric names | — | **28 ms** first, **5.5 ms** steady | — |
 | Query: field predicate, no time bound | — | **2.9 s** first, **1.9 s** steady, 69 of 69 blocks, 25.2 M rows | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** hot, **~0.17 B/B** compacted | ✓ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.5 MB** / 113 crates | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.7 MB** / 117 crates | ✓ |
 
 Reading these honestly:
 

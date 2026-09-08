@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use prost::Message;
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Status};
 use tonic_types::{ErrorDetails, StatusExt};
 
@@ -57,15 +58,22 @@ fn status_for(r: Rejected) -> Status {
     }
 }
 
+/// `accept_compressed` on every service, because the spec says MUST and the
+/// stock exporter says default.
+///
+/// Without it tonic answers a compressed request with `UNIMPLEMENTED`, and
+/// OTLP calls that a permanent failure: the exporter drops the batch instead of
+/// retrying it. `send_compressed` is deliberately absent — the response is an
+/// empty message, and gzipping nothing costs a round of deflate per export.
 impl Receivers {
     pub fn logs_server(&self) -> LogsServiceServer<Self> {
-        LogsServiceServer::new(self.clone())
+        LogsServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
     }
     pub fn traces_server(&self) -> TraceServiceServer<Self> {
-        TraceServiceServer::new(self.clone())
+        TraceServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
     }
     pub fn metrics_server(&self) -> MetricsServiceServer<Self> {
-        MetricsServiceServer::new(self.clone())
+        MetricsServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
     }
 }
 
@@ -170,6 +178,59 @@ fn encoding(h: &HeaderMap) -> Option<Encoding> {
     }
 }
 
+/// A gzip body may not inflate past this.
+///
+/// The 2 MiB body limit bounds what arrives, not what comes out of it: a few
+/// kilobytes of gzipped zeros expand to gigabytes, and `read_to_end` on a
+/// decoder will allocate every one of them. The cap is absolute rather than a
+/// ratio because the ratio a real batch reaches — the same attribute keys over
+/// and over — is around 35:1 and a bomb's is a thousand times that, so there is
+/// no ratio that separates them. 64 MiB of OTLP protobuf is on the order of a
+/// million log records in one export; nothing legitimate sends that.
+const MAX_INFLATED: u64 = 64 << 20;
+
+/// Undo `Content-Encoding` before anything tries to parse the body.
+///
+/// Returning the body untouched for a missing or `identity` header is the
+/// common path. An encoding we do not implement is `415`, not a decode failure:
+/// the exporter has to be told to stop offering it, and a protobuf parser fed
+/// deflate reports "invalid wire type" — a message that sends whoever reads it
+/// looking for corruption instead of a header.
+fn inflate(h: &HeaderMap, body: Bytes) -> Result<Bytes, (StatusCode, String)> {
+    let ce = h
+        .get(header::CONTENT_ENCODING)
+        .map(|v| v.to_str().unwrap_or_default().trim().to_ascii_lowercase());
+    match ce.as_deref() {
+        None | Some("") | Some("identity") => Ok(body),
+        Some("gzip") | Some("x-gzip") => {
+            use std::io::Read;
+            let mut out = Vec::new();
+            // `take` is the whole defence: one byte past the cap and the read
+            // stops, so the refusal costs the cap and not the bomb.
+            flate2::read::GzDecoder::new(&body[..])
+                .take(MAX_INFLATED + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("failed to decompress gzip body: {e}"),
+                    )
+                })?;
+            if out.len() as u64 > MAX_INFLATED {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("gzip body inflates past {MAX_INFLATED} bytes"),
+                ));
+            }
+            Ok(out.into())
+        }
+        Some(other) => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("unsupported content-encoding {other}; expected gzip or identity"),
+        )),
+    }
+}
+
 /// Decode, submit, and answer. Generic over the signal because the three
 /// endpoints differ only in which types they name.
 ///
@@ -193,6 +254,11 @@ async fn export<R: Message + Default, T: Message>(
             )
                 .into_response();
         }
+    };
+
+    let body = match inflate(headers, body) {
+        Ok(b) => b,
+        Err((code, e)) => return fail(json, code, &e),
     };
 
     let decoded = if json {

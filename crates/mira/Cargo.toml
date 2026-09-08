@@ -21,8 +21,9 @@ tonic-types = "0.14"
 axum.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 # The terminal UI's whole backend: termios, TIOCGWINSZ, poll and localtime_r.
-# ratatui is the alternative and costs 61 crates, against a tree of 113.
+# ratatui is the alternative and costs 61 crates, against a tree of 117.
 libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -30,3 +31,6 @@ yaml-rust2 = { version = "0.12.0", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+# For `grpc-status`, which rides in the response trailers that
+# `axum::body::to_bytes` throws away. Already in the tree via axum.
+http-body-util = "0.1"

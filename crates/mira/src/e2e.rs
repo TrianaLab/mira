@@ -40,10 +40,10 @@ fn kv(k: &str, v: &str) -> KeyValue {
     }
 }
 
-/// A router backed by a fresh data directory, with the block age turned down so
-/// the test waits on flushes measured in milliseconds rather than the 2s that is
-/// right in production.
-fn boot(name: &str) -> (Router, std::path::PathBuf) {
+/// A fresh data directory with the three flushers running against it, and the
+/// block age turned down so the test waits on flushes measured in milliseconds
+/// rather than the 2s that is right in production.
+fn wire(name: &str) -> (receiver::Receivers, api::Api, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("mira-e2e-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -61,11 +61,33 @@ fn boot(name: &str) -> (Router, std::path::PathBuf) {
     let api = api::Api {
         data_dir: Arc::new(root.clone()),
     };
+    (recv, api, root)
+}
+
+/// The 4318 listener: OTLP/HTTP, the query API, MCP and the UI on one router.
+fn boot(name: &str) -> (Router, std::path::PathBuf) {
+    let (recv, api, root) = wire(name);
     let app = receiver::http_router(recv)
         .merge(api::router(api.clone()))
         .merge(crate::mcp::router(api))
         .merge(crate::ui::router());
     (app, root)
+}
+
+/// The 4317 listener, with the socket taken off.
+///
+/// `into_axum_router` is the same stack of services `main` hands to
+/// `Server::serve`, reachable through `oneshot` — which is what lets a test
+/// assert on tonic's own framing and decompression without an ephemeral port
+/// and a client stub the shipped binary would then have to carry.
+fn boot_grpc(name: &str) -> (Router, Router, std::path::PathBuf) {
+    let (recv, api, root) = wire(name);
+    let grpc = tonic::service::Routes::default()
+        .add_service(recv.logs_server())
+        .add_service(recv.traces_server())
+        .add_service(recv.metrics_server())
+        .into_axum_router();
+    (grpc, api::router(api), root)
 }
 
 async fn get(
@@ -112,6 +134,83 @@ async fn post(app: &Router, path: &str, content_type: &str, body: Vec<u8>) -> (S
         .await
         .unwrap();
     (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `post`, plus a `content-encoding` the caller chooses.
+///
+/// The body is sent exactly as given rather than compressed here, because half
+/// the point is to send a header that does not match the bytes.
+async fn post_enc(
+    app: &Router,
+    path: &str,
+    content_type: &str,
+    content_encoding: &str,
+    body: Vec<u8>,
+) -> (StatusCode, String) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", content_type)
+                .header("content-encoding", content_encoding)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 16 << 20)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// One gRPC call, framed by hand.
+///
+/// The frame is a flag byte saying whether the payload is compressed, four
+/// bytes of big-endian length, then the payload. Returns `grpc-status`, which
+/// arrives in the headers when the call fails before any message is written
+/// and in the trailers when it does not; both are the status, and a caller that
+/// only reads one of them scores a failure as a pass.
+async fn grpc(app: &Router, service: &str, encoding: Option<&str>, payload: Vec<u8>) -> String {
+    use http_body_util::BodyExt;
+
+    let mut frame = vec![encoding.is_some() as u8];
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/opentelemetry.proto.collector.{service}/Export"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    if let Some(e) = encoding {
+        req = req.header("grpc-encoding", e);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(frame)).unwrap())
+        .await
+        .unwrap();
+    // gRPC reports everything, including its errors, under HTTP 200.
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let status =
+        |h: &axum::http::HeaderMap| h.get("grpc-status").map(|v| v.to_str().unwrap().to_owned());
+    if let Some(s) = status(res.headers()) {
+        return s;
+    }
+    let body = res.into_body().collect().await.unwrap();
+    body.trailers().and_then(status).unwrap_or_default()
+}
+
+fn gzip(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(body).unwrap();
+    e.finish().unwrap()
 }
 
 async fn otlp(app: &Router, path: &str, msg: impl Message) {
@@ -865,4 +964,118 @@ async fn otlp_json_refusals_are_json() {
     // export is a valid one.
     let (status, body) = post(&app, "/v1/logs", "application/x-protobuf", vec![]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The first request most deployments will ever send.
+///
+/// `compression: gzip` is the default on both stock collector exporters and the
+/// OTLP spec makes it a MUST for a server, so a receiver that only speaks plain
+/// bodies rejects every batch — and rejects it with a 400, which OTLP calls
+/// permanent, so the exporter drops the data rather than retrying it.
+#[tokio::test]
+async fn gzipped_exports_are_accepted_on_both_body_encodings() {
+    let (app, _root) = boot("gzip");
+
+    let msg = logs_export("checkout", 1_000, 4).encode_to_vec();
+    let (status, body) = post_enc(
+        &app,
+        "/v1/logs",
+        "application/x-protobuf",
+        "gzip",
+        gzip(&msg),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let doc = br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+        {"timeUnixNano":"2000","body":{"stringValue":"gzipped json arrived"}}]}]}]}"#;
+    let (status, body) = post_enc(&app, "/v1/logs", "application/json", "gzip", gzip(doc)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "{}", "a JSON client gets a JSON answer");
+
+    // Both landed, which is the part a 200 alone would not prove.
+    let all = query(&app, r#"{"signal":"logs","from":0,"to":100000}"#).await;
+    assert!(all.contains("checkout handled request 3"), "{all}");
+    assert!(all.contains("gzipped json arrived"), "{all}");
+
+    // `identity` is the spec's name for "not compressed" and means what an
+    // absent header means.
+    let (status, body) = post_enc(
+        &app,
+        "/v1/logs",
+        "application/x-protobuf",
+        "identity",
+        msg.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An encoding we do not implement is 415, so the exporter is told to stop
+    // offering it. Feeding deflate to a protobuf parser produces "invalid wire
+    // type", which sends whoever reads it looking for corrupt data.
+    let (status, body) = post_enc(
+        &app,
+        "/v1/logs",
+        "application/x-protobuf",
+        "br",
+        msg.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+
+    // A header that lies about the bytes is the client's error, not corruption
+    // of ours.
+    let (status, body) = post_enc(&app, "/v1/logs", "application/x-protobuf", "gzip", msg).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("decompress"), "{body}");
+
+    // A bomb: 80 MiB of zeros in 80 KB of gzip. The body limit bounds the
+    // request, not what comes out of it, so the cap has to be its own thing.
+    let (status, body) = post_enc(
+        &app,
+        "/v1/logs",
+        "application/json",
+        "gzip",
+        gzip(&vec![b'0'; 80 << 20]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.starts_with(r#"{"code":"#), "{body}");
+}
+
+/// The same requirement on 4317, where it is tonic's framing rather than ours.
+///
+/// Without `accept_compressed` this comes back `UNIMPLEMENTED` (12), which OTLP
+/// classes as permanent — the exporter drops the batch instead of retrying it,
+/// so the failure is silent on both ends.
+#[tokio::test]
+async fn a_gzipped_grpc_export_is_accepted_on_every_signal() {
+    let (grpc_app, api, _root) = boot_grpc("grpc-gzip");
+
+    let logs = logs_export("checkout", 1_000, 3).encode_to_vec();
+    let svc = "logs.v1.LogsService";
+    assert_eq!(grpc(&grpc_app, svc, Some("gzip"), gzip(&logs)).await, "0");
+    // Uncompressed still works, which is the other half of the MUST.
+    assert_eq!(grpc(&grpc_app, svc, None, logs).await, "0");
+
+    // An empty export is valid, and the point here is the three services are
+    // configured alike — one of them left plain is the bug this catches.
+    for svc in [
+        "trace.v1.TraceService",
+        "metrics.v1.MetricsService",
+        "logs.v1.LogsService",
+    ] {
+        assert_eq!(
+            grpc(&grpc_app, svc, Some("gzip"), gzip(&[])).await,
+            "0",
+            "{svc} refused a gzipped export"
+        );
+    }
+
+    // 12 is UNIMPLEMENTED: the encoding is refused by name, not mis-decoded.
+    assert_eq!(grpc(&grpc_app, svc, Some("deflate"), gzip(&[])).await, "12");
+
+    // Both of the accepted logs exports landed, in one block or two.
+    let all = query(&api, r#"{"signal":"logs","from":0,"to":100000}"#).await;
+    assert_eq!(all.matches("handled request").count(), 6, "{all}");
 }
