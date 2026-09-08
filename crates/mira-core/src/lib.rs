@@ -303,11 +303,12 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            // No attributes on the link — the common case, and it leaves
+            // span_link_attrs empty, which the publish check below relies on.
             links: (0..links)
                 .map(|_| Link {
                     trace_id: vec![9u8; 16].into(),
                     span_id: vec![8u8; 8].into(),
-                    attributes: vec![kv("rel", "follows_from")],
                     ..Default::default()
                 })
                 .collect(),
@@ -353,7 +354,7 @@ mod tests {
         assert_eq!(rows("span_events"), 2);
         assert_eq!(rows("span_links"), 1);
         assert_eq!(rows("span_event_attrs"), 2);
-        assert_eq!(rows("span_link_attrs"), 1);
+        assert_eq!(rows("span_link_attrs"), 0);
         assert_eq!(rows("span_attrs"), 2);
 
         let u32col = |t: &str, c: &str| {
@@ -374,6 +375,34 @@ mod tests {
         assert_eq!(u32col("span_events", "id").values(), &[0, 1]);
         assert_eq!(u32col("span_event_attrs", "parent_id").values(), &[0, 1]);
         assert_eq!(u32col("span_links", "parent_id").values(), &[1]);
+
+        // An empty table costs ~1-2.5 KB of Arrow IPC framing and is not written.
+        // A traces block has nine tables and a service that emits no span links
+        // would otherwise pay for four of them on every seal.
+        let root = std::env::temp_dir().join(format!("mira-tr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let published = block::publish(
+            &root,
+            "traces",
+            block::node_id("a"),
+            1,
+            sealed.min_ts,
+            sealed.max_ts,
+            &sealed.refs(),
+        )
+        .unwrap();
+        assert!(!published.dir.join("span_link_attrs.arrow").exists());
+        assert!(
+            block::open_table_opt(&published.dir.join("span_link_attrs.arrow"))
+                .unwrap()
+                .is_none()
+        );
+        let ev = block::open_table_opt(&published.dir.join("span_events.arrow"))
+            .unwrap()
+            .unwrap();
+        let (inside, total) = ev.zero_copy_ratio();
+        assert_eq!(inside, total, "{inside}/{total} buffers zero-copy");
+        let _ = std::fs::remove_dir_all(&root);
 
         let spans = sealed.table("spans").unwrap();
         let durations = spans

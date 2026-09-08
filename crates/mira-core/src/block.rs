@@ -226,8 +226,19 @@ pub fn publish(
     }
     fs::create_dir_all(&tmp).ctx(&tmp)?;
 
+    // An empty table is not written. Arrow IPC framing for a zero-row table is
+    // ~1 KB for three columns and ~2.5 KB for nine (measured), which is nothing
+    // against a full 32 MB block and most of a block sealed by the age timer on
+    // a quiet node. A traces block has nine tables and typically two of them —
+    // span_links and its attributes — have any rows at all.
+    //
+    // The reader treats a missing file as an empty table, which it has to do
+    // anyway: it is also how a block written by an older version that did not
+    // have the table reads back.
     for (name, batch) in tables {
-        write_table(&tmp.join(format!("{name}.arrow")), batch)?;
+        if batch.num_rows() > 0 {
+            write_table(&tmp.join(format!("{name}.arrow")), batch)?;
+        }
     }
     fsync_dir(&tmp)?;
 
@@ -352,6 +363,20 @@ impl MappedTable {
             }
         }
         (inside, total)
+    }
+}
+
+/// [`open_table`], but a missing file means an empty table rather than an error.
+///
+/// This is the normal way to read any table that can legitimately have no rows,
+/// which is most of them: `publish` skips writing a zero-row table, so a traces
+/// block from a service that emits no span links simply has no
+/// `span_links.arrow`. It is also how a block written before a table existed
+/// reads back, which is the same case a version from now.
+pub fn open_table_opt(path: &Path) -> Result<Option<MappedTable>> {
+    match open_table(path) {
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        other => other.map(Some),
     }
 }
 
