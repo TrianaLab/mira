@@ -515,7 +515,7 @@ impl Block {
 
 /// `parent_id`s of the attribute rows whose key matches and whose value
 /// satisfies `op value`.
-fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) -> Vec<u32> {
+pub(crate) fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) -> Vec<u32> {
     let keys = a.column(1).as_dictionary::<UInt16Type>();
     // Resolve the key string once. Everything after this compares u16 codes.
     let Some(code) = dict_index(keys.values().as_string::<i32>(), key) else {
@@ -531,7 +531,7 @@ fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) -> Vec<u32> {
         .collect()
 }
 
-fn attr_key(a: &RecordBatch, row: usize) -> &str {
+pub(crate) fn attr_key(a: &RecordBatch, row: usize) -> &str {
     let d = a.column(1).as_dictionary::<UInt16Type>();
     d.values()
         .as_string::<i32>()
@@ -578,7 +578,7 @@ fn attr_matches(a: &RecordBatch, ty: u8, row: usize, op: Op, v: &Value) -> bool 
 /// Linear over the dictionary, which is at most 65536 entries and in practice a
 /// few dozen. Doing it once here is what keeps the row scan off the string data
 /// entirely.
-fn dict_index(values: &StringArray, needle: &str) -> Option<u16> {
+pub(crate) fn dict_index(values: &StringArray, needle: &str) -> Option<u16> {
     (0..values.len())
         .find(|&i| values.value(i) == needle)
         .map(|i| i as u16)
@@ -741,7 +741,7 @@ fn emit_value(j: &mut Json, col: &dyn Array, row: usize) {
 }
 
 /// Emit one attribute's value from whichever column its `type` names.
-fn emit_attr(j: &mut Json, a: &RecordBatch, row: usize) {
+pub(crate) fn emit_attr(j: &mut Json, a: &RecordBatch, row: usize) {
     const STR: u8 = AttrType::Str as u8;
     const INT: u8 = AttrType::Int as u8;
     const DOUBLE: u8 = AttrType::Double as u8;

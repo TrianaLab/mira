@@ -252,6 +252,196 @@ async fn otlp_spans_are_queryable_and_ids_come_back_as_hex() {
     assert!(found.contains(r#""http.route":"/checkout/:id""#), "{found}");
 }
 
+/// Metrics: the point of this one is that a series survives being split across
+/// two blocks.
+///
+/// Ids are rebased per block — that is what makes the attribute joins array
+/// stores rather than hash joins — so nothing block-local can identify a series
+/// across blocks. If the value-based grouping key is wrong in any detail, the
+/// same counter comes back as two series with half the points each, and every
+/// chart in the product is quietly wrong.
+#[tokio::test]
+async fn a_metric_series_survives_being_split_across_two_blocks() {
+    use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use mira_proto::metrics::v1::metric::Data;
+    use mira_proto::metrics::v1::number_data_point::Value as NumValue;
+    use mira_proto::metrics::v1::{
+        AggregationTemporality, HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics,
+        ScopeMetrics, Sum,
+    };
+
+    let (app, _root) = boot("metrics");
+
+    // Two exports, therefore two blocks, each carrying half of the same two
+    // series: one for GET and one for POST.
+    let export = |base: u64| ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", "checkout")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "mira.e2e".into(),
+                    ..Default::default()
+                }),
+                metrics: vec![Metric {
+                    name: "http.server.requests".into(),
+                    unit: "1".into(),
+                    data: Some(Data::Sum(Sum {
+                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        is_monotonic: true,
+                        data_points: ["GET", "POST"]
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(m, method)| {
+                                (0..2).map(move |i| NumberDataPoint {
+                                    time_unix_nano: base + i as u64,
+                                    attributes: vec![kv("http.method", method)],
+                                    value: Some(NumValue::AsInt(
+                                        (base as i64) + i + m as i64 * 100,
+                                    )),
+                                    ..Default::default()
+                                })
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    otlp(&app, "/v1/metrics", export(1_000)).await;
+    otlp(&app, "/v1/metrics", export(5_000)).await;
+
+    let (status, body) = post(
+        &app,
+        "/api/v1/metrics/query",
+        "application/json",
+        br#"{"name":"http.server.requests","from":0,"to":100000}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Two series, not four: the two blocks merged.
+    assert_eq!(
+        body.matches(r#""name":"http.server.requests""#).count(),
+        2,
+        "{body}"
+    );
+    // Four points each, in ascending time order across the block boundary.
+    assert!(
+        body.contains("[1000,1000],[1001,1001],[5000,5000],[5001,5001]"),
+        "{body}"
+    );
+    assert!(
+        body.contains("[1000,1100],[1001,1101],[5000,5100],[5001,5101]"),
+        "{body}"
+    );
+    // The descriptor and the inherited resource attribute both come along.
+    assert!(
+        body.contains(r#""kind":"sum","temporality":2,"monotonic":true"#),
+        "{body}"
+    );
+    // All four attribute levels merged into one sorted object: the point's own
+    // `http.method`, the scope's name, and the resource's `service.name`.
+    assert!(
+        body.contains(
+            r#""attributes":{"http.method":"GET","otel.scope.name":"mira.e2e","service.name":"checkout"}"#
+        ),
+        "{body}"
+    );
+    assert!(body.contains(r#""blocks_scanned":2"#), "{body}");
+
+    // A filter on a resource attribute and one on a point attribute have to work
+    // the same way, even though they live three tables apart.
+    let (_, only_post) = post(
+        &app,
+        "/api/v1/metrics/query",
+        "application/json",
+        br#"{"from":0,"to":100000,"where":[{"attr":"http.method","eq":"POST"},
+                                           {"attr":"service.name","eq":"checkout"}]}"#
+            .to_vec(),
+    )
+    .await;
+    assert_eq!(only_post.matches(r#""points""#).count(), 1, "{only_post}");
+    assert!(only_post.contains(r#""http.method":"POST""#), "{only_post}");
+
+    // The name listing is what a UI puts in a dropdown, so it must work with no
+    // body at all — and with none, the default window is the last hour, which
+    // this test's 1970-era timestamps sit well outside. Blocks pruned without
+    // being opened is the right answer, not an empty database.
+    let (status, recent) = post(&app, "/api/v1/metrics/names", "application/json", vec![]).await;
+    assert_eq!(status, StatusCode::OK, "{recent}");
+    assert!(
+        recent.contains(r#""names":[],"stats":{"blocks_total":2,"blocks_scanned":0"#),
+        "{recent}"
+    );
+
+    let (_, names) = post(
+        &app,
+        "/api/v1/metrics/names",
+        "application/json",
+        br#"{"from":0,"to":100000}"#.to_vec(),
+    )
+    .await;
+    assert!(
+        names.contains(r#"{"name":"http.server.requests","unit":"1","kind":"sum"}"#),
+        "{names}"
+    );
+
+    // A histogram is invisible unless it comes back as something, so it comes
+    // back as the two numbers that answer "how often" and "how much".
+    otlp(
+        &app,
+        "/v1/metrics",
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "http.server.duration".into(),
+                        unit: "ms".into(),
+                        data: Some(Data::Histogram(mira_proto::metrics::v1::Histogram {
+                            aggregation_temporality: AggregationTemporality::Delta as i32,
+                            data_points: vec![HistogramDataPoint {
+                                time_unix_nano: 9_000,
+                                count: 42,
+                                sum: Some(1234.5),
+                                explicit_bounds: vec![1.0, 5.0, 10.0],
+                                bucket_counts: vec![10, 20, 10, 2],
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        },
+    )
+    .await;
+    let (_, hist) = post(
+        &app,
+        "/api/v1/metrics/query",
+        "application/json",
+        br#"{"name":"http.server.duration","from":0,"to":100000}"#.to_vec(),
+    )
+    .await;
+    assert!(
+        hist.contains(r#""name":"http.server.duration.count""#),
+        "{hist}"
+    );
+    assert!(
+        hist.contains(r#""name":"http.server.duration.sum""#),
+        "{hist}"
+    );
+    assert!(hist.contains("[9000,42]"), "{hist}");
+    assert!(hist.contains("[9000,1234.5]"), "{hist}");
+}
+
 /// A bad query has to fail as JSON with a usable message. The caller is often a
 /// model, and "400 Bad Request" with an empty body teaches it nothing.
 #[tokio::test]

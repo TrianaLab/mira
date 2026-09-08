@@ -26,6 +26,7 @@ pub mod logs;
 pub mod metrics;
 pub mod query;
 pub mod schema;
+pub mod series;
 pub mod signal;
 pub mod traces;
 

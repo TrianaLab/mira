@@ -29,6 +29,7 @@ use axum::routing::post;
 use yaml_rust2::{Yaml, YamlLoader};
 
 use mira_core::query::{self, Op, Search, Signal, Target, Term, Value};
+use mira_core::series::{self, SeriesQuery};
 
 #[derive(Clone)]
 pub struct Api {
@@ -38,6 +39,8 @@ pub struct Api {
 pub fn router(api: Api) -> Router {
     Router::new()
         .route("/api/v1/query", post(query_handler))
+        .route("/api/v1/metrics/query", post(series_handler))
+        .route("/api/v1/metrics/names", post(names_handler))
         .with_state(api)
 }
 
@@ -49,16 +52,47 @@ pub fn router(api: Api) -> Router {
 const MAX_LIMIT: usize = 10_000;
 
 async fn query_handler(State(api): State<Api>, body: String) -> Response {
-    let now = now_nanos();
-    let q = match parse_search(&body, now) {
+    let q = match parse_search(&body, now_nanos()) {
         Ok(q) => q,
         Err(e) => return bad_request(&e),
     };
     let dir = api.data_dir.clone();
-    let out = tokio::task::spawn_blocking(move || query::search(&dir, &q)).await;
-    match out {
+    run("rows", move || query::search(&dir, &q)).await
+}
+
+async fn series_handler(State(api): State<Api>, body: String) -> Response {
+    let q = match parse_series(&body, now_nanos()) {
+        Ok(q) => q,
+        Err(e) => return bad_request(&e),
+    };
+    let dir = api.data_dir.clone();
+    run("series", move || series::series(&dir, &q)).await
+}
+
+async fn names_handler(State(api): State<Api>, body: String) -> Response {
+    let now = now_nanos();
+    // An empty body is a valid request for "what is there right now", which is
+    // the first thing a UI or an agent asks.
+    let doc = match window(if body.trim().is_empty() { "{}" } else { &body }, now) {
+        Ok(w) => w,
+        Err(e) => return bad_request(&e),
+    };
+    let dir = api.data_dir.clone();
+    run("names", move || series::names(&dir, doc.0, doc.1)).await
+}
+
+/// Run a blocking read and wrap it in the standard envelope.
+///
+/// `spawn_blocking` is not optional here: reads are mmap reads, and a cold page
+/// fault stalls the OS thread with no yield point, taking every other connection
+/// that tokio worker owns down with it.
+async fn run(
+    field: &'static str,
+    f: impl FnOnce() -> mira_core::error::Result<query::Results> + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(f).await {
         Ok(Ok(r)) => json_ok(format!(
-            "{{\"rows\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
+            "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
              \"rows_scanned\":{},\"rows_matched\":{}}}}}",
             r.json,
             r.stats.blocks_total,
@@ -139,35 +173,78 @@ pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
         Some(s) => Signal::parse(s).ok_or(format!("unknown signal {s:?}"))?,
         None => Signal::Logs,
     };
+    let (from, to) = bounds(doc, now)?;
+    let limit = positive(doc, "limit", 100, MAX_LIMIT)?;
+    Ok(Search {
+        signal,
+        from,
+        to,
+        terms: terms(doc)?,
+        limit,
+    })
+}
 
-    // Default window is the last hour. A query with no bounds at all would scan
-    // the whole retention period, which is the one mistake that turns a fast
-    // engine into a slow one, and it is the mistake an agent makes first.
+/// Parse a metrics query document.
+///
+/// ```yaml
+/// {
+///   "name": "http.server.request.duration",
+///   "from": "-1h",
+///   "where": [ { "attr": "service.name", "eq": "checkout" } ],
+///   "max_series": 50,
+/// }
+/// ```
+///
+/// Same `where` grammar as [`parse_search`], because a caller who has learned
+/// one filter syntax should not have to learn a second one to look at a chart.
+pub fn parse_series(text: &str, now: i64) -> Result<SeriesQuery, String> {
+    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
+    let doc = docs.first().ok_or("empty query")?;
+    let (from, to) = bounds(doc, now)?;
+    Ok(SeriesQuery {
+        name: doc["name"].as_str().map(str::to_owned),
+        from,
+        to,
+        terms: terms(doc)?,
+        max_series: positive(doc, "max_series", 200, 2_000)?,
+        max_points: positive(doc, "max_points", 5_000, 100_000)?,
+    })
+}
+
+/// The `from`/`to` pair of any query document.
+pub fn window(text: &str, now: i64) -> Result<(i64, i64), String> {
+    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
+    bounds(docs.first().ok_or("empty query")?, now)
+}
+
+/// Default window is the last hour. A query with no bounds would scan the whole
+/// retention period, which is the one mistake that turns a fast engine into a
+/// slow one, and it is the mistake an agent makes first.
+fn bounds(doc: &Yaml, now: i64) -> Result<(i64, i64), String> {
     let from = time_field(&doc["from"], now, now - 3_600_000_000_000)?;
     let to = time_field(&doc["to"], now, now)?;
     if from > to {
         return Err(format!("from ({from}) is after to ({to})"));
     }
+    Ok((from, to))
+}
 
-    let limit = match &doc["limit"] {
-        Yaml::BadValue | Yaml::Null => 100,
-        Yaml::Integer(n) if *n > 0 => (*n as usize).min(MAX_LIMIT),
-        other => return Err(format!("limit must be a positive integer, got {other:?}")),
-    };
+fn terms(doc: &Yaml) -> Result<Vec<Term>, String> {
+    match &doc["where"] {
+        Yaml::BadValue | Yaml::Null => Ok(Vec::new()),
+        Yaml::Array(a) => a.iter().map(parse_term).collect(),
+        _ => Err("`where` must be a list of terms".into()),
+    }
+}
 
-    let terms = match &doc["where"] {
-        Yaml::BadValue | Yaml::Null => Vec::new(),
-        Yaml::Array(a) => a.iter().map(parse_term).collect::<Result<_, _>>()?,
-        _ => return Err("`where` must be a list of terms".into()),
-    };
-
-    Ok(Search {
-        signal,
-        from,
-        to,
-        terms,
-        limit,
-    })
+/// A positive integer bound, defaulted and capped rather than refused. Every
+/// one of these caps a materialization that happens in memory.
+fn positive(doc: &Yaml, key: &str, default: usize, max: usize) -> Result<usize, String> {
+    match &doc[key] {
+        Yaml::BadValue | Yaml::Null => Ok(default),
+        Yaml::Integer(n) if *n > 0 => Ok((*n as usize).min(max)),
+        other => Err(format!("{key} must be a positive integer, got {other:?}")),
+    }
 }
 
 fn parse_term(y: &Yaml) -> Result<Term, String> {

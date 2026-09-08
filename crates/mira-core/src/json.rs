@@ -116,6 +116,23 @@ impl Json {
         self.buf.push_str("null");
     }
 
+    /// Splice in a fragment this writer produced earlier — a rendered value, or
+    /// a run of `"k":v,"k":v` members inside an object.
+    ///
+    /// The escape hatch for the one thing the closure API cannot express:
+    /// caching. A metric's descriptor and its resource attributes are identical
+    /// across every point of a series, and re-rendering them per point is the
+    /// difference between a chart query that costs one pass and one that costs
+    /// two. Empty is a no-op so a cached fragment that turned out to be empty
+    /// cannot emit a stray comma.
+    pub fn raw(&mut self, fragment: &str) {
+        if fragment.is_empty() {
+            return;
+        }
+        self.sep();
+        self.buf.push_str(fragment);
+    }
+
     /// Lowercase hex of `bytes`, as one string. Trace and span ids are
     /// `FixedSizeBinary` on disk and hex everywhere a human or a W3C header
     /// sees them.
