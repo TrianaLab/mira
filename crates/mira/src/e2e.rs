@@ -58,10 +58,12 @@ fn boot(name: &str) -> (Router, std::path::PathBuf) {
         traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()),
         metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()),
     };
+    let api = api::Api {
+        data_dir: Arc::new(root.clone()),
+    };
     let app = receiver::http_router(recv)
-        .merge(api::router(api::Api {
-            data_dir: Arc::new(root.clone()),
-        }))
+        .merge(api::router(api.clone()))
+        .merge(crate::mcp::router(api))
         .merge(crate::ui::router());
     (app, root)
 }
@@ -514,4 +516,104 @@ async fn the_ui_is_served_from_the_binary_and_revalidates() {
     let (status, body, _) = get(&app, "/logs", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("<div id=\"app\">"));
+}
+
+/// The agent surface, driven the way a client drives it: initialize, list the
+/// tools, then call one and read the answer out of the content block.
+///
+/// The assertion that matters is the last one. `get_trace` is the tool an agent
+/// reaches for constantly, and it has no time bounds at all — if it ever stops
+/// finding a trace outside the default hour window, every incident
+/// investigation that starts with a trace id from yesterday comes back empty.
+#[tokio::test]
+async fn an_mcp_client_can_list_the_tools_and_call_them() {
+    let (app, _root) = boot("mcp");
+
+    let rpc = async |body: &str| {
+        let (status, out) = post(&app, "/mcp", "application/json", body.into()).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        out
+    };
+
+    let init = rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#).await;
+    assert!(init.contains(r#""id":1"#), "{init}");
+    assert!(init.contains(r#""protocolVersion""#), "{init}");
+    assert!(init.contains(r#""name":"mira""#), "{init}");
+
+    // The notification every client sends next. It has no id, so it takes no
+    // reply — answering it with an error is how a session dies on message two.
+    let (status, body) = post(
+        &app,
+        "/mcp",
+        "application/json",
+        br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.is_empty(), "a notification takes no reply: {body}");
+
+    let tools = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await;
+    for t in ["query_records", "get_trace", "query_metric", "list_metrics"] {
+        assert!(tools.contains(&format!(r#""name":"{t}""#)), "{tools}");
+    }
+
+    otlp(&app, "/v1/logs", logs_export("checkout", 1_000, 4)).await;
+    let rows = rpc(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+             "name":"query_records","arguments":{
+               "signal":"logs","from":0,"to":100000,
+               "where":[{"field":"severity_text","eq":"ERROR"}]}}}"#)
+    .await;
+    assert!(rows.contains(r#""isError":false"#), "{rows}");
+    // The rows arrive as escaped JSON inside the text block, so the envelope is
+    // visible through the escaping.
+    assert!(rows.contains(r#"blocks_scanned"#), "{rows}");
+    assert_eq!(
+        rows.matches("checkout handled request").count(),
+        2,
+        "{rows}"
+    );
+
+    // A tool failure is a result with isError, not a JSON-RPC error: a model has
+    // to be able to read the reason and try again.
+    let bad = rpc(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call",
+             "params":{"name":"get_trace","arguments":{"trace_id":"nope"}}}"#)
+    .await;
+    assert!(bad.contains(r#""isError":true"#), "{bad}");
+    assert!(bad.contains("hex trace id"), "{bad}");
+
+    let missing = rpc(r#"{"jsonrpc":"2.0","id":5,"method":"frobnicate"}"#).await;
+    assert!(missing.contains(r#""code":-32601"#), "{missing}");
+
+    // Spans at time 1000-1500, which is fifty-five years outside the default
+    // window. get_trace has to find them anyway.
+    otlp(
+        &app,
+        "/v1/traces",
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource::default()),
+                scope_spans: vec![ScopeSpans {
+                    spans: (0..3)
+                        .map(|i| Span {
+                            trace_id: vec![0x5a; 16].into(),
+                            span_id: vec![i as u8 + 1; 8].into(),
+                            name: format!("GET /pay/{i}"),
+                            start_time_unix_nano: 1_000 + i * 10,
+                            end_time_unix_nano: 1_500 + i * 10,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        },
+    )
+    .await;
+    let trace = rpc(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{
+             "name":"get_trace","arguments":{
+               "trace_id":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"}}}"#)
+    .await;
+    assert!(trace.contains(r#""isError":false"#), "{trace}");
+    assert_eq!(trace.matches("GET /pay/").count(), 3, "{trace}");
 }

@@ -4,6 +4,7 @@ mod api;
 mod config;
 #[cfg(test)]
 mod e2e;
+mod mcp;
 mod pipeline;
 mod receiver;
 mod ui;
@@ -99,13 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(grpc_addr);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    // One listener for all three: `/v1/*` is OTLP in, `/api/v1/*` is query out,
-    // `/` and `/{file}` are the UI. The UI's wildcard is one segment deep, so it
-    // cannot swallow either of the others.
+    // One listener for all of it: `/v1/*` is OTLP in, `/api/v1/*` is query out,
+    // `/mcp` is the agent surface, `/` and `/{file}` are the UI. The UI's
+    // wildcard is one segment deep, so it cannot swallow any of the others.
+    let api = api::Api { data_dir };
     let http = axum::serve(
         listener,
         receiver::http_router(recv)
-            .merge(api::router(api::Api { data_dir }))
+            .merge(api::router(api.clone()))
+            .merge(mcp::router(api))
             .merge(ui::router()),
     );
 

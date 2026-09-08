@@ -91,15 +91,7 @@ async fn run(
     f: impl FnOnce() -> mira_core::error::Result<query::Results> + Send + 'static,
 ) -> Response {
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(r)) => json_ok(format!(
-            "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
-             \"rows_scanned\":{},\"rows_matched\":{}}}}}",
-            r.json,
-            r.stats.blocks_total,
-            r.stats.blocks_scanned,
-            r.stats.rows_scanned,
-            r.stats.rows_matched
-        )),
+        Ok(Ok(r)) => json_ok(envelope(field, &r)),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,6 +99,21 @@ async fn run(
         )
             .into_response(),
     }
+}
+
+/// The response body every read returns: the rows under their own key, and what
+/// the query cost. The cost is not decoration — it is what tells a caller its
+/// filter was too broad, and an agent has no other way to find that out.
+pub fn envelope(field: &str, r: &query::Results) -> String {
+    format!(
+        "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
+         \"rows_scanned\":{},\"rows_matched\":{}}}}}",
+        r.json,
+        r.stats.blocks_total,
+        r.stats.blocks_scanned,
+        r.stats.rows_scanned,
+        r.stats.rows_matched
+    )
 }
 
 fn json_ok(body: String) -> Response {
@@ -166,9 +173,12 @@ pub fn now_nanos() -> i64 {
 /// because a large share of these documents will be written by a model that has
 /// seen the schema once.
 pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
-    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
-    let doc = docs.first().ok_or("empty query")?;
+    search_doc(&parse(text)?, now)
+}
 
+/// [`parse_search`] on an already-parsed document, for callers that received one
+/// nested inside something else — an MCP tool call, say.
+pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
     let signal = match doc["signal"].as_str() {
         Some(s) => Signal::parse(s).ok_or(format!("unknown signal {s:?}"))?,
         None => Signal::Logs,
@@ -198,8 +208,10 @@ pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
 /// Same `where` grammar as [`parse_search`], because a caller who has learned
 /// one filter syntax should not have to learn a second one to look at a chart.
 pub fn parse_series(text: &str, now: i64) -> Result<SeriesQuery, String> {
-    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
-    let doc = docs.first().ok_or("empty query")?;
+    series_doc(&parse(text)?, now)
+}
+
+pub fn series_doc(doc: &Yaml, now: i64) -> Result<SeriesQuery, String> {
     let (from, to) = bounds(doc, now)?;
     Ok(SeriesQuery {
         name: doc["name"].as_str().map(str::to_owned),
@@ -213,14 +225,19 @@ pub fn parse_series(text: &str, now: i64) -> Result<SeriesQuery, String> {
 
 /// The `from`/`to` pair of any query document.
 pub fn window(text: &str, now: i64) -> Result<(i64, i64), String> {
+    bounds(&parse(text)?, now)
+}
+
+/// One KYAML document, or a readable reason it is not one.
+pub fn parse(text: &str) -> Result<Yaml, String> {
     let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
-    bounds(docs.first().ok_or("empty query")?, now)
+    docs.into_iter().next().ok_or("empty query".into())
 }
 
 /// Default window is the last hour. A query with no bounds would scan the whole
 /// retention period, which is the one mistake that turns a fast engine into a
 /// slow one, and it is the mistake an agent makes first.
-fn bounds(doc: &Yaml, now: i64) -> Result<(i64, i64), String> {
+pub fn bounds(doc: &Yaml, now: i64) -> Result<(i64, i64), String> {
     let from = time_field(&doc["from"], now, now - 3_600_000_000_000)?;
     let to = time_field(&doc["to"], now, now)?;
     if from > to {
