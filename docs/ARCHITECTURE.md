@@ -753,9 +753,10 @@ observable. *Not yet implemented.*
   shows up, and it is currently the largest single gap between design and
   measurement.
 - **A block cache.** Every query re-opens and re-CRCs every block it touches. The
-  fix is a process-local `Arc<MappedTable>` map invalidated by `expire`; the trace
-  filter (§7.4) made it less urgent by cutting the blocks touched, not cheaper per
-  block.
+  fix is a process-local `Arc<MappedTable>` map invalidated by `expire`. This was
+  assumed to be the next big win and it is not: §11 measures the per-block cost as
+  dominated by faulting the mapping in, which the `MADV_WILLNEED` hint already
+  addresses. A cache saves the `open` and the CRC — real, small.
 - **A dependency on `otel-arrow-dfe-quiver` 0.54.1.** It is an embeddable
   Arrow segment store from the OTel Arrow maintainers, Apache-2.0, and it already
   ships a CRC32 WAL with replay, immutable IPC segments, `SegmentReader::open_mmap`,
@@ -783,18 +784,25 @@ observable. *Not yet implemented.*
 The four axes, each with a target and a measurement. Measured on an Apple M3 Pro
 (12 cores, 36 GB), release build, `loadgen --conns 96 --batch 8192 --for 90s`
 over loopback — 6.4 GiB on the wire, 8.4 GiB on disk, 25.2 M log records, 25.2 M
-spans, 69 log blocks. "Warm" means the same query run twice; the difference is
-demand paging.
+spans, 69 log blocks holding 4.56 GB of log Arrow.
+
+Read the two query columns carefully. **Neither is a cold-disk number**: 8.4 GiB
+fits in this machine's page cache, so after one pass everything is resident and
+short of `purge` there is no way back. "First" is the first call after a process
+restart — the pages are in RAM but not in this process's address space, so it
+measures establishing 276 mappings and faulting them in. "Steady" is the same
+call repeated. The gap between them is virtual-memory work, not I/O.
 
 | Axis | Target | Measured | |
 |---|---|---|---|
 | Ingest throughput | ≥ 1 M records/s/core | **544,658 records/s / 71.2 MiB/s** aggregate, 0 shed, 0 resets | ✗ |
 | Resident footprint | ≤ 2 × the open block's target size | holds; no `concat_batches` regression | ✓ |
 | Ack latency | — | p50 **498 ms**, p99 **2,371 ms** | see below |
-| Query: attribute value, absent | ≤ 10 ms | **71 ms** cold, **5.7 ms** warm, 0 of 69 blocks | ✓ |
-| Query: attribute value, matching | ≤ 10 ms | **116 ms** cold, **19 ms** warm, 1 of 69 blocks | ~ |
-| Query: trace by id | ≤ 10 ms | **187 ms** cold, **20 ms** warm, 1 of 86 blocks | ~ |
-| Query: metric names | — | **104 ms** | — |
+| Query: attribute value, absent | ≤ 10 ms | **104 ms** first, **6.1 ms** steady, 0 of 69 blocks | ✓ |
+| Query: attribute value, matching | ≤ 10 ms | **17 ms** first, **14.5 ms** steady, 1 of 69 blocks | ~ |
+| Query: trace by id | ≤ 10 ms | **84 ms** first, **14.3 ms** steady, 1 of 86 blocks | ~ |
+| Query: metric names | — | **28 ms** first, **5.5 ms** steady | — |
+| Query: field predicate, no time bound | — | **2.9 s** first, **1.9 s** steady, 69 of 69 blocks, 25.2 M rows | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** | ✗ |
 | Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.0 MB** / 110 crates | ✓ |
 
@@ -807,12 +815,24 @@ Reading these honestly:
   durability (§9), so read-your-writes is free and every e2e test queries with no
   sleep after export. The per-core encode number needs a criterion bench on
   `append_request` with no I/O in the path, which does not exist yet.
-- **Query warm is at or near target; cold is not.** The two sidecar filters
-  (§7.4) took the block count from "all of them" to one or zero, which is worth
-  between 60× and 1800× and is the reason these rows moved at all. What is left
-  is the per-block cost, paid once per query because there is no block cache:
-  every scan re-opens each block it touches and re-CRCs the whole body (§3.3).
-  That is the difference between the cold and warm columns, and it is §10.
+- **Blocks not opened is the whole game.** The two sidecar filters (§7.4) took
+  the block count from "all of them" to one or zero, which is worth between 60×
+  and 1800× and is the reason these rows are in milliseconds at all. Everything
+  below is about the cost of the blocks that *are* opened.
+- **The per-block cost is page faults, not the scan.** A query that opens one
+  91 MB block answers in ~14 ms, of which the CRC32 of the whole body (§3.3) and
+  the dictionary scan are a few. Multiply that by 69 and the last row of the
+  table should be ~1 s; before this was fixed it was **10.1 s**, and it did not
+  improve on repetition, which ruled out disk — the data was already resident.
+  What it was: `mmap` faults 16 KB at a time and `open_table` touches every page
+  anyway, so a 4.56 GB scan took ~278 K single-page faults with no readahead. One
+  `madvise(MADV_WILLNEED)` at map time — the mapping is about to be read end to
+  end, so there is nothing speculative about the hint — took that row from
+  **10.1 s to 1.9 s**, and every other query row down with it.
+- **A block cache is worth much less than it looks.** It was the obvious next
+  lever and the measurement says otherwise: what it saves is the `open` and the
+  CRC, and those are the small part of a ~14 ms single-block query. It stays on
+  the §10 list, but as a small win, not the missing 10×.
 - **Cost per GB misses by 4×, and the reason is that blocks are uncompressed.**
   Not the sidecars: all 189 `attr.idx` files together are 12.9 KB, and the trace
   filters are 5.5 MB against 8.4 GB.
@@ -842,8 +862,13 @@ Reading these honestly:
   uncompressed and mmap'd, aged blocks are rewritten compressed by the retention
   worker and read into the heap. Queries are overwhelmingly recent, so this buys
   the storage ratio at the cost of latency on exactly the queries that were going
-  to be slow anyway. Deciding the age threshold needs the block cache first, so
-  the two are one piece of work.
+  to be slow anyway.
+
+  One caveat on "cost of latency", to be measured rather than assumed: the last
+  table row is bounded by faulting 4.56 GB of uncompressed pages, and a
+  compressed block is 8× fewer pages to fault. Whether inflating into the heap
+  costs more than the pages it saves is an open question, and the answer decides
+  whether the age threshold should be aggressive or conservative.
 
 Two invariants guard the design rather than the numbers, and both are already
 tests: n/n buffers zero-copy on read, and a corrupted body never returns as data.

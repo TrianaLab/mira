@@ -402,6 +402,10 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
     // and removed only by unlink, which POSIX guarantees leaves live mappings
     // valid. So the bytes under this mapping cannot change for its lifetime.
     let mmap = unsafe { Mmap::map(&file) }.ctx(path)?;
+    // Every open CRCs the whole body, so every page is touched. Faulting them in
+    // one at a time caps a cold scan at fault latency; asking for the file up
+    // front lets the kernel read ahead. A hint, so a failure is not an error.
+    let _ = mmap.advise(memmap2::Advice::WillNeed);
 
     if mmap.len() < MAGIC.len() + 10 || &mmap[..MAGIC.len()] != MAGIC {
         return Err(Error::BadMagic {

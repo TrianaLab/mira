@@ -49,19 +49,26 @@ Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 |---|---|
 | ingest, 96 connections × 8192 records | 544,658 records/s, 71 MiB/s, 0 shed |
 | ack latency (fsync-bound) | p50 498 ms, p99 2.4 s |
-| attribute value that is in one block, of 69 | 116 ms cold, 19 ms warm |
-| attribute value that is in none | 71 ms cold, 5.7 ms warm — 0 blocks opened |
-| every span of one trace, 25M spans on disk | 187 ms cold, 20 ms warm |
-| metric names | 104 ms |
+| attribute value that is in one block, of 69 | 14.5 ms |
+| attribute value that is in none | 6.1 ms — 0 blocks opened |
+| every span of one trace, 25M spans on disk | 14.3 ms — 1 block of 86 |
+| metric names | 5.5 ms |
+| no time bound, no filter that prunes | 1.9 s — 69 blocks, 25.2M rows, 4.56 GB |
 | bytes on disk per byte on the wire | 1.31 |
 
 Ack latency is the block sealing, not the queue: an export is acknowledged when
 its block is durable, so under light load it waits out `max_block_age`.
 
-The two query rows that used to read in seconds are the ones with no time bound —
-"every span of this trace", "any record with this attribute value". Each block
-carries a small Bloom sidecar so those open the one block that can answer instead
-of all of retention; the absent-value case went from 10.4 s to 5.7 ms.
+Query times are steady-state on a machine where all 8.4 GiB stays in page cache;
+first call after a restart is 2–15× slower while the mappings are established.
+
+Two things moved these. The Bloom sidecars mean a query with no time bound —
+"every span of this trace", "any record with this attribute value" — opens the
+one block that can answer instead of all of retention; the absent-value case went
+from 10.4 s to 6 ms. And what was left after that turned out to be `mmap`
+faulting in 16 KB at a time: since every block open reads the whole body to check
+its CRC, one `madvise(MADV_WILLNEED)` took the unprunable full scan from 10.1 s
+to 1.9 s.
 
 1.31 bytes per byte is four times the target and the honest weak spot — blocks
 are written uncompressed. `zstd -3` over a real block gets 8.2×, which would put
@@ -81,8 +88,9 @@ it at 0.16; why that is a tiering decision rather than a flag is
   inflated into the heap, so switching it on would end the zero-copy story
   wholesale. The answer is aged blocks rewritten compressed, hot blocks left
   mapped — not built.
-- No block cache: every query re-opens and re-CRCs each block it touches, which
-  is the whole gap between the cold and warm columns above.
+- No block cache: every query re-opens and re-CRCs each block it touches. This
+  looked like the next big win until it was measured — it is worth a few
+  milliseconds of a 14 ms query, not the 10× that page-fault behaviour was.
 - OTAP is the data model, not yet the wire protocol. OTLP on 4317/4318 is the
   universal path; no language SDK emits OTAP today.
 - Do not put the data directory on NFS or CIFS — `mmap` there raises `SIGBUS`
