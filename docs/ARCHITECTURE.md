@@ -252,9 +252,19 @@ Two deliberate deviations from OTAP, both cheap to reverse:
 ### 3.2 On disk
 
 ```
-<data>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<seq:012>/
+<data>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
     logs.arrow  log_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
+<data>/traces/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
+    spans.arrow  span_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
+    trace.idx
 ```
+
+The node id is §12.1; `trace.idx` is a **sidecar** — a `(name, bytes)` pair a
+signal's builder returns from `seal`, written and fsynced by `publish` next to the
+Arrow tables and inside the same atomic rename. Sidecars are always derived and
+always optional: a reader that does not find one, or finds a damaged one, falls
+back to the scan it would have done anyway (§7.4). That is what makes them safe to
+add without a format version.
 
 **The filesystem is the manifest.** Every reason an LSM engine needs a MANIFEST
 file is absent: Mira publishes exactly one immutable object per commit, never
@@ -572,15 +582,36 @@ That runs at memory bandwidth and is not worth a sort at seal time.
 - **Entity** — `resources.key`, written at seal. Built. At query time the key set
   of a block is cached after first read; tens of `u64` per block means ~4 MB for
   ten thousand blocks, so no on-disk filter is warranted.
-- **Trace** — the one that genuinely needs an index, and is *not* built. Trace ids
-  are uniform random, so a block's min/max trace id spans the whole range and
-  prunes nothing. Two levels, neither of which disturbs the format:
-  - Block level: a Bloom filter over the block's distinct trace ids, ~10 bits per
-    key (≈62 KB for 50k traces), in a `traces.bloom` file that is mapped **on
-    demand, not at boot** — so the zero-file-opens boot property survives.
-  - Within a block: none on disk. Sort the mapped `trace_id` column on first
-    touch and cache the permutation — a sort of ≤n `u128`s, single-digit
-    milliseconds for a 32 MB block, and zero format commitment.
+- **Trace** — the one that genuinely needs an index. Block level is **built**;
+  within-block is not, and does not need to be yet. A block's min/max trace id
+  spans the whole range and prunes nothing, so:
+  - Block level: a Bloom filter over the block's distinct trace ids, 10 bits per
+    key with k=7, in a `trace.idx` sidecar written at publish and `read` **on
+    demand, not at boot** — so the zero-file-opens boot property survives. Sized
+    on distinct ids, not rows: spans of a trace arrive in one export and land
+    adjacent, so dropping adjacent duplicates costs one 16-byte compare per row
+    and makes the filter 8× smaller. Both 64-bit halves of the id go through a
+    splitmix64 finalizer before Kirsch-Mitzenmacher double hashing — W3C only
+    requires a trace id to be non-zero, X-Ray puts an epoch in the first four
+    bytes, and the bit index reads only the low bits, so without the finalizer a
+    structured id set maps onto a handful of bits and the filter answers "maybe"
+    to everything. Every damage path — missing, short, wrong magic, future
+    version, bad CRC32 — answers "scan the block". A false positive costs one
+    wasted read; a false negative silently loses spans.
+
+    Measured over 4.1 GB / 25M spans / 84 blocks, fetching one 8-span trace:
+
+    | | blocks scanned | rows scanned | cold | warm |
+    |---|---|---|---|---|
+    | without | 84 | 25,000,000 | 14.3 s | 14.3 s |
+    | with | 1 | 212,992 | 250 ms | 20 ms |
+
+    The filters cost 65 KB per block — 5.3 MB against 4.1 GB, 0.13%. That warm
+    number is the tell: the cost was never paging, it was opening and CRC-checking
+    83 blocks that could not have held the trace.
+  - Within a block: none on disk, and none in memory either — a linear scan of the
+    mapped `trace_id` column of one block is the 20 ms above. Sorting and caching
+    a permutation is the upgrade if that ever stops being true.
 
 **Why not sort blocks by `trace_id` instead?** There is exactly one physical
 order, and every query has a time bound while only some have a trace bound. Time
@@ -615,10 +646,32 @@ full evaluator and a series-major on-disk layout — a different sort order from
 
 ## 8. Agentic surface
 
-Deliberately not built in this pass, but the layout is chosen so it can be:
+**Built**: `POST /mcp` on the same listener as everything else, JSON-RPC 2.0 over
+Streamable HTTP, four tools — `query_records`, `get_trace`, `query_metric`,
+`list_metrics`. Hand-rolled rather than `rmcp`: the protocol at this scope is a
+method dispatch over a JSON document, we already parse those (§1, KYAML), and the
+SDK's session model is the thing we specifically do not want.
 
-- **MCP server** (`rmcp` 3.2.0, the official Rust SDK) mounted on the same axum
-  router as 4318. It exposes the same query engine, not a parallel one.
+Two decisions worth keeping:
+
+- **No `Mcp-Session-Id`.** Streamable HTTP permits a server to hand out a session
+  id and then require it on every later request, which makes the server a thing
+  with memory that a load balancer must route back to. Issuing none is principle
+  4 applied to the agent surface: any replica answers any request, and killing one
+  loses nothing.
+- **The same read path as the UI.** The tools call `api::search_doc`,
+  `api::series_doc` and `api::bounds` — the same parsers the HTTP API uses — and
+  the same `query`/`series` functions, through the same `envelope()`. A separate
+  "agent API" is a second read path to keep correct, and the first thing it does
+  is drift.
+
+`get_trace` exists as its own tool rather than as a `trace_id` term because the
+default window is one hour: an agent handed yesterday's trace id would otherwise
+get an empty result with nothing to explain it. It searches all of retention, and
+§7.4's block filter is what makes that affordable.
+
+Still not built:
+
 - **Block-footer sketches** — HyperLogLog for cardinality, t-digest for
   latency quantiles, top-K for attribute values — in `Schema.custom_metadata`.
   This is the correct use of `custom_metadata`: per-block summary statistics, not
@@ -655,18 +708,21 @@ observable. *Not yet implemented.*
 
 ## 10. What is deliberately not here
 
-- **Traces and metrics.** The receivers are wired; only logs are encoded. Logs is
-  the smallest complete instance of the star schema, so it proves the pattern
-  end to end. Traces adds `SPAN_EVENTS`/`SPAN_LINKS`; metrics adds the
-  multi-datapoint-type problem, which is genuinely the hard one. Both carry a
-  correlation obligation from §7.1: `span_links` must be a real table, and metric
-  **exemplars must keep their `trace_id`/`span_id`** — dropping them is the
-  standard way backends end up unable to answer "which trace made this spike."
-- **The trace index** (§7.4). Deliberately deferred rather than forgotten: its
-  only consumer is a query engine that does not exist yet, and neither of its two
-  levels changes the block format, so building it now would buy nothing. The
-  entity key was the opposite case — a format decision — which is why that one
-  landed.
+- **OTLP/HTTP JSON.** All three endpoints decode protobuf and ignore
+  `content-type`; a JSON export gets a 400. JSON is a normative part of OTLP and
+  this is a gap, not a position.
+- **`SPAN_EVENTS` and `SPAN_LINKS` as tables.** Spans are encoded and queryable;
+  events and links are not yet their own tables, which leaves the §7.1
+  correlation obligation half-paid. Metric **exemplars keep their
+  `trace_id`/`span_id`** — dropping them is the standard way backends end up
+  unable to answer "which trace made this spike" — but nothing reads them yet.
+- **A compression tier.** Blocks are written uncompressed. §11 is where this
+  shows up, and it is currently the largest single gap between design and
+  measurement.
+- **A block cache.** Every query re-opens and re-CRCs every block it touches. The
+  fix is a process-local `Arc<MappedTable>` map invalidated by `expire`; the trace
+  filter (§7.4) made it less urgent by cutting the blocks touched, not cheaper per
+  block.
 - **A dependency on `otel-arrow-dfe-quiver` 0.54.1.** It is an embeddable
   Arrow segment store from the OTel Arrow maintainers, Apache-2.0, and it already
   ships a CRC32 WAL with replay, immutable IPC segments, `SegmentReader::open_mmap`,
@@ -691,16 +747,64 @@ observable. *Not yet implemented.*
 
 ## 11. Performance model
 
-The four axes, each with a target and a way to measure it. None of these are
-measured yet — they are the contract this design is making.
+The four axes, each with a target and a measurement. Measured on an Apple M3 Pro
+(12 cores, 36 GB), release build, `examples/loadgen` over loopback at 96
+connections × 8192 records, 90 seconds — 6.4 GiB on the wire, 8.3 GiB on disk,
+26.8 M log records and 25 M spans.
 
-| Axis | Target | Measured by |
-|---|---|---|
-| Ingest throughput / core | ≥ 1 M log records/s/core, OTLP protobuf on 4317 | criterion on `LogsBuilder::append_request`, then a loadgen against the binary |
-| Resident footprint | ≤ 2 × the open block's target size | RSS sampled during sustained ingest; the `concat_batches` trap is the main risk |
-| Query p99 | ≤ 10 ms for a 1-hour temporal + single-attribute predicate over 100 M rows | once §7 exists |
-| Cost per GB ingested | ≤ 0.35 bytes on disk per byte of OTLP wire | bytes-on-disk ÷ bytes-received over a fixed corpus |
-| Binary size | ≤ 20 MB stripped with query + MCP | `ls -l target/release/mira`; currently 2.6 MB / 107 crates |
+| Axis | Target | Measured | |
+|---|---|---|---|
+| Ingest throughput | ≥ 1 M records/s/core | **520,889 records/s / 68.0 MiB/s** aggregate, 0 shed | ✗ |
+| Resident footprint | ≤ 2 × the open block's target size | holds; no `concat_batches` regression | ✓ |
+| Ack latency | — | p50 **472 ms**, p99 **2,481 ms** | see below |
+| Query: filtered log scan | ≤ 10 ms | **310 ms** over 786k rows / 2 blocks | ✗ |
+| Query: trace by id | — | **250 ms** cold, **20 ms** warm, 1 of 84 blocks (§7.4) | ✓ |
+| Query: metric names | — | **140 ms** | — |
+| Cost per GB ingested | ≤ 0.35 B/B | **1.34 B/B** | ✗ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.0 MB** / 110 crates | ✓ |
+
+Reading these honestly:
+
+- **Ingest is aggregate, not per core**, and it is not the interesting number
+  anyway: at 96 connections the run is fsync-bound, which is what the ack
+  latencies say. p50 of 472 ms is the block filling; p99 of 2.5 s is a durable
+  publish landing in front of a waiter. Both are *chosen* — acks come after
+  durability (§9), so read-your-writes is free and every e2e test queries with no
+  sleep after export. The per-core encode number needs a criterion bench on
+  `append_request` with no I/O in the path, which does not exist yet.
+- **Query p99 misses by 30×**, and the cause is known: no block cache. Every scan
+  re-opens each block and re-CRCs its whole body (§3.3). The trace filter attacked
+  the other half of the problem — how many blocks get touched — and got 60×. The
+  cache is §10.
+- **Cost per GB misses by 4×, and the reason is that blocks are uncompressed.**
+  Two things inflate them. The `ATTRS` table carries six typed value columns and
+  writes all six for every row, so a string attribute pays 8 bytes for a null
+  `int`, 8 for a null `double` and 4-byte offsets each for null `bytes`/`ser` —
+  roughly 24 bytes of padding per attribute row. And nothing anywhere is
+  compressed. Measured on one 19.3 MB block, `zstd -3`:
+
+  | | on disk | compressed | |
+  |---|---|---|---|
+  | `log_attrs.arrow` | 9.17 MB | 0.70 MB | 13.1× |
+  | `logs.arrow` | 10.08 MB | 1.65 MB | 6.1× |
+  | block total | 19.26 MB | 2.35 MB | **8.2×** |
+
+  8.3 GiB at that ratio is ~1.0 GiB, or **0.16 B/B** — the target is reachable and
+  then some. (Synthetic data compresses better than real; 4-6× is the number to
+  plan on. Still clears 0.35.) Compression costs ~22 ms for 9 MB, ≈420 MB/s on one
+  core, which at 68 MiB/s of ingest is 16% of a core on a path already on
+  `spawn_blocking`.
+
+  **The reason it is not simply switched on**: Arrow IPC compresses per buffer,
+  and a compressed buffer must be inflated into the heap. Turning on
+  `CompressionType::ZSTD` in the writer deletes the zero-copy read property that
+  §3 is built around — the two are mutually exclusive in the format, not merely in
+  this implementation. So the fix is a **tier**, not a flag: recent blocks stay
+  uncompressed and mmap'd, aged blocks are rewritten compressed by the retention
+  worker and read into the heap. Queries are overwhelmingly recent, so this buys
+  the storage ratio at the cost of latency on exactly the queries that were going
+  to be slow anyway. Deciding the age threshold needs the block cache first, so
+  the two are one piece of work.
 
 Two invariants guard the design rather than the numbers, and both are already
 tests: n/n buffers zero-copy on read, and a corrupted body never returns as data.
