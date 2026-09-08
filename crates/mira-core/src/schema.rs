@@ -39,6 +39,11 @@ fn dict_u16_utf8() -> DataType {
     DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8))
 }
 
+/// How many distinct values a `UInt16` dictionary can hold. Lives here because
+/// it is a consequence of the key width chosen above, not of any one builder.
+/// Reaching it is a signal to seal the block, never to fail an export.
+pub const DICT_CAP: usize = u16::MAX as usize + 1;
+
 fn ts() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, None)
 }

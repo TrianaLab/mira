@@ -5,6 +5,8 @@
 //! * [`schema`] — the OTAP-shaped Arrow schemas that are simultaneously the
 //!   in-memory and the on-disk layout. There is no translation step.
 //! * [`identity`] — the stable entity key that correlation joins on.
+//! * [`attrs`] — the attribute tables and Resource-Scope preamble every signal
+//!   shares.
 //! * [`signal`] — the one shape every signal's encoder presents to the flusher.
 //! * [`logs`] — OTLP protobuf into those schemas, with block-local id rebasing.
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
@@ -14,6 +16,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod attrs;
 pub mod block;
 pub mod error;
 pub mod identity;
@@ -258,7 +261,7 @@ mod tests {
         // A request wider than an empty block's dictionary is refused headroom
         // up front, not discovered part way through an append.
         let mut wide = request("checkout", 1, 1_000);
-        wide.resource_logs[0].scope_logs[0].log_records[0].attributes = (0..=logs::DICT_CAP)
+        wide.resource_logs[0].scope_logs[0].log_records[0].attributes = (0..=schema::DICT_CAP)
             .map(|i| kv(&format!("k{i}"), "v"))
             .collect();
         assert!(!small.has_headroom_for(&wide));

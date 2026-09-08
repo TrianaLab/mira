@@ -5,13 +5,14 @@
 //! lives in Arrow's typed builders (which own growable Vecs) rather than in a
 //! `Vec<RecordBatch>` that would need `concat_batches` at flush — that costs
 //! roughly 2x peak memory for the duration of the concat.
-
-use std::collections::HashMap;
+//!
+//! Everything shared with traces and metrics — the attribute tables and the
+//! Resource-Scope preamble — lives in [`crate::attrs`]. What is left here is the
+//! `logs` root table and nothing else.
 
 use arrow_array::builder::{
-    ArrayBuilder, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder,
-    Int32Builder, Int64Builder, StringBuilder, StringDictionaryBuilder, TimestampNanosecondBuilder,
-    UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    BinaryBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder, StringDictionaryBuilder,
+    TimestampNanosecondBuilder, UInt16Builder, UInt32Builder,
 };
 use arrow_array::types::UInt16Type;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -19,166 +20,12 @@ use prost::Message;
 use std::sync::Arc;
 
 use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
-use mira_proto::common::v1::{AnyValue, KeyValue, any_value::Value};
+use mira_proto::common::v1::any_value::Value;
 
+use crate::attrs::{AttrsBuilder, ResourceScope, resource_kv, scope_kv};
 use crate::error::{Error, Result};
-use crate::identity::resource_key;
-use crate::schema::{ATTRS, AttrType, LOGS, RESOURCES};
+use crate::schema::{DICT_CAP, LOGS};
 use crate::signal::{Sealed, SignalBuilder};
-
-/// How many distinct values a `UInt16` dictionary can hold. Reaching it is a
-/// signal to seal the block, never to fail an export — see
-/// [`LogsBuilder::has_headroom_for`].
-pub const DICT_CAP: usize = u16::MAX as usize + 1;
-
-/// Builder for one of the three attribute tables.
-struct AttrsBuilder {
-    parent_id: UInt32Builder,
-    key: StringDictionaryBuilder<UInt16Type>,
-    /// Distinct entries in `key`. Tracked here because the dictionary builder
-    /// does not expose it, and the seal decision has to be made *before* an
-    /// append rather than after one has already failed.
-    n_keys: usize,
-    ty: UInt8Builder,
-    str_: StringBuilder,
-    int: Int64Builder,
-    double: Float64Builder,
-    bool_: BooleanBuilder,
-    bytes: BinaryBuilder,
-    ser: BinaryBuilder,
-}
-
-impl AttrsBuilder {
-    fn new() -> Self {
-        Self {
-            parent_id: UInt32Builder::new(),
-            key: StringDictionaryBuilder::new(),
-            n_keys: 0,
-            ty: UInt8Builder::new(),
-            str_: StringBuilder::new(),
-            int: Int64Builder::new(),
-            double: Float64Builder::new(),
-            bool_: BooleanBuilder::new(),
-            bytes: BinaryBuilder::new(),
-            ser: BinaryBuilder::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.ty.len()
-    }
-
-    /// Bytes held in the variable-width value heaps. Fixed-width columns are
-    /// estimated from the row count; these cannot be, because one row can be a
-    /// 32 KB GenAI prompt.
-    fn heap_bytes(&self) -> usize {
-        self.str_.values_slice().len()
-            + self.bytes.values_slice().len()
-            + self.ser.values_slice().len()
-    }
-
-    /// Append every attribute of `kvs` as rows pointing at `parent_id`.
-    fn append_all(&mut self, parent_id: u32, kvs: &[KeyValue]) -> Result<()> {
-        for kv in kvs {
-            self.append(parent_id, &kv.key, kv.value.as_ref())?;
-        }
-        Ok(())
-    }
-
-    fn append(&mut self, parent_id: u32, key: &str, value: Option<&AnyValue>) -> Result<()> {
-        // The dictionary goes first because it is the only fallible step here.
-        // Every append below it is infallible, so an overflow leaves all nine
-        // columns the same length and the block is still sealable. A half-written
-        // row would fail `RecordBatch::try_new` at flush and take the whole block
-        // with it.
-        let k = self
-            .key
-            .append(key)
-            .map_err(|_| Error::DictionaryFull("attrs.key"))?;
-        self.n_keys = self.n_keys.max(k as usize + 1);
-        self.parent_id.append_value(parent_id);
-
-        // Exactly one of the six value columns is non-null per row; `type` says
-        // which. Null-appending the other five costs one validity bit each.
-        let mut set = [false; 6];
-        let ty = match value.and_then(|v| v.value.as_ref()) {
-            None => AttrType::Empty,
-            Some(Value::StringValue(s)) => {
-                self.str_.append_value(s);
-                set[0] = true;
-                AttrType::Str
-            }
-            Some(Value::IntValue(i)) => {
-                self.int.append_value(*i);
-                set[1] = true;
-                AttrType::Int
-            }
-            Some(Value::DoubleValue(d)) => {
-                self.double.append_value(*d);
-                set[2] = true;
-                AttrType::Double
-            }
-            Some(Value::BoolValue(b)) => {
-                self.bool_.append_value(*b);
-                set[3] = true;
-                AttrType::Bool
-            }
-            Some(Value::BytesValue(b)) => {
-                self.bytes.append_value(b);
-                set[4] = true;
-                AttrType::Bytes
-            }
-            Some(v @ Value::ArrayValue(_)) | Some(v @ Value::KvlistValue(_)) => {
-                let owned = AnyValue {
-                    value: Some(v.clone()),
-                };
-                self.ser.append_value(owned.encode_to_vec());
-                set[5] = true;
-                if matches!(v, Value::ArrayValue(_)) {
-                    AttrType::Slice
-                } else {
-                    AttrType::Map
-                }
-            }
-        };
-        self.ty.append_value(ty as u8);
-
-        if !set[0] {
-            self.str_.append_null();
-        }
-        if !set[1] {
-            self.int.append_null();
-        }
-        if !set[2] {
-            self.double.append_null();
-        }
-        if !set[3] {
-            self.bool_.append_null();
-        }
-        if !set[4] {
-            self.bytes.append_null();
-        }
-        if !set[5] {
-            self.ser.append_null();
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<RecordBatch> {
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.parent_id.finish()),
-            Arc::new(self.key.finish()),
-            Arc::new(self.ty.finish()),
-            Arc::new(self.str_.finish()),
-            Arc::new(self.int.finish()),
-            Arc::new(self.double.finish()),
-            Arc::new(self.bool_.finish()),
-            Arc::new(self.bytes.finish()),
-            Arc::new(self.ser.finish()),
-        ];
-        Ok(RecordBatch::try_new(ATTRS.clone(), cols)?)
-    }
-}
 
 pub struct LogsBuilder {
     id: UInt32Builder,
@@ -199,23 +46,7 @@ pub struct LogsBuilder {
     scope_id: UInt16Builder,
 
     log_attrs: AttrsBuilder,
-    resource_attrs: AttrsBuilder,
-    scope_attrs: AttrsBuilder,
-
-    // The `resources` table. One row per interned resource, so these grow by
-    // tens per block, not by millions.
-    res_id: UInt16Builder,
-    res_key: UInt64Builder,
-    res_dropped: UInt32Builder,
-
-    // Dedup is keyed on the canonical protobuf encoding of the Resource /
-    // InstrumentationScope message. Storing the bytes rather than a hash means
-    // no collision risk, and there are only a handful of distinct resources per
-    // block so the memory is irrelevant. Deliberately block-local: a global
-    // resource dictionary would be shared mutable state on the ingest hot path
-    // and would break TTL-by-directory-drop.
-    resources: HashMap<Vec<u8>, u16>,
-    scopes: HashMap<Vec<u8>, u16>,
+    rs: ResourceScope,
 
     next_id: u32,
     min_ts: i64,
@@ -245,14 +76,8 @@ impl LogsBuilder {
             dropped: UInt32Builder::new(),
             resource_id: UInt16Builder::new(),
             scope_id: UInt16Builder::new(),
-            log_attrs: AttrsBuilder::new(),
-            resource_attrs: AttrsBuilder::new(),
-            scope_attrs: AttrsBuilder::new(),
-            res_id: UInt16Builder::new(),
-            res_key: UInt64Builder::new(),
-            res_dropped: UInt32Builder::new(),
-            resources: HashMap::new(),
-            scopes: HashMap::new(),
+            log_attrs: AttrsBuilder::new("log_attrs.key"),
+            rs: ResourceScope::new(),
             next_id: 0,
             min_ts: i64::MAX,
             max_ts: i64::MIN,
@@ -277,12 +102,11 @@ impl LogsBuilder {
     /// workload — and resident footprint is one of the four axes.
     pub fn approx_bytes(&self) -> usize {
         self.next_id as usize * 64
-            + (self.log_attrs.len() + self.resource_attrs.len() + self.scope_attrs.len()) * 48
+            + (self.log_attrs.len() + self.rs.len()) * 48
             + self.body.values_slice().len()
             + self.body_ser.values_slice().len()
             + self.log_attrs.heap_bytes()
-            + self.resource_attrs.heap_bytes()
-            + self.scope_attrs.heap_bytes()
+            + self.rs.heap_bytes()
     }
 
     /// Whether `req` is guaranteed to fit without overflowing a `UInt16`
@@ -295,14 +119,13 @@ impl LogsBuilder {
     /// costs a slightly small block and never costs the caller their data.
     pub fn has_headroom_for(&self, req: &ExportLogsServiceRequest) -> bool {
         let (mut resources, mut scopes, mut records) = (0usize, 0usize, 0usize);
-        let (mut res_kv, mut scope_kv, mut log_kv) = (0usize, 0usize, 0usize);
+        let (mut res_kv, mut sc_kv, mut log_kv) = (0usize, 0usize, 0usize);
         for rl in &req.resource_logs {
             resources += 1;
-            res_kv += rl.resource.as_ref().map_or(0, |r| r.attributes.len());
+            res_kv += resource_kv(rl.resource.as_ref());
             for sl in &rl.scope_logs {
                 scopes += 1;
-                // +2 for the synthesised otel.scope.name / .version rows.
-                scope_kv += sl.scope.as_ref().map_or(0, |s| s.attributes.len()) + 2;
+                sc_kv += scope_kv(sl.scope.as_ref());
                 records += sl.log_records.len();
                 log_kv += sl
                     .log_records
@@ -311,21 +134,18 @@ impl LogsBuilder {
                     .sum::<usize>();
             }
         }
-        self.resources.len() + resources <= DICT_CAP
-            && self.scopes.len() + scopes <= DICT_CAP
+        self.rs.has_headroom(resources, scopes, res_kv, sc_kv)
+            && self.log_attrs.has_headroom(log_kv)
             && self.n_sev + records <= DICT_CAP
-            && self.log_attrs.n_keys + log_kv <= DICT_CAP
-            && self.resource_attrs.n_keys + res_kv <= DICT_CAP
-            && self.scope_attrs.n_keys + scope_kv <= DICT_CAP
     }
 
     /// Absorb one OTLP export request. Returns the number of log records added.
     pub fn append_request(&mut self, req: &ExportLogsServiceRequest) -> Result<usize> {
         let mut added = 0;
         for rl in &req.resource_logs {
-            let rid = self.intern_resource(rl.resource.as_ref())?;
+            let rid = self.rs.resource(rl.resource.as_ref())?;
             for sl in &rl.scope_logs {
-                let sid = self.intern_scope(sl.scope.as_ref())?;
+                let sid = self.rs.scope(sl.scope.as_ref())?;
                 for rec in &sl.log_records {
                     // Same rule as `AttrsBuilder::append`: the one fallible step
                     // in the row runs before anything is written, so a dictionary
@@ -398,63 +218,6 @@ impl LogsBuilder {
         Ok(added)
     }
 
-    fn intern_resource(&mut self, res: Option<&mira_proto::resource::v1::Resource>) -> Result<u16> {
-        let key = res.map(|r| r.encode_to_vec()).unwrap_or_default();
-        if let Some(&id) = self.resources.get(&key) {
-            return Ok(id);
-        }
-        // resource_id is UInt16 to keep the root table narrow. Overflow means
-        // "seal this block", never "drop data".
-        let id = u16::try_from(self.resources.len())
-            .map_err(|_| Error::DictionaryFull("logs.resource_id"))?;
-        self.resources.insert(key, id);
-
-        let attrs = res.map(|r| r.attributes.as_slice()).unwrap_or_default();
-        self.res_id.append_value(id);
-        self.res_key.append_value(resource_key(attrs));
-        self.res_dropped
-            .append_value(res.map(|r| r.dropped_attributes_count).unwrap_or(0));
-        self.resource_attrs.append_all(id as u32, attrs)?;
-        Ok(id)
-    }
-
-    fn intern_scope(
-        &mut self,
-        scope: Option<&mira_proto::common::v1::InstrumentationScope>,
-    ) -> Result<u16> {
-        let key = scope.map(|s| s.encode_to_vec()).unwrap_or_default();
-        if let Some(&id) = self.scopes.get(&key) {
-            return Ok(id);
-        }
-        let id =
-            u16::try_from(self.scopes.len()).map_err(|_| Error::DictionaryFull("logs.scope_id"))?;
-        self.scopes.insert(key, id);
-        if let Some(s) = scope {
-            self.scope_attrs.append_all(id as u32, &s.attributes)?;
-            // Scope name/version are not attributes on the wire, but modelling
-            // them as such means one table and one join path instead of two.
-            if !s.name.is_empty() {
-                self.scope_attrs.append(
-                    id as u32,
-                    "otel.scope.name",
-                    Some(&AnyValue {
-                        value: Some(Value::StringValue(s.name.clone())),
-                    }),
-                )?;
-            }
-            if !s.version.is_empty() {
-                self.scope_attrs.append(
-                    id as u32,
-                    "otel.scope.version",
-                    Some(&AnyValue {
-                        value: Some(Value::StringValue(s.version.clone())),
-                    }),
-                )?;
-            }
-        }
-        Ok(id)
-    }
-
     /// Seal the accumulated rows into a block and reset for the next one.
     ///
     /// The reset happens on the error path too. `seal` calls `finish` on each
@@ -483,23 +246,14 @@ impl LogsBuilder {
             Arc::new(self.resource_id.finish()),
             Arc::new(self.scope_id.finish()),
         ];
-        let resources = RecordBatch::try_new(
-            RESOURCES.clone(),
-            vec![
-                Arc::new(self.res_id.finish()) as ArrayRef,
-                Arc::new(self.res_key.finish()),
-                Arc::new(self.res_dropped.finish()),
-            ],
-        )?;
+        let mut tables = vec![
+            ("logs", RecordBatch::try_new(LOGS.clone(), cols)?),
+            ("log_attrs", self.log_attrs.finish()?),
+        ];
+        tables.extend(self.rs.finish()?);
         Ok(Sealed {
             num_rows: self.next_id as usize,
-            tables: vec![
-                ("logs", RecordBatch::try_new(LOGS.clone(), cols)?),
-                ("log_attrs", self.log_attrs.finish()?),
-                ("resources", resources),
-                ("resource_attrs", self.resource_attrs.finish()?),
-                ("scope_attrs", self.scope_attrs.finish()?),
-            ],
+            tables,
             min_ts: if self.min_ts == i64::MAX {
                 0
             } else {
@@ -538,7 +292,7 @@ impl SignalBuilder for LogsBuilder {
 /// OTLP leaves trace_id/span_id empty when unset; anything that is neither
 /// empty nor the exact width is malformed and becomes null rather than an error
 /// — a bad id must not cost the caller the whole export.
-fn append_fixed(b: &mut FixedSizeBinaryBuilder, v: &[u8], width: usize) -> Result<()> {
+pub(crate) fn append_fixed(b: &mut FixedSizeBinaryBuilder, v: &[u8], width: usize) -> Result<()> {
     if v.len() == width {
         b.append_value(v)?;
     } else {
