@@ -10,7 +10,7 @@ copies.
 
 ```
 mira --data-dir ./data          # OTLP/gRPC 4317, OTLP/HTTP + UI + MCP 4318
-mira tui --data-dir ./data      # the same views in the terminal, no server needed
+mira mira --data-dir ./data     # the same views in the terminal, no server needed
 ```
 
 No cluster membership, no Raft, no external metadata store, no `protoc` to
@@ -25,7 +25,7 @@ build. The block directory is the only state; the filesystem is the manifest.
 - **The UI is in the binary.** Open `http://localhost:4318/` — records, trace
   waterfalls and metric charts, served from `include_bytes!`. Nothing to deploy
   beside it.
-- **The UI is also in the terminal.** `mira tui` gives the same three tabs, the
+- **The UI is also in the terminal.** `mira mira` gives the same three tabs, the
   same filter grammar and the same trace waterfall over a `termios` raw mode and
   ANSI — no TUI framework, zero crates added. It reads either a running replica
   (`--addr host:4318`) or a block directory in-process (`--data-dir`), and the

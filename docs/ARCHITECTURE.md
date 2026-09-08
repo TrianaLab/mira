@@ -793,8 +793,10 @@ a second thing.
 
 ### 8.3 The terminal UI
 
-`mira tui` renders the same three tabs, the same filter grammar and the same trace
-waterfall in the terminal. Three decisions:
+`mira mira` renders the same three tabs, the same filter grammar and the same trace
+waterfall in the terminal. `mira tui` is kept as an alias, because it is what
+someone types who has not read the usage, and answering that costs one `||` where
+an "unknown flag" costs them a thought. Three decisions:
 
 **No TUI framework.** ratatui is the obvious answer and costs **61 crates** —
 against a tree of 117, whose size is a stated property of the product (§1). What

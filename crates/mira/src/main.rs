@@ -19,13 +19,14 @@ use config::Config;
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
      [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2] [--version]
 
-mira tui [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
 
 Flags override the config file, which overrides the defaults. Every value can
 also come from the file via ${env:VAR} — see docs/CONFIG.md.
 
-`tui` opens the terminal UI. With --data-dir it reads a block directory
-in-process and needs no server running; with --addr it queries one over HTTP.";
+`mira mira` opens the terminal UI. With --data-dir it reads a block directory
+in-process and needs no server running; with --addr it queries one over HTTP.
+`mira tui` is the same thing, for anyone who guesses that first.";
 
 /// Precedence is flag > file > default. Hand-rolled: the flag set exists only to
 /// override the file, so a parser crate would be more code than the thing it
@@ -73,10 +74,10 @@ fn load() -> Result<Config, String> {
     Ok(cfg)
 }
 
-/// Where a `mira tui` invocation should read from.
+/// Where a `mira mira` invocation should read from.
 ///
 /// `--addr` wins if given; otherwise the same `data_dir` the server would use,
-/// so `mira tui --config mira.yaml` looks at exactly the directory that config
+/// so `mira mira --config mira.yaml` looks at exactly the directory that config
 /// writes to.
 fn tui_source(argv: &[String]) -> Result<tui::Source, String> {
     let mut cfg = match argv.iter().position(|a| a == "--config") {
@@ -104,7 +105,10 @@ fn tui_source(argv: &[String]) -> Result<tui::Source, String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().is_some_and(|a| a == "tui") {
+    // `mira mira` is the name; `tui` stays because it is what someone types when
+    // they have not read the usage, and answering that is cheaper than a
+    // "no such flag" they have to think about.
+    if argv.first().is_some_and(|a| a == "mira" || a == "tui") {
         if argv.iter().any(|a| a == "-h" || a == "--help") {
             println!("{USAGE}");
             return Ok(());
