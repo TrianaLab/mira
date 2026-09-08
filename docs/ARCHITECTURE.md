@@ -1,8 +1,9 @@
 # Mira — Architecture
 
-**Status:** proposal for review. Nothing is committed. The workspace under
-`crates/` compiles and its tests pass; treat it as an executable sketch of this
-document, not as v1.
+**Status:** the workspace under `crates/` implements most of this and its tests
+pass. Sections marked "still not built" are the exceptions; the README's *What is
+not true yet* is the short list. Treat this as the reasoning behind the code, not
+as a plan for it.
 
 ---
 
@@ -78,7 +79,7 @@ compression and give up zero-copy. §11 states the target for each axis and how
 it is measured.
 
 **Agentic**, in all four senses the owner selected:
-- *LLM-queryable surface* — a native MCP server (`rmcp`) over the same query
+- *LLM-queryable surface* — a native MCP server (hand-rolled, §8.1) over the same query
   engine, so an agent investigating an incident issues one call instead of
   composing PromQL and TraceQL. Block footers will carry sketches (HLL, t-digest,
   top-K) specifically so exploratory "what is unusual here" queries are answerable
@@ -688,7 +689,7 @@ tables will write wrong joins — silently wrong, because a missing `parent_id`
 predicate returns a cross product that looks like data. An agent handed seven
 closed operations cannot express a wrong join at all, and every call returns a
 frame it can bound before materialising. That is the difference between an
-investigation loop and a timeout. §8.
+investigation loop and a timeout. §8.1.
 
 ### 7.6 Query, outside correlation
 
@@ -707,7 +708,13 @@ full evaluator and a series-major on-disk layout — a different sort order from
 
 ---
 
-## 8. Agentic surface
+## 8. Read surfaces: agents and humans
+
+Three of them — MCP, a browser UI, a terminal UI — and all three go through
+`api.rs`'s parsers and `api::envelope`, so there is one query grammar to keep
+correct rather than three that drift.
+
+### 8.1 Agentic surface
 
 **Built**: `POST /mcp` on the same listener as everything else, JSON-RPC 2.0 over
 Streamable HTTP, four tools — `query_records`, `get_trace`, `query_metric`,
@@ -744,6 +751,59 @@ Still not built:
 - **GenAI conventions** need no special code. They need the attribute table to
   handle multi-kilobyte prompt strings without pathology, which plain `Utf8`
   values already do and dictionary keys would not.
+
+### 8.2 The browser UI
+
+Svelte, built to `crates/mira/ui/dist` and `include_bytes!`'d into the binary,
+served from `/` and `/{file}` on the same listener. Nothing to deploy beside the
+binary and no CORS, because it is the same origin as the API it calls. The
+wildcard is one path segment deep, so it cannot swallow `/v1/*`, `/api/v1/*` or
+`/mcp`.
+
+`dist/` is checked into git so `cargo build` never needs node; `npm run build` is
+a step taken before committing a UI change. A `build.rs` that shelled out to npm
+would make every Rust build depend on a JavaScript toolchain to produce bytes
+that did not change. Freshness is an ETag over the bytes, not a hash in the URL,
+so an unchanged bundle costs a 304 instead of 54 KB.
+
+Owning the UI follows from owning the API. Mira's query shape is not PromQL, not
+LogQL and not SQL — §7.3's frame algebra is the interface — so an off-the-shelf
+frontend would have to be taught it, and teaching it means shipping and versioning
+a second thing.
+
+### 8.3 The terminal UI
+
+`mira tui` renders the same three tabs, the same filter grammar and the same trace
+waterfall in the terminal. Three decisions:
+
+**No TUI framework.** ratatui is the obvious answer and costs **61 crates** —
+against a tree of 113, whose size is a stated property of the product (§1). What
+it buys is a constraint-solving layout engine and a damage-tracked cell buffer;
+this UI has fixed panes and repaints one screenful per keystroke. So `termios` for
+raw mode, `TIOCGWINSZ` for the size, `poll(2)` for input, ANSI for the rest — on
+`libc`, already in the tree for §9's `statfs` guard. Net crates added: **zero**.
+The cost is `crates/mira/src/term.rs`: a ~200-line terminal and a `Row` type that
+tracks visible width separately from bytes, because inline ANSI makes `len()` a
+lie. Unix only, which is the same bet `mmap` and `SIGTERM` already make.
+
+**Two transports, one code path.** `--addr host:4318` POSTs to a running replica.
+`--data-dir` calls `mira_core::query` **in-process, with no server anywhere** —
+which is the reason the TUI is worth building rather than being a smaller browser
+UI. A detached PVC, or the volume of a pod that has already been killed, is still
+readable. Both transports return the same envelope string, produced by the same
+`api::parse_search` / `api::envelope`, so a filter that works against a server
+works against a directory by construction.
+
+**Responses are parsed with the KYAML loader.** JSON is a subset of KYAML and
+`yaml-rust2` is already here for the config file (§1, KYAML-first), so the binary
+still has no JSON *parsing* dependency. A test drives the exact envelope shape —
+escapes, control characters, nested attributes — rather than trusting the spec.
+
+The whole thing is synchronous: no runtime, no task, no channel. A slow query
+freezes the UI for its duration, which is why the frame is painted *before* the
+query runs — the freeze always carries a "running" rather than a stale screen. The
+tracing subscriber is not initialised on this path; one stray `info!` mid-frame
+corrupts the screen.
 
 ---
 

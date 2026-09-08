@@ -850,6 +850,7 @@ dependencies = [
  "arrow-array",
  "axum",
  "bytes",
+ "libc",
  "mira-core",
  "mira-proto",
  "prost",

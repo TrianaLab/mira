@@ -8,6 +8,8 @@ mod json;
 mod mcp;
 mod pipeline;
 mod receiver;
+mod term;
+mod tui;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -17,8 +19,13 @@ use config::Config;
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
      [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2] [--version]
 
+mira tui [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+
 Flags override the config file, which overrides the defaults. Every value can
-also come from the file via ${env:VAR} — see docs/CONFIG.md.";
+also come from the file via ${env:VAR} — see docs/CONFIG.md.
+
+`tui` opens the terminal UI. With --data-dir it reads a block directory
+in-process and needs no server running; with --addr it queries one over HTTP.";
 
 /// Precedence is flag > file > default. Hand-rolled: the flag set exists only to
 /// override the file, so a parser crate would be more code than the thing it
@@ -66,15 +73,62 @@ fn load() -> Result<Config, String> {
     Ok(cfg)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Where a `mira tui` invocation should read from.
+///
+/// `--addr` wins if given; otherwise the same `data_dir` the server would use,
+/// so `mira tui --config mira.yaml` looks at exactly the directory that config
+/// writes to.
+fn tui_source(argv: &[String]) -> Result<tui::Source, String> {
+    let mut cfg = match argv.iter().position(|a| a == "--config") {
+        Some(i) => Config::load(Path::new(argv.get(i + 1).ok_or("--config needs a value")?))?,
+        None => Config::default(),
+    };
+    let mut addr = None;
+    let mut it = argv.iter().cloned();
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--config" => {
+                value()?;
+            }
+            "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
+            "--addr" => addr = Some(tui::parse_addr(&value()?)?),
+            other => return Err(format!("unknown flag {other}\n\n{USAGE}")),
+        }
+    }
+    Ok(match addr {
+        Some(a) => tui::Source::Remote(a),
+        None => tui::Source::Local(cfg.data_dir),
+    })
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| a == "tui") {
+        if argv.iter().any(|a| a == "-h" || a == "--help") {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        // No tracing subscriber on this path, and no runtime. Both write to the
+        // terminal the TUI has just taken over, and one stray `info!` in the
+        // middle of a frame corrupts the whole screen.
+        let src = tui_source(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        return tui::run(src).map_err(Into::into);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "mira=info,mira_core=info".into()),
         )
         .init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
 
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     // Before anything is mapped. A network mount is not a slow start, it is a

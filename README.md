@@ -10,6 +10,7 @@ copies.
 
 ```
 mira --data-dir ./data          # OTLP/gRPC 4317, OTLP/HTTP + UI + MCP 4318
+mira tui --data-dir ./data      # the same views in the terminal, no server needed
 ```
 
 No cluster membership, no Raft, no external metadata store, no `protoc` to
@@ -22,6 +23,12 @@ build. The block directory is the only state; the filesystem is the manifest.
 - **The UI is in the binary.** Open `http://localhost:4318/` — records, trace
   waterfalls and metric charts, served from `include_bytes!`. Nothing to deploy
   beside it.
+- **The UI is also in the terminal.** `mira tui` gives the same three tabs, the
+  same filter grammar and the same trace waterfall over a `termios` raw mode and
+  ANSI — no TUI framework, zero crates added. It reads either a running replica
+  (`--addr host:4318`) or a block directory in-process (`--data-dir`), and the
+  second one is the point: a detached PVC or a dead pod's volume is still
+  readable with nothing running.
 - **MCP on `/mcp`.** Four tools over JSON-RPC, no session id, so any replica can
   answer any call. A model asks the same four questions the UI does, through the
   same read path.
@@ -58,7 +65,7 @@ build. The block directory is the only state; the filesystem is the manifest.
   nothing to catch. A `statfs` at startup names the filesystem and says what to
   point `--data-dir` at instead. FUSE is a warning rather than a refusal,
   because the magic number cannot tell `gcsfuse` from a local one.
-- 4.5 MB, 113 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
+- 4.6 MB, 113 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
   one C dependency and it vendors its own source, so it needs a `cc` — which the
   linker already required — and nothing installed.
 
@@ -121,7 +128,8 @@ beside ZSTD, which is how the one C dependency in the tree got justified.
 ```
 crates/mira-proto   vendored OTLP .proto + pure-Rust codegen (protox)
 crates/mira-core    Arrow schemas, OTLP encoder, block writer, mmap reader
-crates/mira         the binary: receivers, ingest pipeline, retention
+crates/mira         the binary: receivers, ingest pipeline, retention,
+                    query API, MCP, the browser UI and the terminal UI
 ```
 
 Design, and the reasoning behind every non-obvious choice, is in
