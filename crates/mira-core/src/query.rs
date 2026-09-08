@@ -533,7 +533,9 @@ fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) -> Vec<u32> {
 
 fn attr_key(a: &RecordBatch, row: usize) -> &str {
     let d = a.column(1).as_dictionary::<UInt16Type>();
-    d.values().as_string::<i32>().value(d.keys().value(row) as usize)
+    d.values()
+        .as_string::<i32>()
+        .value(d.keys().value(row) as usize)
 }
 
 /// Compare one attribute row against a query scalar, dispatching on the stored
@@ -697,7 +699,9 @@ fn emit_value(j: &mut Json, col: &dyn Array, row: usize) {
         // Nanoseconds as an integer. Every other representation either loses
         // precision or picks a timezone on the user's behalf; the UI formats
         // them, which is where that belongs.
-        DataType::Timestamp(_, _) => j.i64(col.as_primitive::<TimestampNanosecondType>().value(row)),
+        DataType::Timestamp(_, _) => {
+            j.i64(col.as_primitive::<TimestampNanosecondType>().value(row))
+        }
         DataType::Int64 => j.i64(col.as_primitive::<Int64Type>().value(row)),
         DataType::Int32 => j.i64(col.as_primitive::<Int32Type>().value(row) as i64),
         DataType::UInt64 => j.u64(col.as_primitive::<UInt64Type>().value(row)),
@@ -714,7 +718,11 @@ fn emit_value(j: &mut Json, col: &dyn Array, row: usize) {
         },
         DataType::Dictionary(_, _) => {
             let d = col.as_dictionary::<UInt16Type>();
-            j.str(d.values().as_string::<i32>().value(d.keys().value(row) as usize));
+            j.str(
+                d.values()
+                    .as_string::<i32>()
+                    .value(d.keys().value(row) as usize),
+            );
         }
         DataType::List(_) => {
             let inner = col.as_list::<i32>().value(row);

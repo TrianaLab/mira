@@ -495,9 +495,9 @@ mod tests {
         use mira_proto::metrics::v1::number_data_point::Value as NumValue;
         use mira_proto::metrics::v1::summary_data_point::ValueAtQuantile;
         use mira_proto::metrics::v1::{
-            AggregationTemporality, Exemplar, ExponentialHistogram,
-            ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint, Metric,
-            NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
+            AggregationTemporality, Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint,
+            Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics,
+            ScopeMetrics, Sum, Summary, SummaryDataPoint,
             exponential_histogram_data_point::Buckets,
         };
 
@@ -761,8 +761,11 @@ mod tests {
 
         // service.name is a *resource* attribute; the user does not know that
         // and should not have to. It resolves through resources -> resource_id.
-        let r = query::search(&root, &q(vec![attr("service.name", "payments")], 0, i64::MAX, 100))
-            .unwrap();
+        let r = query::search(
+            &root,
+            &q(vec![attr("service.name", "payments")], 0, i64::MAX, 100),
+        )
+        .unwrap();
         assert_eq!(r.stats.rows_matched, 10);
         assert!(r.json.contains("\"service.name\":\"payments\""));
         assert!(!r.json.contains("checkout"));
@@ -771,8 +774,11 @@ mod tests {
         assert_eq!(r.stats.blocks_scanned, 2);
 
         // http.method is a *record* attribute, on every row of both blocks.
-        let r = query::search(&root, &q(vec![attr("http.method", "GET")], 0, i64::MAX, 100))
-            .unwrap();
+        let r = query::search(
+            &root,
+            &q(vec![attr("http.method", "GET")], 0, i64::MAX, 100),
+        )
+        .unwrap();
         assert_eq!(r.stats.rows_matched, 20);
 
         // A key that exists nowhere matches nothing rather than erroring.
@@ -784,7 +790,10 @@ mod tests {
         // opened: the older block is never touched.
         let r = query::search(&root, &q(vec![], 5_000, 9_000, 100)).unwrap();
         assert_eq!(r.stats.blocks_total, 2);
-        assert_eq!(r.stats.blocks_scanned, 1, "the 1_000-range block must prune");
+        assert_eq!(
+            r.stats.blocks_scanned, 1,
+            "the 1_000-range block must prune"
+        );
         assert_eq!(r.stats.rows_matched, 10);
 
         // Dictionary column, substring op: resolved once against the dictionary
@@ -830,7 +839,12 @@ mod tests {
         // ...and a malformed one matches nothing instead of a prefix.
         let r = query::search(
             &root,
-            &q(vec![field("trace_id", Op::Eq, QV::Str("07".into()))], 0, i64::MAX, 100),
+            &q(
+                vec![field("trace_id", Op::Eq, QV::Str("07".into()))],
+                0,
+                i64::MAX,
+                100,
+            ),
         )
         .unwrap();
         assert_eq!(r.stats.rows_matched, 0);

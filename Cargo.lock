@@ -833,6 +833,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-types",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "yaml-rust2",

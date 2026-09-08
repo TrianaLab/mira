@@ -454,13 +454,8 @@ impl MetricsBuilder {
 
     fn append_number(&mut self, p: &NumberDataPoint, mid: u32) -> Result<()> {
         let id = self.next_point(p.time_unix_nano);
-        self.num.append(
-            id,
-            mid,
-            p.start_time_unix_nano,
-            p.time_unix_nano,
-            p.flags,
-        );
+        self.num
+            .append(id, mid, p.start_time_unix_nano, p.time_unix_nano, p.flags);
         match p.value {
             // sfixed64 stays an Int64. Routing a counter through f64 would
             // silently drop its low bits past 2^53, which is a number real
@@ -487,7 +482,8 @@ impl MetricsBuilder {
         self.hist
             .append(id, mid, p.start_time_unix_nano, p.time_unix_nano, p.flags);
         self.hist_stats.append(p.count, p.sum, p.min, p.max);
-        self.hist_counts.append_value(p.bucket_counts.iter().copied().map(Some));
+        self.hist_counts
+            .append_value(p.bucket_counts.iter().copied().map(Some));
         self.list_values += p.bucket_counts.len();
 
         if p.explicit_bounds.is_empty() {
@@ -523,9 +519,9 @@ impl MetricsBuilder {
         self.exp_zero_count.append_value(p.zero_count);
         self.exp_zero_threshold.append_value(p.zero_threshold);
         let buckets = |b: &Option<Buckets>,
-                           off: &mut Int32Builder,
-                           counts: &mut ListBuilder<UInt64Builder>,
-                           total: &mut usize| {
+                       off: &mut Int32Builder,
+                       counts: &mut ListBuilder<UInt64Builder>,
+                       total: &mut usize| {
             match b {
                 Some(b) => {
                     off.append_value(b.offset);
@@ -592,7 +588,8 @@ impl MetricsBuilder {
             }
             append_fixed(&mut self.ex_trace_id, &e.trace_id, 16)?;
             append_fixed(&mut self.ex_span_id, &e.span_id, 8)?;
-            self.exemplar_attrs.append_all(eid, &e.filtered_attributes)?;
+            self.exemplar_attrs
+                .append_all(eid, &e.filtered_attributes)?;
         }
         Ok(())
     }
@@ -671,11 +668,20 @@ impl MetricsBuilder {
         let mut tables = vec![
             ("metrics", metrics),
             ("metric_attrs", self.metric_attrs.finish()?),
-            ("number_dp", RecordBatch::try_new(NUMBER_DP.clone(), number)?),
+            (
+                "number_dp",
+                RecordBatch::try_new(NUMBER_DP.clone(), number)?,
+            ),
             ("hist_dp", RecordBatch::try_new(HIST_DP.clone(), hist)?),
             ("hist_bounds", bounds),
-            ("exp_hist_dp", RecordBatch::try_new(EXP_HIST_DP.clone(), exp)?),
-            ("summary_dp", RecordBatch::try_new(SUMMARY_DP.clone(), summ)?),
+            (
+                "exp_hist_dp",
+                RecordBatch::try_new(EXP_HIST_DP.clone(), exp)?,
+            ),
+            (
+                "summary_dp",
+                RecordBatch::try_new(SUMMARY_DP.clone(), summ)?,
+            ),
             ("dp_attrs", self.dp_attrs.finish()?),
             ("exemplars", exemplars),
             ("exemplar_attrs", self.exemplar_attrs.finish()?),

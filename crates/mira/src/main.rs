@@ -1,6 +1,9 @@
 //! Mira: OTLP in, immutable Arrow blocks out, one binary.
 
+mod api;
 mod config;
+#[cfg(test)]
+mod e2e;
 mod pipeline;
 mod receiver;
 
@@ -72,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (grpc_addr, http_addr) = (cfg.grpc, cfg.http);
     let peers = cfg.peers.len();
 
+    let data_dir = std::sync::Arc::new(cfg.data_dir.clone());
     let pcfg = std::sync::Arc::new(pipeline::Config {
         data_dir: cfg.data_dir,
         node,
@@ -94,7 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(grpc_addr);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    let http = axum::serve(listener, receiver::http_router(recv));
+    // OTLP and the query API share one listener: `/v1/*` in, `/api/v1/*` out.
+    let http = axum::serve(
+        listener,
+        receiver::http_router(recv).merge(api::router(api::Api { data_dir })),
+    );
 
     // The node id is logged because it is the only externally visible thing that
     // distinguishes two replicas' blocks, and a collision is diagnosed here.
