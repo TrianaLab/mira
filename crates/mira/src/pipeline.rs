@@ -215,6 +215,14 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
                 deadline = Instant::now() + cfg.max_block_age;
             }
             match builder.append_request(&job.req) {
+                // An export carrying no records is legal — the Collector emits
+                // one whenever a batch empties out — and there is nothing in it
+                // to make durable. Parking its caller behind a block that will
+                // never be sealed, because nothing was added to seal, strands
+                // that caller for as long as it is willing to wait.
+                Ok(0) => {
+                    let _ = job.ack.send(Ok(()));
+                }
                 Ok(_) => waiters.push(job.ack),
                 Err(e) => {
                     // The append can fail part-way through, having already
