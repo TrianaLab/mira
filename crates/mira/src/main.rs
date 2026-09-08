@@ -6,6 +6,7 @@ mod config;
 mod e2e;
 mod pipeline;
 mod receiver;
+mod ui;
 
 use std::path::{Path, PathBuf};
 
@@ -98,10 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(grpc_addr);
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    // OTLP and the query API share one listener: `/v1/*` in, `/api/v1/*` out.
+    // One listener for all three: `/v1/*` is OTLP in, `/api/v1/*` is query out,
+    // `/` and `/{file}` are the UI. The UI's wildcard is one segment deep, so it
+    // cannot swallow either of the others.
     let http = axum::serve(
         listener,
-        receiver::http_router(recv).merge(api::router(api::Api { data_dir })),
+        receiver::http_router(recv)
+            .merge(api::router(api::Api { data_dir }))
+            .merge(ui::router()),
     );
 
     // The node id is logged because it is the only externally visible thing that

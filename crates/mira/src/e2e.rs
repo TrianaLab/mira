@@ -58,10 +58,38 @@ fn boot(name: &str) -> (Router, std::path::PathBuf) {
         traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()),
         metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()),
     };
-    let app = receiver::http_router(recv).merge(api::router(api::Api {
-        data_dir: Arc::new(root.clone()),
-    }));
+    let app = receiver::http_router(recv)
+        .merge(api::router(api::Api {
+            data_dir: Arc::new(root.clone()),
+        }))
+        .merge(crate::ui::router());
     (app, root)
+}
+
+async fn get(
+    app: &Router,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> (StatusCode, Vec<u8>, String) {
+    let mut req = Request::builder().method("GET").uri(path);
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let etag = res
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let bytes = axum::body::to_bytes(res.into_body(), 16 << 20)
+        .await
+        .unwrap();
+    (status, bytes.to_vec(), etag)
 }
 
 async fn post(app: &Router, path: &str, content_type: &str, body: Vec<u8>) -> (StatusCode, String) {
@@ -457,4 +485,33 @@ async fn a_malformed_query_returns_a_readable_json_error() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.starts_with(r#"{"error":"#), "{body}");
     assert!(body.contains("unknown term key"), "{body}");
+}
+
+/// The UI ships inside the binary, so "is it there" is a compile-time question
+/// and "is it served" is this test. It also pins the revalidation path: if the
+/// ETag ever stops matching itself, every reload re-downloads the bundle.
+#[tokio::test]
+async fn the_ui_is_served_from_the_binary_and_revalidates() {
+    let (app, _root) = boot("ui");
+
+    let (status, body, _) = get(&app, "/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains(r#"<div id="app">"#),
+        "index.html is not the built bundle"
+    );
+
+    let (status, body, etag) = get(&app, "/app.js", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty() && !etag.is_empty());
+
+    let (status, body, _) = get(&app, "/app.js", Some(&etag)).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty(), "a 304 must not carry the body");
+
+    // A deep link the browser reloads is the app's own route, not a missing
+    // file, so it gets the app back rather than a 404.
+    let (status, body, _) = get(&app, "/logs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("<div id=\"app\">"));
 }

@@ -1,0 +1,110 @@
+// The API client, the filter mini-language, and formatting. No Svelte in here
+// on purpose: this is the part with logic worth testing without a DOM.
+
+export async function api(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // JSON.stringify output is valid KYAML, which is why one parser on the
+    // server serves both this and the config file.
+    body: JSON.stringify(body),
+  })
+  const text = await r.text()
+  let j
+  try {
+    j = JSON.parse(text)
+  } catch {
+    throw new Error(text || r.statusText)
+  }
+  if (!r.ok) throw new Error(j.error || r.statusText)
+  return j
+}
+
+// "all" is 1970 to now. There is no unbounded query: an open-ended scan is the
+// one mistake that makes a fast engine look slow.
+export const bounds = (range) =>
+  range === 'all' ? { from: 0, to: 'now' } : { from: range, to: 'now' }
+
+// ---------------------------------------------------------------- filters
+//
+// A mini syntax that maps one-to-one onto the API's `where` terms, because the
+// alternative is asking a human to type KYAML into a text box.
+//
+//   service.name=checkout severity_number>=17 body~timeout name!="GET /health"
+//
+// A bare key is an attribute unless it is one of the signal's root columns, so
+// the box teaches the schema as you use it.
+
+export const FIELDS = {
+  logs: ['time_unix_nano', 'observed_time_unix_nano', 'severity_number',
+    'severity_text', 'body', 'trace_id', 'span_id', 'flags',
+    'dropped_attributes_count'],
+  traces: ['trace_id', 'span_id', 'parent_span_id', 'trace_state', 'flags',
+    'name', 'kind', 'start_time_unix_nano', 'duration_nano', 'status_code',
+    'status_message'],
+  metrics: [],
+}
+
+// Longest first at the same position: `>=` must win over `>`, `!=` over `=`.
+const OPS = [['>=', 'gte'], ['<=', 'lte'], ['!=', 'ne'], ['~', 'contains'],
+  ['>', 'gt'], ['<', 'lt'], ['=', 'eq']]
+
+function coerce(raw) {
+  if (raw.length > 1 && raw[0] === '"' && raw.endsWith('"')) return raw.slice(1, -1)
+  if (raw === 'true') return true
+  if (raw === 'false') return false
+  if (/^-?\d+$/.test(raw)) return Number(raw)
+  if (/^-?\d*\.\d+$/.test(raw)) return Number(raw)
+  return raw
+}
+
+export function parseFilter(text, signal) {
+  const terms = []
+  for (const tok of text.match(/(?:[^\s"]|"[^"]*")+/g) || []) {
+    const hit = OPS.map(([sym, op]) => [tok.indexOf(sym), sym, op])
+      .filter(([i]) => i > 0)
+      .sort((a, b) => a[0] - b[0] || b[1].length - a[1].length)[0]
+    if (!hit) throw new Error(`\`${tok}\` needs an operator: = != ~ > >= < <=`)
+    const [i, sym, op] = hit
+    let key = tok.slice(0, i)
+    const value = coerce(tok.slice(i + sym.length))
+    let target = 'attr'
+    if (key.startsWith('field:') || key.startsWith('attr:')) {
+      ;[target, key] = key.split(':')
+    } else if ((FIELDS[signal] || []).includes(key)) {
+      target = 'field'
+    }
+    terms.push({ [target]: key, [op]: value })
+  }
+  return terms
+}
+
+// ---------------------------------------------------------------- formatting
+
+export function fmtTime(ns) {
+  const d = new Date(Number(ns) / 1e6)
+  const p = (n, w = 2) => String(n).padStart(w, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:` +
+    `${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`
+}
+
+export function fmtDur(ns) {
+  if (ns < 1e3) return `${ns}ns`
+  if (ns < 1e6) return `${(ns / 1e3).toFixed(1)}µs`
+  if (ns < 1e9) return `${(ns / 1e6).toFixed(2)}ms`
+  return `${(ns / 1e9).toFixed(3)}s`
+}
+
+// OTLP severity numbers are banded: 1-4 TRACE, 5-8 DEBUG, 9-12 INFO,
+// 13-16 WARN, 17-20 ERROR, 21-24 FATAL. `severity_text` is optional, so derive
+// it when the exporter left it out.
+const SEV = ['trace', 'debug', 'info', 'warn', 'error', 'fatal']
+export const sevName = (row) =>
+  (row.severity_text || SEV[Math.floor((row.severity_number - 1) / 4)] || '').toLowerCase()
+
+export const svc = (row) => (row.attributes && row.attributes['service.name']) || ''
+
+export const STATUS = ['', 'OK', 'ERROR']
+
+export const COLORS = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#bc8cff',
+  '#39c5cf', '#ff7b72', '#a5d6ff']
