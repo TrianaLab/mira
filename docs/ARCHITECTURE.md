@@ -726,7 +726,19 @@ Still not built:
 | Truncated / non-Arrow file | `ARROW1` check → typed error. |
 | Disk full | `publish` fails, waiters get `INTERNAL`, client retries. No partial block is visible. |
 | Reader holds a block being expired | Safe by POSIX unlink semantics (§6). |
+| **SIGTERM / SIGINT** | Stop accepting, let in-flight exports reach their ack, then close the flusher channels so each open block is sealed and published. Bounded at 15 s. |
 | **Network filesystem** | **Not safe.** mmap on NFS/CIFS raises `SIGBUS` with no recovery path. Needs a `statfs` `f_type` check that disables mmap and falls back to a heap-read path. *Not yet implemented — see §10.* |
+
+**Shutdown is about duplicates, not loss.** A hard kill loses nothing that was
+acknowledged, because an ack *is* an fsync (§4). What it costs is the other
+direction: an export that was received, queued and then cut off is still sealed
+and published by the drain, but the exporter saw a reset, and OTLP tells it to
+retry — so every rolling restart would double-write whatever was in flight. That
+is why the sequence is ordered: stop accepting first, drain the servers, and only
+then close the flusher channels. The graceful window is bounded below by
+`max_block_age`, since a waiting export is waiting on a block that no new data
+will grow once the listener is closed. SIGTERM is handled alongside SIGINT
+because SIGTERM is what an orchestrator actually sends.
 
 **macOS.** Rust's `File::sync_all()` and `sync_data()` both compile to
 `fcntl(F_FULLFSYNC)` on Apple targets. That is correct durability for free and a

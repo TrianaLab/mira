@@ -54,9 +54,9 @@ fn boot(name: &str) -> (Router, std::path::PathBuf) {
         ..Default::default()
     });
     let recv = receiver::Receivers {
-        logs: pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone()),
-        traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()),
-        metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()),
+        logs: pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone()).0,
+        traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()).0,
+        metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()).0,
     };
     let api = api::Api {
         data_dir: Arc::new(root.clone()),

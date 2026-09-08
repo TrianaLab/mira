@@ -24,6 +24,7 @@ use std::time::Duration;
 use mira_core::SignalBuilder;
 use mira_core::block;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 /// Engine configuration.
@@ -118,10 +119,14 @@ pub const SIGNALS: [&str; 3] = ["logs", "traces", "metrics"];
 /// Start one signal's ingest pipeline. Returns the handle its receivers push
 /// into. Each signal gets its own channel, flusher task and block sequence, so a
 /// slow flush on one cannot stall another.
-pub fn spawn<B: SignalBuilder>(cfg: Arc<Config>) -> Ingest<B::Request> {
+///
+/// The `JoinHandle` is the shutdown contract: drop every [`Ingest`] clone and the
+/// flusher seals whatever is open, acks everyone waiting on it and returns. A
+/// caller that exits without awaiting it turns a graceful stop into a reset for
+/// those waiters.
+pub fn spawn<B: SignalBuilder>(cfg: Arc<Config>) -> (Ingest<B::Request>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(128);
-    tokio::spawn(flusher::<B>(rx, cfg));
-    Ingest { tx }
+    (Ingest { tx }, tokio::spawn(flusher::<B>(rx, cfg)))
 }
 
 /// One sweep for all signals, not one per signal: retention is IO against the

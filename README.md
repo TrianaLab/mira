@@ -38,6 +38,9 @@ build. The block directory is the only state; the filesystem is the manifest.
   after the export.
 - **Retention by unlink.** TTL drops whole block directories; in-flight readers
   keep working, guaranteed by POSIX.
+- **SIGTERM drains.** Stop accepting, let in-flight exports reach their ack, seal
+  and publish the open blocks, exit. A rolling restart costs neither the data nor
+  the duplicates a reset-then-retry would have written.
 - **Two active replicas on one volume** need no coordination: the block name
   carries a node id derived from the replica's own name.
 - 4.0 MB, 110 crates, no `protoc`, no node toolchain to build.
