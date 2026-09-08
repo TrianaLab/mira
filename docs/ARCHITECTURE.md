@@ -254,17 +254,21 @@ Two deliberate deviations from OTAP, both cheap to reverse:
 ```
 <data>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
     logs.arrow  log_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
+    attr.idx
 <data>/traces/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
     spans.arrow  span_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
-    trace.idx
+    span_events.arrow  span_event_attrs.arrow  span_links.arrow  span_link_attrs.arrow
+    attr.idx  trace.idx
 ```
 
-The node id is §12.1; `trace.idx` is a **sidecar** — a `(name, bytes)` pair a
-signal's builder returns from `seal`, written and fsynced by `publish` next to the
+The node id is §12.1. `attr.idx` and `trace.idx` are **sidecars** — `(name,
+bytes)` pairs produced at seal, written and fsynced by `publish` next to the
 Arrow tables and inside the same atomic rename. Sidecars are always derived and
 always optional: a reader that does not find one, or finds a damaged one, falls
-back to the scan it would have done anyway (§7.4). That is what makes them safe to
-add without a format version.
+back to the scan it would have done anyway (§7.4). That is what makes them safe
+to add without a format version — and it is the only reason a filter is allowed
+on this path at all, because a filter that can be wrong must only ever be wrong
+in the direction of extra work.
 
 **The filesystem is the manifest.** Every reason an LSM engine needs a MANIFEST
 file is absent: Mira publishes exactly one immutable object per commit, never
@@ -612,6 +616,34 @@ That runs at memory bandwidth and is not worth a sort at seal time.
   - Within a block: none on disk, and none in memory either — a linear scan of the
     mapped `trace_id` column of one block is the 20 ms above. Sorting and caching
     a permutation is the upgrade if that ever stops being true.
+- **Attribute value** — an `attr.idx` sidecar, same machinery, **built**. This is
+  the other query with no useful time bound, and it is less obvious than the
+  trace one: *"any record with `k8s.pod.name = api-7f9`"* has no early exit,
+  because `limit` never fills, so proving a negative reads every block in
+  retention. Measured over 6.4 GB / 25M logs / 69 blocks: **10.4 s → 71 ms cold,
+  5.7 ms warm**, 69 blocks scanned → 0. A matching value goes 286 ms → 116 ms
+  cold, 26 → 19 ms warm.
+
+  The filter holds every distinct `(key, value)` pair from *every* attribute
+  table in the block — record, resource, scope, and span event/link — because the
+  query layer searches all three levels and a filter that missed one would prune
+  blocks holding real matches. It is built from the schema, not from a list of
+  table names, so a fourth level cannot be forgotten into a correctness bug.
+  Sized by distinct pairs, it is **70 bytes per block** on the load generator's
+  corpus and grows only where cardinality is high — which is where it prunes
+  best. Past a million distinct pairs it writes nothing and the block is scanned.
+
+  **The subtle part is what gets indexed.** A query scalar is compared against
+  whatever type the SDK happened to store: `{attr: http.status_code, eq: "200"}`
+  matches a stored integer `200`, because the comparison parses rather than
+  making the caller know the SDK's choice (§7.6). A filter over the *typed* bytes
+  would disagree with that rule and prune the block holding the row — not a slow
+  query, a row that silently does not exist. So the indexed key is the value's
+  **decimal text**, which makes one probe cover every type whose arm can parse
+  it. Doubles are the exception and are not indexed at all: `200`, `200.0` and
+  `2e2` are one number and three strings. The block sets a `HAS_DOUBLE` flag
+  instead, and any query whose value reads as a number scans a block that has
+  them. Blocks with no float attributes — most of them — pay nothing for the rule.
 
 **Why not sort blocks by `trace_id` instead?** There is exactly one physical
 order, and every query has a time bound while only some have a trace bound. Time
@@ -711,11 +743,12 @@ observable. *Not yet implemented.*
 - **OTLP/HTTP JSON.** All three endpoints decode protobuf and ignore
   `content-type`; a JSON export gets a 400. JSON is a normative part of OTLP and
   this is a gap, not a position.
-- **`SPAN_EVENTS` and `SPAN_LINKS` as tables.** Spans are encoded and queryable;
-  events and links are not yet their own tables, which leaves the §7.1
-  correlation obligation half-paid. Metric **exemplars keep their
-  `trace_id`/`span_id`** — dropping them is the standard way backends end up
-  unable to answer "which trace made this spike" — but nothing reads them yet.
+- **Anything that reads `span_links` or `exemplars`.** Both are real tables with
+  real rows — links carry their `trace_id`/`span_id`, and metric exemplars keep
+  theirs, which is the thing backends usually drop and then cannot answer "which
+  trace made this spike". Nothing in the query layer follows either edge yet, so
+  the §7.1 correlation obligation is paid on the write side and unpaid on the
+  read side.
 - **A compression tier.** Blocks are written uncompressed. §11 is where this
   shows up, and it is currently the largest single gap between design and
   measurement.
@@ -748,35 +781,41 @@ observable. *Not yet implemented.*
 ## 11. Performance model
 
 The four axes, each with a target and a measurement. Measured on an Apple M3 Pro
-(12 cores, 36 GB), release build, `examples/loadgen` over loopback at 96
-connections × 8192 records, 90 seconds — 6.4 GiB on the wire, 8.3 GiB on disk,
-26.8 M log records and 25 M spans.
+(12 cores, 36 GB), release build, `loadgen --conns 96 --batch 8192 --for 90s`
+over loopback — 6.4 GiB on the wire, 8.4 GiB on disk, 25.2 M log records, 25.2 M
+spans, 69 log blocks. "Warm" means the same query run twice; the difference is
+demand paging.
 
 | Axis | Target | Measured | |
 |---|---|---|---|
-| Ingest throughput | ≥ 1 M records/s/core | **520,889 records/s / 68.0 MiB/s** aggregate, 0 shed | ✗ |
+| Ingest throughput | ≥ 1 M records/s/core | **544,658 records/s / 71.2 MiB/s** aggregate, 0 shed, 0 resets | ✗ |
 | Resident footprint | ≤ 2 × the open block's target size | holds; no `concat_batches` regression | ✓ |
-| Ack latency | — | p50 **472 ms**, p99 **2,481 ms** | see below |
-| Query: filtered log scan | ≤ 10 ms | **310 ms** over 786k rows / 2 blocks | ✗ |
-| Query: trace by id | — | **250 ms** cold, **20 ms** warm, 1 of 84 blocks (§7.4) | ✓ |
-| Query: metric names | — | **140 ms** | — |
-| Cost per GB ingested | ≤ 0.35 B/B | **1.34 B/B** | ✗ |
+| Ack latency | — | p50 **498 ms**, p99 **2,371 ms** | see below |
+| Query: attribute value, absent | ≤ 10 ms | **71 ms** cold, **5.7 ms** warm, 0 of 69 blocks | ✓ |
+| Query: attribute value, matching | ≤ 10 ms | **116 ms** cold, **19 ms** warm, 1 of 69 blocks | ~ |
+| Query: trace by id | ≤ 10 ms | **187 ms** cold, **20 ms** warm, 1 of 86 blocks | ~ |
+| Query: metric names | — | **104 ms** | — |
+| Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** | ✗ |
 | Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.0 MB** / 110 crates | ✓ |
 
 Reading these honestly:
 
 - **Ingest is aggregate, not per core**, and it is not the interesting number
   anyway: at 96 connections the run is fsync-bound, which is what the ack
-  latencies say. p50 of 472 ms is the block filling; p99 of 2.5 s is a durable
+  latencies say. p50 of ~500 ms is the block filling; p99 of 2.4 s is a durable
   publish landing in front of a waiter. Both are *chosen* — acks come after
   durability (§9), so read-your-writes is free and every e2e test queries with no
   sleep after export. The per-core encode number needs a criterion bench on
   `append_request` with no I/O in the path, which does not exist yet.
-- **Query p99 misses by 30×**, and the cause is known: no block cache. Every scan
-  re-opens each block and re-CRCs its whole body (§3.3). The trace filter attacked
-  the other half of the problem — how many blocks get touched — and got 60×. The
-  cache is §10.
+- **Query warm is at or near target; cold is not.** The two sidecar filters
+  (§7.4) took the block count from "all of them" to one or zero, which is worth
+  between 60× and 1800× and is the reason these rows moved at all. What is left
+  is the per-block cost, paid once per query because there is no block cache:
+  every scan re-opens each block it touches and re-CRCs the whole body (§3.3).
+  That is the difference between the cold and warm columns, and it is §10.
 - **Cost per GB misses by 4×, and the reason is that blocks are uncompressed.**
+  Not the sidecars: all 189 `attr.idx` files together are 12.9 KB, and the trace
+  filters are 5.5 MB against 8.4 GB.
   Two things inflate them. The `ATTRS` table carries six typed value columns and
   writes all six for every row, so a string attribute pays 8 bytes for a null
   `int`, 8 for a null `double` and 4-byte offsets each for null `bytes`/`ser` —

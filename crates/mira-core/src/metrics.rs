@@ -687,21 +687,12 @@ impl MetricsBuilder {
             ("exemplar_attrs", self.exemplar_attrs.finish()?),
         ];
         tables.extend(self.rs.finish()?);
-        Ok(Sealed {
-            num_rows: self.next_dp_id as usize,
+        Ok(Sealed::new(
+            self.next_dp_id as usize,
             tables,
-            sidecars: Vec::new(),
-            min_ts: if self.min_ts == i64::MAX {
-                0
-            } else {
-                self.min_ts
-            },
-            max_ts: if self.max_ts == i64::MIN {
-                0
-            } else {
-                self.max_ts
-            },
-        })
+            self.min_ts,
+            self.max_ts,
+        ))
     }
 }
 

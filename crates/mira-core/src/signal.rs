@@ -32,9 +32,9 @@ pub struct Sealed {
     /// Opaque files published alongside the tables, by name.
     ///
     /// Indexes over what a block contains, for the questions the block name
-    /// cannot answer. Only traces has one today — see [`crate::bloom`] — and
-    /// the read path treats a missing sidecar as "no information", so an old
-    /// block or a signal that publishes none costs nothing.
+    /// cannot answer — see [`crate::bloom`]. The read path treats a missing
+    /// sidecar as "no information", so an old block or a signal that publishes
+    /// none costs nothing but a scan.
     pub sidecars: Vec<(&'static str, Vec<u8>)>,
     /// Oldest and newest row. These become the block's directory name, which is
     /// how the read path prunes without opening a file.
@@ -46,6 +46,44 @@ pub struct Sealed {
 }
 
 impl Sealed {
+    /// Assemble a sealed block, deriving the sidecars that every signal gets.
+    ///
+    /// The attribute filter is built here rather than in each signal's `seal`
+    /// for one reason: a signal that forgets to build one is merely slow, but a
+    /// signal that grows a new attribute table and forgets to *include* it
+    /// publishes a filter that omits real values, and the read path then skips
+    /// blocks that hold matching rows. Deriving both from the tables, once,
+    /// makes that class of mistake unavailable.
+    ///
+    /// Also where the empty-block timestamp sentinels are normalized, which was
+    /// three copies of the same pair of `if`s.
+    pub fn new(
+        num_rows: usize,
+        tables: Vec<(&'static str, RecordBatch)>,
+        min_ts: i64,
+        max_ts: i64,
+    ) -> Sealed {
+        let sidecars = crate::attrs::index(&tables)
+            .map(|b| vec![(crate::bloom::ATTR_IDX, b)])
+            .unwrap_or_default();
+        Sealed {
+            num_rows,
+            tables,
+            sidecars,
+            min_ts: if min_ts == i64::MAX { 0 } else { min_ts },
+            max_ts: if max_ts == i64::MIN { 0 } else { max_ts },
+        }
+    }
+
+    /// Attach a signal-specific sidecar. `None` writes nothing, which the reader
+    /// reads as "no information about this block".
+    pub fn with_sidecar(mut self, name: &'static str, bytes: Option<Vec<u8>>) -> Sealed {
+        if let Some(b) = bytes {
+            self.sidecars.push((name, b));
+        }
+        self
+    }
+
     /// Borrowed view in the shape [`crate::block::publish`] wants.
     pub fn refs(&self) -> Vec<(&str, &RecordBatch)> {
         self.tables.iter().map(|(n, b)| (*n, b)).collect()

@@ -735,9 +735,10 @@ mod tests {
         assert_eq!(r.stats.rows_matched, 10);
         assert!(r.json.contains("\"service.name\":\"payments\""));
         assert!(!r.json.contains("checkout"));
-        // Both blocks were opened — the filter is not a time filter — but only
-        // one contributed.
-        assert_eq!(r.stats.blocks_scanned, 2);
+        // Time did not prune this — both blocks are in the window — but the
+        // attribute filter did: the "checkout" block never carried the value, so
+        // its sidecar ruled it out before it was opened.
+        assert_eq!(r.stats.blocks_scanned, 1);
 
         // http.method is a *record* attribute, on every row of both blocks.
         let r = query::search(
@@ -893,7 +894,10 @@ mod tests {
             })
             .unwrap();
             let sealed = b.finish().unwrap();
-            assert_eq!(sealed.sidecars.len(), 1, "traces publish a trace filter");
+            assert!(
+                sealed.sidecars.iter().any(|(n, _)| *n == bloom::TRACE_IDX),
+                "traces publish a trace filter"
+            );
             block::publish(&root, "traces", block::node_id("a"), seq, &sealed).unwrap();
         }
 
@@ -929,6 +933,119 @@ mod tests {
         let r = query::search(&root, &lookup(hex(tid(17)))).unwrap();
         assert_eq!(r.stats.blocks_scanned, BLOCKS as usize);
         assert_eq!(r.stats.rows_matched, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The attribute filter has one dangerous property, and every case here is
+    /// an instance of it: a query scalar is compared against whatever type the
+    /// SDK happened to store, so `{eq: "200"}` finds an integer `200` and
+    /// `{eq: true}` finds a boolean. A filter that indexed the typed bytes would
+    /// disagree with that rule and prune the block holding the row — and a
+    /// pruned block is not a slow query, it is a row that silently does not
+    /// exist. Indexing the value's *text* is what keeps the two in step.
+    #[test]
+    fn the_attribute_filter_skips_blocks_without_losing_coercions() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-attrs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let attr = |k: &str, v: Value| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue { value: Some(v) }),
+        };
+
+        const BLOCKS: u64 = 8;
+        for seq in 0..BLOCKS {
+            // Overlapping time ranges, so nothing below can be credited to the
+            // block name.
+            let mut req = request("checkout", 2, 1_000);
+            let mut attrs = vec![attr(
+                "k8s.pod.name",
+                Value::StringValue(format!("api-{seq}")),
+            )];
+            // One block carries the three non-string types.
+            if seq == 3 {
+                attrs.push(attr("http.status_code", Value::IntValue(200)));
+                attrs.push(attr("retry", Value::BoolValue(true)));
+                attrs.push(attr("ratio", Value::DoubleValue(1.5)));
+            }
+            for r in &mut req.resource_logs[0].scope_logs[0].log_records {
+                r.attributes = attrs.clone();
+            }
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&req).unwrap();
+            let sealed = b.finish().unwrap();
+            assert_eq!(sealed.sidecars.len(), 1, "logs publish an attribute filter");
+            block::publish(&root, "logs", block::node_id("a"), seq, &sealed).unwrap();
+        }
+
+        let find = |key: &str, value: QV| {
+            query::search(
+                &root,
+                &Search {
+                    signal: Signal::Logs,
+                    from: 0,
+                    to: i64::MAX,
+                    terms: vec![Term {
+                        target: Target::Attr(key.into()),
+                        op: Op::Eq,
+                        value,
+                    }],
+                    limit: 100,
+                },
+            )
+            .unwrap()
+        };
+        let s = |v: &str| QV::Str(v.into());
+
+        // The plain case: one block holds the value, seven are ruled out
+        // without being opened.
+        let r = find("k8s.pod.name", s("api-5"));
+        assert_eq!(r.stats.blocks_total, BLOCKS as usize);
+        assert_eq!(r.stats.blocks_scanned, 1, "the filter must skip the rest");
+        assert_eq!(r.stats.rows_matched, 2);
+
+        // A value in no block at all. This is the query the filter exists for —
+        // it has no early exit, so unfiltered it reads all of retention to prove
+        // a negative. One false positive is allowed for; eight would mean the
+        // filter is not working.
+        let r = find("k8s.pod.name", s("api-99"));
+        assert_eq!(r.stats.rows_matched, 0);
+        assert!(r.stats.blocks_scanned <= 1, "{}", r.stats.blocks_scanned);
+
+        // The coercions. Each of these must find the two rows in block 3.
+        for (key, value) in [
+            ("http.status_code", QV::Int(200)),
+            ("http.status_code", s("200")),
+            // A whole double reaches an integer column through `as_i64`.
+            ("http.status_code", QV::Double(200.0)),
+            ("retry", QV::Bool(true)),
+            ("retry", s("true")),
+            // Doubles are not indexed at all; block 3 declares it holds some and
+            // is scanned, and the other seven are still skipped.
+            ("ratio", QV::Double(1.5)),
+            ("ratio", s("1.5")),
+        ] {
+            let r = find(key, value.clone());
+            assert_eq!(r.stats.rows_matched, 2, "{key} = {value:?}");
+        }
+
+        // A string that cannot be read as a number must still prune the block
+        // that holds doubles — otherwise `HAS_DOUBLE` would disable the filter
+        // for every text query in a block with one float in it.
+        let r = find("ratio", s("banana"));
+        assert_eq!(r.stats.rows_matched, 0);
+        assert!(r.stats.blocks_scanned <= 1, "{}", r.stats.blocks_scanned);
+
+        // Deleting a sidecar has to cost a block read, never a lost row.
+        for b in block::scan(&root, "logs").unwrap() {
+            std::fs::remove_file(b.dir.join(bloom::ATTR_IDX)).unwrap();
+        }
+        let r = find("k8s.pod.name", s("api-5"));
+        assert_eq!(r.stats.blocks_scanned, BLOCKS as usize);
+        assert_eq!(r.stats.rows_matched, 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }

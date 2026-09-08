@@ -345,23 +345,10 @@ impl TracesBuilder {
             ("span_link_attrs", self.link_attrs.finish()?),
         ];
         tables.extend(self.rs.finish()?);
-        Ok(Sealed {
-            num_rows: self.next_id as usize,
-            tables,
-            sidecars: trace_idx
-                .map(|b| vec![(crate::bloom::TRACE_IDX, b)])
-                .unwrap_or_default(),
-            min_ts: if self.min_ts == i64::MAX {
-                0
-            } else {
-                self.min_ts
-            },
-            max_ts: if self.max_ts == i64::MIN {
-                0
-            } else {
-                self.max_ts
-            },
-        })
+        Ok(
+            Sealed::new(self.next_id as usize, tables, self.min_ts, self.max_ts)
+                .with_sidecar(crate::bloom::TRACE_IDX, trace_idx),
+        )
     }
 }
 

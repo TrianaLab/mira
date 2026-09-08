@@ -28,6 +28,10 @@ build. The block directory is the only state; the filesystem is the manifest.
 - **Zero-copy queries.** Blocks are read straight out of their mapping —
   asserted, not assumed: a test walks every buffer of every column and requires
   all of them to point inside the mapping.
+- **Blocks prune themselves.** The directory name is the time index; a Bloom
+  sidecar per block answers "could this hold that trace id / that attribute
+  value" before anything is opened. Every damaged or missing sidecar reads as
+  "scan me", so the worst a filter can do is waste a read.
 - **Durable acknowledgement.** An export returns only once its block is fsynced
   and renamed into place. No write-ahead log, because there is no torn state to
   replay. Read-your-writes falls out of it: the e2e tests query with no sleep
@@ -43,17 +47,23 @@ Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 
 | | |
 |---|---|
-| ingest, 96 connections × 8192 records | 520,889 records/s, 68 MiB/s |
-| ack latency (fsync-bound) | p50 472 ms, p99 2.5 s |
-| filtered log scan, 786k rows | 310 ms |
-| every span of one trace, 25M spans on disk | 250 ms cold, 20 ms warm |
-| metric series, 35 blocks | 140 ms |
-| bytes on disk per byte on the wire | 1.34 |
+| ingest, 96 connections × 8192 records | 544,658 records/s, 71 MiB/s, 0 shed |
+| ack latency (fsync-bound) | p50 498 ms, p99 2.4 s |
+| attribute value that is in one block, of 69 | 116 ms cold, 19 ms warm |
+| attribute value that is in none | 71 ms cold, 5.7 ms warm — 0 blocks opened |
+| every span of one trace, 25M spans on disk | 187 ms cold, 20 ms warm |
+| metric names | 104 ms |
+| bytes on disk per byte on the wire | 1.31 |
 
 Ack latency is the block sealing, not the queue: an export is acknowledged when
 its block is durable, so under light load it waits out `max_block_age`.
 
-1.34 bytes per byte is four times the target and the honest weak spot — blocks
+The two query rows that used to read in seconds are the ones with no time bound —
+"every span of this trace", "any record with this attribute value". Each block
+carries a small Bloom sidecar so those open the one block that can answer instead
+of all of retention; the absent-value case went from 10.4 s to 5.7 ms.
+
+1.31 bytes per byte is four times the target and the honest weak spot — blocks
 are written uncompressed. `zstd -3` over a real block gets 8.2×, which would put
 it at 0.16; why that is a tiering decision rather than a flag is
 [§11](docs/ARCHITECTURE.md).
@@ -72,7 +82,7 @@ it at 0.16; why that is a tiering decision rather than a flag is
   wholesale. The answer is aged blocks rewritten compressed, hot blocks left
   mapped — not built.
 - No block cache: every query re-opens and re-CRCs each block it touches, which
-  is most of the 310 ms above.
+  is the whole gap between the cold and warm columns above.
 - OTAP is the data model, not yet the wire protocol. OTLP on 4317/4318 is the
   universal path; no language SDK emits OTAP today.
 - Do not put the data directory on NFS or CIFS — `mmap` there raises `SIGBUS`

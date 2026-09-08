@@ -272,6 +272,60 @@ fn trace_needle(q: &Search) -> Option<[u8; 16]> {
     })
 }
 
+/// The attribute equalities in a search, in the form a block filter answers.
+///
+/// Terms are AND-ed, so any single one the block cannot satisfy rules the whole
+/// block out — which is why a list of independent probes is enough and no
+/// expression tree is needed.
+///
+/// `numeric` records that the query scalar could be read as a number. Doubles
+/// are not in the index (see [`crate::bloom::HAS_DOUBLE`]), so a block that
+/// holds any must be scanned for a numeric query even when the text probe misses.
+struct AttrProbe {
+    hash: Option<(u64, u64)>,
+    numeric: bool,
+}
+
+impl AttrProbe {
+    /// The block's own answer to "could a row here satisfy this term?".
+    fn maybe(&self, f: &crate::bloom::Filter) -> bool {
+        let text = self.hash.is_none_or(|h| f.may_contain(h));
+        text || (self.numeric && f.flags & crate::bloom::HAS_DOUBLE != 0)
+    }
+}
+
+fn attr_probes(q: &Search) -> Vec<AttrProbe> {
+    q.terms
+        .iter()
+        .filter(|t| t.op == Op::Eq)
+        .filter_map(|t| match &t.target {
+            Target::Attr(key) => Some(AttrProbe {
+                hash: canon(&t.value).map(|v| crate::bloom::attr_hash(key, v.as_bytes())),
+                numeric: t.value.as_f64().is_some(),
+            }),
+            Target::Field(_) => None,
+        })
+        .collect()
+}
+
+/// The text an attribute of this value would have been indexed under.
+///
+/// Mirrors the coercions in [`attr_matches`] exactly: a query scalar matches a
+/// stored value of a *different* type whenever the stored type's arm can parse
+/// it, so the index has to agree about which pairs those are. `None` means no
+/// text form can match — only a double can — which the `numeric` flag covers.
+fn canon(v: &Value) -> Option<String> {
+    match v {
+        Value::Str(s) => Some(s.clone()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        // A whole float reaches integers through `as_i64`; a fractional one
+        // reaches nothing but doubles.
+        Value::Double(d) if d.fract() == 0.0 => Some((*d as i64).to_string()),
+        Value::Double(_) => None,
+    }
+}
+
 /// Run a search against the blocks under `root`.
 ///
 /// Blocking: this mmaps and page-faults. Callers on an async runtime must go
@@ -288,6 +342,7 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
     refs.sort_by_key(|b| std::cmp::Reverse((b.max_ts, b.seq)));
 
     let needle = trace_needle(q);
+    let probes = attr_probes(q);
     let mut hits: Vec<Hit> = Vec::new();
     let mut open: Vec<Option<Block>> = Vec::with_capacity(refs.len());
 
@@ -301,13 +356,23 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
             break;
         }
 
-        // The second pruning key, and the only one that helps a trace lookup:
-        // "every span of trace X" has no time bound, so without this every
-        // block on disk is opened and paged in. A 20 KB sidecar read is two
-        // orders of magnitude cheaper than the block it skips.
+        // The sidecar filters (§7.4). Both cover the case the block name cannot:
+        // a query with no useful time bound, either because it names a trace or
+        // because it names an attribute value that is rare or absent. Without
+        // them the scan runs to the end of retention to prove a negative. A
+        // 20 KB read is two orders of magnitude cheaper than the block it skips,
+        // and every damaged or missing filter reads as "scan me".
         if let Some(id) = &needle
             && let Ok(f) = std::fs::read(bref.dir.join(crate::bloom::TRACE_IDX))
             && !crate::bloom::may_contain(&f, id)
+        {
+            open.push(None);
+            continue;
+        }
+        if !probes.is_empty()
+            && let Ok(bytes) = std::fs::read(bref.dir.join(crate::bloom::ATTR_IDX))
+            && let Some(f) = crate::bloom::Filter::open(&bytes)
+            && !probes.iter().all(|p| p.maybe(&f))
         {
             open.push(None);
             continue;

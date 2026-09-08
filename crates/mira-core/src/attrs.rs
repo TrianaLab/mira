@@ -245,6 +245,75 @@ impl AttrsBuilder {
     }
 }
 
+/// Build a block's [`crate::bloom::ATTR_IDX`] over every attribute table in it.
+///
+/// Driven off the schema rather than off a list of table names, so a signal that
+/// grows a fourth attribute level gets covered without anyone remembering to add
+/// it here — and forgetting would not be a slow query, it would be a block
+/// wrongly skipped.
+///
+/// `None` when the block has no attributes at all or too many distinct ones; the
+/// reader treats a missing file as "scan me", so both are safe.
+pub fn index(tables: &[(&'static str, RecordBatch)]) -> Option<Vec<u8>> {
+    let mut keys = crate::bloom::Keys::default();
+    for (_, b) in tables {
+        if Arc::ptr_eq(&b.schema(), &ATTRS) {
+            index_table(&mut keys, b);
+        }
+    }
+    keys.build()
+}
+
+fn index_table(keys: &mut crate::bloom::Keys, b: &RecordBatch) {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int64Type, UInt8Type};
+
+    let dict = b.column(1).as_dictionary::<UInt16Type>();
+    let names = dict.values().as_string::<i32>();
+    let codes = dict.keys().values();
+    let types = b.column(2).as_primitive::<UInt8Type>().values();
+    let strs = b.column(3).as_string::<i32>();
+    let ints = b.column(4).as_primitive::<Int64Type>();
+    let bools = b.column(6).as_boolean();
+
+    const STR: u8 = AttrType::Str as u8;
+    const INT: u8 = AttrType::Int as u8;
+    const DOUBLE: u8 = AttrType::Double as u8;
+    const BOOL: u8 = AttrType::Bool as u8;
+
+    // Reused across rows so the common case — a value that is already text —
+    // costs no allocation at all.
+    let mut buf = String::new();
+    for row in 0..b.num_rows() {
+        let name = names.value(codes[row] as usize);
+        let text: &str = match types[row] {
+            STR => strs.value(row),
+            INT => {
+                buf.clear();
+                use std::fmt::Write;
+                let _ = write!(buf, "{}", ints.value(row));
+                &buf
+            }
+            BOOL => {
+                if bools.value(row) {
+                    "true"
+                } else {
+                    "false"
+                }
+            }
+            DOUBLE => {
+                keys.flag(crate::bloom::HAS_DOUBLE);
+                continue;
+            }
+            // Empty, Bytes, Slice and Map are not comparable by any operator the
+            // query layer offers, so no query can be pruned wrongly by leaving
+            // them out — and indexing them would only add false positives.
+            _ => continue,
+        };
+        keys.insert(crate::bloom::attr_hash(name, text.as_bytes()));
+    }
+}
+
 /// The `resources` + `resource_attrs` + `scope_attrs` arms of the star, shared
 /// by every signal.
 ///
