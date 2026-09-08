@@ -34,6 +34,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytes = "1"
 memmap2 = "0.9"
+libc = "0.2"
 crc32fast = "1"
 thiserror = "2"
 tracing = "0.1"

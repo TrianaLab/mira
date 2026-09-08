@@ -388,6 +388,107 @@ pub fn expire(root: &Path, signal: &str, cutoff_ns: i64) -> Result<usize> {
     Ok(dropped)
 }
 
+/// Refuse to start on a filesystem the read path cannot survive.
+///
+/// Every block is read through `mmap`. On a network filesystem a server that
+/// goes away, or a file that changes length underneath a mapping, is delivered
+/// as `SIGBUS` — a signal, not an `io::Error`. There is nothing to catch and no
+/// way to unwind; the process dies mid-query. The atomicity this design rests on
+/// is also weaker there: NFS `rename` is atomic on the server but a client may
+/// still serve a cached negative lookup, and `fsync` semantics vary by mount
+/// option. Both are reasons to say no at startup rather than at 3am.
+///
+/// Called once, on the data directory, before anything is published or mapped.
+pub fn check_filesystem(path: &Path) -> Result<()> {
+    let Some(fs) = fs_type(path)? else {
+        return Ok(());
+    };
+    // FUSE is the ambiguous one and it has to stay a warning: the magic number
+    // is identical for `gcsfuse` and `s3fs`, which are exactly as fatal as NFS,
+    // and for a perfectly local userspace filesystem, which is fine. Refusing
+    // would strand the second case; staying silent would strand the first.
+    if fs == "fuse" {
+        tracing::warn!(
+            path = %path.display(),
+            "data directory is on a FUSE filesystem. If it is network-backed \
+             (gcsfuse, s3fs, rclone), mmap will raise SIGBUS and kill the \
+             process; if it is local, ignore this."
+        );
+        return Ok(());
+    }
+    Err(Error::NetworkFilesystem {
+        path: path.to_path_buf(),
+        fs,
+    })
+}
+
+/// The mount's filesystem type, if it is one of the ones that matter. `None`
+/// means "nothing to say about it", which is every local filesystem.
+fn fs_type(path: &Path) -> Result<Option<String>> {
+    // statfs(2) needs the path to exist; the caller creates the data directory
+    // before this runs, but a bare `Ok(None)` if it does not is friendlier than
+    // an ENOENT that says nothing about filesystems.
+    if !path.exists() {
+        return Ok(None);
+    }
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
+    })?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path that outlives the call, and `buf` is
+    // a correctly sized, writable `statfs`.
+    if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
+        return Err(Error::Io {
+            path: path.to_path_buf(),
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    // macOS reports the type by name, which is both readable and complete.
+    #[cfg(target_os = "macos")]
+    {
+        let name: Vec<u8> = buf
+            .f_fstypename
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        let name = String::from_utf8_lossy(&name).into_owned();
+        Ok(match name.as_str() {
+            "nfs" | "smbfs" | "cifs" | "webdav" | "afpfs" | "ftp" => Some(name),
+            n if n.contains("fuse") => Some("fuse".into()),
+            _ => None,
+        })
+    }
+
+    // Linux reports a magic number. Listed rather than ranged because the set of
+    // filesystems that break `mmap` is small, specific and does not grow often;
+    // anything unrecognised is treated as local, which is the right default for
+    // a check whose false positive is "Mira will not start".
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Masked to 32 bits: `f_type` is `__fsword_t`, which is i64 on x86_64
+        // glibc but i32 on some musl and 32-bit targets, where a magic with the
+        // high bit set (CIFS, SMB2) arrives sign-extended.
+        let ty = (buf.f_type as u64) & 0xffff_ffff;
+        Ok(match ty {
+            0x6969 => Some("NFS".into()),
+            0x517b => Some("SMB".into()),
+            0xff53_4d42 => Some("CIFS".into()),
+            0xfe53_4d42 => Some("SMB2".into()),
+            0x0102_1997 => Some("9P".into()),
+            0x5346_414f => Some("AFS".into()),
+            0x00c3_6400 => Some("CephFS".into()),
+            0x0116_1970 => Some("GFS2".into()),
+            0x7461_636f => Some("OCFS2".into()),
+            0x0bd0_0bd0 => Some("Lustre".into()),
+            0x6573_5546 => Some("fuse".into()),
+            _ => None,
+        })
+    }
+}
+
 /// The cold-tier marker. Its presence means every table in the block is already
 /// ZSTD-encoded, so a sweep can skip the directory without opening a file.
 const COLD_MARKER: &str = "cold";

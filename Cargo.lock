@@ -872,6 +872,7 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "crc32fast",
+ "libc",
  "memmap2",
  "mira-proto",
  "prost",

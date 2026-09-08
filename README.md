@@ -53,6 +53,11 @@ build. The block directory is the only state; the filesystem is the manifest.
   the duplicates a reset-then-retry would have written.
 - **Two active replicas on one volume** need no coordination: the block name
   carries a node id derived from the replica's own name.
+- **It refuses to start on a network filesystem.** `mmap` over NFS, SMB, CephFS
+  and friends turns a server hiccup into `SIGBUS` — a signal, not an error, with
+  nothing to catch. A `statfs` at startup names the filesystem and says what to
+  point `--data-dir` at instead. FUSE is a warning rather than a refusal,
+  because the magic number cannot tell `gcsfuse` from a local one.
 - 4.5 MB, 113 crates, no `protoc`, no node toolchain to build. `zstd-sys` is the
   one C dependency and it vendors its own source, so it needs a `cc` — which the
   linker already required — and nothing installed.
@@ -106,8 +111,10 @@ beside ZSTD, which is how the one C dependency in the tree got justified.
   milliseconds of a 14 ms query, not the 10× that page-fault behaviour was.
 - OTAP is the data model, not yet the wire protocol. OTLP on 4317/4318 is the
   universal path; no language SDK emits OTAP today.
-- Do not put the data directory on NFS or CIFS — `mmap` there raises `SIGBUS`
-  with no recovery path, and the guard for it is not written.
+- `fsync` on macOS is `fsync(2)`, which does not flush the drive's own write
+  cache; only `F_FULLFSYNC` does. Linux — the deployment target — is unaffected,
+  and so is the durability claim there. The macOS fallback is not written, which
+  also means the ack latencies above are a touch optimistic on this machine.
 
 ## Layout
 

@@ -1213,6 +1213,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The startup guard has to say yes to an ordinary local directory. It
+    /// cannot be tested against a real NFS mount here, so this is the half that
+    /// catches the failure that would actually happen: a guard that refuses
+    /// everything, or one that errors on a path it should ignore.
+    #[test]
+    fn the_filesystem_guard_passes_a_local_directory() {
+        let dir = std::env::temp_dir().join(format!("mira-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        block::check_filesystem(&dir).unwrap();
+        // A path that does not exist is not a filesystem verdict.
+        block::check_filesystem(&dir.join("nope")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn corrupt_body_is_caught_not_returned_as_data() {
         let dir = std::env::temp_dir().join(format!("mira-crc-{}", std::process::id()));

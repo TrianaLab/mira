@@ -77,6 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     std::fs::create_dir_all(&cfg.data_dir)?;
+    // Before anything is mapped. A network mount is not a slow start, it is a
+    // SIGBUS the first time the server hiccups, and by then there is a process
+    // to explain rather than a flag to change.
+    mira_core::block::check_filesystem(&cfg.data_dir)?;
 
     let node = mira_core::block::node_id(&cfg.node);
     let (grpc_addr, http_addr) = (cfg.grpc, cfg.http);

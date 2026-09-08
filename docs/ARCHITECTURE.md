@@ -758,7 +758,7 @@ Still not built:
 | Disk full | `publish` fails, waiters get `INTERNAL`, client retries. No partial block is visible. |
 | Reader holds a block being expired | Safe by POSIX unlink semantics (§6). |
 | **SIGTERM / SIGINT** | Stop accepting, let in-flight exports reach their ack, then close the flusher channels so each open block is sealed and published. Bounded at 15 s. |
-| **Network filesystem** | **Not safe.** mmap on NFS/CIFS raises `SIGBUS` with no recovery path. Needs a `statfs` `f_type` check that disables mmap and falls back to a heap-read path. *Not yet implemented — see §10.* |
+| **Network filesystem** | **Not safe, and refused.** mmap on NFS/CIFS/CephFS raises `SIGBUS` with no recovery path. `block::check_filesystem` runs one `statfs` on the data directory before anything is mapped and fails startup with the filesystem named — by `f_fstypename` on macOS, by `f_type` magic on Linux. FUSE warns instead of refusing: the magic is the same for `gcsfuse` (fatal) and a local userspace filesystem (fine). A heap-read fallback was considered and rejected — it would silently delete the property the whole design is built on, which is a worse failure than not starting. |
 
 **Shutdown is about duplicates, not loss.** A hard kill loses nothing that was
 acknowledged, because an ack *is* an fsync (§4). What it costs is the other
@@ -806,8 +806,13 @@ observable. *Not yet implemented.*
   Related: do **not** depend on `otel-arrow-dfe-pdata`; it pulls
   `datafusion ^53` non-optionally for two imports.
 - **DataFusion.** §1.
-- **`statfs` network-filesystem guard** and the **`F_FULLFSYNC` fallback**. Both
-  are in §9 and both are real; neither is written.
+- **The `F_FULLFSYNC` fallback** (§9). On macOS `sync_all` is `fsync(2)`, which
+  returns before the drive's own write cache is flushed; only `F_FULLFSYNC`
+  waits. Linux is the deployment target and is unaffected, so this is a
+  dev-machine honesty gap rather than a production one — but it does mean the
+  ack latencies in §11 are measured against a weaker fsync than the one the
+  design claims. The `statfs` guard beside it in that section **is** now written:
+  `block::check_filesystem`, called once before anything is mapped.
 - **The query-side half of `NO_IDENTITY`.** The sentinel is written (§7.2); the
   expander that must refuse it does not exist yet, because the query layer does
   not. It is the first thing that layer owes.
@@ -1032,7 +1037,10 @@ answer is a peer whose data is absent from this answer, and the answer says so.
 If replicas do share one filesystem (an RWX PVC), the design already works
 unmodified — block names are unique per writer, publishes are independent
 renames, and `scan` sees every writer's blocks, so any node answers any query
-with no fan-out at all. It is gated on one thing: **mmap over NFS raises SIGBUS
-with no recovery path** (§9), so the `statfs` guard has to land first. Object
-storage is a larger question — it forecloses mmap entirely — and is deferred to
-the market survey rather than guessed at here.
+with no fan-out at all. The one gate on it — **mmap over NFS raises SIGBUS with
+no recovery path** — is now enforced rather than warned about: `statfs` at
+startup (§9) refuses the mount. So shared-volume mode works on an RWX PVC backed
+by a *block* device shared between nodes, and is refused on an NFS-backed one,
+which is the honest answer rather than a hopeful one. Object storage is a larger
+question — it forecloses mmap entirely — and is deferred to the market survey
+rather than guessed at here.

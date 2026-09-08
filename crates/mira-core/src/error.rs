@@ -39,6 +39,17 @@ pub enum Error {
         #[source]
         source: arrow_schema::ArrowError,
     },
+
+    /// The data directory is on a filesystem Mira's read path cannot survive.
+    /// See `block::check_filesystem`.
+    #[error(
+        "{path} is on {fs}, a network filesystem. Mira reads blocks through mmap, \
+         and on {fs} a server-side error surfaces as SIGBUS — a signal, not an \
+         error, with no recovery path from Rust. Point --data-dir at a local \
+         block device (in Kubernetes: a local PV, an EBS/PD volume, or an \
+         emptyDir, not an NFS/CSI network mount)."
+    )]
+    NetworkFilesystem { path: PathBuf, fs: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

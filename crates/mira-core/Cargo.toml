@@ -16,6 +16,8 @@ arrow-schema.workspace = true
 prost.workspace = true
 bytes.workspace = true
 memmap2.workspace = true
+# Already in the graph under memmap2; direct only for `statfs` (block.rs).
+libc.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
