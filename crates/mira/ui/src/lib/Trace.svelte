@@ -114,6 +114,16 @@
             style="left:{((start(r) - laid.t0) / laid.span) * 100}%;
                    width:{Math.max((Number(r.duration_nano) / laid.span) * 100, 0.2)}%"
           ></div>
+          <!-- Events are where a span says what happened inside it — an
+               exception, a retry, a cache miss — so they belong on the bar, not
+               only in the expanded detail. -->
+          {#each r.events || [] as e, i (i)}
+            <div
+              class="ev"
+              title="{e.name || 'event'}"
+              style="left:{((Number(e.time_unix_nano) - laid.t0) / laid.span) * 100}%"
+            ></div>
+          {/each}
         </div>
         <div class="dur">{fmtDur(Number(r.duration_nano))}</div>
       </div>
@@ -134,6 +144,7 @@
   .track { flex: 1; height: 15px; background: var(--panel); border-radius: 3px; position: relative; }
   .bar { position: absolute; top: 0; bottom: 0; background: var(--accent); border-radius: 3px; }
   .bar.err { background: var(--err); }
+  .ev { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--warn); }
   .dur { width: 84px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
   .detail { padding-left: 14px; background: var(--panel); }
   .crumb { padding: 12px 0; color: var(--dim); }

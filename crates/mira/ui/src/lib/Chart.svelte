@@ -3,6 +3,9 @@
 
   let { series } = $props()
   let canvas = $state(null)
+  // Exemplar screen positions from the last draw, so a click can find the trace
+  // under the cursor. Rebuilt every draw, which is also every resize.
+  let marks = []
 
   // A time-series line chart in about a hundred lines of canvas.
   //
@@ -32,15 +35,19 @@
     if (pw <= 0 || ph <= 0) return
 
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity
+    const extend = (x, y) => {
+      if (x < x0) x0 = x
+      if (x > x1) x1 = x
+      if (y === null || y === undefined) return
+      if (y < y0) y0 = y
+      if (y > y1) y1 = y
+    }
     for (const s of series) {
-      for (const [x, y] of s.points) {
-        if (x < x0) x0 = x
-        if (x > x1) x1 = x
-        if (y !== null) {
-          if (y < y0) y0 = y
-          if (y > y1) y1 = y
-        }
-      }
+      for (const [x, y] of s.points) extend(x, y)
+      // Exemplars are in the extent too. An exemplar is a single measurement,
+      // not an aggregate, so it routinely sits outside the range of the line it
+      // belongs to — and one drawn off the plot is one nobody can click.
+      for (const e of s.exemplars || []) extend(Number(e.time_unix_nano), value(e))
     }
     if (!Number.isFinite(x0) || !Number.isFinite(y0)) return
     // A flat series deserves a line through the middle rather than a division by
@@ -91,6 +98,45 @@
       }
       c.stroke()
     })
+
+    // The metric-to-trace edge, on screen. A diamond per exemplar; clicking one
+    // opens the trace that produced that measurement.
+    marks = []
+    series.forEach((s, i) => {
+      c.fillStyle = COLORS[i % COLORS.length]
+      c.strokeStyle = css.getPropertyValue('--bg').trim() || '#000'
+      for (const e of s.exemplars || []) {
+        const v = value(e)
+        if (v === null || !e.trace_id) continue
+        const px = sx(Number(e.time_unix_nano))
+        const py = sy(v)
+        c.beginPath()
+        c.moveTo(px, py - 4)
+        c.lineTo(px + 4, py)
+        c.lineTo(px, py + 4)
+        c.lineTo(px - 4, py)
+        c.closePath()
+        c.fill()
+        c.stroke()
+        marks.push({ px, py, trace: e.trace_id })
+      }
+    })
+  }
+
+  // An exemplar's value: `int` and `double` are separate columns because an
+  // OTLP counter past 2^53 loses its low bits as a float.
+  const value = (e) => (e.double ?? e.int ?? null)
+
+  function near(ev) {
+    const r = canvas.getBoundingClientRect()
+    const x = ev.clientX - r.left
+    const y = ev.clientY - r.top
+    let best = null
+    for (const m of marks) {
+      const d = Math.hypot(m.px - x, m.py - y)
+      if (d <= 8 && (!best || d < best.d)) best = { d, trace: m.trace }
+    }
+    return best
   }
 
   function tick(v) {
@@ -113,7 +159,13 @@
   })
 </script>
 
-<canvas bind:this={canvas}></canvas>
+<!-- Hit testing rather than a DOM node per exemplar: the markers are painted
+     pixels, so the only thing the element can offer is the cursor position. -->
+<canvas
+  bind:this={canvas}
+  onclick={(e) => { const h = near(e); if (h) location.hash = `#/trace/${h.trace}` }}
+  onmousemove={(e) => { canvas.style.cursor = near(e) ? 'pointer' : 'default' }}
+></canvas>
 
 <style>
   canvas { width: 100%; height: 320px; display: block; margin-top: 12px; }
