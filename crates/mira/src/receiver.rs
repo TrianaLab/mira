@@ -7,7 +7,7 @@
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use prost::Message;
@@ -115,46 +115,106 @@ impl MetricsService for Receivers {
 
 /// OTLP/HTTP on 4318.
 pub fn http_router(r: Receivers) -> Router {
+    // Each route is the same three lines with a different field and response
+    // type; a macro says that once instead of three times.
+    macro_rules! signal {
+        ($field:ident, $resp:ty, $json:path) => {
+            post(
+                |axum::extract::State(r): axum::extract::State<Receivers>,
+                 h: HeaderMap,
+                 b: Bytes| async move {
+                    export(&r.$field, &h, b, <$resp>::default(), $json).await
+                },
+            )
+        };
+    }
     Router::new()
         .route(
             "/v1/logs",
-            post(
-                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
-                    export(&r.logs, b, ExportLogsServiceResponse::default()).await
-                },
-            ),
+            signal!(logs, ExportLogsServiceResponse, crate::json::logs),
         )
         .route(
             "/v1/traces",
-            post(
-                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
-                    export(&r.traces, b, ExportTraceServiceResponse::default()).await
-                },
-            ),
+            signal!(traces, ExportTraceServiceResponse, crate::json::traces),
         )
         .route(
             "/v1/metrics",
-            post(
-                |axum::extract::State(r): axum::extract::State<Receivers>, b: Bytes| async move {
-                    export(&r.metrics, b, ExportMetricsServiceResponse::default()).await
-                },
-            ),
+            signal!(metrics, ExportMetricsServiceResponse, crate::json::metrics),
         )
         .with_state(r)
 }
 
+/// Which body encoding the client sent.
+///
+/// OTLP/HTTP names exactly two, and a request that claims a third has to be
+/// refused rather than guessed at: `415` tells the exporter to stop, where
+/// mis-decoding it as protobuf produces a `400` that reads like corrupt data.
+/// A missing `content-type` is treated as protobuf, which is what every
+/// pre-JSON client that omitted it meant.
+enum Encoding {
+    Protobuf,
+    Json,
+}
+
+fn encoding(h: &HeaderMap) -> Option<Encoding> {
+    let Some(ct) = h.get(header::CONTENT_TYPE) else {
+        return Some(Encoding::Protobuf);
+    };
+    // Compare the media type only; charset and boundary parameters are the
+    // client's business.
+    let ct = ct.to_str().unwrap_or_default();
+    match ct.split(';').next().unwrap_or_default().trim() {
+        "application/x-protobuf" | "application/protobuf" | "" => Some(Encoding::Protobuf),
+        "application/json" => Some(Encoding::Json),
+        _ => None,
+    }
+}
+
 /// Decode, submit, and answer. Generic over the signal because the three
-/// endpoints differ only in which two protobuf types they name.
+/// endpoints differ only in which types they name.
+///
+/// The response is echoed back in the request's own encoding, which the spec
+/// requires: a JSON client gets `{}`, not a protobuf empty message that its
+/// parser will choke on.
 async fn export<R: Message + Default, T: Message>(
     ingest: &Ingest<R>,
+    headers: &HeaderMap,
     body: Bytes,
     ok: T,
+    from_json: fn(&yaml_rust2::Yaml) -> Result<R, String>,
 ) -> Response {
-    let req = match R::decode(body) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let json = match encoding(headers) {
+        Some(Encoding::Protobuf) => false,
+        Some(Encoding::Json) => true,
+        None => {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected application/x-protobuf or application/json",
+            )
+                .into_response();
+        }
     };
+
+    let decoded = if json {
+        std::str::from_utf8(&body)
+            .map_err(|e| e.to_string())
+            .and_then(crate::api::parse)
+            .and_then(|doc| from_json(&doc))
+    } else {
+        R::decode(body).map_err(|e| e.to_string())
+    };
+    let req = match decoded {
+        Ok(r) => r,
+        Err(e) => return fail(json, StatusCode::BAD_REQUEST, &e),
+    };
+
     match ingest.submit(req).await {
+        Ok(()) if json => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}",
+        )
+            .into_response(),
         Ok(()) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-protobuf")],
@@ -162,12 +222,33 @@ async fn export<R: Message + Default, T: Message>(
         )
             .into_response(),
         Err(Rejected::Busy) => (
-            StatusCode::SERVICE_UNAVAILABLE,
             [(header::RETRY_AFTER, "1")],
-            "ingest queue full",
+            fail(json, StatusCode::SERVICE_UNAVAILABLE, "ingest queue full"),
         )
             .into_response(),
-        Err(Rejected::Closed) => (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response(),
-        Err(Rejected::Failed(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(Rejected::Closed) => fail(json, StatusCode::SERVICE_UNAVAILABLE, "shutting down"),
+        Err(Rejected::Failed(e)) => fail(json, StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
+}
+
+/// An error in the encoding the client asked for.
+///
+/// OTLP wants a `google.rpc.Status`; for the JSON case that is a two-field
+/// object, and hand-writing it costs less than a serializer. The protobuf case
+/// keeps returning text — encoding a `Status` there means another generated type
+/// for a path no exporter parses.
+fn fail(json: bool, code: StatusCode, message: &str) -> Response {
+    if !json {
+        return (code, message.to_owned()).into_response();
+    }
+    // The only characters a message here can contain that JSON forbids.
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        // code 2 is UNKNOWN in google.rpc.Code; the HTTP status carries the
+        // detail an exporter actually branches on.
+        format!(r#"{{"code":2,"message":"{escaped}"}}"#),
+    )
+        .into_response()
 }

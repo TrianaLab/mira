@@ -21,6 +21,7 @@ outside.
 | **Zero-copy ingestion** | Impossible on the OTLP path. `prost` memcpies every string unconditionally; varints must be decoded. Even on OTAP, `StreamDecoder` only avoids a copy when the whole message body is one contiguous `Buffer`, and an HTTP/2 body split across DATA frames is `extend_from_slice`'d. | Say **zero-copy queries**, not zero-copy ingestion. The ingest goal is *allocation-lean*: one unavoidable memcpy of the request body, then no per-field heap allocation. |
 | **Lock-free ring buffer for ingestion** | Cargo-culted from LMAX, where an item is a 150 ns order struct. Here an item is an export request costing 10⁵–10⁶ ns to decode and encode, arriving 10²–10⁴ times per second. The queue is four orders of magnitude from being the bottleneck, and a lock-free queue cannot express backpressure. | A bounded `tokio::sync::mpsc` per shard. `send().await` propagates backpressure out as HTTP/2 flow control. Revisit if a queue ever appears in a profile. |
 | **4317 and 4318 both served by tonic** | 4318 is not gRPC. Per the OTLP spec it is plain HTTP/1.1 POST of protobuf or JSON to `/v1/{traces,metrics,logs}`. | Two listeners: tonic on 4317, axum on 4318. axum is already in the tree via tonic's `router` feature, so it costs no dependency. |
+| **A reflective proto3-JSON decoder for OTLP/HTTP JSON** | OTLP JSON is *not* canonical proto3 JSON. Ids are hex where every other `bytes` field is base64 — and a 32-character hex string is itself valid base64, so a generic decoder does not fail, it silently yields 24 bytes of nonsense for every `trace_id`. 64-bit integers are strings. Field names may be either dialect within one document. | `crates/mira/src/json.rs`: a hand-written decoder over the YAML 1.2 loader already in the tree (`api::parse`; YAML 1.2 is a superset of JSON, so KYAML bodies work for free — §1). No new dependency, and the two deviations are handled where they occur rather than configured around. |
 
 Two more, less structural but worth stating:
 
@@ -752,9 +753,6 @@ observable. *Not yet implemented.*
 
 ## 10. What is deliberately not here
 
-- **OTLP/HTTP JSON.** All three endpoints decode protobuf and ignore
-  `content-type`; a JSON export gets a 400. JSON is a normative part of OTLP and
-  this is a gap, not a position.
 - **Anything that reads `span_links` or `exemplars`.** Both are real tables with
   real rows — links carry their `trace_id`/`span_id`, and metric exemplars keep
   theirs, which is the thing backends usually drop and then cannot answer "which

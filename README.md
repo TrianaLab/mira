@@ -18,7 +18,7 @@ build. The block directory is the only state; the filesystem is the manifest.
 ## What is true today
 
 - **Logs, traces and metrics**, stored in their own layouts, over **OTLP/gRPC
-  4317** and **OTLP/HTTP 4318**.
+  4317** and **OTLP/HTTP 4318**, protobuf or JSON.
 - **The UI is in the binary.** Open `http://localhost:4318/` — records, trace
   waterfalls and metric charts, served from `include_bytes!`. Nothing to deploy
   beside it.
@@ -80,8 +80,6 @@ it at 0.16; why that is a tiering decision rather than a flag is
 
 ## What is not true yet
 
-- **Protobuf only on the wire.** OTLP/HTTP with a JSON body is rejected; the
-  three endpoints decode protobuf.
 - **Not** zero-copy *ingestion*. That is not achievable through protobuf —
   `prost` memcpies every string, unconditionally. The ingest goal is
   allocation-lean: one unavoidable copy of the request body, then no per-field

@@ -617,3 +617,170 @@ async fn an_mcp_client_can_list_the_tools_and_call_them() {
     assert!(trace.contains(r#""isError":false"#), "{trace}");
     assert_eq!(trace.matches("GET /pay/").count(), 3, "{trace}");
 }
+
+/// OTLP/HTTP with a JSON body.
+///
+/// The point of this test is the places OTLP JSON is *not* canonical protobuf
+/// JSON, because those are the ones a generic decoder gets wrong quietly:
+/// 64-bit integers arrive as strings, ids arrive as hex rather than base64, and
+/// enums may be spelled by name. It also mixes `lowerCamelCase` and the original
+/// proto field names within one document, which the spec allows and real
+/// pipelines produce.
+#[tokio::test]
+async fn otlp_json_bodies_decode_with_the_deviations_the_spec_requires() {
+    let (app, _root) = boot("json");
+
+    // Logs: camelCase throughout, string nanos, hex ids, enum by name, and one
+    // attribute of every AnyValue kind that survives to a stored row.
+    let body = r#"{
+      "resourceLogs": [{
+        "resource": {"attributes": [{"key":"service.name","value":{"stringValue":"json-svc"}}]},
+        "scopeLogs": [{
+          "scope": {"name":"mira.json","version":"1.2.3"},
+          "logRecords": [{
+            "timeUnixNano": "1000000",
+            "observedTimeUnixNano": "1000001",
+            "severityNumber": "SEVERITY_NUMBER_ERROR",
+            "severityText": "ERROR",
+            "body": {"stringValue": "json log one"},
+            "traceId": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "spanId": "0102030405060708",
+            "attributes": [
+              {"key":"http.status_code","value":{"intValue":"200"}},
+              {"key":"retry","value":{"boolValue":true}},
+              {"key":"ratio","value":{"doubleValue":1.5}},
+              {"key":"blob","value":{"bytesValue":"aGVsbG8="}}
+            ]
+          }]
+        }]
+      }]
+    }"#;
+    let (status, answer) = post(&app, "/v1/logs", "application/json", body.into()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    // A JSON request is answered in JSON, not with a protobuf empty message.
+    assert_eq!(answer, "{}");
+
+    let rows = query(&app, r#"{"signal":"logs","from":0,"to":9000000}"#).await;
+    assert!(rows.contains("json log one"), "{rows}");
+    // Hex in, hex out, byte for byte. This is the assertion that fails if the id
+    // was ever treated as base64.
+    assert!(
+        rows.contains(r#""trace_id":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a""#),
+        "{rows}"
+    );
+    assert!(rows.contains(r#""span_id":"0102030405060708""#), "{rows}");
+    assert!(rows.contains(r#""severity_number":17"#), "{rows}");
+    assert!(rows.contains(r#""service.name":"json-svc""#), "{rows}");
+    assert!(rows.contains(r#""otel.scope.version":"1.2.3""#), "{rows}");
+    // `"200"` was a string in the document because proto3 JSON writes 64-bit
+    // integers that way; it has to have been stored as the integer 200.
+    assert!(rows.contains(r#""http.status_code":200"#), "{rows}");
+    let by_int = query(
+        &app,
+        r#"{"signal":"logs","from":0,"to":9000000,
+            "where":[{"attr":"http.status_code","eq":200}]}"#,
+    )
+    .await;
+    assert!(by_int.contains("json log one"), "{by_int}");
+    assert!(rows.contains(r#""retry":true"#), "{rows}");
+    assert!(rows.contains(r#""ratio":1.5"#), "{rows}");
+
+    // Traces: the *other* dialect. Every field name here is the original proto
+    // name, and the timestamps are JSON numbers rather than strings.
+    let body = r#"{
+      "resource_spans": [{
+        "resource": {"attributes": [{"key":"service.name","value":{"string_value":"json-svc"}}]},
+        "scope_spans": [{
+          "scope": {"name":"mira.json"},
+          "spans": [{
+            "trace_id": "aabbccddeeff00112233445566778899",
+            "span_id": "1111111111111111",
+            "parent_span_id": "",
+            "name": "GET /json",
+            "kind": 2,
+            "start_time_unix_nano": 2000000,
+            "end_time_unix_nano": 2000500,
+            "status": {"code": "STATUS_CODE_ERROR", "message": "boom"},
+            "events": [{"time_unix_nano": "2000100", "name": "cache.miss"}],
+            "links": [{"trace_id": "99887766554433221100ffeeddccbbaa",
+                       "span_id": "2222222222222222"}]
+          }]
+        }]
+      }]
+    }"#;
+    let (status, answer) = post(&app, "/v1/traces", "application/json", body.into()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let spans = query(
+        &app,
+        r#"{"signal":"traces","from":0,"to":9000000,
+            "where":[{"field":"trace_id","eq":"aabbccddeeff00112233445566778899"}]}"#,
+    )
+    .await;
+    assert!(spans.contains("GET /json"), "{spans}");
+    assert!(spans.contains(r#""span_id":"1111111111111111""#), "{spans}");
+    // An absent parent is null — not eight bytes of zero, which would join to a
+    // real span, and not an error.
+    assert!(!spans.contains("parent_span_id"), "{spans}");
+
+    // Metrics: an int-valued gauge point, which is the shape that would silently
+    // become a double if the oneof were decoded by value rather than by key.
+    let body = r#"{
+      "resourceMetrics": [{
+        "scopeMetrics": [{
+          "metrics": [{
+            "name": "json.requests",
+            "unit": "1",
+            "sum": {
+              "isMonotonic": true,
+              "aggregationTemporality": "AGGREGATION_TEMPORALITY_CUMULATIVE",
+              "dataPoints": [{"timeUnixNano": "3000000", "asInt": "42",
+                              "attributes": [{"key":"route","value":{"stringValue":"/json"}}]}]
+            }
+          }]
+        }]
+      }]
+    }"#;
+    let (status, answer) = post(&app, "/v1/metrics", "application/json", body.into()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let (status, names) = post(
+        &app,
+        "/api/v1/metrics/names",
+        "application/json",
+        br#"{"from":0,"to":9000000}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{names}");
+    assert!(names.contains("json.requests"), "{names}");
+}
+
+/// The three ways a JSON export is refused, and the shape of each refusal.
+#[tokio::test]
+async fn otlp_json_refusals_are_json() {
+    let (app, _root) = boot("json-errors");
+
+    // An encoding OTLP does not define. 415 rather than a 400 that would read
+    // like the body was corrupt.
+    let (status, _) = post(&app, "/v1/logs", "text/plain", b"hello".to_vec()).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // A trace id of the wrong length. Truncating it would store a span that can
+    // never be joined and never explain why, so it is an error.
+    let short = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[
+        {"timeUnixNano":"1","traceId":"abcd"}]}]}]}"#;
+    let (status, body) = post(&app, "/v1/logs", "application/json", short.into()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // The error comes back in the encoding the client asked for.
+    assert!(body.starts_with(r#"{"code":"#), "{body}");
+    assert!(body.contains("traceId"), "{body}");
+
+    // Not a document at all.
+    let (status, body) = post(&app, "/v1/logs", "application/json", b"{[".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.starts_with(r#"{"code":"#), "{body}");
+
+    // Protobuf is still the default when nothing says otherwise, and an empty
+    // export is a valid one.
+    let (status, body) = post(&app, "/v1/logs", "application/x-protobuf", vec![]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

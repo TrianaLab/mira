@@ -4,6 +4,7 @@ mod api;
 mod config;
 #[cfg(test)]
 mod e2e;
+mod json;
 mod mcp;
 mod pipeline;
 mod receiver;
