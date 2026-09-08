@@ -1,0 +1,19 @@
+[package]
+name = "mira-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OTLP protobuf/gRPC bindings for Mira, generated from vendored .proto files"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+protox = "0.9"
+prost-build = "0.14"
+tonic-prost-build = "0.14"

@@ -1,0 +1,21 @@
+[package]
+name = "mira-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mira storage engine: OTLP -> Arrow encoding, immutable block writer, zero-copy mmap reader"
+
+[dependencies]
+mira-proto.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+prost.workspace = true
+bytes.workspace = true
+memmap2.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
