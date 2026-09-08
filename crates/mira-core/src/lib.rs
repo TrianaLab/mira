@@ -19,6 +19,7 @@
 
 pub mod attrs;
 pub mod block;
+pub mod bloom;
 pub mod error;
 pub mod identity;
 pub mod json;
@@ -169,16 +170,7 @@ mod tests {
         assert_ne!(keys.value(0), keys.value(2));
 
         let node = block::node_id("replica-a");
-        let published = block::publish(
-            &root,
-            "logs",
-            node,
-            1,
-            sealed.min_ts,
-            sealed.max_ts,
-            &sealed.refs(),
-        )
-        .unwrap();
+        let published = block::publish(&root, "logs", node, 1, &sealed).unwrap();
         assert_eq!(published.node, node);
         // A second replica publishing the same time range must not collide.
         assert_ne!(node, block::node_id("replica-b"));
@@ -385,16 +377,7 @@ mod tests {
         // would otherwise pay for four of them on every seal.
         let root = std::env::temp_dir().join(format!("mira-tr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let published = block::publish(
-            &root,
-            "traces",
-            block::node_id("a"),
-            1,
-            sealed.min_ts,
-            sealed.max_ts,
-            &sealed.refs(),
-        )
-        .unwrap();
+        let published = block::publish(&root, "traces", block::node_id("a"), 1, &sealed).unwrap();
         assert!(!published.dir.join("span_link_attrs.arrow").exists());
         assert!(
             block::open_table_opt(&published.dir.join("span_link_attrs.arrow"))
@@ -690,16 +673,7 @@ mod tests {
         // below n/n.
         let root = std::env::temp_dir().join(format!("mira-me-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let published = block::publish(
-            &root,
-            "metrics",
-            block::node_id("a"),
-            1,
-            sealed.min_ts,
-            sealed.max_ts,
-            &sealed.refs(),
-        )
-        .unwrap();
+        let published = block::publish(&root, "metrics", block::node_id("a"), 1, &sealed).unwrap();
         for t in ["number_dp", "hist_dp", "hist_bounds", "summary_dp"] {
             let m = block::open_table(&published.dir.join(format!("{t}.arrow"))).unwrap();
             let (inside, total) = m.zero_copy_ratio();
@@ -730,16 +704,7 @@ mod tests {
             let mut b = logs::LogsBuilder::new();
             b.append_request(&request(service, 10, base)).unwrap();
             let sealed = b.finish().unwrap();
-            block::publish(
-                &root,
-                "logs",
-                block::node_id("a"),
-                seq as u64,
-                sealed.min_ts,
-                sealed.max_ts,
-                &sealed.refs(),
-            )
-            .unwrap();
+            block::publish(&root, "logs", block::node_id("a"), seq as u64, &sealed).unwrap();
         }
 
         let q = |terms: Vec<Term>, from: i64, to: i64, limit: usize| Search {
@@ -876,6 +841,94 @@ mod tests {
         // Scope name is synthesised into scope_attrs at ingest and merges in
         // here, so all three attribute levels are present on one row.
         assert!(r.json.contains("\"otel.scope.name\":\"test\""));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// "Every span of trace X" carries no time bound, so block names prune
+    /// nothing and the scan reads the whole signal. The Bloom sidecar is the
+    /// only thing standing between that query and every block on disk.
+    #[test]
+    fn a_trace_lookup_opens_only_the_block_holding_the_trace() {
+        use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
+        use mira_proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-bloom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Ids from a hash, not a counter: the filter's premise is that trace ids
+        // are uniform, and 0,1,2,… would test a distribution that cannot occur.
+        let tid = |n: u64| {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&identity::hash64(&n.to_le_bytes()).to_le_bytes());
+            b[8..].copy_from_slice(&identity::hash64(&(!n).to_le_bytes()).to_le_bytes());
+            b
+        };
+
+        const BLOCKS: u64 = 8;
+        for seq in 0..BLOCKS {
+            let mut b = traces::TracesBuilder::new();
+            // Overlapping time ranges on every block, so nothing here can be
+            // credited to time pruning.
+            let spans = (0..4)
+                .map(|i| Span {
+                    trace_id: tid(seq * 4 + i).to_vec().into(),
+                    span_id: vec![i as u8 + 1; 8].into(),
+                    name: "GET /checkout".into(),
+                    start_time_unix_nano: 1_000 + i,
+                    end_time_unix_nano: 1_100 + i,
+                    ..Default::default()
+                })
+                .collect();
+            b.append_request(&ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: Some(Resource::default()),
+                    scope_spans: vec![ScopeSpans {
+                        spans,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            })
+            .unwrap();
+            let sealed = b.finish().unwrap();
+            assert_eq!(sealed.sidecars.len(), 1, "traces publish a trace filter");
+            block::publish(&root, "traces", block::node_id("a"), seq, &sealed).unwrap();
+        }
+
+        let lookup = |id: String| Search {
+            signal: Signal::Traces,
+            from: 0,
+            to: i64::MAX,
+            terms: vec![Term {
+                target: Target::Field("trace_id".into()),
+                op: Op::Eq,
+                value: QV::Str(id),
+            }],
+            limit: 100,
+        };
+
+        let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let r = query::search(&root, &lookup(hex(tid(17)))).unwrap();
+        assert_eq!(r.stats.blocks_total, BLOCKS as usize);
+        assert_eq!(r.stats.blocks_scanned, 1, "the filter must skip the rest");
+        assert_eq!(r.stats.rows_matched, 1);
+
+        // An id in no block at all: with 8 filters probed, a false positive is
+        // possible, so this asserts the bound rather than zero.
+        let r = query::search(&root, &lookup(hex(tid(9_999)))).unwrap();
+        assert_eq!(r.stats.rows_matched, 0);
+        assert!(r.stats.blocks_scanned <= 1, "{}", r.stats.blocks_scanned);
+
+        // Deleting a sidecar has to cost a block read, never a lost span.
+        let one = block::scan(&root, "traces").unwrap();
+        for b in &one {
+            std::fs::remove_file(b.dir.join(bloom::TRACE_IDX)).unwrap();
+        }
+        let r = query::search(&root, &lookup(hex(tid(17)))).unwrap();
+        assert_eq!(r.stats.blocks_scanned, BLOCKS as usize);
+        assert_eq!(r.stats.rows_matched, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

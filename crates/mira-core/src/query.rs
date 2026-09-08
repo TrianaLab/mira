@@ -257,6 +257,21 @@ pub struct Results {
     pub stats: Stats,
 }
 
+/// The trace id this search pins down exactly, if it pins one down.
+///
+/// Only `trace_id = <32 hex chars>` on the traces signal qualifies. Terms are
+/// AND-ed, so one such term is enough no matter what else is in the list: a
+/// block that cannot hold the id cannot hold a row satisfying the conjunction.
+fn trace_needle(q: &Search) -> Option<[u8; 16]> {
+    if q.signal != Signal::Traces {
+        return None;
+    }
+    q.terms.iter().find_map(|t| match (&t.target, t.op) {
+        (Target::Field(f), Op::Eq) if f == "trace_id" => unhex(t.value.as_str()?)?.try_into().ok(),
+        _ => None,
+    })
+}
+
 /// Run a search against the blocks under `root`.
 ///
 /// Blocking: this mmaps and page-faults. Callers on an async runtime must go
@@ -272,6 +287,7 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
     // Newest first, so `limit` can cut the scan short.
     refs.sort_by_key(|b| std::cmp::Reverse((b.max_ts, b.seq)));
 
+    let needle = trace_needle(q);
     let mut hits: Vec<Hit> = Vec::new();
     let mut open: Vec<Option<Block>> = Vec::with_capacity(refs.len());
 
@@ -283,6 +299,18 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
         // reads one block no matter how many are on disk.
         if hits.len() >= q.limit && hits.last().is_some_and(|w| bref.max_ts < w.ts) {
             break;
+        }
+
+        // The second pruning key, and the only one that helps a trace lookup:
+        // "every span of trace X" has no time bound, so without this every
+        // block on disk is opened and paged in. A 20 KB sidecar read is two
+        // orders of magnitude cheaper than the block it skips.
+        if let Some(id) = &needle
+            && let Ok(f) = std::fs::read(bref.dir.join(crate::bloom::TRACE_IDX))
+            && !crate::bloom::may_contain(&f, id)
+        {
+            open.push(None);
+            continue;
         }
 
         let Some(b) = Block::open(bref, q.signal)? else {

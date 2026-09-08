@@ -14,7 +14,7 @@
 //! Everything is derived from a counter, not a random source: the same
 //! arguments produce the same bytes, so two runs are comparable.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -127,7 +127,8 @@ fn main() {
     println!(
         "{} logs, {} spans, {} points in {el:.1}s over {conns} connections \
          of {} records\n\
-         {:.0} records/s, {:.1} MiB/s on the wire, {} exports shed\n\
+         {:.0} records/s, {:.1} MiB/s on the wire, {} exports shed, \
+         {} connection resets\n\
          ack latency p50 {:.1}ms  p99 {:.1}ms  max {:.1}ms",
         all.logs,
         all.spans,
@@ -136,6 +137,7 @@ fn main() {
         n as f64 / el,
         all.bytes as f64 / el / (1 << 20) as f64,
         all.shed,
+        all.resets,
         pct(0.50),
         pct(0.99),
         pct(1.0),
@@ -152,6 +154,10 @@ struct Stats {
     /// throughput number that quietly dropped a third of its offered load is
     /// the most common way an ingest benchmark lies.
     shed: u64,
+    /// Connections rebuilt after a write the kernel could not complete. A
+    /// client-side artifact of loopback mbuf exhaustion, reported because it
+    /// inflates ack latency and is otherwise invisible.
+    resets: u64,
     /// Nanoseconds from the first byte written to the 200. Under
     /// ack-after-durability this is the fsync, so it is the number that tells
     /// you whether the sealer is keeping up.
@@ -163,8 +169,9 @@ impl Stats {
     fn send(&mut self, conn: &mut Conn, path: &str, body: Vec<u8>) {
         let t = Instant::now();
         loop {
-            let (n, ok) = conn.post(path, &body);
+            let (n, ok, resets) = conn.post(path, &body);
             self.bytes += n;
+            self.resets += resets;
             if ok {
                 break;
             }
@@ -180,6 +187,7 @@ impl Stats {
         self.points += o.points;
         self.bytes += o.bytes;
         self.shed += o.shed;
+        self.resets += o.resets;
         self.acks.extend(o.acks);
     }
 }
@@ -196,17 +204,35 @@ struct Conn {
 
 impl Conn {
     fn connect(addr: &str) -> Self {
-        let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("connect {addr}: {e}"));
-        s.set_nodelay(true).unwrap();
         Conn {
             addr: addr.to_string(),
-            io: BufReader::new(s),
+            io: BufReader::new(dial(addr)),
         }
     }
 
-    /// Returns the bytes written and whether the export was accepted, so the
-    /// caller can report wire throughput and count backpressure separately.
-    fn post(&mut self, path: &str, body: &[u8]) -> (u64, bool) {
+    /// Returns the bytes written, whether the export was accepted, and how many
+    /// times the connection had to be rebuilt — so the caller can report wire
+    /// throughput, backpressure and client-side damage separately.
+    fn post(&mut self, path: &str, body: &[u8]) -> (u64, bool, u64) {
+        let mut resets = 0;
+        loop {
+            match self.attempt(path, body) {
+                Ok((n, ok)) => return (n, ok, resets),
+                // The socket is in an unknown state — a `send` that failed may
+                // have queued part of the request, and nothing on this side can
+                // tell how much. The only way back to a known state is a new
+                // connection; resuming would feed the server a body starting
+                // mid-protobuf, which it correctly reports as garbage.
+                Err(_) => {
+                    resets += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.io = BufReader::new(dial(&self.addr));
+                }
+            }
+        }
+    }
+
+    fn attempt(&mut self, path: &str, body: &[u8]) -> io::Result<(u64, bool)> {
         let head = format!(
             "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-protobuf\r\n\
              Content-Length: {}\r\n\r\n",
@@ -214,11 +240,11 @@ impl Conn {
             body.len()
         );
         let s = self.io.get_mut();
-        push(s, head.as_bytes());
-        push(s, body);
+        push(s, head.as_bytes())?;
+        push(s, body)?;
 
         let mut line = String::new();
-        self.io.read_line(&mut line).unwrap();
+        self.io.read_line(&mut line)?;
         let status = line.trim().to_owned();
         // Read the response fully before judging it. Leaving a body in the
         // socket desynchronizes the next request on this keep-alive connection,
@@ -226,16 +252,16 @@ impl Conn {
         let mut len = 0usize;
         loop {
             line.clear();
-            self.io.read_line(&mut line).unwrap();
+            self.io.read_line(&mut line)?;
             if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                len = v.trim().parse().unwrap();
+                len = v.trim().parse().unwrap_or(0);
             }
             if line == "\r\n" || line.is_empty() {
                 break;
             }
         }
         let mut msg = vec![0u8; len];
-        self.io.read_exact(&mut msg).unwrap();
+        self.io.read_exact(&mut msg)?;
 
         // 503 is the engine shedding load, which is a correct answer and not an
         // error: OTLP says retry. Anything else is a bug worth stopping on, and
@@ -246,41 +272,40 @@ impl Conn {
             "{path}: {status}: {}",
             String::from_utf8_lossy(&msg)
         );
-        ((head.len() + body.len()) as u64, ok)
+        Ok(((head.len() + body.len()) as u64, ok))
     }
 }
 
-/// `write_all`, but patient.
+fn dial(addr: &str) -> TcpStream {
+    let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("connect {addr}: {e}"));
+    s.set_nodelay(true).unwrap();
+    s
+}
+
+/// `write_all`, but it gives up rather than guessing.
 ///
 /// A hundred blocking sockets pushing megabyte bodies at loopback exhausts the
-/// kernel's mbuf pool on macOS and the write comes back ENOBUFS. That is the
-/// client running out of socket buffers, not the server refusing anything, so
-/// backing off and continuing is the correct handling — failing here would
-/// report a client limit as a server result.
-fn push(s: &mut TcpStream, mut buf: &[u8]) {
-    /// ENOBUFS: 55 on Darwin, 105 on Linux.
-    const ENOBUFS: i32 = if cfg!(target_os = "macos") { 55 } else { 105 };
+/// kernel's mbuf pool on macOS and the write comes back ENOBUFS. POSIX leaves
+/// the transferred count unspecified on a failed `send`, so the retry that
+/// looks obvious — reissue from the same offset — is the thing that corrupts
+/// the stream. Chunking makes it rare; only reconnecting makes it correct.
+fn push(s: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
     /// Offer the kernel a socket buffer's worth at a time rather than a whole
-    /// megabyte body. A blocking `send` that cannot allocate mbufs for the
-    /// whole request fails outright, and a failed send that may have written
-    /// part of the buffer leaves the connection unresynchronizable.
+    /// megabyte body: a smaller request is far likelier to find mbufs.
     const CHUNK: usize = 64 << 10;
     while !buf.is_empty() {
         match s.write(&buf[..buf.len().min(CHUNK)]) {
-            Ok(0) => panic!("connection closed mid-write"),
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => buf = &buf[n..],
-            Err(e)
-                if e.kind() == std::io::ErrorKind::Interrupted
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                std::thread::sleep(Duration::from_millis(1));
+            // The two kinds that are defined to have transferred nothing.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1))
             }
-            Err(e) if e.raw_os_error() == Some(ENOBUFS) => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => panic!("write: {e}"),
+            Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 fn kv(k: &str, v: &str) -> KeyValue {

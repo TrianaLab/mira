@@ -243,6 +243,7 @@ impl LogsBuilder {
         Ok(Sealed {
             num_rows: self.next_id as usize,
             tables,
+            sidecars: Vec::new(),
             min_ts: if self.min_ts == i64::MAX {
                 0
             } else {

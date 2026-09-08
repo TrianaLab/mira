@@ -258,16 +258,7 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
         seq += 1;
         let rows = sealed.num_rows;
         let result = tokio::task::spawn_blocking(move || {
-            block::publish(
-                &dir,
-                B::SIGNAL,
-                node,
-                this_seq,
-                sealed.min_ts,
-                sealed.max_ts,
-                &sealed.refs(),
-            )
-            .map(|b| b.dir)
+            block::publish(&dir, B::SIGNAL, node, this_seq, &sealed).map(|b| b.dir)
         })
         .await;
 

@@ -29,6 +29,13 @@ use crate::Result;
 /// and not a display detail.
 pub struct Sealed {
     pub tables: Vec<(&'static str, RecordBatch)>,
+    /// Opaque files published alongside the tables, by name.
+    ///
+    /// Indexes over what a block contains, for the questions the block name
+    /// cannot answer. Only traces has one today — see [`crate::bloom`] — and
+    /// the read path treats a missing sidecar as "no information", so an old
+    /// block or a signal that publishes none costs nothing.
+    pub sidecars: Vec<(&'static str, Vec<u8>)>,
     /// Oldest and newest row. These become the block's directory name, which is
     /// how the read path prunes without opening a file.
     pub min_ts: i64,

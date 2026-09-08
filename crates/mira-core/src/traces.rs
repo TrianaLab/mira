@@ -286,9 +286,14 @@ impl TracesBuilder {
     }
 
     fn seal(&mut self) -> Result<Sealed> {
+        let trace_ids = self.trace_id.finish();
+        // Built from the finished column rather than accumulated per append:
+        // the ids are already contiguous here, and a filter built alongside the
+        // rows would have to be discarded whenever `finish` fails part-way.
+        let trace_idx = crate::bloom::build(&trace_ids);
         let spans: Vec<ArrayRef> = vec![
             Arc::new(self.id.finish()),
-            Arc::new(self.trace_id.finish()),
+            Arc::new(trace_ids),
             Arc::new(self.span_id.finish()),
             Arc::new(self.parent_span_id.finish()),
             Arc::new(self.trace_state.finish()),
@@ -343,6 +348,9 @@ impl TracesBuilder {
         Ok(Sealed {
             num_rows: self.next_id as usize,
             tables,
+            sidecars: trace_idx
+                .map(|b| vec![(crate::bloom::TRACE_IDX, b)])
+                .unwrap_or_default(),
             min_ts: if self.min_ts == i64::MAX {
                 0
             } else {

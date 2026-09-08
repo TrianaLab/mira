@@ -42,6 +42,7 @@ use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use memmap2::Mmap;
 
 use crate::error::{Error, IoContext, Result};
+use crate::signal::Sealed;
 
 /// Leading bytes of every Arrow IPC file. arrow-rs's own reader seeks straight
 /// to the trailer and never checks this, so a truncated-from-the-front file
@@ -212,10 +213,9 @@ pub fn publish(
     signal: &str,
     node: u32,
     seq: u64,
-    min_ts: i64,
-    max_ts: i64,
-    tables: &[(&str, &RecordBatch)],
+    sealed: &Sealed,
 ) -> Result<BlockRef> {
+    let (min_ts, max_ts) = (sealed.min_ts, sealed.max_ts);
     // The staging name carries `node` for the same reason the final one does:
     // two replicas on one volume must not stage into the same directory.
     let tmp = root
@@ -235,10 +235,20 @@ pub fn publish(
     // The reader treats a missing file as an empty table, which it has to do
     // anyway: it is also how a block written by an older version that did not
     // have the table reads back.
-    for (name, batch) in tables {
+    for (name, batch) in &sealed.tables {
         if batch.num_rows() > 0 {
             write_table(&tmp.join(format!("{name}.arrow")), batch)?;
         }
+    }
+    // Sidecars are written with the same durability as the tables: a block that
+    // lands with a stale or missing index is one the reader would either skip
+    // wrongly or scan slowly, and only the first of those is a correctness bug —
+    // but both are avoidable for one fsync of 20 KB.
+    for (name, bytes) in &sealed.sidecars {
+        let path = tmp.join(name);
+        let mut f = File::create(&path).ctx(&path)?;
+        f.write_all(bytes).ctx(&path)?;
+        f.sync_all().ctx(&path)?;
     }
     fsync_dir(&tmp)?;
 
