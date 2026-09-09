@@ -25,6 +25,27 @@ protobuf and JSON bodies, gzip on both listeners, and the flush-to-query round
 trip, so a break in the ingest path fails here before you get as far as a
 terminal.
 
+Two of the targets in it are not unit tests and are worth knowing by name:
+
+| Target | What it is |
+| --- | --- |
+| `crates/mira/tests/cli.rs` | The binary as an operator meets it — argv, exit codes, and a SIGTERM mid-flight that has to leave the block on disk. |
+| `crates/mira-core/tests/differential.rs` | The query engine against a reference model. Random stores, random queries, and an oracle that shares no code with the engine. |
+
+The differential test is the closest thing here to a proof. It builds a store of
+one to four blocks from random OTLP exports, computes the expected answer with
+forty lines of `Vec::filter`, and requires the engine to agree — on the rows, on
+their order, on `rows_matched`, and on every page of a cursor walk. What that
+pins down is the part no fixture reaches: that block pruning and the Bloom
+sidecars never drop a block holding a match, that the cross-block merge is
+ordered, and that paging visits every row exactly once.
+
+It is seeded, so it is reproducible. A failure prints the seed:
+
+```sh
+MIRA_DIFF_SEED=12858170866899772564 cargo test -p mira-core --test differential
+```
+
 That is the loop to stay in. The rest of this document is for the things a
 unit test cannot reach: a real socket, a real exporter, and real volume.
 
