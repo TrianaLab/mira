@@ -84,11 +84,6 @@ impl Sealed {
         self
     }
 
-    /// Borrowed view in the shape [`crate::block::publish`] wants.
-    pub fn refs(&self) -> Vec<(&str, &RecordBatch)> {
-        self.tables.iter().map(|(n, b)| (*n, b)).collect()
-    }
-
     pub fn table(&self, name: &str) -> Option<&RecordBatch> {
         self.tables.iter().find(|(n, _)| *n == name).map(|(_, b)| b)
     }

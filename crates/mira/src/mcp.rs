@@ -243,3 +243,191 @@ fn json(body: String) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A data directory with one logs block in it, so the tools that succeed
+    /// have something to have succeeded on.
+    fn api(name: &str) -> (Api, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mira-mcp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut b = mira_core::logs::LogsBuilder::new();
+        b.append_request(&crate::e2e::logs_export(
+            "checkout",
+            api::now_nanos() as u64,
+            4,
+        ))
+        .unwrap();
+        let sealed = b.finish().unwrap();
+        mira_core::block::publish(&dir, "logs", mira_core::block::node_id("a"), 0, &sealed)
+            .unwrap();
+        (
+            Api {
+                data_dir: Arc::new(dir.clone()),
+            },
+            dir,
+        )
+    }
+
+    async fn rpc(api: &Api, body: &str) -> (StatusCode, String) {
+        let res = handler(State(api.clone()), body.to_owned()).await;
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// A tool call answers with `isError` inside a 200, never a JSON-RPC error.
+    /// This is the distinction the module header makes and the one a client is
+    /// most likely to get wrong, so every tool is driven through both sides of
+    /// it: the argument document that parses, and the one that does not.
+    #[tokio::test]
+    async fn a_tool_that_cannot_answer_says_so_in_its_result_not_in_the_protocol() {
+        let (api, _dir) = api("tools");
+        let call = |name: &str, args: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                     "params":{{"name":"{name}","arguments":{args}}}}}"#
+            )
+        };
+        let ok = [
+            ("query_records", r#"{"limit":2}"#),
+            (
+                "get_trace",
+                r#"{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","limit":5}"#,
+            ),
+            ("query_metric", r#"{"name":"http.server.duration"}"#),
+            ("list_metrics", "{}"),
+        ];
+        for (name, args) in ok {
+            let (s, body) = rpc(&api, &call(name, args)).await;
+            assert_eq!(s, StatusCode::OK, "{name}");
+            assert!(body.contains(r#""isError":false"#), "{name}: {body}");
+        }
+
+        // Each tool parses its arguments with a different function, so each one
+        // needs its own way of being wrong.
+        let bad = [
+            ("query_records", r#"{"signal":"metrics"}"#, "unknown signal"),
+            ("get_trace", r#"{"trace_id":"nope"}"#, "hex trace id"),
+            ("query_metric", r#"{"where":"errors"}"#, "list of terms"),
+            ("list_metrics", r#"{"from":"yesterday"}"#, "yesterday"),
+            ("teleport", "{}", "unknown tool"),
+        ];
+        for (name, args, want) in bad {
+            let (s, body) = rpc(&api, &call(name, args)).await;
+            assert_eq!(s, StatusCode::OK, "{name}");
+            assert!(body.contains(r#""isError":true"#), "{name}: {body}");
+            assert!(body.contains(want), "{name}: {body}");
+        }
+    }
+
+    /// A read that fails underneath the tool is still the tool's answer, not a
+    /// dead connection: the model is the one that has to decide what to do next.
+    #[tokio::test]
+    async fn a_broken_store_is_reported_to_the_model_rather_than_thrown() {
+        let dir = std::env::temp_dir().join(format!("mira-mcp-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("logs"), b"not a directory").unwrap();
+        let api = Api {
+            data_dir: Arc::new(dir),
+        };
+        let (s, body) = rpc(
+            &api,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"query_records","arguments":{}}}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#""isError":true"#), "{body}");
+    }
+
+    /// The handshake, and the three ways a request can not be a tool call. The
+    /// notification case is the one that breaks sessions: every client sends
+    /// `notifications/initialized` immediately after `initialize`, and a reply
+    /// to it — even a correct-looking error — ends the session on message two.
+    #[tokio::test]
+    async fn the_protocol_surface_echoes_ids_and_stays_quiet_when_there_is_none() {
+        let (api, _dir) = api("proto");
+        let (_, body) = rpc(
+            &api,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .await;
+        assert!(body.contains(PROTOCOL), "{body}");
+        assert!(body.contains(env!("CARGO_PKG_VERSION")), "{body}");
+
+        let (_, body) = rpc(&api, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await;
+        for tool in ["query_records", "get_trace", "query_metric", "list_metrics"] {
+            assert!(body.contains(tool), "{tool} missing from tools/list");
+        }
+
+        // A string id comes back quoted and escaped, because the client matches
+        // on it byte for byte.
+        let (_, body) = rpc(&api, r#"{"jsonrpc":"2.0","id":"a\"b","method":"ping"}"#).await;
+        assert!(
+            body.starts_with(r#"{"jsonrpc":"2.0","id":"a\"b","result":{}}"#),
+            "{body}"
+        );
+
+        let (s, body) = rpc(
+            &api,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+        assert!(body.is_empty(), "{body}");
+
+        // A method nobody knows, with an id, is a real JSON-RPC error — and a
+        // null id there is still a reply, since the client is waiting for one.
+        let (_, body) = rpc(&api, r#"{"jsonrpc":"2.0","id":true,"method":"levitate"}"#).await;
+        assert!(body.contains(r#""id":null"#), "{body}");
+        assert!(
+            body.contains("-32601") && body.contains("levitate"),
+            "{body}"
+        );
+
+        let (_, body) = rpc(&api, "{not: [kyaml").await;
+        assert!(body.contains("-32700"), "{body}");
+    }
+
+    /// `get_trace` is the one tool with no time bound, so the id is the only
+    /// thing narrowing it. A malformed id has to be refused before the scan,
+    /// not turned into a filter that matches nothing after reading retention.
+    #[test]
+    fn a_trace_lookup_insists_on_a_whole_trace_id() {
+        let doc = |s: &str| api::parse(s).unwrap();
+        let q = trace_search(&doc(r#"{"trace_id":" 4BF92F3577B34DA6A3CE929D0E0E4736 "}"#)).unwrap();
+        assert_eq!(q.signal, Signal::Traces);
+        assert_eq!((q.from, q.to), (0, i64::MAX));
+        assert_eq!(q.limit, 1_000);
+        assert!(q.after.is_none());
+        assert_eq!(q.terms.len(), 1);
+
+        let short = trace_search(&doc(r#"{"trace_id":"ab","limit":7}"#)).unwrap_err();
+        assert!(short.contains("16-byte"), "{short}");
+        // A span id is 8 bytes and looks like a trace id to anyone not counting.
+        assert!(trace_search(&doc(r#"{"trace_id":"0102030405060708"}"#)).is_err());
+        assert!(trace_search(&doc("{}")).unwrap_err().contains("required"));
+
+        let limit = |s: &str| {
+            trace_search(&doc(&format!(
+                r#"{{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","limit":{s}}}"#
+            )))
+            .unwrap()
+            .limit
+        };
+        assert_eq!(limit("7"), 7);
+        assert_eq!(limit("99999"), 10_000);
+        // Zero and "all of them" both mean the default rather than an empty page.
+        assert_eq!(limit("0"), 1_000);
+        assert_eq!(limit(r#""lots""#), 1_000);
+    }
+}

@@ -1084,3 +1084,461 @@ pub(crate) fn emit_attr(j: &mut Json, a: &RecordBatch, row: usize) {
         _ => j.null(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_array::{
+        BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
+        TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use std::sync::Arc;
+
+    fn hits(col: &dyn Array, op: Op, v: Value) -> Vec<u32> {
+        match field_pred(col, op, &v) {
+            Some(p) => (0..col.len() as u32).filter(|&i| p(i)).collect(),
+            None => vec![u32::MAX],
+        }
+    }
+
+    /// The predicate builder is a type-dispatch table, and a column type missing
+    /// from it does not error — it returns no rows. So the only way an arm can be
+    /// wrong and stay quiet is if nothing exercises it.
+    ///
+    /// Every arm gets the same three rows — below, equal, above — so one
+    /// expectation checks the arm, the ordering and the null handling at once.
+    #[test]
+    fn every_column_type_compares_the_same_way() {
+        let cols: Vec<(&str, Arc<dyn Array>)> = vec![
+            (
+                "timestamp",
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    None,
+                ])),
+            ),
+            (
+                "i64",
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "i32",
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "u64",
+                Arc::new(UInt64Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "u32",
+                Arc::new(UInt32Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "u16",
+                Arc::new(UInt16Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "u8",
+                Arc::new(UInt8Array::from(vec![Some(1), Some(2), Some(3), None])),
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from(vec![
+                    Some(1.0),
+                    Some(2.0),
+                    Some(3.0),
+                    None,
+                ])),
+            ),
+        ];
+        for (name, col) in &cols {
+            let c = col.as_ref();
+            assert_eq!(hits(c, Op::Eq, Value::Int(2)), [1], "{name} eq");
+            assert_eq!(hits(c, Op::Ne, Value::Int(2)), [0, 2], "{name} ne");
+            assert_eq!(hits(c, Op::Lt, Value::Int(2)), [0], "{name} lt");
+            assert_eq!(hits(c, Op::Lte, Value::Int(2)), [0, 1], "{name} lte");
+            assert_eq!(hits(c, Op::Gt, Value::Int(2)), [2], "{name} gt");
+            assert_eq!(hits(c, Op::Gte, Value::Int(2)), [1, 2], "{name} gte");
+            // A null is not less than anything, and `ne` is where that bites:
+            // the naive reading would return it.
+            assert!(!hits(c, Op::Ne, Value::Int(9)).contains(&3), "{name} null");
+            // Quoted, because a browser and an LLM both write "2" as often as 2.
+            assert_eq!(hits(c, Op::Eq, Value::Str("2".into())), [1], "{name} str");
+            // Nothing to compare against: no rows, not an error.
+            assert_eq!(
+                hits(c, Op::Eq, Value::Bool(true)),
+                [u32::MAX],
+                "{name} bool"
+            );
+        }
+
+        // A fractional target against an integer column has no integer to be
+        // equal to. Truncating would make `duration > 0.5` mean `duration > 0`.
+        assert_eq!(
+            hits(cols[1].1.as_ref(), Op::Gt, Value::Double(1.5)),
+            [u32::MAX]
+        );
+        assert_eq!(hits(cols[1].1.as_ref(), Op::Gt, Value::Double(2.0)), [2]);
+        // Floats compare as floats, and NaN is unordered rather than equal.
+        let f = Float64Array::from(vec![Some(1.5), Some(f64::NAN)]);
+        assert_eq!(hits(&f, Op::Gt, Value::Double(1.0)), [0]);
+        assert_eq!(hits(&f, Op::Eq, Value::Double(f64::NAN)), Vec::<u32>::new());
+
+        let b = BooleanArray::from(vec![Some(true), Some(false), None]);
+        assert_eq!(hits(&b, Op::Eq, Value::Bool(true)), [0]);
+        assert_eq!(hits(&b, Op::Eq, Value::Str("false".into())), [1]);
+        assert_eq!(hits(&b, Op::Eq, Value::Int(1)), [u32::MAX]);
+
+        let s = StringArray::from(vec![Some("alpha"), Some("beta"), None]);
+        assert_eq!(hits(&s, Op::Eq, Value::Str("beta".into())), [1]);
+        assert_eq!(hits(&s, Op::Contains, Value::Str("et".into())), [1]);
+        assert_eq!(hits(&s, Op::Lt, Value::Str("b".into())), [0]);
+        assert_eq!(hits(&s, Op::Eq, Value::Int(1)), [u32::MAX]);
+
+        let mut d = StringDictionaryBuilder::<UInt16Type>::new();
+        for v in ["ERROR", "INFO", "ERROR"] {
+            d.append_value(v);
+        }
+        let d = d.finish();
+        assert_eq!(hits(&d, Op::Eq, Value::Str("ERROR".into())), [0, 2]);
+        // Resolved against the dictionary once. A value that is not in it cannot
+        // match any row, and saying so costs no row scan at all.
+        assert_eq!(
+            hits(&d, Op::Eq, Value::Str("TRACE".into())),
+            Vec::<u32>::new()
+        );
+
+        // Ids arrive as hex and live as bytes. The needle is decoded once, so a
+        // needle that is not hex at all is no rows rather than every row.
+        let ids = FixedSizeBinaryArray::try_from_iter([[1u8, 2], [3, 4]].into_iter()).unwrap();
+        assert_eq!(hits(&ids, Op::Eq, Value::Str("0102".into())), [0]);
+        assert_eq!(hits(&ids, Op::Gt, Value::Str("0102".into())), [1]);
+        assert_eq!(hits(&ids, Op::Eq, Value::Str("zz".into())), [u32::MAX]);
+        assert_eq!(hits(&ids, Op::Eq, Value::Str("010".into())), [u32::MAX]);
+
+        // A type the table does not know is not a panic and not an error.
+        let l = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
+        assert_eq!(hits(&l, Op::Eq, Value::Int(1)), [u32::MAX]);
+    }
+
+    /// Materialization is the same dispatch table read the other way, and its
+    /// failure mode is worse: a column emitted under the wrong JSON type is a
+    /// reader's bug, not ours.
+    #[test]
+    fn every_column_type_materializes_as_the_json_type_it_is() {
+        let cell = |col: &dyn Array| {
+            let mut j = Json::new();
+            j.arr(|j| emit_value(j, col, 0));
+            let s = j.into_string();
+            s[1..s.len() - 1].to_owned()
+        };
+        let l = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![
+            Some(1),
+            None,
+            Some(3),
+        ])]);
+        let mut d = StringDictionaryBuilder::<UInt16Type>::new();
+        d.append_value("ERROR");
+        let cases: Vec<(Arc<dyn Array>, &str)> = vec![
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_001i64,
+                ])),
+                "1700000000000000001",
+            ),
+            (Arc::new(Int64Array::from(vec![-7i64])), "-7"),
+            (Arc::new(Int32Array::from(vec![-7i32])), "-7"),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+                "18446744073709551615",
+            ),
+            (Arc::new(UInt32Array::from(vec![7u32])), "7"),
+            (Arc::new(UInt16Array::from(vec![7u16])), "7"),
+            (Arc::new(UInt8Array::from(vec![7u8])), "7"),
+            (Arc::new(Float64Array::from(vec![0.5f64])), "0.5"),
+            (Arc::new(BooleanArray::from(vec![true])), "true"),
+            (Arc::new(StringArray::from(vec!["a\"b"])), r#""a\"b""#),
+            (
+                Arc::new(BinaryArray::from(vec![&b"\xab\xcd"[..]])),
+                r#""abcd""#,
+            ),
+            (Arc::new(d.finish()), r#""ERROR""#),
+            // A null inside a list stays a null; the surrounding array does not
+            // collapse to one.
+            (Arc::new(l), "[1,null,3]"),
+        ];
+        for (col, want) in cases {
+            assert_eq!(cell(col.as_ref()), want, "{:?}", col.data_type());
+        }
+
+        // A type with no representation is null rather than a guess.
+        let m = arrow_array::Int8Array::from(vec![1i8]);
+        assert_eq!(cell(&m), "null");
+    }
+
+    /// Everything the scalar helpers promise in their own doc comments, in one
+    /// place, because each of them is a coercion rule a query author will hit
+    /// and none of them is guessable from the type.
+    #[test]
+    fn a_scalar_coerces_to_what_the_column_needs_or_to_nothing() {
+        for (s, want) in [
+            ("eq", Op::Eq),
+            ("=", Op::Eq),
+            ("==", Op::Eq),
+            ("ne", Op::Ne),
+            ("!=", Op::Ne),
+            ("lt", Op::Lt),
+            ("<", Op::Lt),
+            ("lte", Op::Lte),
+            ("<=", Op::Lte),
+            ("gt", Op::Gt),
+            (">", Op::Gt),
+            ("gte", Op::Gte),
+            (">=", Op::Gte),
+            ("contains", Op::Contains),
+            ("~", Op::Contains),
+        ] {
+            assert_eq!(Op::parse(s), Some(want), "{s}");
+        }
+        assert_eq!(Op::parse("=~"), None);
+        // Documented as unreachable — every caller handles Contains first — so
+        // the guarantee is that it stays inert if one day a caller does not.
+        use std::cmp::Ordering::*;
+        for ord in [Less, Equal, Greater] {
+            assert!(!Op::Contains.test_ord(ord));
+        }
+
+        assert_eq!(Value::Int(3).as_i64(), Some(3));
+        assert_eq!(Value::Double(3.0).as_i64(), Some(3));
+        assert_eq!(Value::Double(3.5).as_i64(), None);
+        assert_eq!(Value::Str("3".into()).as_i64(), Some(3));
+        assert_eq!(Value::Str("3.5".into()).as_i64(), None);
+        assert_eq!(Value::Bool(true).as_i64(), None);
+
+        assert_eq!(Value::Int(3).as_f64(), Some(3.0));
+        assert_eq!(Value::Double(3.5).as_f64(), Some(3.5));
+        assert_eq!(Value::Str("3.5".into()).as_f64(), Some(3.5));
+        assert_eq!(Value::Str("x".into()).as_f64(), None);
+        assert_eq!(Value::Bool(true).as_f64(), None);
+
+        assert_eq!(Value::Bool(false).as_bool(), Some(false));
+        assert_eq!(Value::Str("true".into()).as_bool(), Some(true));
+        assert_eq!(Value::Str("false".into()).as_bool(), Some(false));
+        assert_eq!(Value::Str("TRUE".into()).as_bool(), None);
+        assert_eq!(Value::Int(1).as_bool(), None);
+        assert_eq!(Value::Double(1.0).as_bool(), None);
+
+        assert_eq!(Value::Str("x".into()).as_str(), Some("x"));
+        assert_eq!(Value::Int(1).as_str(), None);
+
+        // Ids arrive from a URL, a log line or a model, so both cases and
+        // neither-of-them all have to land somewhere predictable.
+        assert_eq!(unhex("0aFf"), Some(vec![0x0a, 0xff]));
+        assert_eq!(unhex(""), Some(vec![]));
+        assert_eq!(unhex("abc"), None);
+        assert_eq!(unhex("0g"), None);
+        assert_eq!(unhex("0 1"), None);
+
+        let vals = StringArray::from(vec!["a", "b"]);
+        assert_eq!(dict_index(&vals, "b"), Some(1));
+        assert_eq!(dict_index(&vals, "c"), None);
+    }
+
+    /// A block on disk, scanned. The predicate tables above are exercised in
+    /// isolation; this is the path that reaches them — the time prefilter, the
+    /// three attribute levels, and the merge that decides which of two levels
+    /// setting the same key the caller actually sees.
+    #[test]
+    fn a_scan_narrows_by_time_then_by_terms_and_the_most_specific_level_wins() {
+        use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
+        use mira_proto::common::v1::any_value::Value as Av;
+        use mira_proto::common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue};
+        use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use mira_proto::resource::v1::Resource;
+
+        let kv = |k: &str, v: Av| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue { value: Some(v) }),
+        };
+        let base = 1_700_000_000_000_000_000u64;
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![
+                        kv("service.name", Av::StringValue("checkout".into())),
+                        // Also set per-record below, which is the whole point:
+                        // an SDK default that one record overrides.
+                        kv("deploy.env", Av::StringValue("prod".into())),
+                    ],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "mira.test".into(),
+                        attributes: vec![kv("scope.kind", Av::StringValue("lib".into()))],
+                        ..Default::default()
+                    }),
+                    log_records: (0..3)
+                        .map(|i| LogRecord {
+                            time_unix_nano: base + i * 1_000_000_000,
+                            severity_number: 9 + i as i32,
+                            severity_text: "INFO".into(),
+                            body: Some(AnyValue {
+                                value: Some(Av::StringValue(format!("line {i}"))),
+                            }),
+                            attributes: vec![
+                                kv("deploy.env", Av::StringValue("canary".into())),
+                                kv("attempt", Av::IntValue(i as i64)),
+                                // Neither of these is filterable in V0; both
+                                // still have to come back in the row.
+                                kv("payload", Av::BytesValue(vec![0xde, 0xad].into())),
+                                kv(
+                                    "tags",
+                                    Av::ArrayValue(ArrayValue {
+                                        values: vec![AnyValue {
+                                            value: Some(Av::StringValue("a".into())),
+                                        }],
+                                    }),
+                                ),
+                            ],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let dir = std::env::temp_dir().join(format!("mira-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut b = crate::logs::LogsBuilder::new();
+        b.append_request(&req).unwrap();
+        let sealed = b.finish().unwrap();
+        let bref =
+            crate::block::publish(&dir, "logs", crate::block::node_id("a"), 0, &sealed).unwrap();
+
+        let base = base as i64;
+        let scan = |from: i64, to: i64, terms: Vec<Term>| {
+            search(
+                &dir,
+                &Search {
+                    signal: Signal::Logs,
+                    from,
+                    to,
+                    terms,
+                    limit: 100,
+                    after: None,
+                },
+            )
+            .unwrap()
+        };
+        let field = |n: &str, op: Op, v: Value| Term {
+            target: Target::Field(n.into()),
+            op,
+            value: v,
+        };
+        let attr = |n: &str, op: Op, v: Value| Term {
+            target: Target::Attr(n.into()),
+            op,
+            value: v,
+        };
+
+        // A window the block only partly covers: the directory name proved the
+        // block is worth opening, and only then does the timestamp get read.
+        let r = scan(base + 500_000_000, base + 1_500_000_000, vec![]);
+        assert_eq!(r.stats.rows_matched, 1, "{}", r.json);
+        assert!(r.json.contains("line 1"), "{}", r.json);
+
+        let all = base + 10_000_000_000;
+        assert_eq!(scan(base, all, vec![]).stats.rows_matched, 3);
+
+        // A column this signal does not have is no rows, not an error and not
+        // every row — a query spanning signals is a normal thing to try.
+        assert_eq!(
+            scan(
+                base,
+                all,
+                vec![field("duration_nano", Op::Gt, Value::Int(0))]
+            )
+            .stats
+            .rows_matched,
+            0
+        );
+        // Same for a value that cannot be compared against the column's type.
+        assert_eq!(
+            scan(
+                base,
+                all,
+                vec![field("severity_number", Op::Eq, Value::Bool(true))]
+            )
+            .stats
+            .rows_matched,
+            0
+        );
+        // Once nothing is selected the remaining terms are skipped, so a term
+        // that would have been expensive costs nothing.
+        assert_eq!(
+            scan(
+                base,
+                all,
+                vec![
+                    field("severity_number", Op::Gt, Value::Int(99)),
+                    attr("service.name", Op::Eq, Value::Str("checkout".into())),
+                ]
+            )
+            .stats
+            .rows_matched,
+            0
+        );
+        // Attributes are found without being told which level they live at.
+        for (k, v) in [("service.name", "checkout"), ("scope.kind", "lib")] {
+            assert_eq!(
+                scan(base, all, vec![attr(k, Op::Eq, Value::Str(v.into()))])
+                    .stats
+                    .rows_matched,
+                3,
+                "{k}"
+            );
+        }
+        assert_eq!(
+            scan(base, all, vec![attr("attempt", Op::Gte, Value::Int(1))])
+                .stats
+                .rows_matched,
+            2
+        );
+        // A bytes attribute is not filterable in V0. No rows, and no panic on
+        // the way to deciding that.
+        assert_eq!(
+            scan(
+                base,
+                all,
+                vec![attr("payload", Op::Eq, Value::Str("dead".into()))]
+            )
+            .stats
+            .rows_matched,
+            0
+        );
+
+        let row = scan(base, all, vec![]).json;
+        // Record level beats resource level for the same key.
+        assert!(row.contains(r#""deploy.env":"canary""#), "{row}");
+        assert!(!row.contains("prod"), "{row}");
+        assert!(row.contains(r#""service.name":"checkout""#), "{row}");
+        assert!(row.contains(r#""payload":"dead""#), "{row}");
+        // A slice is stored but not yet decoded for display, and null is an
+        // honest answer where a guess would not be.
+        assert!(row.contains(r#""tags":null"#), "{row}");
+
+        // Retention can delete a block between the directory listing and the
+        // read. The block still counts as present and simply contributes
+        // nothing, rather than failing the query.
+        std::fs::remove_file(bref.dir.join("logs.arrow")).unwrap();
+        let r = scan(base, all, vec![]);
+        assert_eq!((r.stats.blocks_total, r.stats.blocks_scanned), (1, 0));
+        assert_eq!(r.json, "[]");
+    }
+}
