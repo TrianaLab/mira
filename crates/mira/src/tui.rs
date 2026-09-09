@@ -66,6 +66,24 @@ impl Tab {
         }
     }
 
+    /// Where a filter word with no operator goes.
+    ///
+    /// Someone who types `refused` means "show me the ones that say refused",
+    /// which is what every log viewer in the market does with a bare word and
+    /// what this one used to do with it: nothing at all, silently, while the
+    /// filter bar showed the word and the rows looked filtered.
+    ///
+    /// `None` for metrics, whose `where` terms are attribute predicates on data
+    /// points — there is no text column to search, so a bare word there is
+    /// reported rather than invented a meaning for.
+    fn free_text(self) -> Option<&'static str> {
+        match self {
+            Tab::Logs => Some("body"),
+            Tab::Traces => Some("name"),
+            Tab::Metrics => None,
+        }
+    }
+
     /// Columns of the signal's root table.
     ///
     /// This is what decides whether `name=checkout` filters a column or an
@@ -211,6 +229,10 @@ impl App {
         self.stats = format!("{} · {}", stats_line(&doc["stats"]), ms(t.elapsed()));
         self.status.clear();
 
+        if let Some(w) = self.ignored_word() {
+            self.status = format!("ignored {w:?}: metrics filters are attr=value terms");
+        }
+
         match job {
             Job::Rows => {
                 self.rows = array(&doc["rows"]);
@@ -307,9 +329,44 @@ impl App {
         j.into_string()
     }
 
+    /// A word in the filter that this tab has nowhere to put.
+    ///
+    /// Only metrics can produce one — every other tab reads a bare word as free
+    /// text. The one thing that must not happen is silence: the filter bar goes
+    /// on showing the word, so the rows look filtered when they are not.
+    fn ignored_word(&self) -> Option<String> {
+        if self.tab.free_text().is_some() {
+            return None;
+        }
+        parse_filter(&self.filter)
+            .into_iter()
+            .find_map(|p| match p {
+                Part::Word(w) => Some(w),
+                Part::Term(..) => None,
+            })
+    }
+
     fn terms(&self, j: &mut Json) {
         j.arr(|j| {
-            for (key, op, val) in parse_filter(&self.filter) {
+            for part in parse_filter(&self.filter) {
+                let (key, op, val) = match part {
+                    Part::Term(k, op, v) => (k, op, v),
+                    // A bare word is free text over the tab's message column.
+                    // Quoted, so `scalar` cannot decide that `500` was a number
+                    // and hand `body` an integer to compare against.
+                    Part::Word(w) => match self.tab.free_text() {
+                        Some(f) => {
+                            j.obj(|j| {
+                                j.key("field");
+                                j.str(f);
+                                j.key("contains");
+                                j.str(&w);
+                            });
+                            continue;
+                        }
+                        None => continue,
+                    },
+                };
                 let field = self.tab.fields().contains(&key.as_str());
                 j.obj(|j| {
                     j.key(if field { "field" } else { "attr" });
@@ -1151,6 +1208,10 @@ fn help(w: usize) -> Vec<String> {
             "  body~\"connection refused\"",
             "quote a value that has spaces in it",
         ),
+        (
+            "  refused",
+            "a word on its own searches body, or a span's name",
+        ),
         ("", ""),
         (
             "on a local directory",
@@ -1405,13 +1466,23 @@ const OPS: [(&str, &str); 7] = [
     ("<", "lt"),
 ];
 
+/// One piece of a filter line: a `key op value`, or a word with no operator.
+///
+/// A bare word is kept rather than discarded because only the caller knows what
+/// it should mean — see [`Tab::free_text`].
+#[derive(Debug, PartialEq)]
+enum Part {
+    Term(String, &'static str, String),
+    Word(String),
+}
+
 /// Split the filter line into query terms.
 ///
 /// `service.name=checkout severity_number>=17 body~"connection refused"`. It is
 /// deliberately not the API's KYAML grammar: that one is for programs, and no
 /// one types `{"attr":"service.name","eq":"checkout"}` into a filter box. Both
 /// end up as the same [`Term`](mira_core::query::Term) either way.
-fn parse_filter(s: &str) -> Vec<(String, &'static str, String)> {
+fn parse_filter(s: &str) -> Vec<Part> {
     let mut out = Vec::new();
     for tok in tokens(s) {
         // Earliest operator wins, longest at that position — otherwise `>=`
@@ -1425,11 +1496,16 @@ fn parse_filter(s: &str) -> Vec<(String, &'static str, String)> {
                 }
             }
         }
-        if let Some((p, l, op)) = best {
-            let (k, v) = (tok[..p].trim(), tok[p + l..].trim());
-            if !k.is_empty() && !v.is_empty() {
-                out.push((k.to_owned(), op, v.to_owned()));
+        match best {
+            // A half-written term (`k=`, `=v`) is dropped: the operator says
+            // what was meant and it is not there yet.
+            Some((p, l, op)) => {
+                let (k, v) = (tok[..p].trim(), tok[p + l..].trim());
+                if !k.is_empty() && !v.is_empty() {
+                    out.push(Part::Term(k.to_owned(), op, v.to_owned()));
+                }
             }
+            None => out.push(Part::Word(tok)),
         }
     }
     out
@@ -1481,22 +1557,31 @@ fn scalar(j: &mut Json, key: &str, v: &str) {
 mod tests {
     use super::*;
 
+    fn term(k: &str, op: &'static str, v: &str) -> Part {
+        Part::Term(k.into(), op, v.into())
+    }
+
     #[test]
     fn filter_terms_split_on_the_longest_operator() {
         let f = parse_filter("service.name=checkout severity_number>=17 http.route~/api");
         assert_eq!(
             f,
             vec![
-                ("service.name".into(), "eq", "checkout".into()),
-                ("severity_number".into(), "gte", "17".into()),
-                ("http.route".into(), "contains", "/api".into()),
+                term("service.name", "eq", "checkout"),
+                term("severity_number", "gte", "17"),
+                term("http.route", "contains", "/api"),
             ]
         );
         // `!=` must not be read as `=` with a key ending in `!`.
-        assert_eq!(parse_filter("k!=v"), vec![("k".into(), "ne", "v".into())]);
-        // A term with no operator, or an empty side, is dropped rather than
-        // sent as something the API will reject.
-        assert!(parse_filter("justawordse").is_empty());
+        assert_eq!(parse_filter("k!=v"), vec![term("k", "ne", "v")]);
+        // A word with no operator survives parsing; what it means is the tab's
+        // business, not this function's.
+        assert_eq!(
+            parse_filter("justawordse"),
+            vec![Part::Word("justawordse".into())]
+        );
+        // A half-written term is still dropped: the operator says what was
+        // meant, and it is not there yet.
         assert!(parse_filter("=v k=").is_empty());
     }
 
@@ -1505,10 +1590,59 @@ mod tests {
         assert_eq!(
             parse_filter("body~\"connection refused\" a=b"),
             vec![
-                ("body".into(), "contains", "connection refused".into()),
-                ("a".into(), "eq", "b".into()),
+                term("body", "contains", "connection refused"),
+                term("a", "eq", "b"),
             ]
         );
+    }
+
+    /// The finding this fixes: a word with no operator used to be dropped on
+    /// the floor while the filter bar went on displaying it, so the rows looked
+    /// filtered and were not.
+    #[test]
+    fn a_bare_word_searches_the_tabs_message_column() {
+        use mira_core::query::{Op, Target, Value};
+
+        let mut app = App::new(Source::Local("/nonexistent".into()));
+        app.filter = "\"connection refused\" service.name=checkout".into();
+        let q = crate::api::parse_search(&app.rows_query(), 0).unwrap();
+        assert_eq!(q.terms.len(), 2);
+        assert!(matches!(&q.terms[0].target, Target::Field(k) if k == "body"));
+        assert_eq!(q.terms[0].op, Op::Contains);
+        assert_eq!(q.terms[0].value, Value::Str("connection refused".into()));
+
+        // On traces the message column is the span name, not the body.
+        app.tab = Tab::Traces;
+        let q = crate::api::parse_search(&app.rows_query(), 0).unwrap();
+        assert!(matches!(&q.terms[0].target, Target::Field(k) if k == "name"));
+
+        // A word that reads as a number stays text: `body` is a string column
+        // and an integer there would match nothing, silently.
+        app.tab = Tab::Logs;
+        app.filter = "500".into();
+        let q = crate::api::parse_search(&app.rows_query(), 0).unwrap();
+        assert_eq!(q.terms[0].value, Value::Str("500".into()));
+    }
+
+    /// Metrics has no message column, so the word is named in the status line
+    /// instead of silently doing nothing.
+    #[test]
+    fn a_bare_word_on_the_metrics_tab_says_it_was_ignored() {
+        let mut app = App::new(Source::Local("/nonexistent".into()));
+        app.tab = Tab::Metrics;
+        app.filter = "refused pod=a".into();
+        assert_eq!(app.ignored_word().as_deref(), Some("refused"));
+
+        // The rest of the line still applies — the word is dropped from the
+        // query, not the whole filter.
+        let q = crate::api::parse_series(&app.series_query(), 0).unwrap();
+        assert_eq!(q.terms.len(), 1);
+
+        // And no tab with a message column ever reports one.
+        for tab in [Tab::Logs, Tab::Traces] {
+            app.tab = tab;
+            assert_eq!(app.ignored_word(), None);
+        }
     }
 
     /// The filter box has to produce a document the API's own parser accepts,
