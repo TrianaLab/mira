@@ -389,13 +389,29 @@ inflates before it decodes, answering an encoding it does not implement with
 `415` — the exporter needs to be told to stop offering it, not handed a parse
 error that reads like corruption.
 
-Inflation is capped at **64 MiB**, separately from the request body limit. The
-body limit bounds what arrives; a few kilobytes of gzipped zeros expand past any
-memory the process has, and the decoder will allocate every byte if asked. The
-cap is absolute rather than a ratio because a real OTLP batch — the same
-attribute keys over and over — reaches about 35:1, so no ratio separates it from
-a bomb. 64 MiB of OTLP protobuf is on the order of a million records in one
-export.
+**One size limit, `ingest.max_request_bytes`, applied three times.** It is
+axum's `DefaultBodyLimit` on 4318, tonic's `max_decoding_message_size` on 4317,
+and the ceiling on what a gzip body may inflate to. Three applications because a
+limit that bound only what *arrives* would not bind at all under gzip: a few
+kilobytes of zeros expand past any memory the process has, and the decoder will
+allocate every byte if asked. The inflation cap is absolute rather than a ratio
+because a real OTLP batch — the same attribute keys over and over — reaches
+about 35:1, so no ratio separates it from a bomb.
+
+One *number*, rather than one per transport, because a batch a collector sends
+happily over 4317 and that fails over 4318 is the worst kind of bug to be handed:
+it depends on a transport nobody changed. The library defaults disagree — axum's
+is 2 MiB and tonic's is 4 MiB — and 2 MiB is below what a stock collector's batch
+processor produces at its own default of 8192 records. Mira's default is 16 MiB,
+roughly 250k records in one export.
+
+The two transports agree on the size and differ on the verdict: 4318 answers
+`413`, which OTLP classes as permanent, and 4317 answers tonic's `OUT_OF_RANGE`,
+which OTLP classes as retryable. Neither is wrong and the difference is not
+Mira's to fix, but it means an oversized batch is dropped on one port and retried
+until the queue gives up on the other. Either way the operator's move is the
+same: raise this number or lower the sender's batch size, which is what both
+error messages say.
 
 `submit` uses `try_reserve`, not `send().await`: shedding *before* the decode
 work is the difference between a fast NACK and an unbounded latency tail. A full

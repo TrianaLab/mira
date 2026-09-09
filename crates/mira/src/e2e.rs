@@ -57,6 +57,9 @@ fn wire(name: &str) -> (receiver::Receivers, api::Api, std::path::PathBuf) {
         logs: pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone()).0,
         traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()).0,
         metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()).0,
+        // The shipped default, not a test-only number: the limits these tests
+        // assert against are the ones an operator gets out of the box.
+        max_request_bytes: crate::config::Config::default().max_request_bytes,
     };
     let api = api::Api {
         data_dir: Arc::new(root.clone()),
@@ -1067,6 +1070,60 @@ async fn gzipped_exports_are_accepted_on_both_body_encodings() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     assert!(body.starts_with(r#"{"code":"#), "{body}");
+}
+
+/// `ingest.max_request_bytes` is one number applied three times.
+///
+/// A batch a collector sends happily over 4317 and that fails over 4318 is the
+/// worst kind of bug to be handed — it depends on a transport nobody changed —
+/// and since an exporter reads 413 as permanent and drops the batch, the
+/// disagreement costs data rather than latency. So the axum body limit, tonic's
+/// `max_decoding_message_size` and the gzip inflation cap are asserted here
+/// against the same configured number, at a size small enough to test cheaply.
+#[tokio::test]
+async fn one_size_limit_governs_both_transports_and_gzip() {
+    const LIMIT: usize = 4 << 10;
+    let (mut recv, _api, _root) = wire("max-request-bytes");
+    recv.max_request_bytes = LIMIT;
+    let grpc_app = tonic::service::Routes::default()
+        .add_service(recv.logs_server())
+        .into_axum_router();
+    let http = receiver::http_router(recv.clone());
+
+    let over = vec![b'0'; LIMIT + 1];
+
+    // 4318, uncompressed: axum's `DefaultBodyLimit`, whose own default is 2 MiB.
+    let (status, body) = post(&http, "/v1/logs", "application/json", over.clone()).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    // 4318, gzipped: 4 KiB of zeros compresses to a few dozen bytes, so the body
+    // limit never sees this one. The cap on what comes *out* is the same number.
+    let (status, body) = post_enc(&http, "/v1/logs", "application/json", "gzip", gzip(&over)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("max_request_bytes"), "{body}");
+
+    // 4317: tonic checks the length prefix, so this never reaches prost. It
+    // answers OUT_OF_RANGE (11), which OTLP classes as *retryable* where the
+    // 413 above is permanent — so the two transports agree on the size and
+    // disagree on the verdict. Pinned rather than papered over: the sender
+    // retries an export that can never fit until its queue gives up.
+    // ponytail: tonic's own status, hand-roll the framing check if the retry
+    // storm ever shows up in a real deployment.
+    assert_eq!(
+        grpc(&grpc_app, "logs.v1.LogsService", None, over).await,
+        "11"
+    );
+
+    // And the line is a ceiling, not a wall: a real export under it still lands
+    // on both transports.
+    let msg = logs_export("checkout", 1_000, 3).encode_to_vec();
+    assert!(msg.len() < LIMIT, "{} bytes", msg.len());
+    assert_eq!(
+        grpc(&grpc_app, "logs.v1.LogsService", None, msg.clone()).await,
+        "0"
+    );
+    let (status, body) = post(&http, "/v1/logs", "application/x-protobuf", msg).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// The same requirement on 4317, where it is tonic's framing rather than ours.

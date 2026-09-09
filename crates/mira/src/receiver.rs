@@ -36,6 +36,14 @@ pub struct Receivers {
     pub logs: Ingest<ExportLogsServiceRequest>,
     pub traces: Ingest<ExportTraceServiceRequest>,
     pub metrics: Ingest<ExportMetricsServiceRequest>,
+    /// The largest export either listener will decode, in bytes.
+    ///
+    /// One number for both, because a batch that a collector sends happily over
+    /// 4317 and that fails over 4318 is the worst kind of bug to be handed: it
+    /// depends on a transport nobody changed. Applied three times — as the
+    /// axum body limit, as tonic's `max_decoding_message_size`, and as the
+    /// ceiling on what a gzip body may inflate to.
+    pub max_request_bytes: usize,
 }
 
 /// Map a rejection onto a gRPC status.
@@ -65,15 +73,26 @@ fn status_for(r: Rejected) -> Status {
 /// OTLP calls that a permanent failure: the exporter drops the batch instead of
 /// retrying it. `send_compressed` is deliberately absent — the response is an
 /// empty message, and gzipping nothing costs a round of deflate per export.
+///
+/// `max_decoding_message_size` is set from the same field the HTTP listener
+/// uses; tonic's own default is 4 MiB and axum's is 2 MiB, and leaving the two
+/// listeners disagreeing means a batch size that works on one port and fails
+/// on the other.
 impl Receivers {
     pub fn logs_server(&self) -> LogsServiceServer<Self> {
-        LogsServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
+        LogsServiceServer::new(self.clone())
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(self.max_request_bytes)
     }
     pub fn traces_server(&self) -> TraceServiceServer<Self> {
-        TraceServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
+        TraceServiceServer::new(self.clone())
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(self.max_request_bytes)
     }
     pub fn metrics_server(&self) -> MetricsServiceServer<Self> {
-        MetricsServiceServer::new(self.clone()).accept_compressed(CompressionEncoding::Gzip)
+        MetricsServiceServer::new(self.clone())
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(self.max_request_bytes)
     }
 }
 
@@ -131,11 +150,13 @@ pub fn http_router(r: Receivers) -> Router {
                 |axum::extract::State(r): axum::extract::State<Receivers>,
                  h: HeaderMap,
                  b: Bytes| async move {
-                    export(&r.$field, &h, b, <$resp>::default(), $json).await
+                    let max = r.max_request_bytes;
+                    export(&r.$field, &h, b, max, <$resp>::default(), $json).await
                 },
             )
         };
     }
+    let max = r.max_request_bytes;
     Router::new()
         .route(
             "/v1/logs",
@@ -149,6 +170,11 @@ pub fn http_router(r: Receivers) -> Router {
             "/v1/metrics",
             signal!(metrics, ExportMetricsServiceResponse, crate::json::metrics),
         )
+        // Explicit, because axum's default is 2 MiB and that is below what a
+        // stock collector's batch processor produces at its own default of
+        // 8192 records. The exporter treats 413 as permanent and drops the
+        // batch, so a limit set too low is data loss rather than a slow start.
+        .layer(axum::extract::DefaultBodyLimit::max(max))
         .with_state(r)
 }
 
@@ -178,17 +204,6 @@ fn encoding(h: &HeaderMap) -> Option<Encoding> {
     }
 }
 
-/// A gzip body may not inflate past this.
-///
-/// The 2 MiB body limit bounds what arrives, not what comes out of it: a few
-/// kilobytes of gzipped zeros expand to gigabytes, and `read_to_end` on a
-/// decoder will allocate every one of them. The cap is absolute rather than a
-/// ratio because the ratio a real batch reaches — the same attribute keys over
-/// and over — is around 35:1 and a bomb's is a thousand times that, so there is
-/// no ratio that separates them. 64 MiB of OTLP protobuf is on the order of a
-/// million log records in one export; nothing legitimate sends that.
-const MAX_INFLATED: u64 = 64 << 20;
-
 /// Undo `Content-Encoding` before anything tries to parse the body.
 ///
 /// Returning the body untouched for a missing or `identity` header is the
@@ -196,7 +211,16 @@ const MAX_INFLATED: u64 = 64 << 20;
 /// the exporter has to be told to stop offering it, and a protobuf parser fed
 /// deflate reports "invalid wire type" — a message that sends whoever reads it
 /// looking for corruption instead of a header.
-fn inflate(h: &HeaderMap, body: Bytes) -> Result<Bytes, (StatusCode, String)> {
+///
+/// `max` caps what comes *out*, which the body limit does not: a few kilobytes
+/// of gzipped zeros expand to gigabytes and `read_to_end` will allocate every
+/// one of them. It is the same number as the body limit rather than a multiple
+/// of it, because that makes one configured value mean one thing — the largest
+/// export Mira will decode — however it arrived. A ratio would be the obvious
+/// alternative and does not work: a real batch, the same attribute keys over
+/// and over, reaches about 35:1, and there is no ratio above that which a bomb
+/// cannot also sit under.
+fn inflate(h: &HeaderMap, body: Bytes, max: usize) -> Result<Bytes, (StatusCode, String)> {
     let ce = h
         .get(header::CONTENT_ENCODING)
         .map(|v| v.to_str().unwrap_or_default().trim().to_ascii_lowercase());
@@ -208,7 +232,7 @@ fn inflate(h: &HeaderMap, body: Bytes) -> Result<Bytes, (StatusCode, String)> {
             // `take` is the whole defence: one byte past the cap and the read
             // stops, so the refusal costs the cap and not the bomb.
             flate2::read::GzDecoder::new(&body[..])
-                .take(MAX_INFLATED + 1)
+                .take(max as u64 + 1)
                 .read_to_end(&mut out)
                 .map_err(|e| {
                     (
@@ -216,10 +240,13 @@ fn inflate(h: &HeaderMap, body: Bytes) -> Result<Bytes, (StatusCode, String)> {
                         format!("failed to decompress gzip body: {e}"),
                     )
                 })?;
-            if out.len() as u64 > MAX_INFLATED {
+            if out.len() > max {
                 return Err((
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("gzip body inflates past {MAX_INFLATED} bytes"),
+                    format!(
+                        "gzip body inflates past the {max} byte limit; \
+                         raise ingest.max_request_bytes or lower the sender's batch size"
+                    ),
                 ));
             }
             Ok(out.into())
@@ -241,6 +268,7 @@ async fn export<R: Message + Default, T: Message>(
     ingest: &Ingest<R>,
     headers: &HeaderMap,
     body: Bytes,
+    max: usize,
     ok: T,
     from_json: fn(&yaml_rust2::Yaml) -> Result<R, String>,
 ) -> Response {
@@ -256,7 +284,7 @@ async fn export<R: Message + Default, T: Message>(
         }
     };
 
-    let body = match inflate(headers, body) {
+    let body = match inflate(headers, body, max) {
         Ok(b) => b,
         Err((code, e)) => return fail(json, code, &e),
     };

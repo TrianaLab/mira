@@ -3,6 +3,7 @@
 ```
 mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
      [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2]
+     [--max-request-bytes SIZE]
 ```
 
 Precedence is **flag > file > default**. Everything works with no config file at
@@ -61,6 +62,10 @@ line above it.
   "cluster": {
     "peers": "${env:MIRA_PEERS,}",      # scatter-gather targets; empty = single node
   },
+
+  "ingest": {
+    "max_request_bytes": "16MiB",       # b | k/kb/kib | m/mb/mib | g/gb/gib; bare number is bytes
+  },
 }
 ```
 
@@ -71,8 +76,29 @@ engine is better placed to choose than you are, and every one of them exposed is
 a number that will be set wrong in production and never revisited.
 
 What *is* configurable is everything the engine genuinely cannot know: where to
-listen, where to write, how long to keep data, what this replica is called, and
-who its peers are.
+listen, where to write, how long to keep data, what this replica is called, who
+its peers are, and how large an export its senders produce.
+
+## `ingest.max_request_bytes`
+
+The largest export Mira will decode, on either port. It is the axum body limit
+on 4318, tonic's `max_decoding_message_size` on 4317, and the ceiling on what a
+gzip body may inflate to — one number, so a batch cannot succeed on one
+transport and fail on the other.
+
+This is the one size knob, and it exists because the size of an export is a
+property of the *sender*, not of the engine. A collector with
+`batch/send_batch_max_size` raised, an application exporting 100k-attribute
+spans, a `telemetrygen` run — none of that is knowable from here. The default,
+16 MiB, is eight times axum's default and four times tonic's, and comfortably
+above what a stock collector produces at its own default of 8192 records.
+
+Units are binary: `MB` means `MiB`. Every other size in this system is binary,
+and a `MB` that meant 10^6 next to a page size that meant 2^20 would be a trap.
+
+Set it too low and you lose data rather than throughput: 4318 answers `413`,
+which OTLP classes as permanent, so the exporter drops the batch instead of
+retrying it. If exports are being rejected, both error messages name this key.
 
 ## Interpolation
 

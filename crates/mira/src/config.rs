@@ -95,6 +95,9 @@ pub struct Config {
     pub retention: Duration,
     /// Peer addresses for scatter-gather queries. Empty means single-node.
     pub peers: Vec<String>,
+    /// The largest export either listener will decode. See
+    /// `receiver::Receivers::max_request_bytes` for why it is one number.
+    pub max_request_bytes: usize,
 }
 
 impl Default for Config {
@@ -106,6 +109,12 @@ impl Default for Config {
             data_dir: PathBuf::from("./mira-data"),
             retention: Duration::from_secs(7 * 24 * 3600),
             peers: Vec::new(),
+            // Eight times axum's default and four times tonic's. A stock
+            // collector batches 8192 records, which is already past 2 MiB of
+            // spans, and an exporter reads 413 as permanent — so the cost of
+            // this being too small is dropped data, while the cost of it being
+            // too large is bounded resident bytes per in-flight request.
+            max_request_bytes: 16 << 20,
         }
     }
 }
@@ -135,6 +144,10 @@ impl Config {
         }
         if let Some(v) = get(&root, "storage.retention")? {
             cfg.retention = duration(&v).map_err(|e| format!("storage.retention: {e}"))?;
+        }
+        if let Some(v) = get(&root, "ingest.max_request_bytes")? {
+            cfg.max_request_bytes =
+                bytes(&v).map_err(|e| format!("ingest.max_request_bytes: {e}"))?;
         }
         // Peers may be a YAML list or one comma-separated string, because both
         // are natural: a list in a hand-written file, a string from a `${env:}`.
@@ -297,6 +310,33 @@ pub fn duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(n * scale))
 }
 
+/// `4MiB`, `512k`, `1048576`. Binary units, because every other size in this
+/// system — page, block, mmap — is binary and a `MB` that meant 10^6 next to a
+/// block size that meant 2^20 would be a trap.
+pub fn bytes(s: &str) -> Result<usize> {
+    let s = s.trim();
+    let split = s.len()
+        - s.chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .count();
+    let (n, unit) = s.split_at(split);
+    let n: usize = n
+        .trim()
+        .parse()
+        .map_err(|_| format!("{s:?} is not a size like `4MiB` or `1048576`"))?;
+    let shift = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        other => return Err(format!("unknown size unit {other:?} in {s:?}")),
+    };
+    n.checked_shl(shift)
+        .filter(|v| v >> shift == n)
+        .ok_or_else(|| format!("{s:?} overflows a usize"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +423,31 @@ mod tests {
                 .unwrap_err()
                 .contains("unterminated")
         );
+    }
+
+    /// Binary units throughout, and no silent second meaning for `MB`.
+    #[test]
+    fn sizes_parse_in_binary_units_or_not_at_all() {
+        assert_eq!(bytes("1048576"), Ok(1 << 20));
+        assert_eq!(bytes(" 512k "), Ok(512 << 10));
+        assert_eq!(bytes("4MiB"), Ok(4 << 20));
+        // `MB` is the same as `MiB` here rather than 10^6, because a config
+        // where `block: 4MiB` and `request: 4MB` differed by 5% would be read
+        // as equal by everyone.
+        assert_eq!(bytes("4MB"), bytes("4MiB"));
+        assert_eq!(bytes("2g"), Ok(2 << 30));
+
+        assert!(bytes("4 fortnights").unwrap_err().contains("unit"));
+        assert!(bytes("MiB").unwrap_err().contains("size"));
+        assert!(bytes("-1").unwrap_err().contains("size"));
+        // The shift is checked, so a plausible typo is an error and not a wrap
+        // to some small number that then silently truncates every export.
+        assert!(bytes("99999999999g").unwrap_err().contains("overflow"));
+
+        let cfg = Config::parse(r#"{ "ingest": { "max_request_bytes": "32MiB" } }"#).unwrap();
+        assert_eq!(cfg.max_request_bytes, 32 << 20);
+        let e = Config::parse(r#"{ "ingest": { "max_request_bytes": "big" } }"#).unwrap_err();
+        assert!(e.contains("ingest.max_request_bytes"), "{e}");
     }
 
     #[test]

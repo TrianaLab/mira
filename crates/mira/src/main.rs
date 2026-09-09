@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use config::Config;
 
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2] [--version]
+     [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2]
+     [--max-request-bytes SIZE] [--version]
 
 mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
 
@@ -60,6 +61,7 @@ fn load() -> Result<Config, String> {
             "--http" => cfg.http = value()?.parse().map_err(|e| format!("--http: {e}"))?,
             "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
             "--retention" => cfg.retention = config::duration(&value()?)?,
+            "--max-request-bytes" => cfg.max_request_bytes = config::bytes(&value()?)?,
             "--peers" => {
                 cfg.peers = value()?
                     .split(',')
@@ -174,6 +176,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         logs,
         traces,
         metrics,
+        max_request_bytes: cfg.max_request_bytes,
     };
     pipeline::spawn_retention(pcfg);
 
