@@ -1,0 +1,34 @@
+# Mira behind a stock collector, for the end-to-end recipe in docs/TESTING.md.
+#
+# Both containers share a compose network so the collector can resolve `mira`.
+# Running Mira on the host and the collector in Docker does not work on Docker
+# Desktop for Mac — `host.docker.internal` resolves to an IPv6 ULA that is not
+# routable from the container, and the bridge gateway is no better.
+services:
+  mira:
+    build:
+      context: ../..
+    ports:
+      # Published so telemetrygen and curl can reach Mira directly from the
+      # host too, without going through the collector.
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      # A named volume, not a bind mount: Mira mmaps its blocks and a Docker
+      # Desktop bind mount is FUSE, where an I/O hiccup arrives as SIGBUS
+      # rather than an error (docs/ARCHITECTURE.md §9).
+      - mira-data:/data
+
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "14317:4317"
+      - "14318:4318"
+    depends_on:
+      - mira
+
+volumes:
+  mira-data:

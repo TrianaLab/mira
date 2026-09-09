@@ -1,0 +1,5 @@
+# The build stage compiles from source; a host `target/` is several GB of
+# wrong-architecture objects.
+target/
+.git/
+ui/node_modules/
