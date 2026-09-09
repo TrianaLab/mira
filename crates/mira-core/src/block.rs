@@ -422,6 +422,29 @@ pub fn check_filesystem(path: &Path) -> Result<()> {
     })
 }
 
+/// Refuse to start on a data directory that cannot be written to.
+///
+/// `create_dir_all` returns `Ok` for a directory that already exists whatever
+/// its mode, so a read-only mount, a wrong-uid volume or a typo pointing at
+/// someone else's path gets all the way to a listening socket. The first
+/// evidence is then a flush error per export, minutes later, under load, which
+/// reads as a Mira fault rather than as a mount that was never writable — the
+/// same reasoning as [`check_filesystem`], and the same one line in `main`.
+///
+/// The probe carries the pid because replicas may share a directory (§10) and
+/// two of them starting together must not race each other's cleanup.
+pub fn check_writable(path: &Path) -> Result<()> {
+    let probe = path.join(format!(".mira-write-probe-{}", std::process::id()));
+    // The error names the directory, not the probe: the probe is an
+    // implementation detail and nobody should go looking for that filename.
+    let fail = |source| Error::NotWritable {
+        path: path.to_path_buf(),
+        source,
+    };
+    fs::write(&probe, []).map_err(fail)?;
+    fs::remove_file(&probe).map_err(fail)
+}
+
 /// The mount's filesystem type, if it is one of the ones that matter. `None`
 /// means "nothing to say about it", which is every local filesystem.
 fn fs_type(path: &Path) -> Result<Option<String>> {

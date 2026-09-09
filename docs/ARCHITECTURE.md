@@ -866,6 +866,7 @@ corrupts the screen.
 | Reader holds a block being expired | Safe by POSIX unlink semantics (§6). |
 | **SIGTERM / SIGINT** | Stop accepting, let in-flight exports reach their ack, then close the flusher channels so each open block is sealed and published. Bounded at 15 s. |
 | **Network filesystem** | **Not safe, and refused.** mmap on NFS/CIFS/CephFS raises `SIGBUS` with no recovery path. `block::check_filesystem` runs one `statfs` on the data directory before anything is mapped and fails startup with the filesystem named — by `f_fstypename` on macOS, by `f_type` magic on Linux. FUSE warns instead of refusing: the magic is the same for `gcsfuse` (fatal) and a local userspace filesystem (fine). A heap-read fallback was considered and rejected — it would silently delete the property the whole design is built on, which is a worse failure than not starting. |
+| **Unwritable data directory** | **Refused, at startup.** `create_dir_all` returns `Ok` for a directory that already exists whatever its mode, so a `readOnly` volume mount or a wrong-uid path otherwise reaches a listening socket and fails one export at a time under load. `block::check_writable` writes and removes a pid-named probe file next to the `statfs` call. Both are the same bet: a startup that refuses is cheaper to diagnose than a server that half-works. |
 
 **Shutdown is about duplicates, not loss.** A hard kill loses nothing that was
 acknowledged, because an ack *is* an fsync (§4). What it costs is the other

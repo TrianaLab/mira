@@ -50,6 +50,20 @@ pub enum Error {
          emptyDir, not an NFS/CSI network mount)."
     )]
     NetworkFilesystem { path: PathBuf, fs: String },
+
+    /// The data directory exists but cannot be written to. See
+    /// `block::check_writable`.
+    #[error(
+        "{path} is not writable: {source}. Mira writes nowhere else, so this is \
+         fatal at startup rather than degraded at 3am. Check that the mount is \
+         read-write and that this process owns the path (in Kubernetes: a \
+         volume mounted readOnly, or a missing fsGroup)."
+    )]
+    NotWritable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

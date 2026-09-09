@@ -103,7 +103,19 @@ fn tui_source(argv: &[String]) -> Result<tui::Source, String> {
     })
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run() {
+        // Returning the error from `main` would print it with `Debug`, which
+        // for `Error::Io` is a struct dump with `Os { code: 13, .. }` in it and
+        // for `Error::NetworkFilesystem` throws away the paragraph explaining
+        // what to do instead. Everything that reaches here is aimed at whoever
+        // typed the command; they need the sentence, not the struct.
+        eprintln!("mira: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // `mira mira` is the name; `tui` stays because it is what someone types when
     // they have not read the usage, and answering that is cheaper than a
@@ -139,6 +151,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // SIGBUS the first time the server hiccups, and by then there is a process
     // to explain rather than a flag to change.
     mira_core::block::check_filesystem(&cfg.data_dir)?;
+    mira_core::block::check_writable(&cfg.data_dir)?;
 
     let node = mira_core::block::node_id(&cfg.node);
     let (grpc_addr, http_addr) = (cfg.grpc, cfg.http);

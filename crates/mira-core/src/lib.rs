@@ -1268,6 +1268,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The other startup guard. `create_dir_all` says yes to a directory that
+    /// already exists whatever its mode, so without this a read-only data
+    /// directory reaches a listening socket and fails one export at a time.
+    #[test]
+    fn the_write_guard_refuses_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("mira-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        block::check_writable(&dir).unwrap();
+        // And it left nothing behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root defeats the mode bits entirely, so ask the filesystem rather
+        // than assume: where a bare write still succeeds, the guard passing is
+        // the right answer and there is nothing here to assert.
+        if std::fs::write(dir.join("canary"), []).is_err() {
+            let e = block::check_writable(&dir).unwrap_err();
+            assert!(matches!(e, Error::NotWritable { .. }), "{e}");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A directory that is not there at all is a different error, but still
+        // an error rather than a successful start.
+        assert!(block::check_writable(&dir.join("nope")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn corrupt_body_is_caught_not_returned_as_data() {
         let dir = std::env::temp_dir().join(format!("mira-crc-{}", std::process::id()));
