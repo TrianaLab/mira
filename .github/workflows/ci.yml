@@ -57,10 +57,10 @@ jobs:
       # that gets switched off the first time it goes red.
       #
       # Destination is 100. What stands between here and there, worst first:
-      # main.rs (0%, no test drives `serve`), tui/source.rs (44%), pipeline.rs
-      # (57%), term.rs (63%) and mira/src/json.rs (66%) — the last of which is
-      # the OTLP JSON decoder and so the one that matters.
+      # tui/source.rs (44%), term.rs (63%), pipeline.rs (63%) — no test kills a
+      # flusher mid-flight — tui.rs (77%) and query.rs (86%), which is the one
+      # that matters: it is the read path.
       #
       # Run the same thing locally with:
       #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 84
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 88

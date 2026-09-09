@@ -744,3 +744,255 @@ fn summary_points(g: &Yaml) -> R<Vec<SummaryDataPoint>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(text: &str) -> Yaml {
+        crate::api::parse(text).expect("document")
+    }
+
+    /// All five metric kinds in one document, because the five point decoders
+    /// share only their scalar helpers and the read path stores them in five
+    /// different tables — a mistake in one is invisible from the others.
+    ///
+    /// The dialects are mixed on purpose: `dataPoints` next to `data_points`,
+    /// `"9"` next to `9`, an enum by name next to the same enum by number. The
+    /// spec allows all of it within one document and the Collector's marshaler
+    /// produces it.
+    #[test]
+    fn metrics_json_decodes_every_data_point_kind() {
+        use mira_proto::metrics::v1::exemplar;
+
+        let m = metrics(&doc(r#"{
+          "resourceMetrics": [{
+            "resource": {"attributes": [{"key":"service.name","value":{"stringValue":"m"}}],
+                         "droppedAttributesCount": 2},
+            "scopeMetrics": [{
+              "scope": {"name":"s","version":"1",
+                        "attributes":[{"key":"a","value":{"intValue":"1"}}]},
+              "schemaUrl": "https://schemas/1",
+              "metrics": [
+                {"name":"g","unit":"By","description":"a gauge",
+                 "gauge":{"dataPoints":[{"timeUnixNano":"7","asDouble":1.5,
+                   "exemplars":[{"timeUnixNano":"7","asInt":"3",
+                                 "traceId":"AABBCCDDEEFF00112233445566778899",
+                                 "spanId":"1122334455667788",
+                                 "filteredAttributes":[
+                                   {"key":"k","value":{"stringValue":"v"}}]}]}]}},
+                {"name":"c",
+                 "sum":{"data_points":[{"time_unix_nano":8,"as_int":"9","flags":1}],
+                        "aggregation_temporality":2,"is_monotonic":true}},
+                {"name":"h",
+                 "histogram":{"dataPoints":[{"timeUnixNano":"9","count":"3","sum":"6.5",
+                   "bucketCounts":["1","2"],"explicitBounds":[2.5],
+                   "min":"NaN","max":"Infinity"}],
+                   "aggregationTemporality":"AGGREGATION_TEMPORALITY_DELTA"}},
+                {"name":"e",
+                 "exponentialHistogram":{"dataPoints":[{"timeUnixNano":"10","count":"4",
+                   "scale":-1,"zeroCount":"1","zeroThreshold":"1e-9","min":"-Infinity",
+                   "positive":{"offset":2,"bucketCounts":["1","3"]}}],
+                   "aggregationTemporality":1}},
+                {"name":"q",
+                 "summary":{"dataPoints":[{"timeUnixNano":"11","count":"5","sum":12.5,
+                   "quantileValues":[{"quantile":0.99,"value":42.0}]}]}},
+                {"name":"nothing"}
+              ]
+            }]
+          }]
+        }"#))
+        .unwrap();
+
+        let rm = &m.resource_metrics[0];
+        assert_eq!(rm.resource.as_ref().unwrap().dropped_attributes_count, 2);
+        let sm = &rm.scope_metrics[0];
+        assert_eq!(sm.schema_url, "https://schemas/1");
+        assert_eq!(sm.scope.as_ref().unwrap().attributes.len(), 1);
+        let ms = &sm.metrics;
+        assert_eq!(ms.len(), 6);
+
+        let Some(metric::Data::Gauge(g)) = &ms[0].data else {
+            panic!("{:?}", ms[0])
+        };
+        assert_eq!(ms[0].unit, "By");
+        let p = &g.data_points[0];
+        assert_eq!(p.value, Some(number_data_point::Value::AsDouble(1.5)));
+        let ex = &p.exemplars[0];
+        // Hex, uppercase, sixteen bytes. A base64 reader does not fail on a
+        // 32-character hex string — it returns twenty-four bytes of nonsense —
+        // so this is checked as bytes and not as a length.
+        assert_eq!(ex.trace_id[..4], [0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(ex.trace_id.len(), 16);
+        assert_eq!(ex.span_id.len(), 8);
+        assert_eq!(ex.value, Some(exemplar::Value::AsInt(3)));
+        assert_eq!(ex.filtered_attributes[0].key, "k");
+
+        let Some(metric::Data::Sum(sum)) = &ms[1].data else {
+            panic!("{:?}", ms[1])
+        };
+        assert!(sum.is_monotonic);
+        assert_eq!(sum.aggregation_temporality, 2);
+        let p = &sum.data_points[0];
+        assert_eq!(p.time_unix_nano, 8);
+        assert_eq!(p.flags, 1);
+        // `asInt` and `asDouble` are a oneof, and 9 stored as 9.0 is a silent
+        // loss of the producer's choice — the read path has two columns.
+        assert_eq!(p.value, Some(number_data_point::Value::AsInt(9)));
+
+        let Some(metric::Data::Histogram(h)) = &ms[2].data else {
+            panic!("{:?}", ms[2])
+        };
+        assert_eq!(h.aggregation_temporality, 1, "DELTA, spelled by name");
+        let p = &h.data_points[0];
+        assert_eq!(p.count, 3);
+        assert_eq!(p.sum, Some(6.5));
+        assert_eq!(p.bucket_counts, [1, 2]);
+        assert_eq!(p.explicit_bounds, [2.5]);
+        // The three specials are strings in proto3 JSON; a number reader that
+        // did not know that would either error or store zero.
+        assert!(p.min.unwrap().is_nan());
+        assert_eq!(p.max, Some(f64::INFINITY));
+
+        let Some(metric::Data::ExponentialHistogram(e)) = &ms[3].data else {
+            panic!("{:?}", ms[3])
+        };
+        let p = &e.data_points[0];
+        assert_eq!(p.scale, -1);
+        assert_eq!(p.zero_count, 1);
+        assert_eq!(p.zero_threshold, 1e-9);
+        assert_eq!(p.min, Some(f64::NEG_INFINITY));
+        let pos = p.positive.as_ref().unwrap();
+        assert_eq!(pos.offset, 2);
+        assert_eq!(pos.bucket_counts, [1, 3]);
+        // Absent is `None`, not an empty bucket set: one means "no negative
+        // side was reported" and the other means "it was, and it was empty".
+        assert!(p.negative.is_none());
+
+        let Some(metric::Data::Summary(q)) = &ms[4].data else {
+            panic!("{:?}", ms[4])
+        };
+        let p = &q.data_points[0];
+        assert_eq!(p.count, 5);
+        assert_eq!(p.sum, 12.5);
+        assert_eq!(p.quantile_values[0].quantile, 0.99);
+        assert_eq!(p.quantile_values[0].value, 42.0);
+
+        // A metric carrying no data is legal on the wire. It encodes to no rows,
+        // which is not the same as being a bad request.
+        assert!(ms[5].data.is_none());
+    }
+
+    /// The readers under all three signals: lenient in the directions proto3
+    /// JSON is, and refusing exactly the inputs whose lenient reading would
+    /// store the wrong bytes.
+    #[test]
+    fn the_scalar_readers_are_strict_only_where_leniency_would_lose_data() {
+        let y = |t: &str| doc(&format!("{{\"v\":{t}}}"))["v"].clone();
+        let none = Yaml::BadValue;
+
+        // Ids: either case, and a wrong length is an error rather than a
+        // truncation, because a truncated id joins to nothing and never says so.
+        assert_eq!(
+            hex(&y(r#""AaBbCcDd00112233""#), 8, "id").unwrap()[..],
+            [0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x11, 0x22, 0x33]
+        );
+        assert!(hex(&none, 8, "id").unwrap().is_empty());
+        assert!(hex(&y(r#""""#), 8, "id").unwrap().is_empty());
+        assert!(
+            hex(&y(r#""abcd""#), 8, "id")
+                .unwrap_err()
+                .contains("expected 16 hex characters, got 4")
+        );
+        assert!(
+            hex(&y(r#""zzzzzzzzzzzzzzzz""#), 8, "id")
+                .unwrap_err()
+                .contains("is not hex")
+        );
+        assert!(hex(&y("17"), 8, "id").unwrap_err().contains("hex string"));
+
+        // Every other `bytes` field really is base64, and the URL-safe alphabet
+        // costs two match arms against a dropped attribute value.
+        assert_eq!(base64(&y(r#""aGVsbG8=""#), "b").unwrap()[..], b"hello"[..]);
+        assert_eq!(
+            base64(&y(r#""-_8=""#), "b").unwrap()[..],
+            [0xfb, 0xff],
+            "URL-safe"
+        );
+        assert!(base64(&y("3"), "b").unwrap().is_empty());
+        assert!(base64(&y(r#""!!""#), "b").unwrap_err().contains("base64"));
+
+        // Integers: a JSON number or the proto3 default of a string, and above
+        // `i64::MAX` only the unsigned reader is correct.
+        assert_eq!(int(&y(r#""-5""#), "n").unwrap(), -5);
+        assert_eq!(int(&none, "n").unwrap(), 0);
+        assert_eq!(int(&y(r#""""#), "n").unwrap(), 0);
+        assert_eq!(
+            uint(&y(r#""18446744073709551615""#), "n").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(uint(&y("-1"), "n").unwrap(), 0, "clamped, not wrapped");
+        assert!(int(&y("[1]"), "n").unwrap_err().contains("expected an int"));
+        assert!(
+            int(&y(r#""x""#), "n")
+                .unwrap_err()
+                .contains("not an integer")
+        );
+        assert!(u32f(&y(r#""4294967296""#), "n").unwrap_err().contains("32"));
+        assert!(i32f(&y(r#""2147483648""#), "n").unwrap_err().contains("32"));
+
+        // Doubles, including the three the spec spells as strings.
+        assert_eq!(float(&y("1.5"), "d").unwrap(), 1.5);
+        assert_eq!(float(&y(r#""1e-9""#), "d").unwrap(), 1e-9);
+        assert_eq!(float(&none, "d").unwrap(), 0.0);
+        assert_eq!(float(&y(r#""""#), "d").unwrap(), 0.0);
+        assert!(float(&y(r#""NaN""#), "d").unwrap().is_nan());
+        assert!(
+            float(&y(r#""x""#), "d")
+                .unwrap_err()
+                .contains("not a number")
+        );
+        assert!(
+            float(&y("[1]"), "d")
+                .unwrap_err()
+                .contains("expected a num")
+        );
+
+        // Enums by name, by number, and by number-in-a-string.
+        assert_eq!(
+            enumerate(&y(r#""AGGREGATION_TEMPORALITY_DELTA""#), &TEMPORALITY, "t").unwrap(),
+            1
+        );
+        assert_eq!(enumerate(&y("2"), &TEMPORALITY, "t").unwrap(), 2);
+        assert_eq!(enumerate(&y(r#""2""#), &TEMPORALITY, "t").unwrap(), 2);
+        assert_eq!(enumerate(&none, &TEMPORALITY, "t").unwrap(), 0);
+        assert!(
+            enumerate(&y(r#""NOPE""#), &TEMPORALITY, "t")
+                .unwrap_err()
+                .contains("not a known")
+        );
+
+        // AnyValue: the two nested kinds, and the empty one OTLP uses for an
+        // attribute whose value the SDK dropped.
+        let av = any_value(&y(
+            r#"{"arrayValue":{"values":[{"stringValue":"a"},{"intValue":"2"},{}]}}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let Some(mira_proto::common::v1::any_value::Value::ArrayValue(a)) = av.value else {
+            panic!("{av:?}")
+        };
+        assert_eq!(a.values.len(), 3);
+        assert!(a.values[2].value.is_none(), "`{{}}` is a valid AnyValue");
+        let av = any_value(&y(
+            r#"{"kvlist_value":{"values":[{"key":"k","value":{"bool_value":true}}]}}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let Some(mira_proto::common::v1::any_value::Value::KvlistValue(l)) = av.value else {
+            panic!("{av:?}")
+        };
+        assert_eq!(l.values[0].key, "k");
+        assert!(any_value(&none).unwrap().is_none());
+    }
+}

@@ -42,7 +42,11 @@ fn load() -> Result<Config, String> {
         println!("mira {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
+    load_from(argv)
+}
 
+/// [`load`] without the two flags that end the process, so it can be called.
+fn load_from(argv: Vec<String>) -> Result<Config, String> {
     // The file has to be read first so flags can override it.
     let mut cfg = match argv.iter().position(|a| a == "--config") {
         Some(i) => Config::load(Path::new(argv.get(i + 1).ok_or("--config needs a value")?))?,
@@ -148,6 +152,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    serve_with(cfg, shutdown()).await
+}
+
+/// The server proper, with its stop edge passed in rather than taken from the
+/// process. A test can hold that edge; nothing else needs to.
+async fn serve_with(
+    cfg: Config,
+    stop_signal: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     // Before anything is mapped. A network mount is not a slow start, it is a
     // SIGBUS the first time the server hiccups, and by then there is a process
@@ -223,7 +236,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         r = &mut grpc => r??,
         r = &mut http => r??,
-        _ = shutdown() => tracing::info!("draining"),
+        _ = stop_signal => tracing::info!("draining"),
     }
 
     // Shutdown is three ordered steps and the order is the whole point.
@@ -279,4 +292,170 @@ async fn shutdown() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mira-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Flag > file > default, and every flag lands in the field it names.
+    ///
+    /// This parser is hand-rolled, and the failure it can produce is the quiet
+    /// kind: a flag written into the wrong field starts a server that looks
+    /// exactly right until someone reads a block from the wrong directory.
+    #[test]
+    fn flags_override_the_file_which_overrides_the_defaults() {
+        let dir = tmp("load");
+        let file = dir.join("mira.yaml");
+        std::fs::write(
+            &file,
+            r#"{ "node": "from-file",
+                 "listen": { "grpc": "127.0.0.1:1", "http": "127.0.0.1:2" },
+                 "storage": { "dir": "/from/file", "retention": "3h" },
+                 "ingest": { "max_request_bytes": "1MiB" } }"#,
+        )
+        .unwrap();
+        let f = file.display();
+
+        let c = load_from(argv(&format!("--config {f}"))).unwrap();
+        assert_eq!(c.node, "from-file");
+        assert_eq!(c.data_dir, PathBuf::from("/from/file"));
+        assert_eq!(c.retention, std::time::Duration::from_secs(3 * 3600));
+        assert_eq!(c.max_request_bytes, 1 << 20);
+        assert_eq!(c.http.port(), 2);
+
+        // The same file, every value overridden. `--config` is seen twice — once
+        // to find the file and once by the loop, which must consume its value
+        // rather than read it as a flag.
+        let c = load_from(argv(&format!(
+            "--config {f} --node cli --grpc 127.0.0.1:3 --http 127.0.0.1:4 \
+             --data-dir /from/cli --retention 30s --max-request-bytes 2MiB \
+             --peers a:1,,b:2,"
+        )))
+        .unwrap();
+        assert_eq!(c.node, "cli");
+        assert_eq!(c.grpc.port(), 3);
+        assert_eq!(c.http.port(), 4);
+        assert_eq!(c.data_dir, PathBuf::from("/from/cli"));
+        assert_eq!(c.retention, std::time::Duration::from_secs(30));
+        assert_eq!(c.max_request_bytes, 2 << 20);
+        // Empty entries are dropped, so a trailing comma is not a peer named "".
+        assert_eq!(c.peers, ["a:1", "b:2"]);
+
+        // No arguments at all is the shipped configuration.
+        let d = load_from(vec![]).unwrap();
+        assert_eq!(d.node, Config::default().node);
+
+        for (args, want) in [
+            ("--nope", "unknown flag --nope"),
+            ("--node", "--node needs a value"),
+            ("--config", "--config needs a value"),
+            ("--grpc nope", "--grpc:"),
+            ("--http nope", "--http:"),
+            ("--retention nope", "not a duration"),
+            ("--max-request-bytes nope", "not a size"),
+            ("--config /no/such/file.yaml", "/no/such/file.yaml"),
+        ] {
+            let e = load_from(argv(args)).unwrap_err();
+            assert!(e.contains(want), "{args:?} said {e:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mira mira` reads the directory the matching `mira serve` would write to,
+    /// which is the whole reason it takes `--config` at all.
+    #[test]
+    fn the_tui_reads_the_directory_its_config_writes_to() {
+        let dir = tmp("tui-src");
+        let file = dir.join("mira.yaml");
+        std::fs::write(&file, r#"{ "storage": { "dir": "/from/file" } }"#).unwrap();
+        let f = file.display();
+
+        let local = |a: &str| {
+            let Ok(tui::Source::Local(p)) = tui_source(&argv(a)) else {
+                panic!("expected a local source for {a:?}")
+            };
+            p
+        };
+        assert_eq!(local(&format!("--config {f}")), PathBuf::from("/from/file"));
+        assert_eq!(
+            local(&format!("--config {f} --data-dir /from/cli")),
+            PathBuf::from("/from/cli")
+        );
+        assert_eq!(local(""), Config::default().data_dir);
+
+        // `--addr` wins outright: a remote source has no directory to read.
+        let tui::Source::Remote(a) = tui_source(&argv("--addr host:9999")).unwrap() else {
+            panic!("expected a remote source")
+        };
+        assert_eq!(a, "host:9999");
+
+        for (args, want) in [
+            ("--nope", "unknown flag --nope"),
+            ("--data-dir", "--data-dir needs a value"),
+            ("--config", "--config needs a value"),
+        ] {
+            let Err(e) = tui_source(&argv(args)) else {
+                panic!("{args:?} was accepted")
+            };
+            assert!(e.contains(want), "{args:?} said {e:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Start everything, then stop it.
+    ///
+    /// The assertion is that this returns at all. Shutdown is three ordered
+    /// steps — stop accepting, await the servers so the last `Ingest` clone
+    /// drops, then let each flusher seal what it holds — and if any link in that
+    /// chain is wrong the drain never completes and the 15s timeout fires. It
+    /// also proves the two listeners and the retention worker start from a
+    /// `Config` alone, which is the one thing `e2e.rs` cannot say: it builds the
+    /// router itself.
+    #[tokio::test]
+    async fn the_server_starts_from_a_config_and_drains_when_stopped() {
+        let dir = tmp("serve");
+        let cfg = Config {
+            data_dir: dir.join("data"),
+            grpc: "127.0.0.1:0".parse().unwrap(),
+            http: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
+        };
+        let t = std::time::Instant::now();
+        serve_with(cfg.clone(), std::future::ready(()))
+            .await
+            .unwrap();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(15),
+            "timed out"
+        );
+        // Created, not required to exist: an operator points `--data-dir` at a
+        // path and expects the first start to make it.
+        assert!(cfg.data_dir.is_dir());
+
+        // A port already taken is reported, not survived. This is the arm that
+        // turns "mira is running" into a process that answers nothing.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = Config {
+            http: held.local_addr().unwrap(),
+            ..cfg
+        };
+        let e = serve_with(taken, std::future::pending())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.to_lowercase().contains("address"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
