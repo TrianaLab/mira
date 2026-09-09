@@ -481,12 +481,20 @@ mod tests {
             vec![Key::Char('j'), Key::Char('k'), Key::Enter, Key::Backspace]
         );
         assert_eq!(keys(b"\x03"), vec![Key::Ctrl('c')]);
-        // Split mid-sequence: nothing until the rest lands.
+        // Split mid-sequence: nothing until the rest lands. Both prefixes, since
+        // CSI and SS3 have separate "could still grow" arms.
         assert_eq!(keys(b"\x1b["), vec![]);
         assert_eq!(keys(b"C"), vec![Key::Right]);
-        // Multi-byte UTF-8, likewise.
+        assert_eq!(keys(b"\x1bO"), vec![]);
+        assert_eq!(keys(b"A"), vec![Key::Up]);
+        // Multi-byte UTF-8, likewise, at every lead-byte width — the width is
+        // read off the lead byte, so a wrong row in that table eats the next key.
         assert_eq!(keys(&[0xc3]), vec![]);
         assert_eq!(keys(&[0xa9]), vec![Key::Char('é')]);
+        assert_eq!(keys(&[0xe2, 0x82]), vec![]);
+        assert_eq!(keys(&[0xac]), vec![Key::Char('€')]);
+        assert_eq!(keys(&[0xf0, 0x9f, 0x98]), vec![]);
+        assert_eq!(keys(&[0x80]), vec![Key::Char('😀')]);
     }
 
     /// Every sequence in the `csi` table, because terminals disagree about which
@@ -581,15 +589,9 @@ mod tests {
         assert!(s.ends_with(&format!("{REV}    {RESET}")), "{s:?}");
     }
 
-    /// The syscall half of this file — `enter`, `size`, `draw`, `key`, `restore`
-    /// — needs a pty, and a test that took one would put the runner's own
-    /// terminal into raw mode. The guard that keeps it from trying is testable,
-    /// and it is the branch that actually fires in anger: `mira mira` in a
-    /// pipeline, in CI, or under a process supervisor.
-    ///
-    /// ponytail: the rest is covered by driving the real binary under
-    /// `script -q /dev/null` — see CLAUDE.md. Worth automating when the TUI's
-    /// input handling grows past `parse`.
+    /// The branch that fires in anger: `mira mira` in a pipeline, in CI, or
+    /// under a process supervisor. The rest of the syscall half runs on a real
+    /// pty in [`the_terminal_half_runs_against_a_real_pty`].
     #[test]
     fn the_tui_refuses_a_stdin_that_is_not_a_terminal() {
         let Err(e) = Term::enter() else {
@@ -614,5 +616,164 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The name of the test below, as `--exact` wants it.
+    const SELF: &str = "term::tests::the_terminal_half_runs_against_a_real_pty";
+
+    /// Everything in this file that talks to a terminal, against a terminal.
+    ///
+    /// `enter`, `size`, `draw`, `key`, `poll_in` and `restore` all address fd 0
+    /// and fd 1 directly, so the only honest way to run them is on a process
+    /// whose fd 0 and fd 1 are a tty — and it must not be *this* process, whose
+    /// stdin belongs to the test runner and whose termios the runner needs back.
+    ///
+    /// So: open a pty, re-exec this same test binary against the slave side, and
+    /// drive it from the master. The child is the same instrumented binary, so
+    /// its coverage counts; `cargo llvm-cov` merges the profraw it writes.
+    ///
+    /// This is CLAUDE.md's `script -q /dev/null` recipe with the pty opened in
+    /// process, which is what makes it a test rather than a thing to run by hand.
+    #[test]
+    fn the_terminal_half_runs_against_a_real_pty() {
+        if std::env::var_os("MIRA_PTY_CHILD").is_some() {
+            return on_the_pty();
+        }
+        use std::os::fd::FromRawFd;
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "{}", io::Error::last_os_error());
+        assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        let slave_path = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&slave_path)
+            .unwrap();
+        // A size the child can assert on, so `size` is checked against something
+        // it cannot have made up. Set on the slave: macOS refuses TIOCSWINSZ on
+        // a master with no slave open yet.
+        let ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&slave);
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", SELF, "--nocapture"])
+            .env("MIRA_PTY_CHILD", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            // Not the pty: the child's failures have to come back over a channel
+            // the child cannot also be scribbling frames onto.
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(slave);
+
+        let mut rd = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut wr = rd.try_clone().unwrap();
+        let screen = Arc::new(Mutex::new(String::new()));
+        let sink = screen.clone();
+        // Drained on a thread: a child that fills the pty buffer while this side
+        // is blocked writing to it is a deadlock, not a slow test.
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = rd.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+
+        let arrived = |marker: &str| {
+            (0..600).any(|_| {
+                if screen.lock().unwrap().contains(marker) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            })
+        };
+
+        // Every keystroke waits for the marker the child draws once it has
+        // consumed the previous one. Not politeness: a lone Esc only resolves as
+        // Esc because the 20ms grace period finds no byte behind it, so an Esc
+        // written while `x` is still in the buffer arrives as Alt+x.
+        let mut child = child;
+        let stalled = [
+            ("mira-pty-ready", &b"\x1b[B"[..]),
+            ("mira-pty-down", b"x"),
+            ("mira-pty-x", b"\x1b"),
+        ]
+        .into_iter()
+        .find(|(marker, keys)| !arrived(marker) || wr.write_all(keys).is_err())
+        .map(|(marker, _)| marker);
+        if stalled.is_some() {
+            // Otherwise it sits in `poll_in(-1)` for the rest of the afternoon.
+            let _ = child.kill();
+        }
+
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        let screen = screen.lock().unwrap().clone();
+        // The child signs off by panicking on purpose, so any *other* panic is a
+        // failed assertion and this is where it gets read out.
+        assert!(
+            stalled.is_none() && err.contains("mira-pty-done"),
+            "child stalled at {stalled:?}: {err}\nscreen:\n{screen:?}"
+        );
+        // The frame reached the terminal, cursor-homed and erased behind itself.
+        assert!(screen.contains("\x1b[H"), "{screen:?}");
+        assert!(screen.contains("mira-pty-ready\x1b[K\r\n"), "{screen:?}");
+        // ...and the panic hook handed the terminal back: cursor on, alternate
+        // screen off. Without it the user's shell is left in raw mode.
+        assert!(screen.contains("\x1b[?25h\x1b[?1049l"), "{screen:?}");
+    }
+
+    /// The child of the test above. Panics are the failure channel: they land on
+    /// the piped stderr and the exit status carries them back.
+    fn on_the_pty() {
+        let mut t = Term::enter().expect("stdin and stdout are the pty slave");
+        assert_eq!(t.size(), (120, 40), "the size the parent set");
+
+        // Before the first marker, so the parent provably has not typed yet: the
+        // timeout expires and says so, rather than returning a key nobody
+        // pressed. After a marker it would be a race the parent usually wins.
+        assert_eq!(t.key(30).unwrap(), None, "empty poll");
+
+        // Each marker is both a frame to assert on and the parent's cue to send
+        // the next key. See the write loop above for why they interleave.
+        t.draw(&["mira-pty-ready".into(), "second row".into()])
+            .unwrap();
+        assert_eq!(t.key(-1).unwrap(), Some(Key::Down));
+        t.draw(&["mira-pty-down".into()]).unwrap();
+        assert_eq!(t.key(-1).unwrap(), Some(Key::Char('x')));
+        t.draw(&["mira-pty-x".into()]).unwrap();
+        // The lone Esc, which only resolves because the grace period ran out.
+        assert_eq!(t.key(-1).unwrap(), Some(Key::Esc));
+
+        // A panic, on purpose, as the last act: the promise `enter` makes by
+        // installing a hook is that a crash still gives you your terminal back,
+        // and the only way to check it is to crash. The parent looks for this
+        // exact message, so a real assertion failure above still reads as one.
+        panic!("mira-pty-done");
     }
 }

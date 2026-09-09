@@ -57,10 +57,10 @@ jobs:
       # that gets switched off the first time it goes red.
       #
       # Destination is 100. What stands between here and there, worst first:
-      # term.rs (74%, 92 lines) is the syscall half — enter, size, draw, key,
-      # restore — and needs a pty; main.rs (78%, 64) is mostly the `mira mira`
-      # arm that calls it; block.rs (85%, 59) is the I/O error paths.
+      # main.rs (78%, 64 lines) is the subcommand wiring, mostly the `mira mira`
+      # arm; block.rs (85%, 59) is the I/O error paths; then series.rs (93%, 30)
+      # and metrics.rs (94%, 28).
       #
       # Run the same thing locally with:
       #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 94
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 95
