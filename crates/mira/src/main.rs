@@ -143,6 +143,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "mira=info,mira_core=info".into()),
         )
+        // Colour only for a terminal. `with_ansi` defaults to on and does not
+        // check, so without this every field name in every line reaches a log
+        // file, a collector, or an agent wrapped in escape codes.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -209,6 +213,11 @@ async fn serve_with(
     );
 
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
+    // The bound address, not the requested one. `--http 127.0.0.1:0` is a real
+    // thing to ask for and the line below is the only place the chosen port is
+    // ever written down. tonic binds its own socket out of reach, so the gRPC
+    // half of that line cannot say the same and a `:0` there stays a `:0`.
+    let http_addr = listener.local_addr()?;
     // One listener for all of it: `/v1/*` is OTLP in, `/api/v1/*` is query out,
     // `/mcp` is the agent surface, `/` and `/{file}` are the UI. The UI's
     // wildcard is one segment deep, so it cannot swallow any of the others.

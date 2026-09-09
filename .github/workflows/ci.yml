@@ -57,10 +57,10 @@ jobs:
       # that gets switched off the first time it goes red.
       #
       # Destination is 100. What stands between here and there, worst first:
-      # main.rs (78%, 64 lines) is the subcommand wiring, mostly the `mira mira`
-      # arm; block.rs (85%, 59) is the I/O error paths; then series.rs (93%, 30)
-      # and metrics.rs (94%, 28).
+      # block.rs (85%, 59 lines) is the I/O error paths; series.rs (93%, 30) and
+      # metrics.rs (94%, 28) are the arms no fixture reaches yet; receiver.rs
+      # (89%, 18) is decode failures.
       #
       # Run the same thing locally with:
       #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 95
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 96
