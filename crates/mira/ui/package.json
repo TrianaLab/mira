@@ -8,7 +8,7 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "svelte": "^5.39.5",
     "vite": "^7.1.7"
   }
