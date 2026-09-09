@@ -96,6 +96,32 @@ struct Series {
     exemplars: Vec<(i64, String)>,
 }
 
+impl Series {
+    /// Discard all but the newest `max` points.
+    ///
+    /// Which points a cap keeps is a correctness question, not a tuning one.
+    /// Points arrive in block-scan order, so refusing them once the buffer is
+    /// full kept whichever ones the directory listing happened to reach first
+    /// — an arbitrary subset that the sort at render time then dressed up as a
+    /// contiguous series. Newest-wins is the same rule `limit` already uses on
+    /// the record side, and it is a window a reader can reason about.
+    ///
+    /// Called at twice `max`, so every call throws away half of what it sorts
+    /// and the amortised cost is constant per point. A bounded heap would hold
+    /// exactly `max` at all times and pay `log max` on every point instead;
+    /// at these sizes the occasional sort is cheaper and much less code.
+    ///
+    /// ponytail: truncation, not downsampling. A chart that needs the whole
+    /// range at a lower resolution needs an aggregation window — until that
+    /// exists the response says `dropped_points` rather than pretending.
+    fn compact(&mut self, max: usize) {
+        // Descending, so `truncate` keeps the newest.
+        self.points.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
+        self.dropped += self.points.len() - max;
+        self.points.truncate(max);
+    }
+}
+
 /// Exemplars kept per series.
 ///
 /// An exemplar is one sampled measurement per collection interval per bucket,
@@ -139,6 +165,16 @@ pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
         collect_block(bref, q, &mut out, &mut stats)?;
     }
 
+    // The last compaction of each series, and the only one for a series that
+    // never reached the trigger. Sorting ascending here as well means the
+    // render below reads `points` directly instead of cloning it.
+    for s in out.values_mut() {
+        if s.points.len() > q.max_points {
+            s.compact(q.max_points);
+        }
+        s.points.sort_unstable_by_key(|p| p.0);
+    }
+
     // Sorted by key so two identical queries produce byte-identical responses.
     // An ETag, a diff and a cache all depend on that, and a HashMap iteration
     // order does not provide it.
@@ -150,8 +186,7 @@ pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
     j.arr(|j| {
         for k in keys {
             let s = &out[k];
-            let mut pts = s.points.clone();
-            pts.sort_unstable_by_key(|p| p.0);
+            let pts = &s.points;
             j.obj(|j| {
                 j.raw(&s.desc);
                 j.key("attributes");
@@ -162,7 +197,7 @@ pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
                 }
                 j.key("points");
                 j.arr(|j| {
-                    for (ts, v) in pts {
+                    for &(ts, v) in pts {
                         j.arr(|j| {
                             j.i64(ts);
                             match v {
@@ -467,10 +502,9 @@ fn collect_block(
                     dropped: 0,
                     exemplars: Vec::new(),
                 });
-                if s.points.len() >= q.max_points {
-                    s.dropped += 1;
-                } else {
-                    s.points.push((time[r], v));
+                s.points.push((time[r], v));
+                if s.points.len() >= 2 * q.max_points {
+                    s.compact(q.max_points);
                 }
                 // A histogram yields two derived series from one point, and its
                 // exemplars belong to both: whichever of `.count` and `.sum` is

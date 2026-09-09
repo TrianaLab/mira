@@ -484,6 +484,32 @@ async fn a_metric_series_survives_being_split_across_two_blocks() {
     );
     assert!(body.contains(r#""blocks_scanned":2"#), "{body}");
 
+    // `max_points` has to cut a *window*, not a sample. Points arrive in
+    // block-scan order, so a cap applied as "refuse once full" kept whichever
+    // ones the directory listing reached first and the sort at render time
+    // then presented that arbitrary subset as a contiguous series. Newest
+    // wins, which is the rule `limit` already uses on the record side.
+    let (status, capped) = post(
+        &app,
+        "/api/v1/metrics/query",
+        "application/json",
+        br#"{"name":"http.server.requests","from":0,"to":100000,"max_points":2}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{capped}");
+    assert!(capped.contains("[5000,5000],[5001,5001]"), "{capped}");
+    assert!(capped.contains("[5000,5100],[5001,5101]"), "{capped}");
+    assert!(
+        !capped.contains("[1000,"),
+        "the older half must be gone\n{capped}"
+    );
+    // And it says so, rather than returning a short series that looks whole.
+    assert_eq!(
+        capped.matches(r#""dropped_points":2"#).count(),
+        2,
+        "{capped}"
+    );
+
     // A filter on a resource attribute and one on a point attribute have to work
     // the same way, even though they live three tables apart.
     let (_, only_post) = post(
