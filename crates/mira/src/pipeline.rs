@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use mira_core::SignalBuilder;
@@ -60,12 +61,13 @@ impl Default for Config {
 
 struct Job<R> {
     req: R,
-    ack: oneshot::Sender<Result<(), String>>,
+    ack: oneshot::Sender<Result<(), Rejected>>,
 }
 
 /// The write handle for one signal. `R` is that signal's OTLP export request.
 pub struct Ingest<R> {
     tx: mpsc::Sender<Job<R>>,
+    rejects: &'static Rejects,
 }
 
 // Derived `Clone` would demand `R: Clone`, which no export request is. Only the
@@ -74,21 +76,91 @@ impl<R> Clone for Ingest<R> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            rejects: self.rejects,
         }
     }
 }
 
-/// Why an export could not be admitted. Neither of these is a partial success:
+/// Why an export could not be admitted. None of these is a partial success:
 /// OTLP forbids the client from retrying a partial success, so reporting
 /// overload that way permanently destroys the data and blames the sender.
+///
+/// The split between the last two is the whole of the failure contract. OTLP's
+/// retryable set is closed — gRPC `UNAVAILABLE` and friends, HTTP 429/502/503/504
+/// — and an exporter handed anything outside it drops the batch on the floor. So
+/// "we could not write it, try again" and "this export can never be written"
+/// cannot share a variant, however similar they look from inside the flusher.
 pub enum Rejected {
     /// Queue full. Transient; retry.
     Busy,
     /// The engine is shutting down.
     Closed,
-    /// Durable write failed.
+    /// The block this export was in did not become durable — a full disk, an
+    /// EIO, a flush task that panicked. Nothing about the export caused it and
+    /// the next one may well land, so it is answered like [`Rejected::Busy`].
+    Unavailable(String),
+    /// This export can never be stored: it does not fit an empty block. A retry
+    /// produces the same answer, so the client must be told not to send one.
     Failed(String),
 }
+
+/// Exports that were not stored, per signal, since start.
+///
+/// Two counters and one warn a second, not a metrics subsystem. An exporter
+/// being NACKed already logs Mira's own reason on its side; what only the server
+/// can say is the *rate* and how long it has been going on, which is what an
+/// operator reads out of `/health` (see `main::health`) when deciding whether to
+/// grow the disk or the node.
+///
+/// Static because `/health` needs all three signals at once and nothing else
+/// ever reads them: threading a handle per signal through two routers to reach
+/// one probe would be more plumbing than two numbers are worth.
+pub struct Rejects {
+    /// The signal these count for, so `/health` can name them.
+    pub signal: &'static str,
+    /// Exports refused before the queue, because it was full.
+    pub shed: AtomicU64,
+    /// Exports accepted and then NACKed, because the write did not land.
+    pub failed: AtomicU64,
+    /// Unix second of the last shed warning. A node that is shedding sheds
+    /// thousands of exports a second, and the log line is worth exactly one of
+    /// them: the rest is in the counter.
+    warned: AtomicU64,
+}
+
+impl Rejects {
+    const fn new(signal: &'static str) -> Self {
+        Self {
+            signal,
+            shed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            warned: AtomicU64::new(0),
+        }
+    }
+
+    fn record_shed(&self) {
+        self.shed.fetch_add(1, Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // `swap`, so of the many threads shedding in the same second exactly one
+        // sees the old value and logs.
+        if self.warned.swap(now, Relaxed) != now {
+            tracing::warn!(
+                signal = self.signal,
+                "ingest queue full; shedding exports (senders are told to retry)"
+            );
+        }
+    }
+}
+
+/// Parallel to [`SIGNALS`].
+pub static REJECTS: [Rejects; SIGNALS.len()] = [
+    Rejects::new(SIGNALS[0]),
+    Rejects::new(SIGNALS[1]),
+    Rejects::new(SIGNALS[2]),
+];
 
 impl<R> Ingest<R> {
     /// Enqueue and wait for durability. Returns as soon as the block containing
@@ -99,13 +171,22 @@ impl<R> Ingest<R> {
         // difference between a fast NACK and an unbounded latency tail.
         let permit = match self.tx.try_reserve() {
             Ok(p) => p,
-            Err(mpsc::error::TrySendError::Full(())) => return Err(Rejected::Busy),
+            Err(mpsc::error::TrySendError::Full(())) => {
+                self.rejects.record_shed();
+                return Err(Rejected::Busy);
+            }
             Err(mpsc::error::TrySendError::Closed(())) => return Err(Rejected::Closed),
         };
         permit.send(Job { req, ack });
         match wait.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(Rejected::Failed(e)),
+            // One counter for both refusals after acceptance: the difference
+            // between them is the status code, and the number an operator wants
+            // is "how much did not get stored".
+            Ok(Err(r)) => {
+                self.rejects.failed.fetch_add(1, Relaxed);
+                Err(r)
+            }
             Err(_) => Err(Rejected::Closed),
         }
     }
@@ -126,7 +207,11 @@ pub const SIGNALS: [&str; 3] = ["logs", "traces", "metrics"];
 /// those waiters.
 pub fn spawn<B: SignalBuilder>(cfg: Arc<Config>) -> (Ingest<B::Request>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(128);
-    (Ingest { tx }, tokio::spawn(flusher::<B>(rx, cfg)))
+    let rejects = REJECTS
+        .iter()
+        .find(|r| r.signal == B::SIGNAL)
+        .expect("every signal that has a builder has a counter slot");
+    (Ingest { tx, rejects }, tokio::spawn(flusher::<B>(rx, cfg)))
 }
 
 /// One sweep for all signals, not one per signal: retention is IO against the
@@ -154,7 +239,7 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
     };
 
     let mut builder = B::default();
-    let mut waiters: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+    let mut waiters: Vec<oneshot::Sender<Result<(), Rejected>>> = Vec::new();
     let mut batch = Vec::with_capacity(64);
     // Jobs that did not fit the open block. They go into the next one, so a full
     // dictionary costs a slightly small block and never costs a caller its data.
@@ -236,7 +321,10 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
                     if empty {
                         let _ = builder.finish();
                     }
-                    let _ = job.ack.send(Err(e.to_string()));
+                    // The only permanent refusal in the pipeline: this request
+                    // did not fit a block with nothing in it, so no retry of it
+                    // ever will.
+                    let _ = job.ack.send(Err(Rejected::Failed(e.to_string())));
                 }
             }
         }
@@ -256,7 +344,10 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
             Err(e) => {
                 let msg = e.to_string();
                 for w in waiters.drain(..) {
-                    let _ = w.send(Err(msg.clone()));
+                    // Whose export broke the encoder is not knowable from here,
+                    // so nobody is blamed permanently: everyone is told to send
+                    // it again.
+                    let _ = w.send(Err(Rejected::Unavailable(msg.clone())));
                 }
                 // `finish` leaves a fresh builder behind even when it fails, so
                 // there is nothing to repair here — see `SignalBuilder::finish`.
@@ -280,11 +371,19 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
                 tracing::info!(signal = B::SIGNAL, rows, seq = this_seq, path = %path.display(), "block published");
                 Ok(())
             }
-            Ok(Err(e)) => Err(e.to_string()),
+            // Logged here and not only counted: a disk that filled up at 02:00
+            // is the one fact that explains every NACK the senders are about to
+            // report, and it is invisible from their side.
+            Ok(Err(e)) => {
+                tracing::error!(signal = B::SIGNAL, seq = this_seq, error = %e, "block not published");
+                Err(e.to_string())
+            }
             Err(e) => Err(format!("flush task panicked: {e}")),
         };
         for w in waiters.drain(..) {
-            let _ = w.send(outcome.clone());
+            // Every failure here is the block's, not any one caller's, so they
+            // all get a retryable answer.
+            let _ = w.send(outcome.clone().map_err(Rejected::Unavailable));
         }
         deadline = Instant::now() + cfg.max_block_age;
     }
@@ -420,12 +519,16 @@ mod tests {
     async fn an_impossible_request_fails_only_itself() {
         let (c, dir) = cfg("toowide");
         let (tx, h) = spawn::<LogsBuilder>(c);
+        let before = tx.rejects.failed.load(Relaxed);
+        // `Failed`, not `Unavailable`: this one is permanent, and the receiver
+        // turns the two into statuses an exporter treats differently.
         match tx.submit(wide(70_000)).await {
             Err(Rejected::Failed(e)) => {
                 assert!(e.contains("65535") || e.contains("dictionary"), "{e}")
             }
             _ => panic!("70k distinct keys cannot fit a u16 dictionary"),
         }
+        assert_eq!(tx.rejects.failed.load(Relaxed), before + 1);
         // The next export proves the builder was replaced, not poisoned.
         tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
             .await
@@ -461,8 +564,12 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_sheds_and_a_closed_one_says_so() {
         let (tx, rx) = mpsc::channel::<Job<ExportLogsServiceRequest>>(1);
-        let ingest = Ingest { tx };
+        let rejects = &REJECTS[0];
+        let ingest = Ingest { tx, rejects };
         let req = || ExportLogsServiceRequest::default();
+        // Relative, not absolute: the counters are process-wide and every other
+        // test in this binary shares them.
+        let before = rejects.shed.load(Relaxed);
 
         // Nothing is reading, so the first send fills the channel and the
         // second finds no permit. The first never returns; that is the point.
@@ -474,6 +581,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(matches!(ingest.submit(req()).await, Err(Rejected::Busy)));
+        // Shedding is counted, because a 503 with no server-side number behind
+        // it is a fact the operator can only get from the sender's log.
+        assert_eq!(rejects.shed.load(Relaxed), before + 1);
 
         // The flusher is gone. In flight becomes `Closed` because the ack sender
         // dropped with it; new work becomes `Closed` because the channel did.

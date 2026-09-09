@@ -54,14 +54,24 @@ pub struct Receivers {
 /// always with `RetryInfo` attached — `grpc-retry-pushback-ms` alone is only
 /// honoured by clients that configured a gRPC retry policy, which OTLP
 /// exporters do not.
+///
+/// The retryable set is closed and `INTERNAL` is not in it, so it is reserved
+/// for the one refusal that really is permanent. A write that failed on a full
+/// disk answered `INTERNAL` would have the exporter drop the batch it is holding
+/// rather than send it again a second later, which is data loss chosen by a
+/// status code.
 fn status_for(r: Rejected) -> Status {
+    // 250ms for the queue, which drains in one block age; a second for a failed
+    // write, which is usually a disk needing longer than that anyway.
+    let retry = |ms| ErrorDetails::with_retry_info(Some(std::time::Duration::from_millis(ms)));
     match r {
-        Rejected::Busy => Status::with_error_details(
-            tonic::Code::Unavailable,
-            "ingest queue full",
-            ErrorDetails::with_retry_info(Some(std::time::Duration::from_millis(250))),
-        ),
+        Rejected::Busy => {
+            Status::with_error_details(tonic::Code::Unavailable, "ingest queue full", retry(250))
+        }
         Rejected::Closed => Status::unavailable("shutting down"),
+        Rejected::Unavailable(e) => {
+            Status::with_error_details(tonic::Code::Unavailable, e, retry(1_000))
+        }
         Rejected::Failed(e) => Status::internal(e),
     }
 }
@@ -321,6 +331,13 @@ async fn export<R: Message + Default, T: Message>(
         )
             .into_response(),
         Err(Rejected::Closed) => fail(json, StatusCode::SERVICE_UNAVAILABLE, "shutting down"),
+        // 503 and not 500 for the same reason as `UNAVAILABLE` above: 500 is
+        // outside OTLP/HTTP's retryable set, so it drops the batch.
+        Err(Rejected::Unavailable(e)) => (
+            [(header::RETRY_AFTER, "1")],
+            fail(json, StatusCode::SERVICE_UNAVAILABLE, &e),
+        )
+            .into_response(),
         Err(Rejected::Failed(e)) => fail(json, StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
@@ -345,4 +362,36 @@ fn fail(json: bool, code: StatusCode, message: &str) -> Response {
         format!(r#"{{"code":2,"message":"{escaped}"}}"#),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The status is the retry policy. OTLP names the retryable codes exactly —
+    /// `UNAVAILABLE` is in the set, `INTERNAL` is not — so an exporter handed
+    /// `INTERNAL` for a full disk drops the batch instead of resending it thirty
+    /// seconds later when the disk has room. `RetryInfo` rides along because the
+    /// bare code leaves the backoff to the client.
+    #[test]
+    fn a_write_that_failed_is_retryable_and_an_impossible_export_is_not() {
+        for r in [Rejected::Busy, Rejected::Unavailable("no space".into())] {
+            let s = status_for(r);
+            assert_eq!(s.code(), tonic::Code::Unavailable);
+            assert!(
+                s.get_error_details().retry_info().is_some(),
+                "an exporter with no retry policy needs the pushback"
+            );
+        }
+        assert_eq!(
+            status_for(Rejected::Closed).code(),
+            tonic::Code::Unavailable,
+            "a draining node must be retried elsewhere, not written off"
+        );
+        assert_eq!(
+            status_for(Rejected::Failed("too wide".into())).code(),
+            tonic::Code::Internal,
+            "an export no block can hold must not be retried forever"
+        );
+    }
 }

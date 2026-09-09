@@ -16,7 +16,9 @@
 //! process stateless in the sense that matters: kill it, restart it, point a
 //! second one at the same directory read-only — nothing to reconcile.
 //!
-//! Publish is write-tmp / fsync-files / fsync-tmpdir / rename-dir / fsync-parent.
+//! Publish is write-tmp / fsync-files / fsync-tmpdir / rename-dir / fsync-parent
+//! / fsync-grandparent — the last because the partition directory itself is a
+//! new entry in `<root>/<signal>` on the first block of every hour.
 //! Directory rename is atomic on POSIX, so a block is either wholly visible or
 //! wholly absent; there is no torn state for recovery to clean up, and therefore
 //! no write-ahead log.
@@ -302,13 +304,19 @@ pub fn publish(
     }
     fsync_dir(&tmp)?;
 
-    let partition = root
-        .join(signal)
-        .join(format!("p={}", min_ts.div_euclid(NANOS_PER_HOUR)));
+    let signal_dir = root.join(signal);
+    let partition = signal_dir.join(format!("p={}", min_ts.div_euclid(NANOS_PER_HOUR)));
     fs::create_dir_all(&partition).ctx(&partition)?;
     let dir = partition.join(dir_name(min_ts, max_ts, node, seq));
     fs::rename(&tmp, &dir).ctx(&dir)?;
     fsync_dir(&partition)?;
+    // And the directory naming the partition. fsyncing `partition` persists the
+    // entries inside it, not the entry for it in its own parent — so on the
+    // first block of a new hour the block is durable and the directory holding
+    // it is unflushed metadata, which loses an acked block on XFS and btrfs
+    // (ext4's ordered journal happens to cover it). One extra fsync per 32 MB
+    // block, against the per-table fsyncs already paid.
+    fsync_dir(&signal_dir)?;
 
     Ok(BlockRef {
         dir,

@@ -34,6 +34,10 @@ pub struct LogsBuilder {
     /// Twenty-four distinct values in practice, unbounded from a hostile
     /// client, so it is counted like any other dictionary.
     sev_text: DictColumn,
+    /// Set only on OTel Events, and enumerable by definition — an event name
+    /// names a schema, so a producer minting a new one per record is already
+    /// wrong.
+    event_name: DictColumn,
     body: StringBuilder,
     body_ser: BinaryBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -65,6 +69,7 @@ impl LogsBuilder {
             observed: TimestampNanosecondBuilder::new(),
             sev_num: Int32Builder::new(),
             sev_text: DictColumn::new("logs.severity_text"),
+            event_name: DictColumn::new("logs.event_name"),
             body: StringBuilder::new(),
             body_ser: BinaryBuilder::new(),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -134,6 +139,7 @@ impl LogsBuilder {
         self.rs.has_headroom(resources, scopes, res_kv, sc_kv)
             && self.log_attrs.has_headroom(log_kv)
             && self.sev_text.has_headroom(records)
+            && self.event_name.has_headroom(records)
     }
 
     /// Absorb one OTLP export request. Returns the number of log records added.
@@ -144,12 +150,19 @@ impl LogsBuilder {
             for sl in &rl.scope_logs {
                 let sid = self.rs.scope(sl.scope.as_ref())?;
                 for rec in &sl.log_records {
-                    // Same rule as `AttrsBuilder::append`: the one fallible step
-                    // in the row runs before anything is written, so a dictionary
-                    // overflow cannot leave a half-row behind and poison the
-                    // block. It also runs before `next_id` moves, so ids stay
-                    // dense — the whole join story rests on that.
+                    // Same rule as `AttrsBuilder::append`: the fallible steps of
+                    // the row run before anything else is written, so a
+                    // dictionary overflow cannot leave a half-row behind and
+                    // poison the block. They also run before `next_id` moves, so
+                    // ids stay dense — the whole join story rests on that.
+                    //
+                    // Two dictionaries now, so an overflow of the second does
+                    // leave the first one row long. `has_headroom_for` counts
+                    // both, and the one caller that skips it — an oversized
+                    // request against an empty block — discards the builder on
+                    // any error, so neither path can publish an uneven block.
                     self.sev_text.append(&rec.severity_text)?;
+                    self.event_name.append(&rec.event_name)?;
 
                     let id = self.next_id;
                     self.next_id += 1;
@@ -233,6 +246,7 @@ impl LogsBuilder {
             Arc::new(self.observed.finish()),
             Arc::new(self.sev_num.finish()),
             self.sev_text.finish(),
+            self.event_name.finish(),
             Arc::new(self.body.finish()),
             Arc::new(self.body_ser.finish()),
             Arc::new(trace_ids),

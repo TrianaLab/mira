@@ -4,47 +4,66 @@
 
   let { signal, params, nonce, onstats } = $props()
 
+  const PAGE = 200
+
   let rows = $state([])
+  // The cursor the server returned with the last page, or '' for the end of the
+  // result. Absent rather than null on the last page, so this is the whole of
+  // the paging logic.
+  let next = $state('')
   let loading = $state(true)
   let error = $state('')
   let open = $state(new Set())
 
-  $effect(() => {
-    // Read every dependency up front so the effect re-runs on any of them, and
-    // so the async body below cannot accidentally track something later.
-    const q = params.q || ''
-    const range = params.range || '-1h'
-    const sig = signal
-    void nonce
+  // What the visible rows were fetched with. "Load more" pages exactly this, not
+  // whatever has been typed into the boxes at the top since without pressing Run.
+  let sent = null
+  // A slow query that the user has already navigated away from must not
+  // overwrite the results of the one they are looking at now, nor page into
+  // them. Identity, not a boolean, so a page in flight knows which query it is.
+  let live = { ok: true }
 
-    let live = true
+  async function page(after) {
+    const gen = live
     loading = true
     error = ''
-    open = new Set()
-    ;(async () => {
-      try {
-        const r = await api('/api/v1/query', {
-          signal: sig,
-          ...bounds(range),
-          where: parseFilter(q, sig),
-          limit: 200,
-        })
-        if (!live) return
-        rows = r.rows
-        onstats(r.stats)
-      } catch (e) {
-        if (live) {
-          error = String(e.message || e)
-          rows = []
-          onstats(null)
-        }
-      } finally {
-        if (live) loading = false
+    try {
+      const doc = {
+        signal: sent.sig,
+        ...bounds(sent.range),
+        where: parseFilter(sent.q, sent.sig),
+        limit: PAGE,
       }
-    })()
-    // A slow query that the user has already navigated away from must not
-    // overwrite the results of the one they are looking at now.
-    return () => { live = false }
+      if (after) doc.after = after
+      const r = await api('/api/v1/query', doc)
+      if (!gen.ok) return
+      rows = after ? [...rows, ...r.rows] : r.rows
+      next = r.next || ''
+      onstats(r.stats)
+    } catch (e) {
+      if (!gen.ok) return
+      error = String(e.message || e)
+      rows = []
+      next = ''
+      onstats(null)
+    } finally {
+      if (gen.ok) loading = false
+    }
+  }
+
+  $effect(() => {
+    // Read every dependency up front so the effect re-runs on any of them, and
+    // so nothing `page` touches after its first await is tracked by accident.
+    sent = { q: params.q || '', range: params.range || '-1h', sig: signal }
+    void nonce
+
+    const gen = { ok: true }
+    live = gen
+    rows = []
+    next = ''
+    open = new Set()
+    page()
+    return () => { gen.ok = false }
   })
 
   function toggle(i) {
@@ -58,7 +77,7 @@
 
 {#if error}
   <div class="err">{error}</div>
-{:else if loading}
+{:else if loading && !rows.length}
   <div class="empty">Loading…</div>
 {:else if !rows.length}
   <div class="empty">No matching records.</div>
@@ -99,4 +118,28 @@
       {/each}
     </tbody>
   </table>
+  <div class="more">
+    <span>{rows.length} rows</span>
+    {#if next}
+      <button onclick={() => page(next)} disabled={loading}>
+        {loading ? 'Loading…' : `Load ${PAGE} more`}
+      </button>
+    {:else}
+      <span>end of results</span>
+    {/if}
+  </div>
 {/if}
+
+<style>
+  .more { display: flex; align-items: center; gap: 14px; padding: 14px 0; color: var(--dim); }
+  .more button {
+    font: inherit;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  .more button:disabled { color: var(--dim); cursor: default; }
+</style>

@@ -84,6 +84,16 @@ pub static LOGS: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("observed_time_unix_nano", ts(), true),
         Field::new("severity_number", DataType::Int32, true),
         Field::new("severity_text", dict_u16_utf8(), true),
+        // What makes a record an OTel Event rather than a log line, and the key
+        // the event's attribute schema is defined against. A dictionary because
+        // the whole point of an event name is that it is enumerable.
+        //
+        // Added after the first blocks were written, and a published block is
+        // never rewritten. That is safe only because the reader never touches a
+        // root table positionally: it filters through `column_by_name` and
+        // materializes by walking the *file's* own schema, so a block from
+        // before this line reads back exactly as it did — minus the field.
+        Field::new("event_name", dict_u16_utf8(), true),
         // String bodies, the overwhelmingly common case, land in `body`.
         // Anything else is protobuf-encoded into `body_ser` so nothing is lost.
         Field::new("body", DataType::Utf8, true),

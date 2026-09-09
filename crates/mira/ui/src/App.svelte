@@ -38,8 +38,14 @@
 <header>
   <a class="brand" href="#/logs">mira</a>
   <nav>
+    <!-- The range comes along; the filter does not. Terms are signal-scoped by
+         FIELDS, so `severity_number>=17` carried from logs to traces turns from
+         a column predicate into an attribute one and matches nothing. -->
     {#each ['logs', 'traces', 'metrics'] as v (v)}
-      <a href="#/{v}" class:on={v === (view === 'trace' ? 'traces' : view)}>
+      <a
+        href="#/{v}?range={encodeURIComponent(range)}"
+        class:on={v === (view === 'trace' ? 'traces' : view)}
+      >
         {v[0].toUpperCase() + v.slice(1)}
       </a>
     {/each}

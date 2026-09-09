@@ -235,8 +235,14 @@ mod tests {
 
         // No metrics in this directory, so these answer empty — which is the
         // point: they answer, under their own key, rather than erroring.
-        for (route, field) in [(SERIES, "series"), (NAMES, "names")] {
-            let d = src.post(route, r#"{"name":"anything"}"#).unwrap();
+        // The name listing takes a window and nothing else — the same document
+        // the TUI sends it — because a key an endpoint does not implement is now
+        // an error rather than a silently dropped filter.
+        for (route, field, body) in [
+            (SERIES, "series", r#"{"name":"anything"}"#),
+            (NAMES, "names", "{}"),
+        ] {
+            let d = src.post(route, body).unwrap();
             assert!(d[field].as_vec().unwrap().is_empty(), "{route}");
             assert_eq!(d["stats"]["blocks_total"].as_i64().unwrap(), 0);
         }

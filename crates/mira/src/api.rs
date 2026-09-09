@@ -191,6 +191,7 @@ pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
 /// [`parse_search`] on an already-parsed document, for callers that received one
 /// nested inside something else — an MCP tool call, say.
 pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
+    known(doc, &["signal", "from", "to", "where", "limit", "after"])?;
     let signal = match doc["signal"].as_str() {
         Some(s) => Signal::parse(s).ok_or(format!("unknown signal {s:?}"))?,
         None => Signal::Logs,
@@ -236,6 +237,10 @@ pub fn parse_series(text: &str, now: i64) -> Result<SeriesQuery, String> {
 }
 
 pub fn series_doc(doc: &Yaml, now: i64) -> Result<SeriesQuery, String> {
+    known(
+        doc,
+        &["name", "from", "to", "where", "max_series", "max_points"],
+    )?;
     let (from, to) = bounds(doc, now)?;
     Ok(SeriesQuery {
         name: doc["name"].as_str().map(str::to_owned),
@@ -249,13 +254,90 @@ pub fn series_doc(doc: &Yaml, now: i64) -> Result<SeriesQuery, String> {
 
 /// The `from`/`to` pair of any query document.
 pub fn window(text: &str, now: i64) -> Result<(i64, i64), String> {
-    bounds(&parse(text)?, now)
+    window_doc(&parse(text)?, now)
+}
+
+/// [`window`] on an already-parsed document, for the MCP side.
+pub fn window_doc(doc: &Yaml, now: i64) -> Result<(i64, i64), String> {
+    known(doc, &["from", "to"])?;
+    bounds(doc, now)
+}
+
+/// Refuse a document that is not a mapping, or that carries a key this endpoint
+/// does not implement.
+///
+/// Every other reader here indexes by key and defaults what is missing, so a
+/// misspelled `where` is indistinguishable from no `where` at all and the answer
+/// is a confident 200 over the whole window — the one failure a caller cannot
+/// see in the response it gets. `parse_term` has always been this strict one
+/// level down; this is the same rule at the top of the document.
+fn known(doc: &Yaml, keys: &[&str]) -> Result<(), String> {
+    // A tool call that carries no `arguments` at all is a legal MCP request and
+    // means the same thing as an empty document.
+    if doc.is_badvalue() || doc.is_null() {
+        return Ok(());
+    }
+    let map = doc.as_hash().ok_or("a query must be a mapping")?;
+    for k in map.keys() {
+        let k = k.as_str().ok_or("query keys must be strings")?;
+        if !keys.contains(&k) {
+            return Err(format!(
+                "unknown query key {k:?}; expected one of {}",
+                keys.join(" ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One KYAML document, or a readable reason it is not one.
 pub fn parse(text: &str) -> Result<Yaml, String> {
-    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not valid KYAML: {e}"))?;
+    let docs = match YamlLoader::load_from_str(text) {
+        Ok(docs) => docs,
+        // JSON spells a non-BMP character as a surrogate pair and `json.dumps`
+        // does so by default, but YAML 1.2 has no surrogates and the loader
+        // refuses one — which would make an ASCII-escaping JSON client the one
+        // client principle 5 does not get for free. Retrying only a document
+        // that has already failed keeps the rewrite away from every valid one:
+        // a single-quoted `'\ud83d\ude00'` is twelve literal characters, and
+        // it parses on the first attempt.
+        Err(e) => YamlLoader::load_from_str(&fold_surrogates(text))
+            .map_err(|_| format!("not valid KYAML: {e}"))?,
+    };
     docs.into_iter().next().ok_or("empty query".into())
+}
+
+/// `\ud83d\ude00` becomes the character it encodes. Everything else is copied
+/// through untouched, an unpaired surrogate included: that is not a character,
+/// and folding it into a replacement one would turn a rejected query into a
+/// silently different one.
+fn fold_surrogates(text: &str) -> String {
+    fn hex4(s: &str) -> Option<u32> {
+        u32::from_str_radix(s.strip_prefix("\\u")?.get(..4)?, 16).ok()
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("\\u") {
+        out.push_str(&rest[..i]);
+        let folded = match (hex4(&rest[i..]), rest.get(i + 6..).and_then(hex4)) {
+            (Some(h @ 0xD800..=0xDBFF), Some(l @ 0xDC00..=0xDFFF)) => {
+                char::from_u32(0x10000 + ((h - 0xD800) << 10) + (l - 0xDC00))
+            }
+            _ => None,
+        };
+        match folded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[i + 12..];
+            }
+            None => {
+                out.push_str("\\u");
+                rest = &rest[i + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Default window is the last hour. A query with no bounds would scan the whole
@@ -388,6 +470,26 @@ mod tests {
         assert_eq!(q.terms[2].op, Op::Contains);
     }
 
+    /// ...and the same query from a JSON client that escapes non-ASCII, which
+    /// `json.dumps` does by default. A character outside the BMP arrives as a
+    /// surrogate pair, which YAML 1.2 has no notion of, so without the fold the
+    /// one client that does not work for free is a JSON one.
+    #[test]
+    fn json_surrogate_escapes_are_folded_into_the_character() {
+        let q = parse_search(
+            r#"{"where":[{"field":"body","contains":"caf\u00e9 \ud83d\ude00"}]}"#,
+            0,
+        )
+        .unwrap();
+        assert_eq!(q.terms[0].value, Value::Str("café 😀".into()));
+        // Half a pair is not a character, so it stays the loader's error rather
+        // than becoming a replacement character in a filter that then silently
+        // matches nothing.
+        let err =
+            parse_search(r#"{"where":[{"field":"body","contains":"\ud83d"}]}"#, 0).unwrap_err();
+        assert!(err.contains("not valid KYAML"), "{err}");
+    }
+
     /// ...and the same query in house style, with the trailing commas and the
     /// comment that JSON cannot carry. This is what makes the format worth
     /// having: an agent can annotate its own query.
@@ -421,8 +523,44 @@ mod tests {
         assert!(err(r#"{"where":[{"attr":"a"}]}"#).contains("needs an operator"));
         assert!(err(r#"{"from":"now","to":"-1h"}"#).contains("is after"));
         assert!(err(r#"{"limit":0}"#).contains("positive integer"));
-        // A whole document that is not a mapping should not panic on indexing.
-        assert!(parse_search("[1,2,3]", 0).is_ok());
+        // A key nothing implements is a typo, and answering a typo with a page
+        // of unfiltered rows is worse than answering it with an error: the
+        // caller has no way to tell that its filter was dropped.
+        assert!(err(r#"{"signal":"logs","filters":[]}"#).contains("unknown query key"));
+        assert!(err(r#"{"query":{"signal":"logs"}}"#).contains("unknown query key"));
+        // A whole document that is not a mapping is not a query either.
+        assert!(err("[1,2,3]").contains("must be a mapping"));
+        let step = parse_series(r#"{"name":"m","step":"1m"}"#, 0).unwrap_err();
+        assert!(step.contains("step"), "{step}");
+        let w = window(r#"{"from":0,"limit":5}"#, 0).unwrap_err();
+        assert!(w.contains("limit"), "{w}");
+    }
+
+    /// Unknown keys are refused, so the known set has to be exactly what the
+    /// shipped clients send — a false rejection breaks the browser UI, the
+    /// terminal UI and every MCP tool at once. The terminal UI's documents are
+    /// checked in `tui.rs` against the code that builds them; these are the
+    /// browser's and the agent's.
+    #[test]
+    fn every_document_the_clients_send_is_accepted() {
+        for d in [
+            r#"{"signal":"logs","from":"-1h","to":"now","where":[],"limit":200}"#,
+            r#"{"signal":"traces","from":0,"to":"now","limit":2000,
+                "where":[{"field":"trace_id","eq":"ab"}]}"#,
+            r#"{"signal":"logs","limit":100,"after":"1757241600000000000.2718281828.7.41"}"#,
+        ] {
+            assert!(parse_search(d, 0).is_ok(), "{d}");
+        }
+        for d in [
+            r#"{"name":"m","from":"-1h","to":"now","where":[]}"#,
+            r#"{"name":"m","from":"-1h","to":"now","max_series":64,"max_points":400,"where":[]}"#,
+        ] {
+            assert!(parse_series(d, 0).is_ok(), "{d}");
+        }
+        assert!(window(r#"{"from":"-1h","to":"now"}"#, 0).is_ok());
+        assert!(window("{}", 0).is_ok());
+        // An MCP tool call is allowed to carry no `arguments` member at all.
+        assert!(search_doc(&Yaml::BadValue, 0).is_ok());
     }
 
     #[test]

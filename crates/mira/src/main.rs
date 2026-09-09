@@ -13,11 +13,16 @@ mod tui;
 mod ui;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+
+use axum::Router;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 
 use config::Config;
 
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION] [--peers a:1,b:2]
+     [--data-dir PATH] [--retention DURATION]
      [--max-request-bytes SIZE] [--version]
 
 mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
@@ -66,14 +71,6 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
             "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
             "--retention" => cfg.retention = config::duration(&value()?)?,
             "--max-request-bytes" => cfg.max_request_bytes = config::bytes(&value()?)?,
-            "--peers" => {
-                cfg.peers = value()?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }
             other => return Err(format!("unknown flag {other}\n\n{USAGE}")),
         }
     }
@@ -165,7 +162,17 @@ async fn serve_with(
     cfg: Config,
     stop_signal: impl std::future::Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
+    // Named, because `File exists (os error 17)` on its own sends whoever reads
+    // it looking for a bug in Mira rather than at the path they passed.
+    std::fs::create_dir_all(&cfg.data_dir).map_err(|e| {
+        format!(
+            "cannot create data directory {}: {e}. Mira makes this path on first \
+             start, so this is a parent that is not writable or something that is \
+             not a directory already sitting there (in Kubernetes: a subPath that \
+             names a file, or a volume mounted readOnly).",
+            cfg.data_dir.display()
+        )
+    })?;
     // Before anything is mapped. A network mount is not a slow start, it is a
     // SIGBUS the first time the server hiccups, and by then there is a process
     // to explain rather than a flag to change.
@@ -173,8 +180,34 @@ async fn serve_with(
     mira_core::block::check_writable(&cfg.data_dir)?;
 
     let node = mira_core::block::node_id(&cfg.node);
-    let (grpc_addr, http_addr) = (cfg.grpc, cfg.http);
-    let peers = cfg.peers.len();
+
+    // Both sockets are bound here, before a flusher starts and long before the
+    // line that says which addresses Mira is listening on. tonic binds inside
+    // its own future, so a port still held by the container that is shutting
+    // down used to surface as `mira: transport error` *after* the log line
+    // claiming the address — the most common way a start fails, reported as the
+    // least useful sentence Mira can print.
+    let taken = |addr: std::net::SocketAddr, what: &str, e: std::io::Error| {
+        format!(
+            "cannot bind {addr} for {what}: {e}. Nothing has started yet, so this \
+             is another process on the port — most often the previous instance \
+             still draining (in Kubernetes: a terminationGracePeriodSeconds \
+             shorter than the drain takes, or two replicas sharing a hostPort)."
+        )
+    };
+    let grpc_socket = tonic::transport::server::TcpIncoming::bind(cfg.grpc)
+        .map_err(|e| taken(cfg.grpc, "OTLP/gRPC", e))?
+        // `serve_with_incoming` ignores the builder's TCP settings, and tonic's
+        // default is nodelay on: without this every small export pays a Nagle
+        // delay that `serve` would not have charged it.
+        .with_nodelay(Some(true));
+    let http_socket = tokio::net::TcpListener::bind(cfg.http)
+        .await
+        .map_err(|e| taken(cfg.http, "OTLP/HTTP and the query API", e))?;
+    // The bound addresses, not the requested ones: `--grpc 127.0.0.1:0` is a
+    // real thing to ask for and the "listening" line is the only place the
+    // chosen port is ever written down.
+    let (grpc_addr, http_addr) = (grpc_socket.local_addr()?, http_socket.local_addr()?);
 
     let data_dir = std::sync::Arc::new(cfg.data_dir.clone());
     let pcfg = std::sync::Arc::new(pipeline::Config {
@@ -209,24 +242,20 @@ async fn serve_with(
             .add_service(recv.logs_server())
             .add_service(recv.traces_server())
             .add_service(recv.metrics_server())
-            .serve_with_shutdown(grpc_addr, stopped(stop_rx.clone())),
+            .serve_with_incoming_shutdown(grpc_socket, stopped(stop_rx.clone())),
     );
 
-    let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    // The bound address, not the requested one. `--http 127.0.0.1:0` is a real
-    // thing to ask for and the line below is the only place the chosen port is
-    // ever written down. tonic binds its own socket out of reach, so the gRPC
-    // half of that line cannot say the same and a `:0` there stays a `:0`.
-    let http_addr = listener.local_addr()?;
     // One listener for all of it: `/v1/*` is OTLP in, `/api/v1/*` is query out,
-    // `/mcp` is the agent surface, `/` and `/{file}` are the UI. The UI's
-    // wildcard is one segment deep, so it cannot swallow any of the others.
+    // `/mcp` is the agent surface, `/health` is the probe, `/` and `/{file}` are
+    // the UI. The UI's wildcard is one segment deep, so it cannot swallow any of
+    // the others.
     let api = api::Api { data_dir };
     let serve = axum::serve(
-        listener,
+        http_socket,
         receiver::http_router(recv)
             .merge(api::router(api.clone()))
             .merge(mcp::router(api))
+            .merge(health_router())
             .merge(ui::router()),
     )
     .with_graceful_shutdown(stopped(stop_rx));
@@ -237,14 +266,25 @@ async fn serve_with(
     // distinguishes two replicas' blocks, and a collision is diagnosed here.
     tracing::info!(
         grpc = %grpc_addr, http = %http_addr,
-        node = %cfg.node, node_id = format!("{node:08x}"), peers,
+        node = %cfg.node, node_id = format!("{node:08x}"),
         "mira listening"
     );
 
     let (mut grpc, mut http) = (grpc, http);
+    let mut flushers = flushers;
+    let mut wedged = false;
     tokio::select! {
         r = &mut grpc => r??,
         r = &mut http => r??,
+        // A flusher cannot see its channel close while the listeners still hold
+        // an `Ingest`, so one that returns before the stop signal has failed and
+        // said why on its way out. Carrying on is what this used to do: the other
+        // two signals keep working, that one answers every export with a 503
+        // forever, and every probe stays green. A crashloop is the honest shape
+        // of "this process cannot store logs" — the orchestrator reports it, and
+        // the restart is the recovery for the case that caused it, a data
+        // directory that was not there yet.
+        _ = first_stopped(&mut flushers) => wedged = true,
         _ = stop_signal => tracing::info!("draining"),
     }
 
@@ -273,7 +313,12 @@ async fn serve_with(
         let _ = (&mut grpc).await;
         let _ = (&mut http).await;
         for h in flushers {
-            let _ = h.await;
+            // Skipped rather than awaited once it is done: `first_stopped` may
+            // already have polled one of these to completion, and a `JoinHandle`
+            // polled twice panics. A finished flusher has nothing left to seal.
+            if !h.is_finished() {
+                let _ = h.await;
+            }
         }
     };
     if tokio::time::timeout(std::time::Duration::from_secs(15), drain)
@@ -283,7 +328,64 @@ async fn serve_with(
         tracing::warn!("did not drain in 15s; exiting anyway");
     }
     tracing::info!("stopped");
+    if wedged {
+        // The other two signals were still drained above; only then is this
+        // process allowed to be a failed one.
+        return Err("a flusher stopped, so one signal can no longer be stored; \
+                    exiting for the supervisor to restart (the cause is logged above)"
+            .into());
+    }
     Ok(())
+}
+
+/// Resolve as soon as any one flusher has returned.
+async fn first_stopped(flushers: &mut [tokio::task::JoinHandle<()>; 3]) {
+    let [logs, traces, metrics] = flushers;
+    tokio::select! {
+        _ = logs => {}
+        _ = traces => {}
+        _ = metrics => {}
+    }
+}
+
+/// Liveness for a probe, and the two numbers that say whether ingest is coping.
+///
+/// Here rather than in `api.rs` because it answers for the process, not for the
+/// block directory: no query engine, no data directory, nothing that can be slow.
+/// `/readyz` is the same answer under the name Kubernetes reaches for first —
+/// Mira has no warm-up and no cluster to join, so there is no state in which it
+/// is alive and not ready, and a probe pointed at the wrong one of the two used
+/// to get 200 and a page of HTML from the UI's catch-all.
+fn health_router() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/readyz", get(health))
+}
+
+async fn health() -> Response {
+    // A flusher that stops takes the process with it (see `serve_with`), so
+    // answering at all is the liveness answer. The counters are here so that the
+    // probe and the log agree about how much has been refused, and because a
+    // shedding node is the case where an operator is looking at exactly this.
+    let mut j = mira_core::json::Json::new();
+    j.obj(|j| {
+        j.key("status");
+        j.str("ok");
+        for r in &pipeline::REJECTS {
+            j.key(r.signal);
+            j.obj(|j| {
+                j.key("shed");
+                j.u64(r.shed.load(Relaxed));
+                j.key("failed");
+                j.u64(r.failed.load(Relaxed));
+            });
+        }
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        j.into_string(),
+    )
+        .into_response()
 }
 
 /// Resolve on the first stop signal.
@@ -349,8 +451,7 @@ mod tests {
         // rather than read it as a flag.
         let c = load_from(argv(&format!(
             "--config {f} --node cli --grpc 127.0.0.1:3 --http 127.0.0.1:4 \
-             --data-dir /from/cli --retention 30s --max-request-bytes 2MiB \
-             --peers a:1,,b:2,"
+             --data-dir /from/cli --retention 30s --max-request-bytes 2MiB"
         )))
         .unwrap();
         assert_eq!(c.node, "cli");
@@ -359,8 +460,6 @@ mod tests {
         assert_eq!(c.data_dir, PathBuf::from("/from/cli"));
         assert_eq!(c.retention, std::time::Duration::from_secs(30));
         assert_eq!(c.max_request_bytes, 2 << 20);
-        // Empty entries are dropped, so a trailing comma is not a peer named "".
-        assert_eq!(c.peers, ["a:1", "b:2"]);
 
         // No arguments at all is the shipped configuration.
         let d = load_from(vec![]).unwrap();
@@ -368,6 +467,9 @@ mod tests {
 
         for (args, want) in [
             ("--nope", "unknown flag --nope"),
+            // Deleted along with the fan-out that never existed. It is an
+            // unknown flag now, which is the whole point of deleting it.
+            ("--peers a:1", "unknown flag --peers"),
             ("--node", "--node needs a value"),
             ("--config", "--config needs a value"),
             ("--grpc nope", "--grpc:"),
@@ -453,18 +555,83 @@ mod tests {
         // path and expects the first start to make it.
         assert!(cfg.data_dir.is_dir());
 
-        // A port already taken is reported, not survived. This is the arm that
-        // turns "mira is running" into a process that answers nothing.
+        // A port already taken is reported, not survived, and the message names
+        // the address — on both listeners. The gRPC half is the one that used to
+        // print `transport error` *after* logging that it was listening on it.
         let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let taken = Config {
-            http: held.local_addr().unwrap(),
-            ..cfg
+        let addr = held.local_addr().unwrap();
+        for taken in [
+            Config {
+                http: addr,
+                ..cfg.clone()
+            },
+            Config {
+                grpc: addr,
+                ..cfg.clone()
+            },
+        ] {
+            let e = serve_with(taken, std::future::pending())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&addr.to_string()), "{e}");
+            assert!(e.to_lowercase().contains("address"), "{e}");
+        }
+
+        // A data directory that cannot be made says which path and why, rather
+        // than `File exists (os error 17)`.
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let e = serve_with(
+            Config {
+                data_dir: file.clone(),
+                ..cfg
+            },
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(&file.display().to_string()), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flusher that cannot start takes the process down with it.
+    ///
+    /// The alternative is the failure nobody notices: two signals keep working,
+    /// the third answers every export with a 503 until someone restarts it, and
+    /// the process stays up and green throughout. Here `logs` is a regular file,
+    /// so the logs flusher cannot scan its directory and returns immediately.
+    #[tokio::test]
+    async fn a_flusher_that_cannot_start_stops_the_server() {
+        let dir = tmp("wedged");
+        std::fs::write(dir.join("logs"), b"not a directory").unwrap();
+        let cfg = Config {
+            data_dir: dir.clone(),
+            grpc: "127.0.0.1:0".parse().unwrap(),
+            http: "127.0.0.1:0".parse().unwrap(),
+            ..Config::default()
         };
-        let e = serve_with(taken, std::future::pending())
+        // `pending`, so the only thing that can end this is the flusher.
+        let e = serve_with(cfg, std::future::pending())
             .await
             .unwrap_err()
             .to_string();
-        assert!(e.to_lowercase().contains("address"), "{e}");
+        assert!(e.contains("flusher"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe answers, and it answers with the numbers an operator wants
+    /// while ingest is unhappy — the same ones the warn! lines count.
+    #[tokio::test]
+    async fn health_reports_every_signals_rejections() {
+        let (parts, body) = health().await.into_parts();
+        assert_eq!(parts.status, axum::http::StatusCode::OK);
+        let body = String::from_utf8(axum::body::to_bytes(body, 64 << 10).await.unwrap().to_vec())
+            .unwrap();
+        assert!(body.starts_with(r#"{"status":"ok""#), "{body}");
+        for signal in pipeline::SIGNALS {
+            assert!(body.contains(&format!(r#""{signal}":{{"shed":"#)), "{body}");
+        }
     }
 }

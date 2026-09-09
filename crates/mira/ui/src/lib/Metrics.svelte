@@ -49,10 +49,17 @@
     return () => { live = false }
   })
 
-  const label = (s) =>
+  // A histogram comes back as `<name>.count` and `<name>.sum` over the *same*
+  // attributes, so attributes alone label the two lines identically. Show the
+  // name whenever the response holds more than one of them.
+  let named = $derived(new Set(series.map((s) => s.name)).size > 1)
+
+  const attrs = (s) =>
     Object.entries(s.attributes || {})
       .map(([k, v]) => `${k}=${v}`)
-      .join(' ') || s.name
+      .join(' ')
+
+  const label = (s) => (named ? `${s.name} ${attrs(s)}`.trim() : attrs(s) || s.name)
 </script>
 
 {#if error}

@@ -82,22 +82,38 @@
 
     c.lineWidth = 1.5
     c.lineJoin = 'round'
+    // Points with no neighbour to join. A subpath of one moveTo strokes nothing
+    // at all, so a series of a single point -- which is every series in the
+    // window after one SDK export interval -- would paint a blank chart. A gap
+    // in the middle of a dense one has the same problem, and this catches both.
+    // Collected rather than filled here: the line's path is still open.
+    const dots = []
     series.forEach((s, i) => {
       c.strokeStyle = COLORS[i % COLORS.length]
       c.beginPath()
       let pen = false
-      for (const [x, y] of s.points) {
+      s.points.forEach(([x, y], k) => {
         // A null is a non-finite value the engine refused to fake -- a histogram
         // sum over no observations is NaN. Break the line rather than
         // interpolating across a gap that has no data in it.
-        if (y === null) { pen = false; continue }
+        if (y === null) { pen = false; return }
         const px = sx(x)
         const py = sy(y)
-        pen ? c.lineTo(px, py) : c.moveTo(px, py)
+        if (pen) c.lineTo(px, py)
+        else {
+          c.moveTo(px, py)
+          if ((s.points[k + 1]?.[1] ?? null) === null) dots.push([px, py, i])
+        }
         pen = true
-      }
+      })
       c.stroke()
     })
+    for (const [px, py, i] of dots) {
+      c.fillStyle = COLORS[i % COLORS.length]
+      c.beginPath()
+      c.arc(px, py, 2.5, 0, Math.PI * 2)
+      c.fill()
+    }
 
     // The metric-to-trace edge, on screen. A diamond per exemplar; clicking one
     // opens the trace that produced that measurement.

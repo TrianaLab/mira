@@ -63,7 +63,7 @@ const TOOLS: &str = r#"[
    "limit":{"type":"integer","description":"default 1000, max 10000"}}}},
 
 {"name":"query_metric",
- "description":"One metric as time series, grouped by attribute set. Each series carries its identifying attributes and its points. Sums are reported as rates where the temporality allows it. Omit `name` at your peril - it scans every metric in the window.",
+ "description":"One metric as time series, grouped by attribute set. Each series carries its identifying attributes, its `temporality` as the OTLP enum (0 unspecified, 1 delta, 2 cumulative), whether it is `monotonic`, and its points. Points are the values as stored: no step, no aggregation and no rate, so a cumulative sum is the running counter and a per-second rate is yours to derive by subtracting consecutive points and dividing by the gap between their timestamps. Omit `name` at your peril - it scans every metric in the window.",
  "inputSchema":{"type":"object","properties":{
    "name":{"type":"string","description":"exact metric name, from list_metrics"},
    "from":{"type":"string"},"to":{"type":"string"},
@@ -128,7 +128,7 @@ async fn call(api: Api, id: &Yaml, params: &Yaml) -> Response {
             Ok(q) => blocking("series", move || series::series(&dir, &q)).await,
             Err(e) => Err(e),
         },
-        "list_metrics" => match api::bounds(args, now) {
+        "list_metrics" => match api::window_doc(args, now) {
             Ok((from, to)) => blocking("names", move || series::names(&dir, from, to)).await,
             Err(e) => Err(e),
         },
@@ -311,6 +311,15 @@ mod tests {
             assert!(body.contains(r#""isError":false"#), "{name}: {body}");
         }
 
+        // A tool that needs no arguments may be called with no `arguments`
+        // member at all, and that is a request, not a malformed document.
+        let (_, body) = rpc(
+            &api,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_metrics"}}"#,
+        )
+        .await;
+        assert!(body.contains(r#""isError":false"#), "{body}");
+
         // Each tool parses its arguments with a different function, so each one
         // needs its own way of being wrong.
         let bad = [
@@ -319,6 +328,11 @@ mod tests {
             ("query_metric", r#"{"where":"errors"}"#, "list of terms"),
             ("list_metrics", r#"{"from":"yesterday"}"#, "yesterday"),
             ("teleport", "{}", "unknown tool"),
+            // A misspelled key is a filter that was silently dropped, which the
+            // model cannot see in a page of unfiltered rows.
+            ("query_records", r#"{"filters":[]}"#, "unknown query key"),
+            ("query_metric", r#"{"step":"1m"}"#, "unknown query key"),
+            ("list_metrics", r#"{"name":"http"}"#, "unknown query key"),
         ];
         for (name, args, want) in bad {
             let (s, body) = rpc(&api, &call(name, args)).await;
@@ -368,6 +382,12 @@ mod tests {
         for tool in ["query_records", "get_trace", "query_metric", "list_metrics"] {
             assert!(body.contains(tool), "{tool} missing from tools/list");
         }
+        // These descriptions are the model's only documentation of the data, so
+        // they may not promise arithmetic the engine does not do: points come
+        // back as stored, and the temporality legend is what lets the model do
+        // the subtraction itself.
+        assert!(!body.contains("as rates"), "{body}");
+        assert!(body.contains("2 cumulative"), "{body}");
 
         // A string id comes back quoted and escaped, because the client matches
         // on it byte for byte.

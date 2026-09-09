@@ -774,11 +774,12 @@ async fn the_ui_is_served_from_the_binary_and_revalidates() {
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert!(body.is_empty(), "a 304 must not carry the body");
 
-    // A deep link the browser reloads is the app's own route, not a missing
-    // file, so it gets the app back rather than a 404.
-    let (status, body, _) = get(&app, "/logs", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(String::from_utf8_lossy(&body).contains("<div id=\"app\">"));
+    // Every view lives under the hash (`/#/logs`), so a *path* that is not one
+    // of the three assets is a request for something that does not exist. It
+    // used to get index.html and a 200, which meant `/health` and `/metrics`
+    // reported success in HTML to whatever was probing them.
+    let (status, _, _) = get(&app, "/logs", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// The agent surface, driven the way a client drives it: initialize, list the

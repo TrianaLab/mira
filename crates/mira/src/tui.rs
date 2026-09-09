@@ -33,9 +33,6 @@ pub fn run(src: Source) -> Result<(), String> {
     let mut term = Term::enter().map_err(|e| e.to_string())?;
     loop {
         let (w, h) = term.size();
-        // A terminal narrower than this cannot show a timestamp and a body, and
-        // every column computation below would start clamping to zero.
-        let (w, h) = (w.max(40), h.max(8));
         term.draw(&app.frame(w, h)).map_err(|e| e.to_string())?;
 
         // Deferred so the frame above — the one that says what is running — is
@@ -124,6 +121,12 @@ enum Mode {
     Filter,
     Detail,
     Trace,
+    /// One span of the waterfall, in the same renderer [`Mode::Detail`] uses.
+    ///
+    /// A separate mode rather than a flag on `Detail` because the two differ in
+    /// where they came from and where Esc goes back to, and because the span is
+    /// not in `self.rows` — see [`App::selected`].
+    Span,
     Help,
 }
 
@@ -316,11 +319,19 @@ impl App {
             j.str(&format!("-{}", WINDOWS[self.win]));
             j.key("to");
             j.str("now");
+            // ponytail: 64 series is three screenfuls at three lines each, and
+            // the engine does not report `max_series` truncation the way it
+            // reports `max_points`, so the 65th is invisible here. Give it a
+            // badge when the response grows a count to put in one.
             j.key("max_series");
             j.i64(64);
-            // A sparkline is one character per point. Asking for the API's
-            // default 5 000 would download three orders of magnitude more than
-            // the widest terminal can render.
+            // A sparkline is one character per point, so the API's default of
+            // 5 000 would download three orders of magnitude more than the
+            // widest terminal can render. Not scaled to the terminal either:
+            // `spark` buckets by the column's peak, so points past the column
+            // count still decide whether a spike shows, and 400 is enough of
+            // them for any width. What the cap costs — it keeps the newest
+            // 400, not a thinned 400 — is on screen as `+n dropped`.
             j.key("max_points");
             j.i64(400);
             j.key("where");
@@ -388,7 +399,14 @@ impl App {
         let page = body_h(h).saturating_sub(1).max(1);
         match k {
             Key::Char('q') | Key::Ctrl('c') if self.mode == Mode::List => return false,
-            Key::Char('q') | Key::Esc => self.mode = Mode::List,
+            // Back one step, not back to the list: a span detail was opened
+            // from the waterfall and that is where its reader still is.
+            Key::Char('q') | Key::Esc => {
+                self.mode = match self.mode {
+                    Mode::Span => Mode::Trace,
+                    _ => Mode::List,
+                }
+            }
             Key::Ctrl('c') => return false,
             Key::Char('?') => {
                 self.mode = match self.mode {
@@ -446,6 +464,13 @@ impl App {
                 }
                 Mode::List => {
                     self.mode = Mode::Detail;
+                    self.scroll = 0;
+                }
+                // The waterfall renders a span's shape; its attributes and its
+                // status message only exist in the detail view, and without
+                // this the selected span had no way to reach one.
+                Mode::Trace => {
+                    self.mode = Mode::Span;
                     self.scroll = 0;
                 }
                 _ => {}
@@ -515,7 +540,7 @@ impl App {
             // arithmetic is the same and the bound is the line count, which the
             // renderer knows and this does not — so let it run to the end and
             // let `frame` clamp.
-            (Mode::Detail, _) | (Mode::Help, _) => (self.scroll, usize::MAX),
+            (Mode::Detail | Mode::Span | Mode::Help, _) => (self.scroll, usize::MAX),
             (Mode::Trace, _) => (
                 self.trace.as_ref().map_or(0, |t| t.sel),
                 self.trace.as_ref().map_or(0, |t| t.spans.len()),
@@ -528,7 +553,7 @@ impl App {
 
     fn set_cursor(&mut self, n: usize) {
         match (self.mode, self.tab) {
-            (Mode::Detail, _) | (Mode::Help, _) => self.scroll = n,
+            (Mode::Detail | Mode::Span | Mode::Help, _) => self.scroll = n,
             (Mode::Trace, _) => {
                 if let Some(t) = self.trace.as_mut() {
                     t.sel = n
@@ -549,7 +574,8 @@ impl App {
     /// looking it is the same question.
     fn open_trace(&mut self) {
         let id = match (self.mode, self.tab) {
-            (Mode::Trace, _) => return,
+            // Already inside the trace this would open.
+            (Mode::Trace | Mode::Span, _) => return,
             (_, Tab::Metrics) => self
                 .series
                 .get(self.ssel)
@@ -574,8 +600,16 @@ impl App {
     }
 
     fn selected(&self) -> Option<&Yaml> {
-        match self.tab {
-            Tab::Metrics => self.series.get(self.ssel),
+        match (self.mode, self.tab) {
+            // The waterfall's own selection, which is not in `self.rows` and
+            // usually cannot be: a followed trace is queried over all of
+            // retention, so its spans are rarely the rows the list tab holds.
+            (Mode::Span, _) => self
+                .trace
+                .as_ref()
+                .and_then(|t| t.spans.get(t.sel))
+                .map(|(s, _)| s),
+            (_, Tab::Metrics) => self.series.get(self.ssel),
             _ => self.rows.get(self.sel),
         }
     }
@@ -583,6 +617,16 @@ impl App {
     // ---- rendering --------------------------------------------------------
 
     fn frame(&mut self, w: usize, h: usize) -> Vec<String> {
+        // A terminal narrower than this cannot show a timestamp and a body, and
+        // every column computation below starts clamping to zero. Drawing the
+        // frame at 40 anyway is worse than not drawing it: `Term::draw` has no
+        // cursor addressing, so every over-wide row wraps and the top of the
+        // frame scrolls off for good, with nothing on screen saying why.
+        if w < 40 || h < 8 {
+            let mut r = Row::new(w);
+            r.put(term::RED, "terminal too small — need 40x8");
+            return vec![r.done()];
+        }
         let mut out = Vec::with_capacity(h);
         out.push(self.tabbar(w));
         out.push(self.filterbar(w));
@@ -590,7 +634,7 @@ impl App {
         let bh = body_h(h);
         let mut body = match self.mode {
             Mode::Help => help(w),
-            Mode::Detail => self.detail_full(w),
+            Mode::Detail | Mode::Span => self.detail_full(w),
             Mode::Trace => self.waterfall(w, bh),
             _ => match self.tab {
                 Tab::Metrics => self.metrics(w, bh),
@@ -599,7 +643,7 @@ impl App {
         };
         // Scrolling panes hand back every line they have and are windowed here,
         // so each one does not have to reimplement the clamp.
-        if matches!(self.mode, Mode::Detail | Mode::Help) {
+        if matches!(self.mode, Mode::Detail | Mode::Span | Mode::Help) {
             self.scroll = self.scroll.min(body.len().saturating_sub(1));
             body = body.into_iter().skip(self.scroll).take(bh).collect();
         }
@@ -695,7 +739,8 @@ impl App {
         let keys = match self.mode {
             Mode::Filter => "enter apply  esc cancel  ^w word  ^u clear",
             Mode::Detail => "esc back  ↑↓ scroll  t trace",
-            Mode::Trace => "esc back  ↑↓ span",
+            Mode::Trace => "esc back  ↑↓ span  enter detail",
+            Mode::Span => "esc waterfall  ↑↓ scroll",
             Mode::Help => "esc back",
             Mode::List if self.tab == Tab::Metrics => {
                 "↑↓ move  tab pane  enter load  t trace  / filter  [] window  r reload  ? help  q quit"
@@ -851,10 +896,24 @@ impl App {
                         pts.iter().cloned().fold(f64::INFINITY, f64::min),
                         pts.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                     );
-                    let bars = w.saturating_sub(28).max(8);
+                    // `max_points` truncation is newest-wins, so a capped
+                    // sparkline is the tail of the window drawn under a filter
+                    // bar that still says `last 24h`. Its width is taken out of
+                    // the bar rather than appended, because `Row` clips at the
+                    // edge and the one thing that must not be clipped is the
+                    // line saying the picture is incomplete. The browser legend
+                    // carries the same badge, for the same reason.
+                    let badge = match s["dropped_points"].as_i64().unwrap_or(0) {
+                        0 => String::new(),
+                        n => format!("  +{n} dropped"),
+                    };
+                    let bars = w.saturating_sub(28 + badge.len()).max(8);
                     r.put(term::CYAN, &spark(&pts, bars));
                     r.plain("  ");
                     r.put(term::DIM, &format!("{} → {}", g(lo), g(hi)));
+                    if !badge.is_empty() {
+                        r.put(term::YELLOW, &badge);
+                    }
                 }
             }
             let ex = s["exemplars"].as_vec().map_or(0, Vec::len);
@@ -1766,6 +1825,43 @@ mod tests {
         assert!(spark(&[0.0, 0.0, 9.0, 0.0], 2).ends_with('█'));
     }
 
+    /// `max_points` truncation keeps the newest points, so a capped sparkline
+    /// is the tail of the window drawn under a filter bar that still says
+    /// `last 24h`. The engine reports the count; the only failure is not
+    /// showing it.
+    #[test]
+    fn a_truncated_sparkline_says_how_many_points_are_missing() {
+        let mut app = App::new(Source::Local("/nonexistent".into()));
+        let series = |extra: &str| {
+            // A full sparkline and a wide range, so the badge is the field
+            // that would be clipped if its width were not reserved.
+            let pts: Vec<String> = (0..400)
+                .map(|i| format!("[{i},{}]", (i - 200) * 1000))
+                .collect();
+            array(
+                &crate::api::parse(&format!(
+                    r#"{{"series":[{{"name":"m","attributes":{{}},{extra}"points":[{}]}}]}}"#,
+                    pts.join(",")
+                ))
+                .unwrap()["series"],
+            )
+        };
+
+        app.series = series(r#""dropped_points":8240,"#);
+        let capped = strip(&app.series_lines(80)[1]);
+        assert!(capped.contains("+8240 dropped"), "{capped:?}");
+
+        // Reserved out of the bar rather than appended past the edge: `Row`
+        // clips at the right margin, and this is the field that must not be
+        // the one it clips.
+        assert!(capped.trim_end().ends_with("+8240 dropped"), "{capped:?}");
+
+        // And no badge at all when the whole window fitted, rather than a `+0`.
+        app.series = series("");
+        let whole = strip(&app.series_lines(80)[1]);
+        assert!(!whole.contains("dropped"), "{whole:?}");
+    }
+
     /// Every pane clamps its own cursor, and an empty result is the case that
     /// gets it wrong.
     #[test]
@@ -1826,6 +1922,7 @@ mod tests {
                     Mode::Filter,
                     Mode::Detail,
                     Mode::Trace,
+                    Mode::Span,
                     Mode::Help,
                 ] {
                     app.tab = tab;
@@ -1855,6 +1952,20 @@ mod tests {
                 }
             }
         }
+
+        // Under the minimum there is no frame to fit. Drawing the 40-column one
+        // anyway wraps every row — `Term::draw` has no cursor addressing — and
+        // scrolls its own top off the screen for good, so it says so instead,
+        // at the width the terminal actually has.
+        for (w, h) in [(30, 6), (80, 7), (39, 24), (0, 0)] {
+            let f = app.frame(w, h);
+            assert_eq!(f.len(), 1, "{w}x{h} is one line, not a frame");
+            assert!(strip(&f[0]).chars().count() <= w, "{w}x{h}");
+        }
+        assert_eq!(
+            strip(&app.frame(30, 6)[0]),
+            "terminal too small — need 40x8"
+        );
     }
 
     const W: usize = 100;
@@ -2073,6 +2184,19 @@ mod tests {
         assert_eq!(app.trace.as_ref().unwrap().sel, 1);
         // `t` inside a trace is a no-op rather than a reload of the same trace.
         press(&mut app, Key::Char('t'));
+        assert_eq!(app.mode, Mode::Trace);
+
+        // Enter opens the selected span. The waterfall draws a span's shape;
+        // its attributes and its status message exist nowhere else, and the
+        // span is not in `self.rows` — this trace came from an exemplar.
+        let f = strip(&press(&mut app, Key::Enter));
+        assert_eq!(app.mode, Mode::Span);
+        assert!(f.contains("GET /checkout/1"), "{f}");
+        assert!(f.contains("duration_nano"), "{f}");
+        press(&mut app, Key::Char('j'));
+        assert_eq!(app.scroll, 1, "the span detail scrolls like any other");
+        // Back to the waterfall it was opened from, not to the list.
+        press(&mut app, Key::Esc);
         assert_eq!(app.mode, Mode::Trace);
         // `q` leaves the mode. Only `q` on the list quits.
         press(&mut app, Key::Char('q'));

@@ -147,6 +147,13 @@ type Prefix = (String, Vec<Attr>);
 /// pays for every column of every type on every row.
 const DP_TABLES: [&str; 4] = ["number_dp", "hist_dp", "exp_hist_dp", "summary_dp"];
 
+/// The suffixes a histogram's or summary's name is derived with. Named rather
+/// than written twice, because the name filter has to accept back exactly the
+/// names the renderer hands out and two literal lists would drift apart.
+const COUNT: &str = ".count";
+const SUM: &str = ".sum";
+const DERIVED: [&str; 2] = [COUNT, SUM];
+
 pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
     let refs = block::scan(root, "metrics")?;
     let mut stats = Stats {
@@ -372,14 +379,32 @@ fn collect_block(
     // Name filter: resolve the string against the dictionary once, then compare
     // u16 codes. A block whose dictionary lacks the name has no rows to check.
     let mut wanted = vec![true; n_metrics];
+    // Set when the requested name was a derived one, so only that half of the
+    // histogram is emitted rather than both.
+    let mut only_suffix = "";
     if let Some(want) = &q.name {
         let d = metrics
             .column_by_name("name")
             .map(|c| c.as_dictionary::<UInt16Type>());
         let Some(d) = d else { return Ok(()) };
-        let Some(code) = dict_index(d.values().as_string::<i32>(), want) else {
-            return Ok(());
-        };
+        let names = d.values().as_string::<i32>();
+        // The descriptor dictionary holds `http.server.duration`; this function
+        // hands back series called `http.server.duration.count`. A caller
+        // pasting a name off its own previous answer — a chart legend, an agent
+        // reading the result it just got — must not get a silent empty series
+        // list, so a miss retries against the base name. A metric genuinely
+        // called `foo.count` matches on the first try and keeps winning.
+        let mut code = dict_index(names, want);
+        if code.is_none() {
+            for s in DERIVED {
+                if let Some(base) = want.strip_suffix(s) {
+                    code = dict_index(names, base);
+                    only_suffix = s;
+                    break;
+                }
+            }
+        }
+        let Some(code) = code else { return Ok(()) };
         let codes = d.keys().values();
         for (r, w) in wanted.iter_mut().enumerate() {
             *w = codes[r] == code;
@@ -500,6 +525,9 @@ fn collect_block(
             let attrs = merge(upper, &own);
 
             for (suffix, v) in vals.at(&dp, r) {
+                if !only_suffix.is_empty() && suffix != only_suffix {
+                    continue;
+                }
                 let key = format!("{desc_prefix}\u{1}{suffix}\u{1}{attrs}");
                 let s = out.entry(key).or_insert_with(|| Series {
                     desc: with_suffix(desc_prefix, suffix),
@@ -554,6 +582,11 @@ fn describe(metrics: &RecordBatch, row: usize) -> String {
 
 /// `describe` with the derived-series suffix folded into the name, so a
 /// `.count` series reports the name a caller can query it back by.
+///
+/// That is only true because `collect_block` strips a [`DERIVED`] suffix when
+/// the descriptor dictionary does not hold the requested name. Emitting a name
+/// here that the filter there does not accept is the same bug as returning a
+/// cursor nobody can page with.
 fn with_suffix(desc: &str, suffix: &str) -> String {
     if suffix.is_empty() {
         return desc.to_owned();
@@ -705,18 +738,133 @@ impl Values {
                 if let Some(c) = dp.column_by_name("count") {
                     let a = c.as_primitive::<UInt64Type>();
                     if !a.is_null(r) {
-                        v.push((".count", Pt::Int(a.value(r) as i64)));
+                        v.push((COUNT, Pt::Int(a.value(r) as i64)));
                     }
                 }
                 if let Some(c) = dp.column_by_name("sum") {
                     let a = c.as_primitive::<Float64Type>();
                     if !a.is_null(r) {
-                        v.push((".sum", Pt::Double(a.value(r))));
+                        v.push((SUM, Pt::Double(a.value(r))));
                     }
                 }
                 v
             }
             Values::None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use mira_proto::metrics::v1::metric::Data;
+    use mira_proto::metrics::v1::number_data_point::Value as NumValue;
+    use mira_proto::metrics::v1::{
+        Gauge, Histogram, HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics,
+        ScopeMetrics,
+    };
+
+    /// A histogram comes back as two series called `<name>.count` and
+    /// `<name>.sum`, and those are the names a chart legend shows and an agent
+    /// reads off its own previous answer. Matching only the base name against
+    /// the descriptor dictionary made that round trip return an empty list with
+    /// a 200, which reads as "the metric stopped reporting".
+    #[test]
+    fn a_derived_series_name_queries_back_to_the_series_it_names() {
+        let dir = std::env::temp_dir().join(format!("mira-derived-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "http.server.duration".into(),
+                            data: Some(Data::Histogram(Histogram {
+                                data_points: vec![HistogramDataPoint {
+                                    time_unix_nano: 1_000,
+                                    count: 3,
+                                    sum: Some(1.5),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        // A gauge whose name already ends in `.count`. The base
+                        // name has to win the lookup, or this metric becomes
+                        // unreachable the moment the stripping is added.
+                        Metric {
+                            name: "queue.depth.count".into(),
+                            data: Some(Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: 1_000,
+                                    value: Some(NumValue::AsInt(42)),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let mut b = crate::metrics::MetricsBuilder::new();
+        b.append_request(&req).unwrap();
+        let sealed = b.finish().unwrap();
+        crate::block::publish(&dir, "metrics", crate::block::node_id("a"), 0, &sealed).unwrap();
+
+        let ask = |name: &str| {
+            series(
+                &dir,
+                &SeriesQuery {
+                    name: Some(name.into()),
+                    from: 0,
+                    to: 10_000,
+                    terms: Vec::new(),
+                    max_series: 100,
+                    max_points: 100,
+                },
+            )
+            .unwrap()
+            .json
+        };
+
+        // The base name still returns both halves.
+        let both = ask("http.server.duration");
+        for half in [COUNT, SUM] {
+            assert!(
+                both.contains(&format!(r#""name":"http.server.duration{half}""#)),
+                "{both}"
+            );
+        }
+
+        // Each derived name returns exactly the series it names, and only it.
+        let c = ask("http.server.duration.count");
+        assert!(c.contains(r#""name":"http.server.duration.count""#), "{c}");
+        assert!(!c.contains(SUM), "{c}");
+        assert!(c.contains("[1000,3]"), "{c}");
+        let s = ask("http.server.duration.sum");
+        assert!(s.contains(r#""name":"http.server.duration.sum""#), "{s}");
+        assert!(!s.contains(COUNT), "{s}");
+        assert!(s.contains("[1000,1.5]"), "{s}");
+
+        // A metric that really is called `x.count` matches before the suffix is
+        // stripped.
+        let q = ask("queue.depth.count");
+        assert!(q.contains(r#""name":"queue.depth.count""#), "{q}");
+        assert!(q.contains("[1000,42]"), "{q}");
+
+        // The retry widens the lookup; it does not make it match anything. A
+        // derived name on a metric that has no derived series is still empty,
+        // and so is a base name nothing carries.
+        assert_eq!(ask("queue.depth.count.sum"), "[]");
+        assert_eq!(ask("nope.count"), "[]");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

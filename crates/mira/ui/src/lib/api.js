@@ -59,10 +59,19 @@ export const FREE_TEXT = { logs: 'body', traces: 'name' }
 const unquote = (raw) =>
   raw.length > 1 && raw[0] === '"' && raw.endsWith('"') ? raw.slice(1, -1) : raw
 
-function coerce(raw) {
+// Ids stay strings whatever they look like, the same exemption the terminal
+// filter box makes: a span id of 16 decimal digits reads as a number, the
+// engine's unhex path only accepts a string, and an inapplicable term is
+// defined to return no rows rather than an error -- so the mistake is silent.
+// A 32-digit trace id, which this repo's own loadgen emits, loses its low bits
+// to the float as well.
+const isId = (key) => key.endsWith('_id') || key.endsWith('.id')
+
+function coerce(raw, key) {
   if (raw !== unquote(raw)) return unquote(raw)
   if (raw === 'true') return true
   if (raw === 'false') return false
+  if (isId(key)) return raw
   if (/^-?\d+$/.test(raw)) return Number(raw)
   if (/^-?\d*\.\d+$/.test(raw)) return Number(raw)
   return raw
@@ -86,14 +95,14 @@ export function parseFilter(text, signal) {
     }
     const [i, sym, op] = hit
     let key = tok.slice(0, i)
-    const value = coerce(tok.slice(i + sym.length))
     let target = 'attr'
     if (key.startsWith('field:') || key.startsWith('attr:')) {
       ;[target, key] = key.split(':')
     } else if ((FIELDS[signal] || []).includes(key)) {
       target = 'field'
     }
-    terms.push({ [target]: key, [op]: value })
+    // Typed after the prefix is stripped, so the exemption sees the real key.
+    terms.push({ [target]: key, [op]: coerce(tok.slice(i + sym.length), key) })
   }
   return terms
 }

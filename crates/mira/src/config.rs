@@ -39,9 +39,8 @@
 //!   be. They live in `pipeline::Config`, derived, with no path from this file.
 //! * **Deployment description** is what the engine cannot know: which addresses
 //!   to listen on, which directory is the data directory, how long the retention
-//!   policy is, what this replica is called, where its peers are. That is not
-//!   tuning. Refusing to accept it does not make an engine self-driving, it makes
-//!   it unusable.
+//!   policy is, what this replica is called. That is not tuning. Refusing to
+//!   accept it does not make an engine self-driving, it makes it unusable.
 //!
 //! The boundary is structural rather than documentary: this struct has no field
 //! that affects how the engine performs, only where it runs.
@@ -93,8 +92,6 @@ pub struct Config {
     pub http: SocketAddr,
     pub data_dir: PathBuf,
     pub retention: Duration,
-    /// Peer addresses for scatter-gather queries. Empty means single-node.
-    pub peers: Vec<String>,
     /// The largest export either listener will decode. See
     /// `receiver::Receivers::max_request_bytes` for why it is one number.
     pub max_request_bytes: usize,
@@ -108,7 +105,6 @@ impl Default for Config {
             http: "0.0.0.0:4318".parse().unwrap(),
             data_dir: PathBuf::from("./mira-data"),
             retention: Duration::from_secs(7 * 24 * 3600),
-            peers: Vec::new(),
             // Eight times axum's default and four times tonic's. A stock
             // collector batches 8192 records, which is already past 2 MiB of
             // spans, and an exporter reads 413 as permanent — so the cost of
@@ -149,29 +145,56 @@ impl Config {
             cfg.max_request_bytes =
                 bytes(&v).map_err(|e| format!("ingest.max_request_bytes: {e}"))?;
         }
-        // Peers may be a YAML list or one comma-separated string, because both
-        // are natural: a list in a hand-written file, a string from a `${env:}`.
-        cfg.peers = match lookup(&root, "cluster.peers") {
-            Some(Yaml::Array(items)) => {
-                let mut out = Vec::new();
-                for it in items {
-                    let s = scalar(it)
-                        .map_err(|e| format!("cluster.peers: {e}"))?
-                        .ok_or("cluster.peers: non-scalar list entry")?;
-                    out.push(resolve(&root, &s, &mut Vec::new())?);
-                }
-                out
-            }
-            _ => get(&root, "cluster.peers")?
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        };
+        check_keys(&root, "")?;
         Ok(cfg)
     }
+}
+
+/// Every path this file may contain, in the order [`Config::parse`] reads them.
+const KNOWN: [&str; 6] = [
+    "node",
+    "listen.grpc",
+    "listen.http",
+    "storage.dir",
+    "storage.retention",
+    "ingest.max_request_bytes",
+];
+
+/// Refuse a key Mira does not read.
+///
+/// The seven `lookup`s above are silent about everything they do not name, so
+/// `storage.retension` and a `retention` nested one level too deep both boot
+/// happily on the 7-day default and surface a week later as a full disk. A flag
+/// Mira does not know is already `unknown flag --nope`; there is no reason a file
+/// should be the lenient half of the same interface.
+///
+/// The closed set is also what makes deleting a setting safe: a key that no
+/// longer exists becomes a startup error naming it, rather than a value the
+/// operator still believes is in effect.
+fn check_keys(node: &Yaml, prefix: &str) -> Result<()> {
+    let Yaml::Hash(h) = node else { return Ok(()) };
+    for (k, v) in h {
+        // Keys obey the same rule as values, and for the same reason: `2: x` is
+        // a key nobody typed. `scalar` says it with the message that teaches it.
+        let path = match (prefix, scalar(k)?.unwrap_or_default()) {
+            ("", name) => name,
+            (p, name) => format!("{p}.{name}"),
+        };
+        // A map is a section on the way to a leaf — or a leaf someone nested one
+        // level too deep, in which case the recursion is what names it.
+        if matches!(v, Yaml::Hash(_)) {
+            check_keys(v, &path)?;
+            continue;
+        }
+        if KNOWN.contains(&path.as_str()) {
+            continue;
+        }
+        return Err(format!(
+            "unknown key {path:?}. Mira reads exactly {}; see docs/CONFIG.md",
+            KNOWN.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn lookup<'a>(root: &'a Yaml, path: &str) -> Option<&'a Yaml> {
@@ -245,13 +268,39 @@ fn resolve(root: &Yaml, raw: &str, stack: &mut Vec<String>) -> Result<String> {
             continue;
         }
         let rest = &raw[i + 2..];
-        let end = rest
-            .find('}')
-            .ok_or_else(|| format!("unterminated `${{` in {raw:?}"))?;
+        let end = closing_brace(rest).ok_or_else(|| format!("unterminated `${{` in {raw:?}"))?;
         out.push_str(&expand(root, &rest[..end], stack)?);
         i += 2 + end + 1;
     }
     Ok(out)
+}
+
+/// Offset of the `}` that closes a `${` already consumed.
+///
+/// The matching brace, not the first one. `${env:A,${env:B,fallback}}` is a
+/// documented shape — a default that is itself an expression — and taking
+/// `find('}')` splits it in the middle: with `A` unset it complains about a `${`
+/// the author did terminate, and with `A` set it yields the value with a stray
+/// `}` welded on. That second one is the failure that matters, because `node`
+/// ends up in every block directory name.
+fn closing_brace(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut i) = (0usize, 0);
+    while i < b.len() {
+        // A multi-byte character's continuation bytes are all ≥ 0x80, so
+        // scanning bytes for these three ASCII ones cannot land inside one.
+        match b[i] {
+            b'$' if b.get(i + 1) == Some(&b'{') => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn expand(root: &Yaml, expr: &str, stack: &mut Vec<String>) -> Result<String> {
@@ -364,7 +413,6 @@ mod tests {
     "dir": "/var/lib/${node}/${env:MIRA_TEST_MISSING,fallback}",
     "retention": "36h",
   },
-  "cluster": { "peers": ["a:1", "b:2",], },
 }"#,
         )
         .unwrap();
@@ -373,12 +421,23 @@ mod tests {
         assert_eq!(cfg.grpc.port(), 5317);
         assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/node-7/fallback"));
         assert_eq!(cfg.retention, Duration::from_secs(36 * 3600));
-        assert_eq!(cfg.peers, vec!["a:1", "b:2"]);
         // Unset keys keep their defaults rather than becoming empty.
         assert_eq!(cfg.http.port(), 4318);
 
         let esc = Config::parse(r#"{ "node": "$${env:NOPE}" }"#).unwrap();
         assert_eq!(esc.node, "${env:NOPE}");
+
+        // Defaults nest, which only works if the scan finds the *matching*
+        // brace. Taking the first one used to boot the node called `alpha}` —
+        // a stray character in every block directory this replica writes.
+        let chain = r#"{ "node": "${env:MIRA_TEST_MISSING,${env:MIRA_TEST_HOST,last}}" }"#;
+        assert_eq!(Config::parse(chain).unwrap().node, "node-7");
+        let all_unset =
+            r#"{ "node": "${env:MIRA_TEST_MISSING,${env:MIRA_TEST_ALSO_MISSING,last}}" }"#;
+        assert_eq!(Config::parse(all_unset).unwrap().node, "last");
+        // And the outer value still wins without picking up the inner brace.
+        let outer = r#"{ "node": "${env:MIRA_TEST_HOST,${env:MIRA_TEST_MISSING,last}}" }"#;
+        assert_eq!(Config::parse(outer).unwrap().node, "node-7");
     }
 
     /// The coercions KYAML exists to kill. Each of these used to be accepted,
@@ -423,6 +482,43 @@ mod tests {
                 .unwrap_err()
                 .contains("unterminated")
         );
+        // A nested default that never closes is still unterminated, rather than
+        // swallowing the rest of the file quietly.
+        assert!(
+            Config::parse("node: ${env:X,${env:Y,z}")
+                .unwrap_err()
+                .contains("unterminated")
+        );
+    }
+
+    /// A key Mira does not read is a startup error, not a shrug.
+    ///
+    /// The failure this prevents is the quietest one in the system: `retension`
+    /// for `retention` keeps the 7-day default, says nothing, and is diagnosed
+    /// weeks later as a disk that will not stop growing.
+    #[test]
+    fn a_key_mira_does_not_read_refuses_to_start() {
+        let e = Config::parse(r#"{ "storage": { "retension": "30d" } }"#).unwrap_err();
+        assert!(e.contains("storage.retension"), "{e}");
+
+        // Right name, wrong depth. Reported by its full path, because that is
+        // the thing that is wrong about it.
+        let e = Config::parse(r#"{ "retention": "30d" }"#).unwrap_err();
+        assert!(e.contains("unknown key \"retention\""), "{e}");
+        let e = Config::parse(r#"{ "storage": { "dir": { "path": "/x" } } }"#).unwrap_err();
+        assert!(e.contains("storage.dir.path"), "{e}");
+
+        // A setting that was deleted becomes loud for free — no special case.
+        let e = Config::parse(r#"{ "cluster": { "peers": "a:1" } }"#).unwrap_err();
+        assert!(e.contains("cluster.peers"), "{e}");
+
+        // Keys are held to the same quoting rule as values.
+        let e = Config::parse("2: x").unwrap_err();
+        assert!(e.contains("quote"), "{e}");
+
+        // And the shipped shape passes, including sections with nothing in them.
+        Config::parse(r#"{ "node": "a", "listen": {}, "ingest": { "max_request_bytes": "1k" } }"#)
+            .unwrap();
     }
 
     /// Binary units throughout, and no silent second meaning for `MB`.
@@ -448,12 +544,5 @@ mod tests {
         assert_eq!(cfg.max_request_bytes, 32 << 20);
         let e = Config::parse(r#"{ "ingest": { "max_request_bytes": "big" } }"#).unwrap_err();
         assert!(e.contains("ingest.max_request_bytes"), "{e}");
-    }
-
-    #[test]
-    fn peers_accept_a_list_as_well_as_a_string() {
-        let cfg = Config::parse("cluster:\n  peers:\n    - a:1\n    - b:2\n").unwrap();
-        assert_eq!(cfg.peers, vec!["a:1", "b:2"]);
-        assert!(Config::default().peers.is_empty());
     }
 }

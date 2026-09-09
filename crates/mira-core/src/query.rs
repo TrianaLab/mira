@@ -40,6 +40,8 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
+use mira_proto::common::v1::AnyValue;
+use prost::Message;
 
 use crate::block::{self, BlockRef};
 use crate::error::Result;
@@ -792,7 +794,16 @@ pub(crate) fn emit_fields(j: &mut Json, b: &RecordBatch, row: u32) {
             continue;
         }
         j.key(f.name());
-        emit_value(j, col.as_ref(), row as usize);
+        // `body_ser` is the one Binary column that is not opaque bytes: it holds
+        // the protobuf encoding of a non-string log body, written precisely so
+        // that nothing is lost. Sending it through the generic Binary arm below
+        // renders a map-valued body as a hex dump, which loses it on the way out
+        // instead of on the way in.
+        if f.name() == "body_ser" {
+            emit_any(j, col.as_binary::<i32>().value(row as usize));
+        } else {
+            emit_value(j, col.as_ref(), row as usize);
+        }
     }
 }
 
@@ -1079,6 +1090,8 @@ pub(crate) fn emit_attr(j: &mut Json, a: &RecordBatch, row: usize) {
     const DOUBLE: u8 = AttrType::Double as u8;
     const BOOL: u8 = AttrType::Bool as u8;
     const BYTES: u8 = AttrType::Bytes as u8;
+    const SLICE: u8 = AttrType::Slice as u8;
+    const MAP: u8 = AttrType::Map as u8;
     match a.column(2).as_primitive::<UInt8Type>().value(row) {
         STR => j.str(a.column(3).as_string::<i32>().value(row)),
         // Int attributes go out as JSON numbers even though OTLP allows the
@@ -1089,9 +1102,54 @@ pub(crate) fn emit_attr(j: &mut Json, a: &RecordBatch, row: usize) {
         DOUBLE => j.f64(a.column(5).as_primitive::<Float64Type>().value(row)),
         BOOL => j.bool(a.column(6).as_boolean().value(row)),
         BYTES => j.hex(a.column(7).as_binary::<i32>().value(row)),
-        // Slice and Map are protobuf-encoded in `ser`. Decoding them for
-        // display is a V0 cut, not a storage limitation.
+        // `ser` holds the protobuf encoding of the whole `AnyValue`, so an array
+        // or a map is a decode away rather than a reconstruction. They are not
+        // exotic: `process.command_args` and `http.request.header.*` are arrays
+        // by semantic convention, and `gen_ai.input.messages` — the first-class
+        // case in ARCHITECTURE §1 — is a kvlist.
+        SLICE | MAP => emit_any(j, a.column(8).as_binary::<i32>().value(row)),
+        // AttrType::Empty: the key arrived with no value at all, which is what
+        // `null` means.
         _ => j.null(),
+    }
+}
+
+/// Render a protobuf-encoded `AnyValue` — the attribute `ser` column, and a log
+/// body that was not a string — as the JSON it describes.
+///
+/// A decode failure becomes `null`. These bytes were written by this process
+/// from an already-decoded message, so a failure here means the block is
+/// damaged, and one damaged value must not take the whole response with it.
+pub(crate) fn emit_any(j: &mut Json, bytes: &[u8]) {
+    match AnyValue::decode(bytes) {
+        Ok(v) => emit_any_value(j, v.value.as_ref()),
+        Err(_) => j.null(),
+    }
+}
+
+/// Recursion is bounded by prost's own decode recursion limit (100), which
+/// `AnyValue::decode` above has already enforced on these bytes — a hostile
+/// client cannot nest deeply enough here to reach the stack.
+fn emit_any_value(j: &mut Json, v: Option<&mira_proto::common::v1::any_value::Value>) {
+    use mira_proto::common::v1::any_value::Value as Av;
+    match v {
+        None => j.null(),
+        Some(Av::StringValue(s)) => j.str(s),
+        Some(Av::IntValue(i)) => j.i64(*i),
+        Some(Av::DoubleValue(d)) => j.f64(*d),
+        Some(Av::BoolValue(b)) => j.bool(*b),
+        Some(Av::BytesValue(b)) => j.hex(b),
+        Some(Av::ArrayValue(a)) => j.arr(|j| {
+            for e in &a.values {
+                emit_any_value(j, e.value.as_ref());
+            }
+        }),
+        Some(Av::KvlistValue(m)) => j.obj(|j| {
+            for e in &m.values {
+                j.key(&e.key);
+                emit_any_value(j, e.value.as_ref().and_then(|v| v.value.as_ref()));
+            }
+        }),
     }
 }
 
@@ -1357,6 +1415,57 @@ mod tests {
         assert_eq!(dict_index(&vals, "c"), None);
     }
 
+    /// Every `AnyValue` arm, including the ones no attribute in the scan below
+    /// carries, and bytes that are not an `AnyValue` at all. The renderer is a
+    /// recursive decoder over attacker-supplied structure, which is the one
+    /// shape in this file where a missing arm is a silently wrong answer.
+    #[test]
+    fn every_any_value_arm_renders_and_damage_renders_as_null() {
+        use mira_proto::common::v1::any_value::Value as Av;
+        use mira_proto::common::v1::{ArrayValue, KeyValue, KeyValueList};
+
+        let render = |v: Option<Av>| {
+            let mut j = Json::new();
+            emit_any(&mut j, &AnyValue { value: v }.encode_to_vec());
+            j.into_string()
+        };
+        assert_eq!(render(None), "null");
+        assert_eq!(render(Some(Av::StringValue("s".into()))), r#""s""#);
+        assert_eq!(render(Some(Av::IntValue(-1))), "-1");
+        assert_eq!(render(Some(Av::DoubleValue(0.5))), "0.5");
+        assert_eq!(render(Some(Av::BoolValue(true))), "true");
+        assert_eq!(
+            render(Some(Av::BytesValue(vec![0xbe, 0xef].into()))),
+            r#""beef""#
+        );
+        // Nested both ways round, because the recursion is the only part of
+        // this that can be wrong in a way a flat value would not show.
+        assert_eq!(
+            render(Some(Av::ArrayValue(ArrayValue {
+                values: vec![
+                    AnyValue { value: None },
+                    AnyValue {
+                        value: Some(Av::KvlistValue(KeyValueList {
+                            values: vec![KeyValue {
+                                key: "k".into(),
+                                value: Some(AnyValue {
+                                    value: Some(Av::IntValue(2)),
+                                }),
+                            }],
+                        })),
+                    },
+                ],
+            }))),
+            r#"[null,{"k":2}]"#
+        );
+
+        // A field number and wire type no protobuf carries. The bytes only get
+        // here by being on disk, so this is a damaged block, not a bad request.
+        let mut j = Json::new();
+        emit_any(&mut j, &[0xff, 0xff, 0xff]);
+        assert_eq!(j.into_string(), "null");
+    }
+
     /// A block on disk, scanned. The predicate tables above are exercised in
     /// isolation; this is the path that reaches them — the time prefilter, the
     /// three attribute levels, and the merge that decides which of two levels
@@ -1365,7 +1474,9 @@ mod tests {
     fn a_scan_narrows_by_time_then_by_terms_and_the_most_specific_level_wins() {
         use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
         use mira_proto::common::v1::any_value::Value as Av;
-        use mira_proto::common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue};
+        use mira_proto::common::v1::{
+            AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
+        };
         use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
         use mira_proto::resource::v1::Resource;
 
@@ -1396,21 +1507,51 @@ mod tests {
                             time_unix_nano: base + i * 1_000_000_000,
                             severity_number: 9 + i as i32,
                             severity_text: "INFO".into(),
+                            // OTel Events carry the identity of the event here
+                            // and not in an attribute; empty on the others,
+                            // which is how OTLP says "this is a plain log".
+                            event_name: if i == 0 {
+                                "user.login".into()
+                            } else {
+                                String::new()
+                            },
+                            // The last record's body is a map rather than a
+                            // string, which is the case `body_ser` exists for.
                             body: Some(AnyValue {
-                                value: Some(Av::StringValue(format!("line {i}"))),
+                                value: Some(if i == 2 {
+                                    Av::KvlistValue(KeyValueList {
+                                        values: vec![kv(
+                                            "msg",
+                                            Av::StringValue("structured body".into()),
+                                        )],
+                                    })
+                                } else {
+                                    Av::StringValue(format!("line {i}"))
+                                }),
                             }),
                             attributes: vec![
                                 kv("deploy.env", Av::StringValue("canary".into())),
                                 kv("attempt", Av::IntValue(i as i64)),
-                                // Neither of these is filterable in V0; both
-                                // still have to come back in the row.
+                                // None of these three is filterable in V0; all
+                                // three still have to come back in the row.
                                 kv("payload", Av::BytesValue(vec![0xde, 0xad].into())),
                                 kv(
                                     "tags",
                                     Av::ArrayValue(ArrayValue {
-                                        values: vec![AnyValue {
-                                            value: Some(Av::StringValue("a".into())),
-                                        }],
+                                        values: vec![
+                                            AnyValue {
+                                                value: Some(Av::StringValue("a".into())),
+                                            },
+                                            AnyValue {
+                                                value: Some(Av::IntValue(7)),
+                                            },
+                                        ],
+                                    }),
+                                ),
+                                kv(
+                                    "gen_ai.input.messages",
+                                    Av::KvlistValue(KeyValueList {
+                                        values: vec![kv("role", Av::StringValue("user".into()))],
                                     }),
                                 ),
                             ],
@@ -1539,9 +1680,44 @@ mod tests {
         assert!(!row.contains("prod"), "{row}");
         assert!(row.contains(r#""service.name":"checkout""#), "{row}");
         assert!(row.contains(r#""payload":"dead""#), "{row}");
-        // A slice is stored but not yet decoded for display, and null is an
-        // honest answer where a guess would not be.
-        assert!(row.contains(r#""tags":null"#), "{row}");
+        // Slice and Map round-trip through `ser` as the JSON they were, because
+        // a value nothing can read back is a value that was not stored.
+        assert!(row.contains(r#""tags":["a",7]"#), "{row}");
+        assert!(
+            row.contains(r#""gen_ai.input.messages":{"role":"user"}"#),
+            "{row}"
+        );
+        // Same for a non-string body, and for the field that says the record is
+        // an OTel Event rather than a log line.
+        assert!(
+            row.contains(r#""body_ser":{"msg":"structured body"}"#),
+            "{row}"
+        );
+        assert!(row.contains(r#""event_name":"user.login""#), "{row}");
+        // Empty on the wire is absent in the row, not an empty string.
+        assert_eq!(row.matches("event_name").count(), 1, "{row}");
+
+        // A block written before `event_name` was added to the schema. Once a
+        // block is on disk a schema change is not revertible, so the claim that
+        // the reader is `column_by_name` all the way down has to be checked
+        // rather than asserted: dropping the column reproduces the old writer
+        // exactly, and the only difference in the answer must be the field.
+        let table = bref.dir.join("logs.arrow");
+        let mut old = block::open_table_opt(&table).unwrap().unwrap().batches[0].clone();
+        old.remove_column(old.schema().index_of("event_name").unwrap());
+        // Staged and renamed rather than truncated in place: a mapping over a
+        // truncated file is a SIGBUS, which is why `write_table` says so.
+        let staged = bref.dir.join("logs.arrow.new");
+        crate::block::write_table(&staged, &old).unwrap();
+        std::fs::rename(&staged, &table).unwrap();
+        let r = scan(base, all, vec![]);
+        assert_eq!(r.stats.rows_matched, 3, "{}", r.json);
+        assert!(!r.json.contains("event_name"), "{}", r.json);
+        assert!(
+            r.json.contains(r#""body_ser":{"msg":"structured body"}"#),
+            "{}",
+            r.json
+        );
 
         // Retention can delete a block between the directory listing and the
         // read. The block still counts as present and simply contributes

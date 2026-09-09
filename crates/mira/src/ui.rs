@@ -63,14 +63,19 @@ async fn index(headers: HeaderMap) -> Response {
     serve(&ASSETS[0], &headers)
 }
 
-/// Anything that is not a known asset is the UI's own route.
+/// One of the three assets, or nothing.
 ///
-/// The whole app lives under the hash, so this only fires when someone reloads
-/// a URL the router does not know about — and the honest answer there is the
-/// same page, not a 404 for a file that was never meant to exist.
+/// There is no SPA fallback here and there must not be one: every view in the
+/// app lives under the hash (`/#/logs`), so a *path* this table does not know is
+/// not a UI route that needs rescuing — it is a request for something that does
+/// not exist. Answering it with 200 and index.html made `/health`, `/metrics`
+/// and every probe path an operator might try report success in HTML, which is
+/// the one answer worse than a 404.
 async fn file(Path(file): Path<String>, headers: HeaderMap) -> Response {
-    let a = ASSETS.iter().find(|a| a.name == file).unwrap_or(&ASSETS[0]);
-    serve(a, &headers)
+    match ASSETS.iter().find(|a| a.name == file) {
+        Some(a) => serve(a, &headers),
+        None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
 }
 
 fn serve(a: &Asset, headers: &HeaderMap) -> Response {

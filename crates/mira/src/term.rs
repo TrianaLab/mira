@@ -5,8 +5,8 @@
 //! What it buys over this file is a constraint-solving layout engine and a
 //! damage-tracked cell buffer; the TUI here has fixed panes and redraws one
 //! screenful per keystroke. So: `termios` for raw mode, `TIOCGWINSZ` for the
-//! size, `poll(2)` for input, ANSI for the rest. `libc` is already in the tree
-//! for `statfs`.
+//! size, `poll(2)` for input, three `sigaction`s to survive a resize and a
+//! `kill`, ANSI for the rest. `libc` is already in the tree for `statfs`.
 //!
 //! Unix only, which is the same bet `mmap`, `SIGTERM` and the filesystem guard
 //! already make.
@@ -64,6 +64,15 @@ impl Term {
             prev(info);
         }));
 
+        // SIGWINCH so a resize breaks the `poll` in `key` and the loop repaints
+        // at the new size; SIGTERM and SIGHUP so a `kill` or a closed ssh
+        // session gives the terminal back the way the panic hook does. Their
+        // default dispositions — discard, and die on the spot — are both wrong
+        // for a process that owns the screen.
+        on_signal(libc::SIGWINCH, winch);
+        on_signal(libc::SIGTERM, bail);
+        on_signal(libc::SIGHUP, bail);
+
         let mut out = io::BufWriter::new(io::stdout());
         // Alternate screen, then hide the cursor. Leaving on the alternate
         // screen is what puts the user's scrollback back the way they left it.
@@ -77,9 +86,9 @@ impl Term {
 
     /// Visible size, re-read every frame.
     ///
-    /// Polling beats a `SIGWINCH` handler here: the draw loop already wakes on a
-    /// timer, and a signal handler would need a `static` flag to communicate
-    /// with it anyway.
+    /// The `SIGWINCH` handler [`enter`](Term::enter) installs records nothing;
+    /// it exists only to interrupt the `poll` the draw loop is parked in. This
+    /// call is what learns the new size, on the frame that interruption paints.
     pub fn size(&self) -> (usize, usize) {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(1, libc::TIOCGWINSZ as _, &mut ws) } != 0 || ws.ws_col == 0 {
@@ -236,15 +245,48 @@ fn csi(seq: &[u8]) -> Key {
     }
 }
 
-/// Put the terminal back. Idempotent, because both `Drop` and the panic hook
-/// can reach it and a double panic would otherwise run it twice.
+/// Put the terminal back. Idempotent, because `Drop`, the panic hook and a
+/// fatal signal can all reach it and a double panic would otherwise run it
+/// twice.
+///
+/// Every call in here is async-signal-safe — `tcsetattr` and `write` are on
+/// POSIX's list, and `OnceLock::get` is one atomic load — because [`bail`] runs
+/// it from a signal handler. `io::stdout()` is the thing that would not do:
+/// taking its lock in a handler that interrupted the thread already holding it
+/// is a deadlock at exactly the moment the user wants their terminal back.
 fn restore() {
     if let Some(t) = ORIG.get() {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
     }
-    let mut out = io::stdout();
-    let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
-    let _ = out.flush();
+    const OFF: &[u8] = b"\x1b[?25h\x1b[?1049l";
+    unsafe { libc::write(1, OFF.as_ptr().cast(), OFF.len()) };
+}
+
+/// Install `h` for `sig`, deliberately without `SA_RESTART`: a syscall the
+/// signal interrupts must fail with `EINTR` rather than be resumed behind the
+/// caller's back, which is the whole mechanism [`poll_in`] relies on.
+fn on_signal(sig: libc::c_int, h: unsafe extern "C" fn(libc::c_int)) {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = h as usize;
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+/// A resize. Nothing to do in the handler — the delivery itself is the message,
+/// and it arrives as an `EINTR` in [`poll_in`].
+unsafe extern "C" fn winch(_: libc::c_int) {}
+
+/// Give the terminal back, then die.
+///
+/// Installing a handler removed the default disposition, so returning would
+/// resume a process the user asked to end; `_exit` rather than `exit` because
+/// the latter runs atexit handlers that are not async-signal-safe, and 128+n is
+/// the status a shell reports for a signal death.
+unsafe extern "C" fn bail(sig: libc::c_int) {
+    restore();
+    unsafe { libc::_exit(128 + sig) };
 }
 
 fn poll_in(timeout_ms: i32) -> io::Result<bool> {
@@ -258,7 +300,9 @@ fn poll_in(timeout_ms: i32) -> io::Result<bool> {
         return Ok(n > 0);
     }
     let e = io::Error::last_os_error();
-    // A resize interrupts the poll. Reporting "nothing to read" sends the caller
+    // A resize interrupts the poll, which is the only reason `enter` installs a
+    // SIGWINCH handler at all — the default disposition discards it and this
+    // arm would be unreachable. Reporting "nothing to read" sends the caller
     // back around the draw loop, which re-reads the size — which is exactly the
     // handling a resize wants, so it is not retried here.
     match e.kind() {
@@ -758,6 +802,39 @@ mod tests {
         // timeout expires and says so, rather than returning a key nobody
         // pressed. After a marker it would be a race the parent usually wins.
         assert_eq!(t.key(30).unwrap(), None, "empty poll");
+
+        // A resize has to break an *infinite* poll, or the frame is never
+        // repainted at the new size. Aimed at this exact thread: plain `kill`
+        // is free to hand the signal to the test harness's thread, which is not
+        // the one parked in `poll`.
+        struct Tid(libc::pthread_t);
+        // Handing a thread handle to the thread that will signal with it is the
+        // only reason this type exists.
+        unsafe impl Send for Tid {}
+        let me = Tid(unsafe { libc::pthread_self() });
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            unsafe { libc::pthread_kill(me.0, libc::SIGWINCH) };
+        });
+        assert_eq!(t.key(-1).unwrap(), None, "a resize interrupts the poll");
+
+        // SIGTERM and SIGHUP are inspected rather than raised: they end the
+        // process, and a child that dies of a signal writes no coverage profile
+        // and reports nothing back. The failure that actually happened — no
+        // handler at all, so a `kill` left the shell in raw mode — is visible
+        // from the disposition.
+        for sig in [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP] {
+            let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+            let got = unsafe { libc::sigaction(sig, std::ptr::null(), &mut sa) };
+            assert_eq!(got, 0, "reading the disposition of {sig}");
+            assert!(
+                sa.sa_sigaction != libc::SIG_DFL && sa.sa_sigaction != libc::SIG_IGN,
+                "signal {sig} has no handler"
+            );
+            // With SA_RESTART the kernel resumes the interrupted `poll` for us
+            // and the wake-up above never reaches `poll_in`.
+            assert_eq!(sa.sa_flags & libc::SA_RESTART, 0, "signal {sig}");
+        }
 
         // Each marker is both a frame to assert on and the parent's cue to send
         // the next key. See the write loop above for why they interleave.
