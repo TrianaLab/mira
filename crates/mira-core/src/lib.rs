@@ -970,6 +970,9 @@ mod tests {
                 attrs.push(attr("http.status_code", Value::IntValue(200)));
                 attrs.push(attr("retry", Value::BoolValue(true)));
                 attrs.push(attr("ratio", Value::DoubleValue(1.5)));
+                // The same kind of number, stored as text — which is what a
+                // good half of the SDKs emitting a status code actually send.
+                attrs.push(attr("status.text", Value::StringValue("404".into())));
             }
             for r in &mut req.resource_logs[0].scope_logs[0].log_records {
                 r.attributes = attrs.clone();
@@ -981,7 +984,7 @@ mod tests {
             block::publish(&root, "logs", block::node_id("a"), seq, &sealed).unwrap();
         }
 
-        let find = |key: &str, value: QV| {
+        let find_op = |key: &str, op: Op, value: QV| {
             query::search(
                 &root,
                 &Search {
@@ -990,7 +993,7 @@ mod tests {
                     to: i64::MAX,
                     terms: vec![Term {
                         target: Target::Attr(key.into()),
-                        op: Op::Eq,
+                        op,
                         value,
                     }],
                     limit: 100,
@@ -998,6 +1001,7 @@ mod tests {
             )
             .unwrap()
         };
+        let find = |key: &str, value: QV| find_op(key, Op::Eq, value);
         let s = |v: &str| QV::Str(v.into());
 
         // The plain case: one block holds the value, seven are ruled out
@@ -1031,6 +1035,43 @@ mod tests {
             let r = find(key, value.clone());
             assert_eq!(r.stats.rows_matched, 2, "{key} = {value:?}");
         }
+
+        // The reverse direction, which used to be the asymmetry: every other
+        // arm parses a string, so `eq: "200"` finds an integer column, but the
+        // string column read only `Value::Str` and `eq: 404` against text was
+        // unconditionally false. The index never agreed — it holds the text
+        // "404" either way and pointed straight at the block.
+        let r = find("status.text", QV::Int(404));
+        assert_eq!(r.stats.rows_matched, 2);
+        assert_eq!(r.stats.blocks_scanned, 1, "and it is still pruned");
+
+        // Ordering against a number stored as text is numeric, not
+        // lexicographic. "404" is below 500 both ways, but above 99 only one of
+        // them — a byte comparison puts '4' before '9' and answers no.
+        assert_eq!(
+            find_op("status.text", Op::Lt, QV::Int(500))
+                .stats
+                .rows_matched,
+            2
+        );
+        assert_eq!(
+            find_op("status.text", Op::Gt, QV::Int(99))
+                .stats
+                .rows_matched,
+            2
+        );
+        // A quoted scalar asked for a text comparison and still gets one.
+        assert_eq!(
+            find_op("status.text", Op::Gt, s("99")).stats.rows_matched,
+            0
+        );
+        // `contains` renders the scalar rather than refusing it.
+        assert_eq!(
+            find_op("status.text", Op::Contains, QV::Int(40))
+                .stats
+                .rows_matched,
+            2
+        );
 
         // A string that cannot be read as a number must still prune the block
         // that holds doubles — otherwise `HAS_DOUBLE` would disable the filter

@@ -697,6 +697,13 @@ That runs at memory bandwidth and is not worth a sort at seal time.
   instead, and any query whose value reads as a number scans a block that has
   them. Blocks with no float attributes — most of them — pay nothing for the rule.
 
+  `canon()` is where that text is decided, and it is the *only* place: the
+  comparison in `attr_matches` is written against it rather than the other way
+  round, so the two cannot drift into a false negative. Every scalar has a text
+  form there, including a fractional double — a producer is free to send `0.5`
+  as the string `"0.5"` — and having `canon()` answer "unindexable" for that
+  case meant every fractional-double equality scanned every block in retention.
+
 **Why not sort blocks by `trace_id` instead?** There is exactly one physical
 order, and every query has a time bound while only some have a trace bound. Time
 wins.
@@ -719,6 +726,24 @@ filter `log_attrs` on `(key, active-value-column)` → collect the `parent_id` s
 `filter`, `take`, `interleave`, `concat`, and no join), so this is roughly 120
 lines of `FxHashSet`-based helper covering all six value columns and all three
 attribute levels. Correct only because ids were rebased at ingest (§0).
+
+**Comparison dispatches on the stored type, not the query's**, because the SDK
+chose the type and the caller should not have to know which. `eq: "200"` finds a
+stored integer and `eq: 200` finds a stored string, symmetrically. Making that
+symmetric is more delicate than it looks: on a string column, equality is
+*defined* as equality with `canon()` — the same decimal text §7's filter indexes
+— and not as "both parse to the same number". The looser rule would match the
+stored string `"200.0"` against `eq: 200`, and the index, which holds only the
+text `"200.0"`, would have pruned that block away first. A sidecar is allowed to
+return blocks that hold nothing; it is not allowed to hide one that does.
+
+Ordering is the exception and *is* numeric on a string column, because ordering
+is not in the index — `attr_probes` takes only `Op::Eq` — so there is nothing
+there to disagree with. It has to be numeric: lexicographically `"1000"` sorts
+below `"400"`, so `gte: 400` would otherwise mean one thing against an SDK that
+sends the code as an integer and another against one that sends it as text. A
+quoted query scalar still gets a text comparison — asking for `"99"` is asking
+about the string.
 
 **"Vector matching" is settled**: it means cross-signal correlation, as above, not
 the PromQL sense (`on`/`ignoring`, `group_left`). The PromQL reading would need a

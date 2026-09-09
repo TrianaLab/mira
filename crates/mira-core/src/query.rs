@@ -282,15 +282,14 @@ fn trace_needle(q: &Search) -> Option<[u8; 16]> {
 /// are not in the index (see [`crate::bloom::HAS_DOUBLE`]), so a block that
 /// holds any must be scanned for a numeric query even when the text probe misses.
 struct AttrProbe {
-    hash: Option<(u64, u64)>,
+    hash: (u64, u64),
     numeric: bool,
 }
 
 impl AttrProbe {
     /// The block's own answer to "could a row here satisfy this term?".
     fn maybe(&self, f: &crate::bloom::Filter) -> bool {
-        let text = self.hash.is_none_or(|h| f.may_contain(h));
-        text || (self.numeric && f.flags & crate::bloom::HAS_DOUBLE != 0)
+        f.may_contain(self.hash) || (self.numeric && f.flags & crate::bloom::HAS_DOUBLE != 0)
     }
 }
 
@@ -300,7 +299,7 @@ fn attr_probes(q: &Search) -> Vec<AttrProbe> {
         .filter(|t| t.op == Op::Eq)
         .filter_map(|t| match &t.target {
             Target::Attr(key) => Some(AttrProbe {
-                hash: canon(&t.value).map(|v| crate::bloom::attr_hash(key, v.as_bytes())),
+                hash: crate::bloom::attr_hash(key, canon(&t.value).as_bytes()),
                 numeric: t.value.as_f64().is_some(),
             }),
             Target::Field(_) => None,
@@ -310,19 +309,27 @@ fn attr_probes(q: &Search) -> Vec<AttrProbe> {
 
 /// The text an attribute of this value would have been indexed under.
 ///
-/// Mirrors the coercions in [`attr_matches`] exactly: a query scalar matches a
-/// stored value of a *different* type whenever the stored type's arm can parse
-/// it, so the index has to agree about which pairs those are. `None` means no
-/// text form can match — only a double can — which the `numeric` flag covers.
-fn canon(v: &Value) -> Option<String> {
+/// This is the contract between [`attr_matches`] and the block index, and both
+/// sides are written against it: `Op::Eq` on a stored string is *defined* as
+/// equality with this text, and [`crate::attrs::index`] writes exactly these
+/// bytes for the str, int and bool types. Doubles are not in the index at all —
+/// the `numeric` flag covers them — so a stored double is reached through
+/// `HAS_DOUBLE` rather than through this string.
+///
+/// Every value has a text form, including a fractional double: nothing forces a
+/// producer to send `0.5` as a double rather than as `"0.5"`, and returning
+/// `None` here to mean "unindexable" made every fractional-double equality scan
+/// every block.
+fn canon(v: &Value) -> String {
     match v {
-        Value::Str(s) => Some(s.clone()),
-        Value::Int(i) => Some(i.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        // A whole float reaches integers through `as_i64`; a fractional one
-        // reaches nothing but doubles.
-        Value::Double(d) if d.fract() == 0.0 => Some((*d as i64).to_string()),
-        Value::Double(_) => None,
+        Value::Str(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+        // `1.0` is written `1` by the int arm of the indexer and would be
+        // written `1` by anything rendering the number for a human, so a whole
+        // float has to canonicalise the same way or `eq: 1.0` misses `1`.
+        Value::Double(d) if d.fract() == 0.0 => (*d as i64).to_string(),
+        Value::Double(d) => d.to_string(),
     }
 }
 
@@ -739,8 +746,30 @@ fn attr_matches(a: &RecordBatch, ty: u8, row: usize, op: Op, v: &Value) -> bool 
         STR => {
             let s = a.column(3).as_string::<i32>().value(row);
             match op {
-                Op::Contains => v.as_str().is_some_and(|n| s.contains(n)),
-                _ => v.as_str().is_some_and(|n| op.test_ord(s.cmp(n))),
+                // Equality against a string column is *defined* as equality
+                // with `canon`, because that is the text the block index holds
+                // (see [`canon`]). Widening it any further — say, matching the
+                // stored string "200.0" against `eq: 200` because both parse to
+                // the same number — would make the filter prune away blocks
+                // that do contain a match, which is the one failure mode a
+                // sidecar is not allowed to have.
+                Op::Eq | Op::Ne => op.test_ord(s.cmp(canon(v).as_str())),
+                Op::Contains => s.contains(canon(v).as_str()),
+                // Ordering is not in the index — `attr_probes` only takes
+                // `Op::Eq` — so there is nothing here to disagree with, and a
+                // number written as a string can be ordered as the number it
+                // is. It has to be: half the SDKs that emit
+                // `http.response.status_code` emit it as text, and
+                // lexicographically "1000" sorts below "400", so `gte: 400`
+                // would otherwise mean something different on each of them.
+                _ => match (s.parse::<f64>(), v.as_f64()) {
+                    (Ok(x), Some(y)) if !matches!(v, Value::Str(_)) => {
+                        x.partial_cmp(&y).is_some_and(|o| op.test_ord(o))
+                    }
+                    // A quoted query scalar asked for a text comparison and
+                    // gets one; so does anything that is not a number.
+                    _ => op.test_ord(s.cmp(canon(v).as_str())),
+                },
             }
         }
         INT => {
