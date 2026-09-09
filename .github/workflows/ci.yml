@@ -21,6 +21,26 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # `dist/` is checked in and `include_bytes!`d, so the bundle in git is what
+  # ships. Two things have to hold: it still builds, and it matches the source
+  # it was built from — a fix landed in `src/` and not rebuilt is a fix nobody
+  # gets. `--test` is Node's own runner; the UI has no test framework and does
+  # not need one for a pure function.
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mira/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: git diff --exit-code dist
+
   coverage:
     runs-on: ubuntu-latest
     steps:

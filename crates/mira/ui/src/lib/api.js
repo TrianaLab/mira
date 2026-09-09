@@ -34,6 +34,11 @@ export const bounds = (range) =>
 //
 // A bare key is an attribute unless it is one of the signal's root columns, so
 // the box teaches the schema as you use it.
+//
+// A whole word with no operator is free text over the signal's message column,
+// which is what every log viewer does with one and what the terminal UI does
+// with one. Metrics has no message column — its terms are attribute predicates
+// on data points — so there a bare word is an error rather than a guess.
 
 export const FIELDS = {
   logs: ['time_unix_nano', 'observed_time_unix_nano', 'severity_number',
@@ -49,8 +54,13 @@ export const FIELDS = {
 const OPS = [['>=', 'gte'], ['<=', 'lte'], ['!=', 'ne'], ['~', 'contains'],
   ['>', 'gt'], ['<', 'lt'], ['=', 'eq']]
 
+export const FREE_TEXT = { logs: 'body', traces: 'name' }
+
+const unquote = (raw) =>
+  raw.length > 1 && raw[0] === '"' && raw.endsWith('"') ? raw.slice(1, -1) : raw
+
 function coerce(raw) {
-  if (raw.length > 1 && raw[0] === '"' && raw.endsWith('"')) return raw.slice(1, -1)
+  if (raw !== unquote(raw)) return unquote(raw)
   if (raw === 'true') return true
   if (raw === 'false') return false
   if (/^-?\d+$/.test(raw)) return Number(raw)
@@ -64,7 +74,16 @@ export function parseFilter(text, signal) {
     const hit = OPS.map(([sym, op]) => [tok.indexOf(sym), sym, op])
       .filter(([i]) => i > 0)
       .sort((a, b) => a[0] - b[0] || b[1].length - a[1].length)[0]
-    if (!hit) throw new Error(`\`${tok}\` needs an operator: = != ~ > >= < <=`)
+    if (!hit) {
+      // An operator at position 0 (`=v`) is a half-written term, not a word:
+      // the operator says what was meant and the key is missing.
+      const free = OPS.some(([sym]) => tok.includes(sym)) ? null : FREE_TEXT[signal]
+      if (!free) throw new Error(`\`${tok}\` needs an operator: = != ~ > >= < <=`)
+      // `unquote`, not `coerce`: the message column is text, and `500` sent as
+      // an integer would match nothing at all.
+      terms.push({ field: free, contains: unquote(tok) })
+      continue
+    }
     const [i, sym, op] = hit
     let key = tok.slice(0, i)
     const value = coerce(tok.slice(i + sym.length))
