@@ -761,6 +761,33 @@ sends the code as an integer and another against one that sends it as text. A
 quoted query scalar still gets a text comparison — asking for `"99"` is asking
 about the string.
 
+**Paging is keyset, and there is no `offset`.** A response carries `next` when it
+filled `limit`; passing it back as `after` continues where it stopped, and its
+absence means that was the last page — a reader never asks for an empty page to
+find out it is done. The cursor is `ts.node.seq.row`: the row's timestamp, the
+block's node id and sequence, and the row's index inside it. Every component is
+intrinsic to the record, so the cursor survives blocks being written, flushed and
+retired between two pages — which is exactly what an offset does not. On a live
+store `offset: 20000` shifts under the reader whenever a batch lands, so it sees
+a row twice or never; it also forces the engine to find and discard twenty
+thousand rows before the ones it wants, turning §7's early exit into a full scan
+and making the last page the most expensive one. Here the opposite holds: `after`
+prunes whole blocks by `min_ts` before any of them is opened, so page five
+touches fewer blocks than page one.
+
+The sort key is total on purpose. Rows sharing a nanosecond are routine — one
+batch, one clock read — so a cursor of "the last timestamp I saw" would re-emit
+or skip every row tied with it. `Reverse((ts, node, seq, row))` is the one
+descending order, used identically by the sort, the truncate and the cursor
+filter; if the sort used a shorter key than the filter, truncation could keep a
+row that sorts *behind* one it dropped and the next page would repeat it.
+`(node, seq)` identifies a block globally with no coordination (§12), so this
+holds across replicas as well as within one. Metrics do not page: `max_series`
+and `max_points` cap what a chart can render rather than cut a list short, so
+`next` is always absent there. Neither does `get_trace` — a trace is one page or
+it is a broken trace, and an agent handed a third of one will reason about the
+third.
+
 **"Vector matching" is settled**: it means cross-signal correlation, as above, not
 the PromQL sense (`on`/`ignoring`, `group_left`). The PromQL reading would need a
 full evaluator and a series-major on-disk layout — a different sort order from

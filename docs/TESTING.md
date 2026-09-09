@@ -132,6 +132,17 @@ Every response carries a `stats` object:
 {"blocks_total":2,"blocks_scanned":2,"rows_scanned":600,"rows_matched":1}
 ```
 
+A response that filled `limit` also carries `next`. Pass it back as `after` to
+get the following page; when `next` is absent you have them all.
+
+```sh
+curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
+  -d '{"signal":"logs","limit":5,"after":"1757241600000000000.2718281828.7.41"}'
+```
+
+Quote it — it is a string, and unquoted YAML reads it as a float. There is no
+`offset`; §7.6 of the architecture says why.
+
 `blocks_scanned` well below `blocks_total` is the sidecar pruning working.
 `blocks_scanned == blocks_total` on a filtered query over many blocks means it
 is not, and that is the number to watch when you touch anything in

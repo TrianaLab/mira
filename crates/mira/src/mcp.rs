@@ -47,13 +47,14 @@ pub fn router(api: Api) -> Router {
 /// not a restatement of the parameter names.
 const TOOLS: &str = r#"[
 {"name":"query_records",
- "description":"Search logs or spans. Returns matching records newest-first with all attributes merged in, plus the blocks and rows the scan touched. Terms are AND-ed. Use `attr` for OpenTelemetry attributes (service.name, http.route, k8s.pod.name) and `field` for columns of the record itself (severity_text, severity_number, body, name, duration_nano, status_code, trace_id, span_id). Attributes are searched at all three levels - record, resource and scope - so you do not need to know where the SDK put them. Time bounds default to the last hour; widening them costs blocks scanned.",
+ "description":"Search logs or spans. Returns matching records newest-first with all attributes merged in, plus the blocks and rows the scan touched. Terms are AND-ed. Use `attr` for OpenTelemetry attributes (service.name, http.route, k8s.pod.name) and `field` for columns of the record itself (severity_text, severity_number, body, name, duration_nano, status_code, trace_id, span_id). Attributes are searched at all three levels - record, resource and scope - so you do not need to know where the SDK put them. Time bounds default to the last hour; widening them costs blocks scanned. `rows_matched` above `limit` means you are seeing a page: narrow the filter, or page with `after`.",
  "inputSchema":{"type":"object","properties":{
    "signal":{"type":"string","enum":["logs","traces"],"description":"default logs"},
    "from":{"type":"string","description":"'-15m', 'now', or absolute nanoseconds. Default -1h."},
    "to":{"type":"string","description":"same forms. Default now."},
    "where":{"type":"array","description":"AND-ed terms, each {attr|field: <name>, <op>: <value>} where op is one of eq ne lt lte gt gte contains","items":{"type":"object"}},
-   "limit":{"type":"integer","description":"default 100, max 10000"}}}},
+   "limit":{"type":"integer","description":"default 100, max 10000"},
+   "after":{"type":"string","description":"the `next` value from a previous response, verbatim, to continue where it stopped. Absent `next` means that was the last page. There is no offset: a store still being written to shifts under one."}}}},
 
 {"name":"get_trace",
  "description":"Every span of one trace, by trace id, over all of retention. Prefer this to query_records with a trace_id filter: blocks carry a trace-id index, and this is the call that uses it. Returns spans newest-first; parent_span_id links them into the tree.",
@@ -180,6 +181,10 @@ fn trace_search(args: &Yaml) -> Result<Search, String> {
             value: Value::Str(id.to_owned()),
         }],
         limit,
+        // A trace is one page or it is a broken trace. 10,000 spans is already
+        // past what any waterfall can show, and an agent handed "here is a
+        // third of a trace, ask again" will reason about the third.
+        after: None,
     })
 }
 

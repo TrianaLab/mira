@@ -327,6 +327,68 @@ async fn otlp_logs_are_queryable_the_moment_the_export_is_acknowledged() {
     assert!(checkout.contains(r#""blocks_total":2"#), "{checkout}");
 }
 
+/// Paging over the wire, which is a different claim from paging in the engine:
+/// the cursor has to survive being printed into JSON, read back out of a YAML
+/// document, and re-parsed — and the reader has to be able to tell it is done.
+#[tokio::test]
+async fn a_paged_read_reassembles_the_one_shot_answer() {
+    let (app, _root) = boot("paging");
+    // Three exports, so a page boundary lands inside a block and between two.
+    for base in [1_000, 2_000, 3_000] {
+        otlp(&app, "/v1/logs", logs_export("checkout", base, 5)).await;
+    }
+    // The rows array, brackets stripped, so pages concatenate.
+    let rows = |body: &str| {
+        let s = body.find(r#""rows":["#).unwrap() + 8;
+        body[s..body.find(r#"],"stats":"#).unwrap()].to_owned()
+    };
+
+    let all = query(&app, r#"{"signal":"logs","from":0,"to":100000}"#).await;
+    assert_eq!(all.matches("handled request").count(), 15, "{all}");
+    assert!(
+        !all.contains(r#""next""#),
+        "a short page is the last page: {all}"
+    );
+
+    let mut pages = Vec::new();
+    let mut after = String::new();
+    for _ in 0..10 {
+        let body = query(
+            &app,
+            &format!(r#"{{"signal":"logs","from":0,"to":100000,"limit":4{after}}}"#),
+        )
+        .await;
+        pages.push(rows(&body));
+        // `next` absent is the terminator. A reader never has to ask for an
+        // empty page to find out it has them all.
+        let Some(i) = body.find(r#""next":""#) else {
+            break;
+        };
+        let c = &body[i + 8..];
+        after = format!(r#","after":"{}""#, &c[..c.find('"').unwrap()]);
+    }
+    assert_eq!(pages.len(), 4, "15 rows, 4 a page");
+    assert_eq!(
+        pages.join(","),
+        rows(&all),
+        "pages must reassemble the whole"
+    );
+
+    // A cursor is a string. Unquoted it is a YAML float, and `1757241600000000000.2`
+    // has already lost the digits that made it a cursor by the time we see it.
+    for (doc, want) in [
+        (r#"{"signal":"logs","after":1.2}"#, "it is a string"),
+        (
+            r#"{"signal":"logs","after":"1.2.3"}"#,
+            "pass back the `next` field verbatim",
+        ),
+    ] {
+        let (status, body) = post(&app, "/api/v1/query", "application/json", doc.into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains(want), "{body}");
+    }
+}
+
 #[tokio::test]
 async fn otlp_spans_are_queryable_and_ids_come_back_as_hex() {
     let (app, _root) = boot("traces");

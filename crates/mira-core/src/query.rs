@@ -225,6 +225,73 @@ pub struct Search {
     pub to: i64,
     pub terms: Vec<Term>,
     pub limit: usize,
+    /// Start after this row. See [`Cursor`].
+    pub after: Option<Cursor>,
+}
+
+/// Where the previous page stopped.
+///
+/// Keyset, not offset, and not for tidiness: `offset: 20000` forces the engine
+/// to find and discard twenty thousand rows on every page, which turns the
+/// early exit below into a full scan and makes the last page the most expensive
+/// one. It is also *wrong* on a store that is still being written to — a batch
+/// arriving between two pages shifts every row down and the reader sees a row
+/// twice or never.
+///
+/// This is the sort key of the last row returned, so "the next page" is
+/// "everything that sorts after this", which is exact whatever else has landed
+/// meanwhile. `(node, seq)` identifies the block globally with no coordination
+/// (see [`block::node_id`]) and `row` is its offset inside it, so the key is
+/// intrinsic to the record rather than to the query that found it.
+///
+/// Rendered as `ts.node.seq.row`, in decimal, on purpose: an agent reading a
+/// response can tell what it is holding, and a human debugging a stuck reader
+/// can tell where it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub ts: i64,
+    pub node: u32,
+    pub seq: u64,
+    pub row: u32,
+}
+
+impl Cursor {
+    /// Descending: newest first, and for rows sharing a nanosecond, the
+    /// higher-numbered block and row first. Any total order would do; what
+    /// matters is that it is total, so no row can hide in a tie.
+    fn key(&self) -> std::cmp::Reverse<(i64, u32, u64, u32)> {
+        std::cmp::Reverse((self.ts, self.node, self.seq, self.row))
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.ts, self.node, self.seq, self.row)
+    }
+}
+
+impl std::str::FromStr for Cursor {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Cursor, String> {
+        let bad = || format!("{s:?} is not a cursor; pass back the `next` field verbatim");
+        let mut p = s.split('.');
+        let mut next = |f: &dyn Fn(&str) -> bool| p.next().filter(|v| f(v)).ok_or_else(bad);
+        // `ts` may be negative; nothing else may. Parsing the pieces by hand
+        // rather than trusting `parse` to reject `+1` or `1_000`.
+        let ts = next(&|v: &str| !v.is_empty())?.parse().map_err(|_| bad())?;
+        let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+        let c = Cursor {
+            ts,
+            node: next(&digits)?.parse().map_err(|_| bad())?,
+            seq: next(&digits)?.parse().map_err(|_| bad())?,
+            row: next(&digits)?.parse().map_err(|_| bad())?,
+        };
+        match p.next() {
+            Some(_) => Err(bad()),
+            None => Ok(c),
+        }
+    }
 }
 
 /// One matching record, kept only long enough to sort and materialize.
@@ -255,6 +322,10 @@ pub struct Results {
     /// A JSON array of row objects.
     pub json: String,
     pub stats: Stats,
+    /// Pass back as `after` for the next page. `None` means this was the last
+    /// one — not "ask again and see", which is the ambiguity that makes readers
+    /// poll forever.
+    pub next: Option<Cursor>,
 }
 
 /// The trace id this search pins down exactly, if it pins one down.
@@ -345,11 +416,23 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
         ..Default::default()
     };
     refs.retain(|b| b.overlaps(q.from, q.to));
+    // A block whose oldest row is newer than the cursor is entirely on a page
+    // already delivered. Pruning here rather than per row is what keeps deep
+    // paging as cheap as the first page.
+    if let Some(c) = &q.after {
+        refs.retain(|b| b.min_ts <= c.ts);
+    }
     // Newest first, so `limit` can cut the scan short.
     refs.sort_by_key(|b| std::cmp::Reverse((b.max_ts, b.seq)));
 
     let needle = trace_needle(q);
     let probes = attr_probes(q);
+    // With no cursor, every row is after the start — which is the key that
+    // sorts ahead of all of them.
+    let after = q.after.map_or(
+        std::cmp::Reverse((i64::MAX, u32::MAX, u64::MAX, u32::MAX)),
+        |c| c.key(),
+    );
     let mut hits: Vec<Hit> = Vec::new();
     let mut open: Vec<Option<Block>> = Vec::with_capacity(refs.len());
 
@@ -393,19 +476,25 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
         stats.rows_scanned += b.root.num_rows();
 
         let sel = b.select(q, bref);
+        // Counted before the cursor is applied: `rows_matched` answers "how
+        // broad is my filter", which is a property of the query and not of
+        // which page of it is being read.
         stats.rows_matched += sel.len();
         if let Some(time) = b.time() {
-            hits.extend(sel.iter().map(|&row| Hit {
-                ts: time[row as usize],
-                block: i,
-                row,
+            hits.extend(sel.iter().filter_map(|&row| {
+                let h = Hit {
+                    ts: time[row as usize],
+                    block: i,
+                    row,
+                };
+                (cursor(bref, &h).key() > after).then_some(h)
             }));
         }
         open.push(Some(b));
 
         // Trim as we go, so memory is bounded by `limit` rather than by the
         // match count, which is not bounded by anything.
-        hits.sort_unstable_by_key(|h| std::cmp::Reverse(h.ts));
+        hits.sort_unstable_by_key(|h| cursor(&refs[h.block], h).key());
         hits.truncate(q.limit);
     }
 
@@ -419,7 +508,22 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
     Ok(Results {
         json: j.into_string(),
         stats,
+        // A short page is the last page. Saying so costs nothing here and saves
+        // every reader one round trip that returns nothing.
+        next: (hits.len() == q.limit)
+            .then(|| hits.last().map(|h| cursor(&refs[h.block], h)))
+            .flatten(),
     })
+}
+
+/// The sort key of one hit, which is also the cursor a caller pages on.
+fn cursor(bref: &block::BlockRef, h: &Hit) -> Cursor {
+    Cursor {
+        ts: h.ts,
+        node: bref.node,
+        seq: bref.seq,
+        row: h.row,
+    }
 }
 
 /// The tables of one block, opened and ready to scan.

@@ -107,12 +107,17 @@ async fn run(
 pub fn envelope(field: &str, r: &query::Results) -> String {
     format!(
         "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
-         \"rows_scanned\":{},\"rows_matched\":{}}}}}",
+         \"rows_scanned\":{},\"rows_matched\":{}}}{}}}",
         r.json,
         r.stats.blocks_total,
         r.stats.blocks_scanned,
         r.stats.rows_scanned,
-        r.stats.rows_matched
+        r.stats.rows_matched,
+        // Absent rather than null on the last page, so `if (doc.next)` is the
+        // whole of a reader's paging logic.
+        r.next
+            .map(|c| format!(",\"next\":\"{c}\""))
+            .unwrap_or_default()
     )
 }
 
@@ -163,8 +168,15 @@ pub fn now_nanos() -> i64 {
 ///     { "attr": "http.route", "contains": "/api" },
 ///   ],
 ///   "limit": 100,
+///   "after": "1757241600000000000.2718281828.7.41",
 /// }
 /// ```
+///
+/// `after` is the `next` field of a previous response, passed back verbatim, and
+/// is how you read past `limit`. There is no `offset`: on a store still being
+/// written to, a batch arriving between two pages shifts every row down, so an
+/// offset reader sees a row twice or never — and it costs the engine the whole
+/// prefix on every page.
 ///
 /// A term names its target with `attr` or `field` and its operator with the
 /// other key, so `{"attr": "x", "eq": 1}` rather than
@@ -185,12 +197,24 @@ pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
     };
     let (from, to) = bounds(doc, now)?;
     let limit = positive(doc, "limit", 100, MAX_LIMIT)?;
+    let after = match &doc["after"] {
+        Yaml::BadValue | Yaml::Null => None,
+        // A cursor is a string even though it is all digits and dots: KYAML
+        // quotes every scalar, and `1757241600000000000.2718281828.7.41` read
+        // as a float would come back as a different cursor entirely.
+        y => Some(
+            y.as_str()
+                .ok_or("after: quote the cursor; it is a string")?
+                .parse()?,
+        ),
+    };
     Ok(Search {
         signal,
         from,
         to,
         terms: terms(doc)?,
         limit,
+        after,
     })
 }
 

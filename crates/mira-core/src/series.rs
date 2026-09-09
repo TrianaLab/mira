@@ -226,6 +226,9 @@ pub fn series(root: &Path, q: &SeriesQuery) -> Result<Results> {
     Ok(Results {
         json: j.into_string(),
         stats,
+        // Metrics are bounded by `max_series` and `max_points`, which cap what
+        // a chart can render rather than cut a list short. Nothing to page.
+        next: None,
     })
 }
 
@@ -280,6 +283,9 @@ pub fn names(root: &Path, from: i64, to: i64) -> Result<Results> {
     Ok(Results {
         json: j.into_string(),
         stats,
+        // Metrics are bounded by `max_series` and `max_points`, which cap what
+        // a chart can render rather than cut a list short. Nothing to page.
+        next: None,
     })
 }
 

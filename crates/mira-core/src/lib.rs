@@ -713,6 +713,7 @@ mod tests {
             to,
             terms,
             limit,
+            after: None,
         };
         let attr = |k: &str, v: &str| Term {
             target: Target::Attr(k.into()),
@@ -846,6 +847,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Paging must be a partition of the one-shot answer: every row once, in
+    /// the same order, no matter where the page boundaries land.
+    ///
+    /// The hard part is ties. Four blocks here carry *identical* timestamps, so
+    /// every instant is shared by four rows in four different blocks — which is
+    /// exactly what a boundary falling mid-nanosecond looks like, and exactly
+    /// what a cursor of "the last timestamp I saw" gets wrong. Real ingest makes
+    /// these constantly: a batch of records stamped by one call to the clock.
+    #[test]
+    fn paging_returns_every_row_once_even_across_ties() {
+        use query::{Cursor, Search, Signal};
+
+        let root = std::env::temp_dir().join(format!("mira-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Two clusters of two blocks. Within a cluster the timestamps are the
+        // same to the nanosecond; the clusters are far apart, so the older one
+        // can be pruned by name once paging has passed it.
+        for seq in 0..4u64 {
+            let base = if seq < 2 { 5_000 } else { 1_000 };
+            let mut req = request("svc", 25, base);
+            // Five records per nanosecond, so ties exist *inside* a block as
+            // well as across them. That matters: within a block rows arrive in
+            // ascending row order and the sort key runs descending, so a sort
+            // that ignores the tiebreak reorders them, the page boundary lands
+            // in the middle of the reordering, and rows come back twice.
+            for (i, r) in req.resource_logs[0].scope_logs[0]
+                .log_records
+                .iter_mut()
+                .enumerate()
+            {
+                r.time_unix_nano = base + i as u64 / 5;
+            }
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&req).unwrap();
+            let sealed = b.finish().unwrap();
+            block::publish(&root, "logs", block::node_id("a"), seq, &sealed).unwrap();
+        }
+
+        let page = |limit: usize, after| {
+            query::search(
+                &root,
+                &Search {
+                    signal: Signal::Logs,
+                    from: 0,
+                    to: i64::MAX,
+                    terms: vec![],
+                    limit,
+                    after,
+                },
+            )
+            .unwrap()
+        };
+
+        let all = page(1_000, None);
+        assert_eq!(all.json.matches("\"body\"").count(), 100);
+        assert!(all.next.is_none(), "a short page is the last page");
+
+        // 100 rows at 7 a page is 14 full pages and a remainder — so boundaries
+        // land inside a tie group on most of them.
+        let mut rows = Vec::new();
+        let mut after = None;
+        let mut deepest = 0;
+        for _ in 0..100 {
+            let r = page(7, after);
+            rows.push(r.json[1..r.json.len() - 1].to_owned());
+            deepest = r.stats.blocks_scanned;
+            match r.next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(rows.len(), 15);
+        assert_eq!(
+            format!("[{}]", rows.join(",")),
+            all.json,
+            "paged reads must reassemble the one-shot answer byte for byte"
+        );
+
+        // And the last page is cheaper than the first, not dearer: the two
+        // newest blocks are ruled out by name once the cursor is past them.
+        // This is the whole reason the cursor is a key and not an offset.
+        assert_eq!(all.stats.blocks_scanned, 4);
+        assert_eq!(deepest, 2);
+
+        // A cursor from a different query shape is still just a position, and a
+        // cursor past the end yields nothing rather than wrapping.
+        let end = Cursor {
+            ts: 0,
+            node: 0,
+            seq: 0,
+            row: 0,
+        };
+        assert_eq!(page(7, Some(end)).json, "[]");
+
+        // Round-trips through the wire form, which is the only form a caller
+        // ever sees.
+        let c = page(7, None).next.unwrap();
+        assert_eq!(c.to_string().parse::<Cursor>(), Ok(c));
+        for bad in ["", "1.2.3", "1.2.3.4.5", "1.-2.3.4", "a.2.3.4", "1.2.3.x"] {
+            assert!(bad.parse::<Cursor>().is_err(), "{bad:?} parsed");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// "Every span of trace X" carries no time bound, so block names prune
     /// nothing and the scan reads the whole signal. The Bloom sidecar is the
     /// only thing standing between that query and every block on disk.
@@ -911,6 +1018,7 @@ mod tests {
                 value: QV::Str(id),
             }],
             limit: 100,
+            after: None,
         };
 
         let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -997,6 +1105,7 @@ mod tests {
                         value,
                     }],
                     limit: 100,
+                    after: None,
                 },
             )
             .unwrap()
@@ -1245,6 +1354,7 @@ mod tests {
                     value: QV::Str("checkout".into()),
                 }],
                 limit: 2_000,
+                after: None,
             },
         )
         .unwrap();
