@@ -350,15 +350,75 @@ every version.
 
 ## 7. The OpenTelemetry Demo
 
-The demo is ~15 instrumented microservices producing continuous traffic across
-all three signals — the closest thing to a real workload without one. Point its
-collector at Mira by adding the same two exporters as
-[`docs/e2e/otelcol.yaml`](e2e/otelcol.yaml) to
-`src/otel-collector/otelcol-config-extras.yml`, with Mira reachable on the
-demo's compose network.
+Twenty instrumented microservices in eight languages, producing continuous
+traffic across all three signals from a load generator that drives a real
+storefront. It is the closest thing to a production workload you can start with
+one command, and it is the only test here where neither the client nor the data
+is ours.
 
-> Not yet run against Mira end to end. Unlike everything above, treat this
-> section as a direction rather than a transcript.
+Two files in this repo do the whole integration, and the demo has a documented
+seam for each — both are empty upstream and both are loaded last, so nothing in
+the demo checkout is patched:
+
+| | |
+|---|---|
+| [`docs/e2e/demo/otelcol-config-extras.yml`](e2e/demo/otelcol-config-extras.yml) | adds `otlp_grpc/mira` and `otlp_http/mira` to the collector's three pipelines |
+| [`docs/e2e/demo/compose.mira.yaml`](e2e/demo/compose.mira.yaml) | adds Mira as a service on the demo's compose network |
+
+```sh
+git clone --depth 1 https://github.com/open-telemetry/opentelemetry-demo /tmp/otel-demo
+docker build -t mira .
+cp docs/e2e/demo/otelcol-config-extras.yml /tmp/otel-demo/src/otel-collector/
+docker compose -f /tmp/otel-demo/compose.yaml -f docs/e2e/demo/compose.mira.yaml up -d
+```
+
+The core `compose.yaml` alone is enough — around 8 GB of images and about 6 GB
+of RAM. The `compose.full.yaml` and `compose.observability.yaml` layers add
+Kafka, Jaeger, Prometheus and OpenSearch, which are the demo's *own* backends
+and are not needed to prove anything about Mira.
+
+Give it two minutes and query Mira on `4318`, published to the host:
+
+```sh
+curl -s -X POST localhost:4318/api/v1/metrics/names -H 'content-type: application/json' -d '{}'
+curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
+  -d '{"signal":"traces","from":"-15m","to":"now","limit":1}'
+./target/release/mira mira --addr localhost:4318     # all three tabs, live
+```
+
+What came back on this machine, four minutes in:
+
+- **285 distinct metric names** — 206 sums, 58 gauges, 21 histograms — from the
+  OTLP exporters of eight SDKs *plus* the collector's `host_metrics`,
+  `docker_stats`, `nginx`, `redis`, `postgresql` and Prometheus receivers. That
+  spread of instrument shapes is the reason to run this: no generator produces
+  it.
+- **Spans from Envoy's C++ SDK, Go, Python, .NET, Java and Node**, with resource
+  and scope attributes merged onto the record — `telemetry.sdk.language`,
+  `service.namespace`, `otel.scope.name` all intact.
+- **Cross-service correlation on real trace ids.** One `frontend-proxy` trace
+  came back as six spans over three services, root present and no orphans, with
+  `blocks_scanned: 3` of `blocks_total: 102` — the trace sidecar pruning 97% of
+  the store on data nobody designed for it.
+- **No export failures.** `docker logs otel-collector` shows no permanent errors
+  toward either Mira exporter. The startup noise in that log is the demo's own
+  `postgresql` and `prometheus/ad` receivers racing their targets.
+
+One thing to expect and not misread: **the newest traces look incomplete.** A
+parent span ends after its children, so it is exported after them, and Mira only
+answers from sealed blocks. Query a trace ninety seconds old and it is whole.
+The waterfall does not currently say "this may still be filling", which is worth
+knowing before you go bug-hunting.
+
+`profiles` is deliberately not routed to Mira — it is a fourth OTLP signal with
+its own protobuf, Mira does not accept it, and wiring it up would only produce a
+permanent export error every few seconds.
+
+Tear it down with the same two `-f` files:
+
+```sh
+docker compose -f /tmp/otel-demo/compose.yaml -f docs/e2e/demo/compose.mira.yaml down -v
+```
 
 ## 8. Cleanup
 

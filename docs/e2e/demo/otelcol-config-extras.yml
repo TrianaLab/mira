@@ -1,0 +1,44 @@
+# Mira as a backend for the OpenTelemetry Demo.
+#
+# Copy this over `src/otel-collector/otelcol-config-extras.yml` in a demo
+# checkout. That file is the demo's documented seam for exactly this — it is
+# empty upstream and always loaded last — so nothing else in the demo is
+# touched.
+#
+# The Collector *replaces* arrays across config files rather than appending to
+# them, so every pipeline below repeats the upstream exporters it wants to keep.
+# Getting this wrong silently unhooks the demo's own backends, which then looks
+# like Mira broke them.
+#
+# Names are `otlp_grpc` / `otlp_http`: the demo pins collector-contrib 0.159,
+# where the old `otlp` / `otlphttp` spellings are deprecated aliases. Both work;
+# docs/e2e/otelcol.yaml uses the old ones because it runs against `:latest` and
+# they are the pair that works on every version.
+exporters:
+  otlp_grpc/mira:
+    endpoint: mira:4317
+    tls:
+      insecure: true
+  otlp_http/mira:
+    endpoint: http://mira:4318
+
+service:
+  pipelines:
+    # Split across transports on purpose: traces over gRPC, logs over HTTP, so
+    # one run exercises both of Mira's listeners with a client that is not ours.
+    traces:
+      exporters: [debug, span_metrics, otlp_grpc/mira]
+    metrics:
+      # Repeated verbatim from otelcol-config.yml. The demo's metrics pipeline
+      # is the interesting one: alongside OTLP from the services it carries
+      # `host_metrics`, `docker_stats`, `nginx`, `redis`, `postgresql` and a
+      # Prometheus scrape, which is a far wider spread of instrument shapes —
+      # including exponential histograms — than any generator produces.
+      receivers: [docker_stats, http_check/frontend-proxy, host_metrics, nginx, otlp, redis, postgresql, prometheus/ad, span_metrics]
+      exporters: [debug, otlp_grpc/mira]
+    logs:
+      exporters: [debug, otlp_http/mira]
+    # `profiles` is deliberately not routed here. OTLP profiles are a separate
+    # signal with its own protobuf, Mira does not accept it, and adding it to
+    # this pipeline would make the collector log a permanent export failure
+    # every few seconds for a signal nobody asked Mira to store.
