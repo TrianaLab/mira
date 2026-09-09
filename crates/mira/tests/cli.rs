@@ -149,6 +149,10 @@ fn a_sigterm_stops_the_server_with_the_data_on_disk() {
 
     let posted = port.map(|p| post(p, "/v1/logs", &one_log().encode_to_vec()));
     // SIGTERM rather than `child.kill`, which is SIGKILL and proves nothing.
+    // SAFETY: `kill` dereferences nothing, so the only hazard is signalling the
+    // wrong process. `child` has not been waited on yet — `child.wait()` is
+    // below — so the kernel still holds its zombie slot and the pid cannot have
+    // been recycled onto someone else's process.
     let signalled = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } == 0;
     let stopped = signalled && logged("stopped");
     if !stopped {

@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 mira-core.workspace = true
 mira-proto.workspace = true
-arrow-array.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-types = "0.14"
@@ -34,3 +33,6 @@ tower = { version = "0.5.3", features = ["util"] }
 # For `grpc-status`, which rides in the response trailers that
 # `axum::body::to_bytes` throws away. Already in the tree via axum.
 http-body-util = "0.1"
+
+[lints]
+workspace = true

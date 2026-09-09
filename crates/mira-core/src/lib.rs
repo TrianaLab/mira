@@ -1514,11 +1514,28 @@ mod tests {
         assert_eq!(block::scan(&root, "logs").unwrap(), vec![published.clone()]);
 
         // A publish killed between staging and rename leaves the staging
-        // directory behind, under the name the *next* publish of that sequence
-        // will stage into. It must be cleared rather than merged with.
-        let stale = root.join(".tmp").join(format!("logs-{node:08x}-{:012}", 1));
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(stale.join("logs.arrow"), b"leftovers").unwrap();
+        // directory behind. The name is unique per block, so nothing reuses it
+        // and it is `sweep_staging` at boot that clears it — filtered by signal
+        // and node, so a directory belonging to another replica sharing the
+        // volume, or to another signal, survives untouched.
+        let stale = root
+            .join(".tmp")
+            .join(format!("logs-{node:08x}-{:012}-x", 1));
+        let other_node = root.join(".tmp").join("logs-deadbeef-000000000001-x");
+        let other_signal = root.join(".tmp").join(format!("traces-{node:08x}-1-x"));
+        for d in [&stale, &other_node, &other_signal] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("logs.arrow"), b"leftovers").unwrap();
+        }
+        assert_eq!(block::sweep_staging(&root, "logs", node).unwrap(), 1);
+        assert!(!stale.exists());
+        assert!(other_node.is_dir() && other_signal.is_dir());
+        // Sweeping a data directory that never staged anything is not an error.
+        assert_eq!(
+            block::sweep_staging(&root.join("nope"), "logs", node).unwrap(),
+            0
+        );
+
         let second = block::publish(&root, "logs", node, 1, &seal(2_000)).unwrap();
         assert!(block::open_table(&second.dir.join("logs.arrow")).is_ok());
         assert_eq!(block::scan(&root, "logs").unwrap().len(), 2);

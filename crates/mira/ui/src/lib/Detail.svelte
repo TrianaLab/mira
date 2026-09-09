@@ -1,5 +1,5 @@
 <script>
-  import { fmtTime } from './api.js'
+  import { fmtTime, fmtValue } from './api.js'
 
   // The raw row, everything the engine returned. That is the point: a field
   // missing from this dump is missing from storage, not from the renderer.
@@ -15,7 +15,7 @@
   }
   const kvs = (a) =>
     Object.entries(a || {})
-      .map(([k, v]) => `${k}=${v}`)
+      .map(([k, v]) => `${k}=${fmtValue(v)}`)
       .join(' ')
 </script>
 
@@ -24,7 +24,7 @@
     <a href="#/trace/{row.trace_id}">→ view trace {row.trace_id}</a>
   {/if}
   {#each entries as [k, v] (k)}
-    <pre><b>{k}:</b> {String(v)}</pre>
+    <pre><b>{k}:</b> {fmtValue(v)}</pre>
   {/each}
   {#each row.events || [] as e, i (i)}
     <pre class="ev"><b>event {fmtTime(e.time_unix_nano)}</b> {e.name || ''} {kvs(e.attributes)}</pre>

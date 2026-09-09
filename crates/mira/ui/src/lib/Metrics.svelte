@@ -1,5 +1,5 @@
 <script>
-  import { api, bounds, parseFilter, COLORS } from './api.js'
+  import { api, bounds, parseFilter, fmtValue, COLORS } from './api.js'
   import Chart from './Chart.svelte'
 
   let { params, nonce, onstats, onnames } = $props()
@@ -56,7 +56,7 @@
 
   const attrs = (s) =>
     Object.entries(s.attributes || {})
-      .map(([k, v]) => `${k}=${v}`)
+      .map(([k, v]) => `${k}=${fmtValue(v)}`)
       .join(' ')
 
   const label = (s) => (named ? `${s.name} ${attrs(s)}`.trim() : attrs(s) || s.name)

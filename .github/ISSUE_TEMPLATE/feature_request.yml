@@ -1,0 +1,118 @@
+name: Feature request
+description: Propose something Mira should do that it does not
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things worth knowing before you write this up, because they decide
+        most proposals on their own:
+
+        - **`docs/ARCHITECTURE.md` §0** lists the mechanisms that did not
+          survive contact with the OTLP and Arrow formats, and what replaced
+          them. If your idea is in there, the interesting issue is why the
+          replacement is not enough — not the original idea.
+        - **The README's "What is not true yet"** is the list of things already
+          known to be missing. A `+1` on one of those is more useful as a
+          comment on an existing issue than as a new one.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you were trying to do, and where Mira stopped you. Describe the
+        situation, not the solution — the solution is the next box, and
+        separating them is what lets a cheaper one get found.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: What Mira would do instead, concretely. A sketch of the API, query document or flag helps.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - OTLP ingest and the receivers
+        - Block format and storage (mira-core)
+        - Query engine and the query API
+        - MCP and the agent surface
+        - Browser UI
+        - Terminal UI (`mira mira`)
+        - Config and CLI
+        - Operations: retention, compaction, probes, packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: cost
+    attributes:
+      label: Which performance axes does this cost?
+      description: >-
+        Performance is the product, and it is four axes at once — a feature
+        that wins one by spending another is a trade, not a win. An honest
+        guess is fine; "none that I can see" is an answer, and so is ticking
+        every box.
+      options:
+        - label: Ingest throughput per core
+        - label: Resident footprint
+        - label: Query p99
+        - label: Cost per GB on disk
+        - label: Binary size or crate count
+        - label: None that I can see
+
+  - type: dropdown
+    id: dependency
+    attributes:
+      label: Would it need a new dependency?
+      description: >-
+        The crate count and binary size are stated in the README and treated as
+        product properties. A new crate is not forbidden, but it has to earn
+        its place, and a pure-Rust one earns it more easily — `zstd-sys` is
+        deliberately the only C in the tree.
+      options:
+        - "No"
+        - "Yes, one pure-Rust crate"
+        - "Yes, several, or one with a C dependency"
+        - "Unsure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: >-
+        What you tried instead, and why it was not enough. Including the ugly
+        workaround that does work — it is often the cheapest thing to make
+        official.
+
+  - type: dropdown
+    id: contributing
+    attributes:
+      label: Would you be willing to implement it?
+      options:
+        - "Yes"
+        - "Yes, with guidance on where it goes"
+        - "No"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I checked `docs/ARCHITECTURE.md` §0 and the README's "What is not true yet".
+          required: true

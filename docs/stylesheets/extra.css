@@ -1,0 +1,116 @@
+/* ===========================================================================
+   Mira docs theme.
+
+   One accent — "hot rust", #F74C00, the colour of the wordmark — and neutral
+   surfaces either side of it. The header stays white/near-black (set by the
+   palette in mkdocs.yml); this file only retints the accent, the dark surfaces
+   and the code blocks, so there is a single place to change the brand.
+   =========================================================================== */
+
+/* ---- Brand tokens ---------------------------------------------------------
+   #F74C00 measures 3.5:1 on white — under the 4.5:1 WCAG AA floor for body
+   text — and 5.4:1 on the near-black below. So the light scheme uses the
+   deeper --mira-rust-deep (5.4:1 on white) wherever the colour carries text or
+   sits behind white text, and keeps the brand hex for marks and decoration.
+   The dark scheme has no such problem and uses the brand hex throughout. */
+:root {
+  --mira-rust: #f74c00;
+  --mira-rust-deep: #c23a00;
+  --mira-rust-darker: #9c2f00;
+  /* Dark surfaces, matched to the #0d1117 used elsewhere in the project. */
+  --mira-surface: #0d1117;
+  --mira-surface-code: #161b22;
+  --mira-surface-footer: #090c10;
+}
+
+[data-md-color-scheme="default"] {
+  --md-accent-fg-color: var(--mira-rust-deep);
+  --md-typeset-a-color: var(--mira-rust-deep);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-accent-fg-color: var(--mira-rust);
+  --md-typeset-a-color: var(--mira-rust);
+}
+
+/* ---- Dark surfaces --------------------------------------------------------
+   Material's slate scheme tints every surface blue, which reads muddy under an
+   orange accent. Retint to the project's near-black so the site sits on the
+   same surface as the UI and the terminal. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: var(--mira-surface);
+  --md-default-bg-color--light: hsla(0, 0%, 100%, 0.7);
+  --md-default-bg-color--lighter: hsla(0, 0%, 100%, 0.3);
+  --md-default-bg-color--lightest: hsla(0, 0%, 100%, 0.12);
+  --md-code-bg-color: var(--mira-surface-code);
+  --md-footer-bg-color: var(--mira-surface-footer);
+  --md-footer-bg-color--dark: var(--mira-surface-footer);
+}
+
+/* ---- Typography -----------------------------------------------------------
+   Space Grotesk (set in mkdocs.yml) is drawn for display, so headings get the
+   tighter tracking the wordmark has and body text keeps the default. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+/* ---- Nav, tabs and buttons ------------------------------------------------
+   The primary colour is neutral, so Material would draw all of these in
+   black/white. Pin them to the accent instead. */
+.md-nav__link--active,
+.md-nav__link:hover,
+.md-tabs__link--active,
+.md-tabs__link:hover {
+  color: var(--md-accent-fg-color);
+  opacity: 1;
+}
+
+.md-typeset .md-button--primary {
+  background-color: var(--md-accent-fg-color);
+  border-color: var(--md-accent-fg-color);
+  color: #fff;
+}
+.md-typeset .md-button--primary:hover,
+.md-typeset .md-button--primary:focus {
+  background-color: var(--mira-rust-darker);
+  border-color: var(--mira-rust-darker);
+  color: #fff;
+}
+[data-md-color-scheme="slate"] .md-typeset .md-button--primary {
+  color: var(--mira-surface);
+}
+
+/* ---- Code -----------------------------------------------------------------
+   Most of this site is command lines and KYAML documents, so the code block is
+   the page. Give it a hairline border in both schemes — on dark, #161b22 on
+   #0d1117 is only just distinguishable — and keep the mono at a size that does
+   not force the 96-column examples to wrap. */
+.md-typeset pre > code,
+.md-typeset .highlight {
+  border-radius: 0.2rem;
+}
+.md-typeset pre > code {
+  border: 1px solid var(--md-default-fg-color--lightest);
+}
+.md-typeset code,
+.md-typeset pre {
+  font-size: 0.75rem;
+}
+/* Inline code: tinted toward the accent so it is told apart from the prose by
+   more than a background, without competing with links. */
+.md-typeset a > code {
+  color: inherit;
+}
+
+/* ---- Home page wordmark ---------------------------------------------------
+   docs/index.md leads with assets/mira-wordmark.svg in place of a visible h1.
+   The SVG is stroked orange on transparent, so it reads on both schemes. */
+.mira-wordmark {
+  width: 15rem;
+  max-width: 70%;
+  height: auto;
+  margin: 0.6rem 0 1.2rem;
+}

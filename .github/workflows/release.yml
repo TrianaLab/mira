@@ -1,0 +1,374 @@
+name: release
+
+# Mira is a single binary, so the release artifacts *are* the product's front
+# door — there is no package, no chart and no operator behind them. The whole
+# file therefore has one rule: nothing is published until every platform has
+# built. The matrix produces tarballs, one job checksums and attests them, one
+# job turns the same bytes into a multi-arch image, and only then does the
+# GitHub Release appear.
+#
+# `workflow_dispatch` runs all of that with publishing switched off, so the
+# first real tag is never the first test.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not cancel-in-progress. A cancelled release is a half-published one: some
+  # assets uploaded, an image pushed under `latest` that no release points at,
+  # an attestation for a tarball nobody can download. Letting a superseded run
+  # finish is strictly cheaper than reconciling that by hand.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/trianalab/mira
+
+jobs:
+  # Everything downstream keys off these three strings, so they are computed
+  # once. Deriving them per-job is how a release ends up tagged v0.2.0 with a
+  # binary that prints 0.1.0.
+  meta:
+    name: meta
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: v
+        run: |
+          set -euo pipefail
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+            # The tag and Cargo.toml have to agree, because `mira --version`
+            # prints CARGO_PKG_VERSION and nothing downstream can fix that
+            # afterwards. Fail here, before anything is uploaded.
+            if [ "${version}" != "${crate}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version ${crate} in Cargo.toml"
+              exit 1
+            fi
+          else
+            version="${crate}-dev.${GITHUB_SHA::7}"
+            publish=false
+          fi
+
+          # Pre-release covers both readings: an explicit -rc/-beta suffix, and
+          # 0.x, where CHANGELOG.md already says the block format and the query
+          # document may change under you. `latest` still moves — a 0.x project
+          # whose `latest` tag points nowhere is worse than an honest badge.
+          case "${version}" in
+            0.*|*-*) prerelease=true ;;
+            *)       prerelease=false ;;
+          esac
+
+          printf 'version=%s\npublish=%s\nprerelease=%s\n' \
+            "${version}" "${publish}" "${prerelease}" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: meta
+    strategy:
+      # One red platform should not hide the state of the other three.
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not 24.04, on purpose. zstd-sys is the only C
+          # dependency in the tree and it is compiled against the runner's
+          # glibc, so the runner picks the floor: 22.04 gives a binary whose
+          # highest required symbol is GLIBC_2.34 (measured with `objdump -T`),
+          # which runs on RHEL 9, Amazon Linux 2023, Debian 12, Ubuntu 22.04
+          # and the distroless/cc-debian12 base the image uses. Building on
+          # 24.04 links __isoc23_* at GLIBC_2.38 and silently drops all of them.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native arm64 rather than a cross-compile: cross-compiling means a
+          # C cross-toolchain for zstd-sys, which is exactly the machinery this
+          # project refuses to carry. The runner label is free on public repos.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          # Cross-compiled from the arm64 runner. This one is safe where the
+          # Linux equivalent is not: the macOS SDK carries both slices, so
+          # clang cross-compiles zstd with -arch x86_64 and no extra toolchain.
+          - target: x86_64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    env:
+      # cargo honours this, so `make build` needs no --target and the Makefile
+      # stays the single source of truth. Output lands under target/<triple>/.
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No toolchain action, matching ci.yml: rustup on the runner resolves
+      # rust-toolchain.toml on the first cargo invocation. `target add` is a
+      # no-op for the two native legs and the whole story for the other two.
+      - run: rustup target add "${CARGO_BUILD_TARGET}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      # The one build command in the repo. `[profile.release] strip = "symbols"`
+      # in Cargo.toml means the artifact is already stripped, so there is no
+      # strip step here to drift away from what `make drift` measures.
+      - run: make build
+
+      - env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="mira-${VERSION}-${TARGET}"
+          bin="target/${TARGET}/release/mira"
+
+          # A binary that cannot run, or runs and disagrees with the tag, is
+          # caught here rather than by whoever downloads it. Skipped for the
+          # cross-compiled leg, which this runner cannot execute.
+          if [ "${TARGET}" != "x86_64-apple-darwin" ]; then
+            "$bin" --version
+          fi
+
+          mkdir -p "dist/${name}"
+          cp "$bin" "dist/${name}/mira"
+          # Apache-2.0 §4(a): the licence travels with the binary.
+          cp LICENSE README.md "dist/${name}/"
+          # macOS tar writes ._ AppleDouble sidecars into the archive otherwise,
+          # and they show up as junk when a Linux user extracts a darwin build.
+          COPYFILE_DISABLE=1 tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          rm -rf "dist/${name}"
+
+          # `wc -c` rather than `stat`, whose size flag differs between the GNU
+          # and BSD runners. The number matters: README and
+          # docs/ARCHITECTURE.md §11 both quote a binary size, and a release
+          # that quietly doubles it should be visible in the run summary. A
+          # plain line rather than a table row, because each matrix leg writes
+          # its own summary and a lone row renders as neither.
+          echo "\`${TARGET}\`: binary $(( $(wc -c < "$bin") / 1024 )) KiB, tarball $(( $(wc -c < "dist/${name}.tar.gz") / 1024 )) KiB" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The SBOM describes the dependency graph, which is identical on all four
+      # targets, so it is generated once on the leg that has already compiled
+      # rather than in a job that would compile a fifth time. `make build` from
+      # the sbom target is a cache hit here.
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          make sbom
+          # Located rather than hardcoded: `make sbom` owns cargo-cyclonedx's
+          # --output-pattern, and it should be free to move the file without
+          # breaking a release five minutes into the build.
+          sbom=$(find . -name 'mira.cdx.json' -not -path './target/*' -print -quit)
+          [ -n "${sbom}" ] || { echo "::error::make sbom produced no mira.cdx.json"; exit 1; }
+          cp "${sbom}" "dist/mira-${VERSION}.cdx.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # Checksums and provenance over the finished set, not per-leg: one SHA256SUMS
+  # is what a user actually verifies against, and one attestation call covering
+  # every subject in it is what `gh attestation verify` then checks.
+  package:
+    name: package
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - run: |
+          set -euo pipefail
+          cd dist
+          # Written to the parent first so the file cannot list itself. `--`
+          # rather than `./*` so the names in it are bare filenames: they
+          # become the subject names in the provenance attestation below, and
+          # `./mira-...tar.gz` would be a subject nobody can look up by name.
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          cat SHA256SUMS
+          {
+            echo '### Release assets'
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # subject-checksums attests every file named in SHA256SUMS in one
+      # statement — the tarballs and the SBOM. Runs on dry runs too, because an
+      # attestation step that only ever executes on a tag is untested.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  image:
+    name: image
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*-unknown-linux-gnu
+          merge-multiple: true
+          path: artifacts
+
+      # The image gets the same bytes the tarball got, rather than a second
+      # compile inside the Dockerfile. That is faster, but mainly it means the
+      # provenance statement over the tarball and the one over the image are
+      # about one artifact, and `docker cp` out of the image reproduces a file
+      # that is in SHA256SUMS.
+      - env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}"; triple="${pair##*:}-unknown-linux-gnu"
+            mkdir -p "dist/linux/${arch}"
+            tar -xzf "artifacts/mira-${VERSION}-${triple}.tar.gz" \
+              -C "dist/linux/${arch}" --strip-components=1 \
+              "mira-${VERSION}-${triple}/mira"
+          done
+          ls -l dist/linux/*/mira
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No QEMU. With BIN=prebuilt neither the prebuilt stage nor the runtime
+      # stage runs a command, so a linux/amd64 + linux/arm64 build is buildx
+      # copying files the host already has.
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BIN=prebuilt
+            VERSION=${{ needs.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          # `outputs:` rather than the `push:` input, because a dry run still
+          # builds both platforms and needs an explicit exporter — the default
+          # docker exporter cannot hold a manifest list. Written as an
+          # interpolation, not a `&&/||` ternary: the false branch of one of
+          # those would have to be the empty string, which GitHub evaluates as
+          # falsy, so the ternary would collapse and nothing would ever push.
+          outputs: type=image,push=${{ needs.meta.outputs.publish }}
+          # buildkit's own inline attestations would be a second, weaker
+          # provenance record next to the SLSA one attached below.
+          provenance: false
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    name: release
+    needs: [meta, package, image]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      # gh is preinstalled on the runner and does exactly this, so there is no
+      # third-party release action to pin and review.
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # The Keep a Changelog section for this version, if there is one:
+          # everything between `## [x.y.z]` and the next `## `. A missing
+          # section degrades to --generate-notes rather than failing, because a
+          # release with autogenerated notes beats a tag with no release.
+          notes_arg=(--generate-notes)
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="${VERSION}" '
+              $0 ~ "^## \\[" v "\\]" { f = 1; next }
+              f && /^## / { exit }
+              f { print }
+            ' CHANGELOG.md > NOTES.md
+            if [ -s NOTES.md ]; then
+              notes_arg=(--notes-file NOTES.md)
+            else
+              echo "::warning::no '## [${VERSION}]' section in CHANGELOG.md — using generated notes"
+            fi
+          fi
+
+          # `if`, not `[ x ] && y=z`. bash exempts the AND-list form from
+          # `set -e` here, so it happens to work — but it evaluates to 1 on the
+          # non-prerelease path, and the day someone moves it to the end of a
+          # step that becomes a red release for a 1.0.0 tag. Write the form
+          # that has no such edge.
+          prerelease_arg=()
+          if [ "${PRERELEASE}" = true ]; then
+            prerelease_arg=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --title "mira ${VERSION}" \
+            --verify-tag \
+            "${notes_arg[@]}" \
+            "${prerelease_arg[@]}" \
+            dist/*

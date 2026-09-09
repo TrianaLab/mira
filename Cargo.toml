@@ -9,9 +9,57 @@ rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/trianalab/mira"
 
+# Lints, declared once and inherited by every member via `lints.workspace =
+# true`. Anything set here is enforced by `make lint`, which runs clippy with
+# `-D warnings`, so "warn" and "deny" mean the same thing in CI. The difference
+# is local: a "warn" still lets you compile while you work on it.
+[workspace.lints.rust]
+# Edition 2024 already requires this, but spelling it out keeps the intent
+# when the edition moves — the point is that an `unsafe fn` is a contract with
+# its caller, not a licence for its body.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# The one that matters. Every unsafe block here is either a read out of an
+# mmap'd file or a libc call, and the only artefact of an audit that survives
+# review is the comment. A block without one has not been audited, it has been
+# typed. No count in this comment on purpose: a number in prose is a number
+# nothing checks, and this lint is the check.
+undocumented_unsafe_blocks = "deny"
+# Mira parses untrusted OTLP off the network and `panic = "abort"` is set in
+# the release profile, so a panic in a decode path is not an error — it is the
+# process dying and every in-flight batch with it.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+checked_conversions = "warn"
+manual_let_else = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+
+# ponytail: `cast_possible_truncation`, `cast_sign_loss` and `cast_precision_loss`
+# are deliberately absent, and they are the three with the most to say about a
+# storage engine — a truncated `as u32` on a length or a nanosecond timestamp is
+# a data bug, not a style one. They fire 128 times today, almost all on `as`
+# casts of lengths that the block format already bounds. Enabling them means 128
+# `#[allow(..., reason = "...")]` annotations, and 128 reasons written in one
+# sitting are 128 reasons nobody read — the same failure as an unaudited
+# `SAFETY:` comment. The upgrade path is a pass per module, converting the ones
+# that should be `TryFrom` and annotating the rest, and then this block turns
+# into three `warn` lines.
+#
+# `doc_markdown` (256 hits) and `unreachable_pub` (74) are absent for the
+# opposite reason: high volume, no correctness content.
+
 [workspace.dependencies]
-mira-core = { path = "crates/mira-core" }
-mira-proto = { path = "crates/mira-proto" }
+# The `version` is not decoration: a path dependency with no version is a
+# wildcard, which crates.io refuses and `cargo deny check bans` flags. Keep
+# these in step with `workspace.package.version` above — Cargo has no syntax
+# for inheriting it here.
+mira-core = { path = "crates/mira-core", version = "0.0.1" }
+mira-proto = { path = "crates/mira-proto", version = "0.0.1" }
 
 # Arrow. Pinned as one version across the workspace: arrow_array::RecordBatch
 # from two different major versions is two different types, and the error you

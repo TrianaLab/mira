@@ -2,14 +2,15 @@
 // repo gaining a test framework, a config file and a lockfile entry for one
 // pure function.
 //
-// Only `parseFilter` is covered, deliberately: it is the one piece of this
-// bundle that can be wrong *silently*. Everything else here either renders
-// visibly or throws.
+// Only `parseFilter` and `fmtValue` are covered, deliberately: they are the
+// pieces of this bundle that can be wrong *silently* — one turns a real column
+// into a predicate that matches nothing, the other turns a nested attribute
+// into `[object Object]`. Everything else here either renders visibly or throws.
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { parseFilter } from './api.js'
+import { fmtValue, parseFilter } from './api.js'
 
 test('operators split longest-first and route to field or attr', () => {
   assert.deepEqual(
@@ -61,6 +62,30 @@ test('ids stay strings however numeric they look', () => {
   assert.deepEqual(parseFilter('http.status_code=500', 'logs'), [
     { attr: 'http.status_code', eq: 500 },
   ])
+})
+
+test('event_name and the dropped counts are columns, not attributes', () => {
+  // Read as an attribute this is worse than wrong: the block gets Bloom-pruned
+  // on a key no attribute table holds, so it is a confidently empty result.
+  assert.deepEqual(parseFilter('event_name=user.login', 'logs'), [
+    { field: 'event_name', eq: 'user.login' },
+  ])
+  assert.deepEqual(parseFilter('dropped_events_count>0', 'traces'), [
+    { field: 'dropped_events_count', gt: 0 },
+  ])
+})
+
+test('a nested AnyValue survives rendering', () => {
+  // What the engine decodes out of a kvlist and an array attribute. `String()`
+  // gave `[object Object]` and `mira,--data-dir` respectively.
+  assert.equal(fmtValue({ role: 'user', content: 'hello' }), '{"role":"user","content":"hello"}')
+  assert.equal(fmtValue(['mira', '--data-dir']), '["mira","--data-dir"]')
+  // Scalars stay bare, and a missing body renders as an empty cell.
+  assert.equal(fmtValue('connection refused'), 'connection refused')
+  assert.equal(fmtValue(0), '0')
+  assert.equal(fmtValue(false), 'false')
+  assert.equal(fmtValue(undefined), '')
+  assert.equal(fmtValue(null), '')
 })
 
 test('what cannot be placed is an error, never a dropped term', () => {

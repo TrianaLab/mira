@@ -237,6 +237,15 @@ async fn flusher<B: SignalBuilder>(mut rx: mpsc::Receiver<Job<B::Request>>, cfg:
             return;
         }
     };
+    // The other half of crash recovery: drop the staging directory a killed
+    // publish left behind. Not fatal if it fails — a leaked directory under
+    // `.tmp` costs disk and nothing else, and refusing to ingest over it would
+    // turn a janitorial problem into an outage.
+    match block::sweep_staging(&cfg.data_dir, B::SIGNAL, cfg.node) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(signal = B::SIGNAL, count = n, "swept stale staging dirs"),
+        Err(e) => tracing::warn!(signal = B::SIGNAL, error = %e, "cannot sweep staging dirs"),
+    }
 
     let mut builder = B::default();
     let mut waiters: Vec<oneshot::Sender<Result<(), Rejected>>> = Vec::new();
@@ -524,7 +533,7 @@ mod tests {
         // turns the two into statuses an exporter treats differently.
         match tx.submit(wide(70_000)).await {
             Err(Rejected::Failed(e)) => {
-                assert!(e.contains("65535") || e.contains("dictionary"), "{e}")
+                assert!(e.contains("65535") || e.contains("dictionary"), "{e}");
             }
             _ => panic!("70k distinct keys cannot fit a u16 dictionary"),
         }

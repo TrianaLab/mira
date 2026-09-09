@@ -84,15 +84,20 @@ impl Tab {
     /// Columns of the signal's root table.
     ///
     /// This is what decides whether `name=checkout` filters a column or an
-    /// attribute, and getting it wrong is silent: an unknown `field` matches
-    /// nothing rather than erroring, by design, so a typo here would look like
-    /// "no results" forever.
+    /// attribute, and getting it wrong is silent both ways: an unknown `field`
+    /// matches nothing rather than erroring, and a column missing from this
+    /// list is sent as `attr`, which the Bloom filter prunes to zero rows. That
+    /// is what happened to `event_name`, added to the schema after this list
+    /// was written — so `tests::the_field_list_is_the_schema` now pins the two
+    /// together. Not an intra-doc link: the target is behind `cfg(test)`, so it
+    /// does not exist in the configuration rustdoc builds.
     fn fields(self) -> &'static [&'static str] {
         match self {
             Tab::Traces => &[
                 "trace_id",
                 "span_id",
                 "parent_span_id",
+                "trace_state",
                 "flags",
                 "name",
                 "kind",
@@ -100,16 +105,21 @@ impl Tab {
                 "duration_nano",
                 "status_code",
                 "status_message",
+                "dropped_attributes_count",
+                "dropped_events_count",
+                "dropped_links_count",
             ],
             _ => &[
                 "time_unix_nano",
                 "observed_time_unix_nano",
                 "severity_number",
                 "severity_text",
+                "event_name",
                 "body",
                 "trace_id",
                 "span_id",
                 "flags",
+                "dropped_attributes_count",
             ],
         }
     }
@@ -268,7 +278,7 @@ impl App {
                     self.err = true;
                     return;
                 }
-                self.trace = Some(Trace::new(id, spans));
+                self.trace = Some(Trace::new(id, &spans));
                 self.mode = Mode::Trace;
                 self.scroll = 0;
                 let _ = h;
@@ -428,7 +438,7 @@ impl App {
                 Tab::Metrics => Tab::Logs,
             }),
             Key::Tab if self.tab == Tab::Metrics && self.mode == Mode::List => {
-                self.on_series = !self.on_series
+                self.on_series = !self.on_series;
             }
             Key::Char('j') | Key::Down => self.move_by(1),
             Key::Char('k') | Key::Up => self.move_by(-1),
@@ -556,7 +566,7 @@ impl App {
             (Mode::Detail | Mode::Span | Mode::Help, _) => self.scroll = n,
             (Mode::Trace, _) => {
                 if let Some(t) = self.trace.as_mut() {
-                    t.sel = n
+                    t.sel = n;
                 }
             }
             (_, Tab::Metrics) if self.on_series => self.ssel = n,
@@ -1006,7 +1016,7 @@ impl App {
 }
 
 impl Trace {
-    fn new(id: String, spans: Vec<Yaml>) -> Trace {
+    fn new(id: String, spans: &[Yaml]) -> Trace {
         let t0 = spans
             .iter()
             .filter_map(|s| s["start_time_unix_nano"].as_i64())
@@ -1331,15 +1341,44 @@ fn pairs(y: &Yaml) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// One value on one line.
+///
+/// Nested values are rendered inline rather than summarised as `[2 items]`: an
+/// array attribute, a kvlist attribute and a structured body are decoded by the
+/// engine at some cost, and the detail pane is the one place the reader asked to
+/// see them. `Row` clips the line at the pane width, so this only has to be
+/// compact, not fitted.
+///
+/// ponytail: the whole value is built and then clipped, so a thousand-element
+/// array costs a string nobody sees, once per frame. Depth is capped because
+/// nesting is what makes that unbounded; cap the element count too if a payload
+/// that wide ever turns up.
 fn text(y: &Yaml) -> String {
+    nested(y, 4)
+}
+
+fn nested(y: &Yaml, depth: usize) -> String {
     match y {
         Yaml::String(s) => s.clone(),
         Yaml::Integer(i) => i.to_string(),
         Yaml::Real(r) => r.clone(),
         Yaml::Boolean(b) => b.to_string(),
         Yaml::Null => "null".into(),
-        Yaml::Array(a) => format!("[{} items]", a.len()),
-        Yaml::Hash(h) => format!("{{{} keys}}", h.len()),
+        Yaml::Array(a) if depth == 0 => format!("[{} items]", a.len()),
+        Yaml::Hash(h) if depth == 0 => format!("{{{} keys}}", h.len()),
+        Yaml::Array(a) => {
+            let items: Vec<String> = a.iter().map(|v| nested(v, depth - 1)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Yaml::Hash(h) => {
+            let items: Vec<String> = h
+                .iter()
+                // A non-string key cannot happen in decoded OTLP, but rendering
+                // it beats dropping the pair it belongs to.
+                .map(|(k, v)| format!("{}: {}", nested(k, 0), nested(v, depth - 1)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
         _ => String::new(),
     }
 }
@@ -1412,7 +1451,15 @@ fn stamp(ns: i64) -> String {
 fn civil(ns: i64) -> (libc::tm, i64) {
     let secs = ns.div_euclid(1_000_000_000) as libc::time_t;
     let ms = ns.rem_euclid(1_000_000_000) / 1_000_000;
+    // SAFETY: `tm` is integers plus a `tm_zone` pointer, and null is a valid
+    // value for a raw pointer, so all-zero is a valid `tm`. It has to be: the
+    // return value is discarded below, and `localtime_r` returns NULL without
+    // writing anything for a `time_t` it cannot represent. The zeroed struct
+    // then renders as 1900-01-01 — a wrong timestamp, not uninitialised memory.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both arguments are live, correctly typed locals. The `_r` form
+    // writes only into `tm` and returns no pointer into shared state, so unlike
+    // `localtime` nothing here can be clobbered by another thread's call.
     unsafe { libc::localtime_r(&secs, &mut tm) };
     (tm, ms)
 }
@@ -1513,7 +1560,7 @@ fn trace_query(id: &str) -> String {
                 j.str("trace_id");
                 j.key("eq");
                 j.str(id);
-            })
+            });
         });
     });
     j.into_string()
@@ -1613,7 +1660,7 @@ fn scalar(j: &mut Json, key: &str, v: &str) {
             return j.f64(f);
         }
     }
-    j.str(v)
+    j.str(v);
 }
 
 #[cfg(test)]
@@ -1749,6 +1796,67 @@ mod tests {
         use mira_core::query::Target;
     }
 
+    /// Every root column the engine can compare has to be in `fields`, or the
+    /// filter box sends it as `attr` and the Bloom filter prunes it to nothing.
+    /// Pinned against the schema so the next column added there cannot repeat
+    /// what happened to `event_name`.
+    ///
+    /// The browser UI keeps a second copy of the same list and, being
+    /// JavaScript, cannot read `schema.rs` — so it is pinned here too rather
+    /// than against literals of its own. `include_str!` is what makes that
+    /// work: the file is a compile-time input, so adding a column to the
+    /// schema fails this test until *both* filter boxes know about it.
+    #[test]
+    fn the_field_list_is_the_schema() {
+        // Left out on purpose: `id`, `resource_id` and `scope_id` are
+        // block-local numbers that mean nothing to whoever is typing, and
+        // `body_ser` is Binary, which `field_pred` has no comparison for.
+        let skip = ["id", "resource_id", "scope_id", "body_ser"];
+        let js = include_str!("../ui/src/lib/api.js");
+        for (tab, key, schema) in [
+            (Tab::Logs, "logs", &mira_core::schema::LOGS),
+            (Tab::Traces, "traces", &mira_core::schema::SPANS),
+        ] {
+            let mut want: Vec<&str> = schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|n| !skip.contains(n))
+                .collect();
+            let mut got = tab.fields().to_vec();
+            // Every odd field of a split on `'` is a quoted element, which is
+            // enough parsing for a list of bare identifiers.
+            let arr = js
+                .split_once(&format!("\n  {key}: ["))
+                .expect("FIELDS key")
+                .1;
+            let mut browser: Vec<&str> = arr[..arr.find(']').expect("closing bracket")]
+                .split('\'')
+                .skip(1)
+                .step_by(2)
+                .collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            browser.sort_unstable();
+            assert_eq!(got, want, "{tab:?}");
+            assert_eq!(browser, want, "{tab:?} in ui/src/lib/api.js");
+        }
+    }
+
+    /// An array or kvlist attribute is decoded by the engine at real cost, and
+    /// the detail pane is where the reader asked to see it — `[2 items]` there
+    /// throws the answer away.
+    #[test]
+    fn nested_values_render_inline_down_to_a_depth() {
+        let v = |s: &str| text(&crate::api::parse(s).unwrap()["v"]);
+        assert_eq!(v(r#"{"v":["mira","serve"]}"#), "[mira, serve]");
+        assert_eq!(v(r#"{"v":{"role":"user","n":2}}"#), "{role: user, n: 2}");
+        assert_eq!(v(r#"{"v":[{"type":"text"}]}"#), "[{type: text}]");
+        // Capped, so a pathological nest cannot spend a frame building a line
+        // that gets clipped at the pane width anyway.
+        assert_eq!(v(r#"{"v":[[[[["deep"]]]]]}"#), "[[[[[1 items]]]]]");
+    }
+
     #[test]
     fn the_trace_query_is_the_bloom_indexed_shape() {
         let q =
@@ -1774,7 +1882,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let t = Trace::new("abc".into(), array(&doc["rows"]));
+        let t = Trace::new("abc".into(), &array(&doc["rows"]));
         let seen: Vec<(&str, usize)> = t
             .spans
             .iter()
@@ -1807,7 +1915,7 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let t = Trace::new("abc".into(), array(&doc["rows"]));
+        let t = Trace::new("abc".into(), &array(&doc["rows"]));
         assert_eq!(t.spans.len(), 2);
     }
 
@@ -1912,7 +2020,7 @@ mod tests {
         app.rows = array(&doc["rows"]);
         app.series = array(&doc["series"]);
         app.names = array(&doc["names"]);
-        app.trace = Some(Trace::new("ab".into(), array(&doc["rows"])));
+        app.trace = Some(Trace::new("ab".into(), &array(&doc["rows"])));
         app.stats = "x".into();
 
         for (w, h) in [(40, 8), (80, 24), (200, 60), (41, 9)] {

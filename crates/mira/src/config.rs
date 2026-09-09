@@ -26,7 +26,8 @@
 //!
 //! Enforcement is [`scalar`]: every value Mira reads out of this file is a
 //! string, so anything that arrived as another type is refused at boot with a
-//! message saying to quote it.
+//! message saying to quote it. A list or a map never reaches a value at all, so
+//! [`check_keys`] refuses those, by path — quoting is not the fix for a shape.
 //!
 //! # Why there is a config file at all
 //!
@@ -83,6 +84,19 @@ use yaml_rust2::{Yaml, YamlLoader};
 type Error = String;
 type Result<T> = std::result::Result<T, Error>;
 
+/// How `${env:NAME}` is resolved, handed to the parser rather than read out of
+/// the process.
+///
+/// Not an abstraction for its own sake — it is what lets the tests supply an
+/// environment without writing one. `std::env::set_var` is `unsafe` in edition
+/// 2024 because it can reallocate `environ` under a concurrent `getenv`, in any
+/// thread, including one inside libc; `cargo test` runs this binary's tests as
+/// threads of a single process, and at least two of them read: `term.rs` looks
+/// up `MIRA_PTY_CHILD`, and every `tui.rs` test that formats a timestamp reaches
+/// `localtime_r`, which reads `TZ`. No lock closes that, because the libc reader
+/// will not take it. Not writing does.
+type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// This replica's name. Hashed into the block directory name so that
@@ -122,26 +136,31 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_with(text, &|k| std::env::var(k).ok())
+    }
+
+    /// [`Config::parse`] against a supplied environment. See [`Env`].
+    fn parse_with(text: &str, env: Env) -> Result<Self> {
         let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
         let root = docs.into_iter().next().unwrap_or(Yaml::Null);
         let mut cfg = Config::default();
 
-        if let Some(v) = get(&root, "node")? {
+        if let Some(v) = get(&root, "node", env)? {
             cfg.node = v;
         }
-        if let Some(v) = get(&root, "listen.grpc")? {
+        if let Some(v) = get(&root, "listen.grpc", env)? {
             cfg.grpc = v.parse().map_err(|e| format!("listen.grpc: {e}"))?;
         }
-        if let Some(v) = get(&root, "listen.http")? {
+        if let Some(v) = get(&root, "listen.http", env)? {
             cfg.http = v.parse().map_err(|e| format!("listen.http: {e}"))?;
         }
-        if let Some(v) = get(&root, "storage.dir")? {
+        if let Some(v) = get(&root, "storage.dir", env)? {
             cfg.data_dir = PathBuf::from(v);
         }
-        if let Some(v) = get(&root, "storage.retention")? {
+        if let Some(v) = get(&root, "storage.retention", env)? {
             cfg.retention = duration(&v).map_err(|e| format!("storage.retention: {e}"))?;
         }
-        if let Some(v) = get(&root, "ingest.max_request_bytes")? {
+        if let Some(v) = get(&root, "ingest.max_request_bytes", env)? {
             cfg.max_request_bytes =
                 bytes(&v).map_err(|e| format!("ingest.max_request_bytes: {e}"))?;
         }
@@ -160,13 +179,18 @@ const KNOWN: [&str; 6] = [
     "ingest.max_request_bytes",
 ];
 
-/// Refuse a key Mira does not read.
+/// Refuse a key Mira does not read, or a shape it cannot read.
 ///
-/// The seven `lookup`s above are silent about everything they do not name, so
+/// The six `get`s above are silent about everything they do not name, so
 /// `storage.retension` and a `retention` nested one level too deep both boot
 /// happily on the 7-day default and surface a week later as a full disk. A flag
 /// Mira does not know is already `unknown flag --nope`; there is no reason a file
 /// should be the lenient half of the same interface.
+///
+/// `lookup` is just as silent about a value of the wrong *shape* — a list where
+/// a string belongs, a string where a section belongs — and the outcome is
+/// identical: the default, in silence. So the structure is checked here too,
+/// where the full path is in hand to name.
 ///
 /// The closed set is also what makes deleting a setting safe: a key that no
 /// longer exists becomes a startup error naming it, rather than a value the
@@ -180,19 +204,52 @@ fn check_keys(node: &Yaml, prefix: &str) -> Result<()> {
             ("", name) => name,
             (p, name) => format!("{p}.{name}"),
         };
-        // A map is a section on the way to a leaf — or a leaf someone nested one
-        // level too deep, in which case the recursion is what names it.
-        if matches!(v, Yaml::Hash(_)) {
-            check_keys(v, &path)?;
-            continue;
+        // A name is acceptable as a whole key or as the *prefix* of one —
+        // `listen` is a section only because `listen.grpc` exists. Judging the
+        // name rather than waiting for a leaf under it is what makes the set
+        // closed: `{ "cluster": {} }` is exactly how an operator writes a
+        // section they are about to fill in, and testing leaves only would let
+        // it boot in silence and look accepted.
+        let known = KNOWN.iter().any(|k| {
+            *k == path
+                || k.strip_prefix(path.as_str())
+                    .is_some_and(|r| r.starts_with('.'))
+        });
+        if !known {
+            return Err(format!(
+                "unknown key {path:?}. Mira reads exactly {}; see docs/CONFIG.md",
+                KNOWN.join(", ")
+            ));
         }
-        if KNOWN.contains(&path.as_str()) {
-            continue;
+        // Shape has to match the name: a section holds a map, a setting holds a
+        // scalar. `scalar` judges the scalar itself at read time; the two
+        // collection types never reach it, because `lookup` walks past a list
+        // and stops inside a map, returning "absent" for both.
+        let leaf = KNOWN.contains(&path.as_str());
+        match v {
+            Yaml::Hash(_) => {
+                // No known key is a prefix of another, so a map under a setting
+                // holds nothing but keys nested a level too deep, and the
+                // recursion is what names them. An empty one has nothing to
+                // name, which is why the check below is not unreachable.
+                check_keys(v, &path)?;
+                if leaf {
+                    return Err(format!("{path}: expected a string, found a map"));
+                }
+            }
+            Yaml::Array(_) => return Err(format!("{path}: expected a string, found a list")),
+            // `null` is "absent, use the default" at every level, for the reason
+            // `scalar` gives: it is how a templating layer writes "not set".
+            Yaml::Null => {}
+            // A scalar where a section belongs: `{ "listen": "0.0.0.0:4317" }`
+            // reads as neither `listen.grpc` nor `listen.http`.
+            _ if !leaf => {
+                return Err(format!(
+                    "{path}: expected a map of settings, found a value; see docs/CONFIG.md"
+                ));
+            }
+            _ => {}
         }
-        return Err(format!(
-            "unknown key {path:?}. Mira reads exactly {}; see docs/CONFIG.md",
-            KNOWN.join(", ")
-        ));
     }
     Ok(())
 }
@@ -212,7 +269,9 @@ fn lookup<'a>(root: &'a Yaml, path: &str) -> Option<&'a Yaml> {
 /// path, a name, a duration. So the rule is simply that it must have arrived as
 /// one.
 ///
-/// `Ok(None)` means "not a scalar at all": a missing key, a map, a list. `Err`
+/// `Ok(None)` means "no scalar here": a missing key, an explicit `null`, or a
+/// collection — and a collection at a key Mira reads is refused by
+/// [`check_keys`], which knows the path to name it by. `Err`
 /// means the key is present and the parser resolved it to some other type,
 /// which is the ambiguity KYAML exists to remove. Coercing back with
 /// `to_string()` is what makes `0x1f` silently become `31`; refusing costs the
@@ -236,20 +295,20 @@ fn scalar(y: &Yaml) -> Result<Option<String>> {
     }
 }
 
-fn get(root: &Yaml, path: &str) -> Result<Option<String>> {
+fn get(root: &Yaml, path: &str, env: Env) -> Result<Option<String>> {
     let found = match lookup(root, path) {
         Some(y) => scalar(y).map_err(|e| format!("{path}: {e}"))?,
         None => None,
     };
     match found {
         None => Ok(None),
-        Some(raw) => resolve(root, &raw, &mut vec![path.to_owned()]).map(Some),
+        Some(raw) => resolve(root, &raw, &mut vec![path.to_owned()], env).map(Some),
     }
 }
 
 /// Expand every `${...}` in `raw`. `stack` carries the config paths currently
 /// being resolved, so a reference cycle is reported rather than overflowing.
-fn resolve(root: &Yaml, raw: &str, stack: &mut Vec<String>) -> Result<String> {
+fn resolve(root: &Yaml, raw: &str, stack: &mut Vec<String>, env: Env) -> Result<String> {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0;
@@ -269,7 +328,7 @@ fn resolve(root: &Yaml, raw: &str, stack: &mut Vec<String>) -> Result<String> {
         }
         let rest = &raw[i + 2..];
         let end = closing_brace(rest).ok_or_else(|| format!("unterminated `${{` in {raw:?}"))?;
-        out.push_str(&expand(root, &rest[..end], stack)?);
+        out.push_str(&expand(root, &rest[..end], stack, env)?);
         i += 2 + end + 1;
     }
     Ok(out)
@@ -303,16 +362,16 @@ fn closing_brace(s: &str) -> Option<usize> {
     None
 }
 
-fn expand(root: &Yaml, expr: &str, stack: &mut Vec<String>) -> Result<String> {
+fn expand(root: &Yaml, expr: &str, stack: &mut Vec<String>, env: Env) -> Result<String> {
     if let Some(rest) = expr.strip_prefix("env:") {
         let (name, default) = match rest.split_once(',') {
             Some((n, d)) => (n.trim(), Some(d)),
             None => (rest.trim(), None),
         };
-        return match (std::env::var(name), default) {
-            (Ok(v), _) => Ok(v),
-            (Err(_), Some(d)) => resolve(root, d, stack),
-            (Err(_), None) => Err(format!(
+        return match (env(name), default) {
+            (Some(v), _) => Ok(v),
+            (None, Some(d)) => resolve(root, d, stack, env),
+            (None, None) => Err(format!(
                 "${{env:{name}}} is not set and has no default (write `${{env:{name},<default>}}`)"
             )),
         };
@@ -330,7 +389,7 @@ fn expand(root: &Yaml, expr: &str, stack: &mut Vec<String>) -> Result<String> {
     .ok_or_else(|| format!("${{{path}}} does not name a scalar key"))?;
 
     stack.push(path.to_owned());
-    let v = resolve(root, &raw, stack)?;
+    let v = resolve(root, &raw, stack, env)?;
     stack.pop();
     Ok(v)
 }
@@ -390,11 +449,13 @@ pub fn bytes(s: &str) -> Result<usize> {
 mod tests {
     use super::*;
 
-    // SAFETY: set_var is unsafe in edition 2024 because it races other threads
-    // reading the environment. These tests are the only reader here and cargo
-    // runs each test binary's threads against a fresh process.
-    fn set(k: &str, v: &str) {
-        unsafe { std::env::set_var(k, v) }
+    /// The environment these tests parse against. A literal, not the process's:
+    /// see [`Env`] for why writing the real one is not an option.
+    fn env(k: &str) -> Option<String> {
+        match k {
+            "MIRA_TEST_HOST" => Some("node-7".to_owned()),
+            _ => None,
+        }
     }
 
     /// Written in KYAML, and deliberately so: this doubles as the check that
@@ -404,8 +465,7 @@ mod tests {
     /// YAML 1.2 permits them in flow collections but plenty of parsers do not.
     #[test]
     fn interpolation_covers_env_reference_default_and_escape() {
-        set("MIRA_TEST_HOST", "node-7");
-        let cfg = Config::parse(
+        let cfg = Config::parse_with(
             r#"{
   "node": "${env:MIRA_TEST_HOST}",
       "listen": { "grpc": "0.0.0.0:5317", },
@@ -414,6 +474,7 @@ mod tests {
     "retention": "36h",
   },
 }"#,
+            &env,
         )
         .unwrap();
 
@@ -424,20 +485,20 @@ mod tests {
         // Unset keys keep their defaults rather than becoming empty.
         assert_eq!(cfg.http.port(), 4318);
 
-        let esc = Config::parse(r#"{ "node": "$${env:NOPE}" }"#).unwrap();
+        let esc = Config::parse_with(r#"{ "node": "$${env:NOPE}" }"#, &env).unwrap();
         assert_eq!(esc.node, "${env:NOPE}");
 
         // Defaults nest, which only works if the scan finds the *matching*
         // brace. Taking the first one used to boot the node called `alpha}` —
         // a stray character in every block directory this replica writes.
         let chain = r#"{ "node": "${env:MIRA_TEST_MISSING,${env:MIRA_TEST_HOST,last}}" }"#;
-        assert_eq!(Config::parse(chain).unwrap().node, "node-7");
+        assert_eq!(Config::parse_with(chain, &env).unwrap().node, "node-7");
         let all_unset =
             r#"{ "node": "${env:MIRA_TEST_MISSING,${env:MIRA_TEST_ALSO_MISSING,last}}" }"#;
-        assert_eq!(Config::parse(all_unset).unwrap().node, "last");
+        assert_eq!(Config::parse_with(all_unset, &env).unwrap().node, "last");
         // And the outer value still wins without picking up the inner brace.
         let outer = r#"{ "node": "${env:MIRA_TEST_HOST,${env:MIRA_TEST_MISSING,last}}" }"#;
-        assert_eq!(Config::parse(outer).unwrap().node, "node-7");
+        assert_eq!(Config::parse_with(outer, &env).unwrap().node, "node-7");
     }
 
     /// The coercions KYAML exists to kill. Each of these used to be accepted,
@@ -468,7 +529,7 @@ mod tests {
     #[test]
     fn bad_config_fails_at_boot_rather_than_silently() {
         // A missing env var with no default must not become "".
-        let e = Config::parse("node: ${env:MIRA_DEFINITELY_UNSET_XYZ}").unwrap_err();
+        let e = Config::parse_with("node: ${env:MIRA_MISSING}", &env).unwrap_err();
         assert!(e.contains("is not set"), "{e}");
 
         let e = Config::parse("node: ${a}\na: ${node}").unwrap_err();
@@ -509,8 +570,15 @@ mod tests {
         assert!(e.contains("storage.dir.path"), "{e}");
 
         // A setting that was deleted becomes loud for free — no special case.
+        // The section is what no longer exists, so that is what the error names.
         let e = Config::parse(r#"{ "cluster": { "peers": "a:1" } }"#).unwrap_err();
-        assert!(e.contains("cluster.peers"), "{e}");
+        assert!(e.contains("unknown key \"cluster\""), "{e}");
+
+        // And with nothing in it yet, which is how an operator writes a section
+        // they are about to fill in — so it is the reading most likely to be
+        // believed, and it used to be the one that booted.
+        let e = Config::parse(r#"{ "cluster": {} }"#).unwrap_err();
+        assert!(e.contains("unknown key \"cluster\""), "{e}");
 
         // Keys are held to the same quoting rule as values.
         let e = Config::parse("2: x").unwrap_err();
@@ -519,6 +587,34 @@ mod tests {
         // And the shipped shape passes, including sections with nothing in them.
         Config::parse(r#"{ "node": "a", "listen": {}, "ingest": { "max_request_bytes": "1k" } }"#)
             .unwrap();
+    }
+
+    /// A list or a map where a value belongs is refused, not ignored.
+    ///
+    /// `lookup` returns "absent" for both — it walks past a list and stops
+    /// inside a map — so each of these used to boot on the default: the wrong
+    /// listen address, or worse, the wrong data directory, with nothing said.
+    #[test]
+    fn a_value_of_the_wrong_shape_refuses_to_start() {
+        let e = Config::parse(r#"{ "node": ["a"] }"#).unwrap_err();
+        assert!(e.contains("node: expected a string, found a list"), "{e}");
+
+        // The empty map is the one the leaf-only check missed.
+        let e = Config::parse(r#"{ "storage": { "dir": {} } }"#).unwrap_err();
+        assert!(
+            e.contains("storage.dir: expected a string, found a map"),
+            "{e}"
+        );
+
+        // A section given a value instead of its settings.
+        let e = Config::parse(r#"{ "listen": "0.0.0.0:4317" }"#).unwrap_err();
+        assert!(e.contains("listen: expected a map of settings"), "{e}");
+
+        // `null` still means "absent, use the default" — a key present-but-null
+        // is how a templating layer says "not set", at either level.
+        let cfg = Config::parse(r#"{ "node": null, "listen": null }"#).unwrap();
+        assert_eq!(cfg.node, "mira");
+        assert_eq!(cfg.http.port(), 4318);
     }
 
     /// Binary units throughout, and no silent second meaning for `MB`.

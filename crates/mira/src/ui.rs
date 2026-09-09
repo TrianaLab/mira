@@ -16,7 +16,8 @@
 //!
 //! Freshness is an ETag over the bytes rather than a hash in the URL. The hash
 //! is computed once on first use, the browser sends it back on the next load,
-//! and an unchanged bundle costs one 304 instead of 54 KB.
+//! and an unchanged bundle costs three 304s — the ETag is per asset, so a page
+//! load revalidates each of the three — instead of 60 KB.
 
 use std::sync::LazyLock;
 

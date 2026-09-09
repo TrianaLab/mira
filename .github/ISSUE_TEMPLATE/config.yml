@@ -1,0 +1,22 @@
+# Blank issues are off: both forms exist because a free-text bug report on a
+# database arrives missing the version, the filesystem and whether it survives
+# a clean data directory, and getting those costs a round trip each. If neither
+# form fits, pick the closest and say so in the first line.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/TrianaLab/mira/security/advisories/new
+    about: Private, maintainers only. Never open a public issue for one — see SECURITY.md.
+
+  - name: Why the tree looks like this
+    url: https://github.com/TrianaLab/mira/blob/main/docs/ARCHITECTURE.md
+    about: §0 lists the mechanisms that did not survive contact with the formats, and what replaced them.
+
+  - name: Configuration reference
+    url: https://github.com/TrianaLab/mira/blob/main/docs/CONFIG.md
+    about: Every flag and every KYAML key, with the env interpolation syntax.
+
+  - name: Testing against a live instance
+    url: https://github.com/TrianaLab/mira/blob/main/docs/TESTING.md
+    about: Reproduce with synthetic data, telemetrygen or a stock Collector before filing.

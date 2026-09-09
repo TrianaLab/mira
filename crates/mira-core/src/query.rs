@@ -1043,7 +1043,7 @@ fn emit_value(j: &mut Json, col: &dyn Array, row: usize) {
         // precision or picks a timezone on the user's behalf; the UI formats
         // them, which is where that belongs.
         DataType::Timestamp(_, _) => {
-            j.i64(col.as_primitive::<TimestampNanosecondType>().value(row))
+            j.i64(col.as_primitive::<TimestampNanosecondType>().value(row));
         }
         DataType::Int64 => j.i64(col.as_primitive::<Int64Type>().value(row)),
         DataType::Int32 => j.i64(col.as_primitive::<Int32Type>().value(row) as i64),
@@ -1163,8 +1163,8 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn hits(col: &dyn Array, op: Op, v: Value) -> Vec<u32> {
-        match field_pred(col, op, &v) {
+    fn hits(col: &dyn Array, op: Op, v: &Value) -> Vec<u32> {
+        match field_pred(col, op, v) {
             Some(p) => (0..col.len() as u32).filter(|&i| p(i)).collect(),
             None => vec![u32::MAX],
         }
@@ -1224,20 +1224,20 @@ mod tests {
         ];
         for (name, col) in &cols {
             let c = col.as_ref();
-            assert_eq!(hits(c, Op::Eq, Value::Int(2)), [1], "{name} eq");
-            assert_eq!(hits(c, Op::Ne, Value::Int(2)), [0, 2], "{name} ne");
-            assert_eq!(hits(c, Op::Lt, Value::Int(2)), [0], "{name} lt");
-            assert_eq!(hits(c, Op::Lte, Value::Int(2)), [0, 1], "{name} lte");
-            assert_eq!(hits(c, Op::Gt, Value::Int(2)), [2], "{name} gt");
-            assert_eq!(hits(c, Op::Gte, Value::Int(2)), [1, 2], "{name} gte");
+            assert_eq!(hits(c, Op::Eq, &Value::Int(2)), [1], "{name} eq");
+            assert_eq!(hits(c, Op::Ne, &Value::Int(2)), [0, 2], "{name} ne");
+            assert_eq!(hits(c, Op::Lt, &Value::Int(2)), [0], "{name} lt");
+            assert_eq!(hits(c, Op::Lte, &Value::Int(2)), [0, 1], "{name} lte");
+            assert_eq!(hits(c, Op::Gt, &Value::Int(2)), [2], "{name} gt");
+            assert_eq!(hits(c, Op::Gte, &Value::Int(2)), [1, 2], "{name} gte");
             // A null is not less than anything, and `ne` is where that bites:
             // the naive reading would return it.
-            assert!(!hits(c, Op::Ne, Value::Int(9)).contains(&3), "{name} null");
+            assert!(!hits(c, Op::Ne, &Value::Int(9)).contains(&3), "{name} null");
             // Quoted, because a browser and an LLM both write "2" as often as 2.
-            assert_eq!(hits(c, Op::Eq, Value::Str("2".into())), [1], "{name} str");
+            assert_eq!(hits(c, Op::Eq, &Value::Str("2".into())), [1], "{name} str");
             // Nothing to compare against: no rows, not an error.
             assert_eq!(
-                hits(c, Op::Eq, Value::Bool(true)),
+                hits(c, Op::Eq, &Value::Bool(true)),
                 [u32::MAX],
                 "{name} bool"
             );
@@ -1246,50 +1246,53 @@ mod tests {
         // A fractional target against an integer column has no integer to be
         // equal to. Truncating would make `duration > 0.5` mean `duration > 0`.
         assert_eq!(
-            hits(cols[1].1.as_ref(), Op::Gt, Value::Double(1.5)),
+            hits(cols[1].1.as_ref(), Op::Gt, &Value::Double(1.5)),
             [u32::MAX]
         );
-        assert_eq!(hits(cols[1].1.as_ref(), Op::Gt, Value::Double(2.0)), [2]);
+        assert_eq!(hits(cols[1].1.as_ref(), Op::Gt, &Value::Double(2.0)), [2]);
         // Floats compare as floats, and NaN is unordered rather than equal.
         let f = Float64Array::from(vec![Some(1.5), Some(f64::NAN)]);
-        assert_eq!(hits(&f, Op::Gt, Value::Double(1.0)), [0]);
-        assert_eq!(hits(&f, Op::Eq, Value::Double(f64::NAN)), Vec::<u32>::new());
+        assert_eq!(hits(&f, Op::Gt, &Value::Double(1.0)), [0]);
+        assert_eq!(
+            hits(&f, Op::Eq, &Value::Double(f64::NAN)),
+            Vec::<u32>::new()
+        );
 
         let b = BooleanArray::from(vec![Some(true), Some(false), None]);
-        assert_eq!(hits(&b, Op::Eq, Value::Bool(true)), [0]);
-        assert_eq!(hits(&b, Op::Eq, Value::Str("false".into())), [1]);
-        assert_eq!(hits(&b, Op::Eq, Value::Int(1)), [u32::MAX]);
+        assert_eq!(hits(&b, Op::Eq, &Value::Bool(true)), [0]);
+        assert_eq!(hits(&b, Op::Eq, &Value::Str("false".into())), [1]);
+        assert_eq!(hits(&b, Op::Eq, &Value::Int(1)), [u32::MAX]);
 
         let s = StringArray::from(vec![Some("alpha"), Some("beta"), None]);
-        assert_eq!(hits(&s, Op::Eq, Value::Str("beta".into())), [1]);
-        assert_eq!(hits(&s, Op::Contains, Value::Str("et".into())), [1]);
-        assert_eq!(hits(&s, Op::Lt, Value::Str("b".into())), [0]);
-        assert_eq!(hits(&s, Op::Eq, Value::Int(1)), [u32::MAX]);
+        assert_eq!(hits(&s, Op::Eq, &Value::Str("beta".into())), [1]);
+        assert_eq!(hits(&s, Op::Contains, &Value::Str("et".into())), [1]);
+        assert_eq!(hits(&s, Op::Lt, &Value::Str("b".into())), [0]);
+        assert_eq!(hits(&s, Op::Eq, &Value::Int(1)), [u32::MAX]);
 
         let mut d = StringDictionaryBuilder::<UInt16Type>::new();
         for v in ["ERROR", "INFO", "ERROR"] {
             d.append_value(v);
         }
         let d = d.finish();
-        assert_eq!(hits(&d, Op::Eq, Value::Str("ERROR".into())), [0, 2]);
+        assert_eq!(hits(&d, Op::Eq, &Value::Str("ERROR".into())), [0, 2]);
         // Resolved against the dictionary once. A value that is not in it cannot
         // match any row, and saying so costs no row scan at all.
         assert_eq!(
-            hits(&d, Op::Eq, Value::Str("TRACE".into())),
+            hits(&d, Op::Eq, &Value::Str("TRACE".into())),
             Vec::<u32>::new()
         );
 
         // Ids arrive as hex and live as bytes. The needle is decoded once, so a
         // needle that is not hex at all is no rows rather than every row.
         let ids = FixedSizeBinaryArray::try_from_iter([[1u8, 2], [3, 4]].into_iter()).unwrap();
-        assert_eq!(hits(&ids, Op::Eq, Value::Str("0102".into())), [0]);
-        assert_eq!(hits(&ids, Op::Gt, Value::Str("0102".into())), [1]);
-        assert_eq!(hits(&ids, Op::Eq, Value::Str("zz".into())), [u32::MAX]);
-        assert_eq!(hits(&ids, Op::Eq, Value::Str("010".into())), [u32::MAX]);
+        assert_eq!(hits(&ids, Op::Eq, &Value::Str("0102".into())), [0]);
+        assert_eq!(hits(&ids, Op::Gt, &Value::Str("0102".into())), [1]);
+        assert_eq!(hits(&ids, Op::Eq, &Value::Str("zz".into())), [u32::MAX]);
+        assert_eq!(hits(&ids, Op::Eq, &Value::Str("010".into())), [u32::MAX]);
 
         // A type the table does not know is not a panic and not an error.
         let l = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1)])]);
-        assert_eq!(hits(&l, Op::Eq, Value::Int(1)), [u32::MAX]);
+        assert_eq!(hits(&l, Op::Eq, &Value::Int(1)), [u32::MAX]);
     }
 
     /// Materialization is the same dispatch table read the other way, and its

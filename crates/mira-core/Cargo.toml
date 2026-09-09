@@ -14,7 +14,6 @@ arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 prost.workspace = true
-bytes.workspace = true
 memmap2.workspace = true
 # Already in the graph under memmap2; direct only for `statfs` (block.rs).
 libc.workspace = true
@@ -25,3 +24,6 @@ tracing.workspace = true
 [dev-dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 //! A block is a *directory* holding one Arrow IPC file per table:
 //!
 //! ```text
-//! <root>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<seq:012>/
+//! <root>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
 //!     logs.arrow  log_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
 //! ```
 //!
@@ -269,20 +269,35 @@ pub fn publish(
 ) -> Result<BlockRef> {
     let (min_ts, max_ts) = (sealed.min_ts, sealed.max_ts);
     // The staging name carries `node` for the same reason the final one does:
-    // two replicas on one volume must not stage into the same directory.
-    let tmp = root
-        .join(".tmp")
-        .join(format!("{signal}-{node:08x}-{seq:012}"));
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp).ctx(&tmp)?;
-    }
-    fs::create_dir_all(&tmp).ctx(&tmp)?;
+    // two replicas on one volume must not stage into the same directory. It
+    // also carries the timestamp range, because `node` alone is not enough: two
+    // replicas started with the same `--node` — a misconfiguration, but a silent
+    // one — walk the same `seq` from 0 and collide. The observed cost was two
+    // lost publishes in 107, both retryable; the unobserved one is worse, since
+    // B's `remove_dir_all` can empty a directory A is still writing tables into
+    // and the winner then publishes a block assembled from two sealed sets.
+    // Adding the range the final name already carries makes the path unique per
+    // block content, which is exactly the granularity the collision needs.
+    let staging = root.join(".tmp");
+    let tmp = staging.join(format!(
+        "{signal}-{node:08x}-{seq:012}-{min_ts:020}-{max_ts:020}"
+    ));
+    fs::create_dir_all(&staging).ctx(&staging)?;
+    // `create_dir`, not `create_dir_all`: the latter succeeds on a directory
+    // that already exists, which is how a leftover from a killed publish gets
+    // silently merged into this one. Colliding here is a retryable error, and
+    // `sweep_staging` clears the leftover at the next boot.
+    fs::create_dir(&tmp).ctx(&tmp)?;
 
     // An empty table is not written. Arrow IPC framing for a zero-row table is
     // ~1 KB for three columns and ~2.5 KB for nine (measured), which is nothing
     // against a full 32 MB block and most of a block sealed by the age timer on
-    // a quiet node. A traces block has nine tables and typically two of them —
-    // span_links and its attributes — have any rows at all.
+    // a quiet node. A traces block has nine tables and typically five of them
+    // have any rows: the four event and link tables — span_events,
+    // span_links and the attribute table of each — stay empty unless a service
+    // emits events or links, which most do not. Measured on the smoke corpus,
+    // every traces block writes exactly those five and skips 8 KB of framing
+    // against 18 KB of tables; a metrics block writes eight of thirteen.
     //
     // The reader treats a missing file as an empty table, which it has to do
     // anyway: it is also how a block written by an older version that did not
@@ -295,7 +310,9 @@ pub fn publish(
     // Sidecars are written with the same durability as the tables: a block that
     // lands with a stale or missing index is one the reader would either skip
     // wrongly or scan slowly, and only the first of those is a correctness bug —
-    // but both are avoidable for one fsync of 20 KB.
+    // but both are avoidable for one fsync each of files `bloom` sizes by row
+    // count — 1 KB apiece on the blocks a quiet node writes, 65 KB at the top
+    // end, against tens of MB of tables.
     for (name, bytes) in &sealed.sidecars {
         let path = tmp.join(name);
         let mut f = File::create(&path).ctx(&path)?;
@@ -325,6 +342,43 @@ pub fn publish(
         node,
         seq,
     })
+}
+
+/// Remove staging directories this node left behind for this signal.
+///
+/// Since the staging name carries the block's timestamp range it is never
+/// reused, so a publish killed between staging and `rename` leaks a directory
+/// that nothing else will ever clear. Sweeping is filtered by signal *and* node
+/// rather than emptying `.tmp` wholesale, because another replica on the same
+/// volume may have a publish in flight — deleting under it is exactly the
+/// corruption the unique staging name exists to prevent. Called once per signal
+/// at boot, before that signal's flusher can publish anything.
+pub fn sweep_staging(root: &Path, signal: &str, node: u32) -> Result<usize> {
+    let tmp = root.join(".tmp");
+    let prefix = format!("{signal}-{node:08x}-");
+    let entries = match fs::read_dir(&tmp) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(Error::Io {
+                path: tmp,
+                source: e,
+            });
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let path = entry.ctx(&tmp)?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&prefix))
+        {
+            fs::remove_dir_all(&path).ctx(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Rebuild the catalog from the filesystem. This is the entire boot sequence for
@@ -466,9 +520,13 @@ fn fs_type(path: &Path) -> Result<Option<String>> {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
     })?;
+    // SAFETY: `statfs` is POD — integers and fixed byte arrays — so all-zero is
+    // a valid value to hold until the call below fills it. Only fields `statfs`
+    // itself writes are read afterwards, and only on the success path.
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a NUL-terminated path that outlives the call, and `buf` is
-    // a correctly sized, writable `statfs`.
+    // SAFETY: `c` is a `CString` — NUL-terminated by construction, rejected
+    // above if the path had an interior NUL — and it is still live at the call.
+    // `&mut buf` is a correctly typed, writable `statfs` the kernel fills.
     if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
         return Err(Error::Io {
             path: path.to_path_buf(),
@@ -668,12 +726,20 @@ pub fn open_table_opt(path: &Path) -> Result<Option<MappedTable>> {
 /// dedicated reader pool.
 pub fn open_table(path: &Path) -> Result<MappedTable> {
     let file = File::open(path).ctx(path)?;
-    // SAFETY: published blocks are immutable — never written to again, never
-    // truncated, and removed only by unlink, which POSIX guarantees leaves live
-    // mappings valid. `compact` replaces a table by renaming a new file over the
-    // name, which unlinks the old inode rather than modifying it, so it lands on
-    // the same side of that guarantee. The bytes under this mapping cannot
-    // change for its lifetime.
+    // SAFETY: the obligation is that nothing modifies or truncates this file
+    // while the mapping lives — a truncation is a SIGBUS on the next page
+    // touched, which no in-process check can catch. What discharges it is
+    // Mira's own discipline, not the kernel: a block becomes visible by one
+    // directory rename and is never written again ([`publish`]); [`compact`]
+    // replaces a table by renaming a new file over the name, which unlinks the
+    // old inode rather than truncating it; [`expire`] is `remove_dir_all`,
+    // also unlink. POSIX keeps an unlinked inode alive under its mappings, so
+    // every path Mira has lands on the safe side.
+    //
+    // That argument covers this process and every replica sharing the volume,
+    // because they all run this code. It does not cover a third party editing
+    // a block file in place, and nothing here can — the data directory is
+    // Mira's, and that is a deployment property, not a checkable one.
     let mmap = unsafe { Mmap::map(&file) }.ctx(path)?;
     // Every open CRCs the whole body, so every page is touched. Faulting them in
     // one at a time caps a cold scan at fault latency; asking for the file up
@@ -689,8 +755,14 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
     let len = mmap.len();
     let base = mmap.as_ptr() as usize;
     let ptr = NonNull::new(mmap.as_ptr().cast_mut()).expect("mmap is never null");
-    // SAFETY: the Arc<Mmap> handed over as the allocation owner keeps the pages
-    // mapped for at least as long as any Buffer derived from them.
+    // SAFETY: `ptr` and `len` are `mmap`'s own `as_ptr`/`len`, so they describe
+    // exactly the mapped region and nothing beyond it, page-aligned. Moving the
+    // `Mmap` into the `Arc` moves an (address, length) pair, not the mapping,
+    // so `ptr` is still the same live region afterwards — and the `Arc` is the
+    // allocation owner, so `munmap` runs only after the last `Buffer` sliced
+    // from it is dropped. `cast_mut` is to fit the signature; `Buffer` is
+    // read-only and never writes through it, which matters because the mapping
+    // is `PROT_READ`.
     let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, Arc::new(mmap)) };
 
     let trailer = len - 10;
@@ -739,11 +811,31 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
         },
     )?));
 
-    // skip_validation is sound here because the CRC above already proves the
-    // bytes are exactly what Mira wrote. Without it, every read of a Utf8 column
-    // runs std::str::from_utf8 over the whole values buffer — a full sequential
-    // scan that faults in every page of string data, which is precisely what
-    // demand paging was supposed to avoid.
+    // Skipping validation is what keeps this a mmap read: with it on, every
+    // Utf8 column runs `std::str::from_utf8` over the whole values buffer — a
+    // sequential scan that faults in every page of string data, which is
+    // precisely what demand paging was supposed to avoid.
+    //
+    // SAFETY: only `with_skip_validation` is unsafe here. It turns off offset
+    // bounds, buffer length and UTF-8 checks, so the arrays built below are
+    // trusted rather than verified, and an out-of-range offset would read
+    // arbitrary memory. What backs the trust is the CRC checked above: it
+    // covers `[0, body_len)`, which is every byte the IPC writer emitted before
+    // `finish()` — schema, dictionary and record-batch messages and their
+    // bodies (see `write_table_with`, which snapshots the CRC at exactly that
+    // point). Those bytes are therefore provably the ones arrow-rs's own writer
+    // produced from arrays it had already validated.
+    //
+    // The gap is the tail. The CRC is stamped before the footer exists, so the
+    // footer flatbuffer — the schema and the block offsets used below — is
+    // outside the checked range. Most corruption there still fails loudly: the
+    // `root_as_footer` above runs the flatbuffer verifier, an offset outside the
+    // file panics in `slice_with_length`, and one that lands on non-message
+    // bytes fails verification in `read_message`. What is not covered is a
+    // corrupt-but-verifiable footer — a schema that names a wider type than the
+    // body holds would decode past the end of a buffer with the checks off.
+    // Extending the CRC over the footer is the fix if that stops being
+    // theoretical.
     let decoder = unsafe {
         FileDecoder::new(schema, footer.version())
             .with_require_alignment(true)

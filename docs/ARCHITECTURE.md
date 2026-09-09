@@ -9,7 +9,7 @@ as a plan for it.
 
 ## 0. Corrections to the original brief
 
-The brief specified several mechanisms by name. Six of them do not survive
+The brief specified several mechanisms by name. Seven of them do not survive
 contact with the formats involved. They are listed first because they change the
 shape of everything below, and because the reasons are not obvious from the
 outside.
@@ -88,31 +88,45 @@ it is measured.
   case. Concretely this means the attribute table must handle multi-kilobyte
   prompt/completion strings without pathology, which is exactly why attribute
   values are plain `Utf8` and not dictionary keys.
-- *Self-driving* — no tuning knobs. Block size, flush cadence and memory ceiling
-  adapt to observed load. There **is** a config file (`docs/CONFIG.md`), and it
-  is not a contradiction: it describes *where the process runs* — addresses, data
-  directory, retention policy, replica name, peers — and contains no value that
-  affects how the engine performs. The boundary is structural, not documentary.
-  `pipeline::Config` holds `target_block_bytes` and `max_block_age`, the two
-  numbers an operator would most want to tune, and there is no path from the YAML
-  to either.
-- *Agent-based internals* — the shard tasks, flusher and retention worker are a
-  supervised message-passing mesh already. This is a description of the design,
-  not a licence to build an actor framework.
+- *Self-driving* — no tuning knobs. `pipeline::Config::default` holds
+  `target_block_bytes` and `max_block_age`, the two numbers an operator would
+  most want to tune, and they are constants in the binary: there is no path from
+  the YAML to either, and nothing moves them at runtime. Adapting them to
+  observed load is the ambition and is not built; what is built is the half that
+  matters more, which is that neither can be set wrong from outside. There **is**
+  a config file (`docs/CONFIG.md`), and it is not a contradiction: it describes
+  *where the process runs* — addresses, data directory, retention policy, replica
+  name — and contains no value that affects how the engine performs. The boundary
+  is structural, not documentary. It is also closed — six keys, and an unknown
+  one is a startup error naming it — because the alternative is what
+  `cluster.peers` was (§12.2): a key read by nothing that still looks like a
+  setting in effect.
+- *Agent-based internals* — the three flusher tasks and the retention worker are
+  a message-passing mesh already, and the flushers are supervised: one that
+  returns before the stop signal takes the process with it, once the other two
+  have drained. A crashloop is the honest shape of "this node cannot store logs"
+  — an orchestrator reports it, and a restart is the recovery for the case that
+  causes it — whereas carrying on leaves one signal answering 503 forever behind
+  a probe that stays green. The retention worker is *not* in that select:
+  `spawn_retention` drops its handle, so a sweep that stopped is invisible until
+  a disk fills. This is a description of the design, not a licence to build an
+  actor framework.
 
 **OTLP-first.** The Arrow schemas in `crates/mira-core/src/schema.rs` *are* the
 OTLP Resource-Scope-Signal model. There is no transformation step to a generic
 relational or inverted-index store, and therefore no place for one to lose
-fidelity.
+fidelity. The claim is only ever as good as the column list, though, which is
+the shape every fidelity loss here takes: `LogRecord.event_name` was decoded off
+the wire and had nowhere to land. Not a transformation — a missing field.
 
 **Single binary, no operational overhead, stateless.** Stateless means *no
 coordination state*: no cluster membership, no Raft, no external metadata store.
 The concrete mechanism is in §3.2 — the filesystem is the manifest. This also
 rules out DataFusion: it would give SQL for free at a cost of 47 direct
 dependencies, a ~1.5M SLoC transitive tree and a 68–92 MB binary. Mira
-hand-rolls the ~2,000 LOC of query logic it needs. The skeleton as it stands is
-**2.6 MB stripped, 107 crates** — that will grow as traces, metrics, query and
-MCP land, but it sets the scale the design is defending.
+hand-rolls the ~2,000 LOC of query logic it needs. With traces, metrics, query,
+MCP and both UIs in it, that is **4.73 MiB stripped, 117 crates** — the scale
+the design is defending.
 
 **KYAML-first, everywhere.** Every text format Mira reads or writes — the config
 file, dashboard definitions, saved queries, MCP examples, anything added later —
@@ -222,14 +236,28 @@ one-row-per-record table.
 | `id` | `UInt32` | dense, block-local; the join key |
 | `time_unix_nano` | `Timestamp(ns)` | plain; falls back to observed time when unset |
 | `observed_time_unix_nano` | `Timestamp(ns)` | nullable |
-| `severity_number` | `Int32` | |
-| `severity_text` | `Dictionary<UInt16, Utf8>` | ~24 distinct values in practice |
-| `body` | `Utf8` | string bodies, the common case |
-| `body_ser` | `Binary` | anything else, encoded; nothing is dropped |
+| `severity_number` | `Int32` | nullable |
+| `severity_text` | `Dictionary<UInt16, Utf8>` | nullable; ~24 distinct values in practice |
+| `event_name` | `Dictionary<UInt16, Utf8>` | nullable; OTLP logs.proto field 12, what makes a record an Event. A dictionary because an event name is enumerable by definition |
+| `body` | `Utf8` | nullable; string bodies, the common case |
+| `body_ser` | `Binary` | nullable; anything else, protobuf-encoded; decoded back on read, so nothing is dropped in either direction |
 | `trace_id` | `FixedSizeBinary(16)` | nullable |
 | `span_id` | `FixedSizeBinary(8)` | nullable |
-| `flags`, `dropped_attributes_count` | `UInt32` | |
+| `flags` | `UInt32` | nullable |
+| `dropped_attributes_count` | `UInt32` | |
 | `resource_id`, `scope_id` | `UInt16` | foreign keys, block-local |
+
+An unmarked row is non-null in `schema.rs`. Only `id`, `time_unix_nano`,
+`dropped_attributes_count` and the two foreign keys are.
+
+`event_name` was added after blocks had been written, and a published block is
+never rewritten (§6), so the question it raises is what a reader does with the
+thirteen-column ones. Nothing: the reader never touches a root table
+positionally — it locates columns through `column_by_name` and materialises a
+row by walking the *file's* own schema — so an older block reads back exactly as
+it did, minus the field. That is the property that lets a column be appended
+without a format version, and it is the same property §3.2 relies on for
+sidecars.
 
 `resources` — one row per distinct resource, so tens of rows against hundreds of
 thousands in the root table:
@@ -258,8 +286,14 @@ cost one validity bit each.
 
 Two deliberate deviations from OTAP, both cheap to reverse:
 - `ser` holds the protobuf encoding of the `AnyValue`, not CBOR. We own both
-  ends, and it costs zero dependencies. Switch to CBOR when a third party needs
-  to read a block.
+  ends — and both are connected: the read path decodes these bytes back, so an
+  array attribute like `process.command_args`, a kvlist like
+  `gen_ai.input.messages` and a structured log body come back as the JSON they
+  were rather than as a hex dump. It costs zero dependencies. Switch to CBOR when
+  a third party needs to read a block. Rendering is not filtering, though:
+  `attrs.rs` leaves Slice and Map out of the block's attribute filter and no
+  comparison operator accepts them, so a structured value is returned in a row
+  and cannot select one.
 - `parent_id` is `UInt32` and block-local rather than the wire's per-batch id.
   See §0.
 
@@ -273,7 +307,25 @@ Two deliberate deviations from OTAP, both cheap to reverse:
     spans.arrow  span_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
     span_events.arrow  span_event_attrs.arrow  span_links.arrow  span_link_attrs.arrow
     attr.idx  trace.idx
+<data>/metrics/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
+    metrics.arrow  metric_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
+    number_dp.arrow  hist_dp.arrow  hist_bounds.arrow  exp_hist_dp.arrow  summary_dp.arrow
+    dp_attrs.arrow  exemplars.arrow  exemplar_attrs.arrow
+    attr.idx
 ```
+
+Those are the tables a block *can* hold, not the ones it does: `publish` skips an
+empty one, so a traces block normally holds five of the nine — the event and link
+tables stay empty unless a span carries one — and a metrics block eight of
+thirteen. Thirteen is what OTLP's point types cost. Four point tables, because gauge and
+sum share a column set and the three others do not; `hist_bounds` interns the
+boundary array that every point of a histogram repeats, which measured 1.67×
+smaller point rows; `exemplars` and its attributes carry the bridge to a trace,
+and point ids are one space across all four point tables so that column needs no
+discriminant saying which one to look in. Metrics blocks carry no `trace.idx`,
+because nothing looks a trace up in one: search takes `logs` or `traces` only,
+and an exemplar's trace id comes back attached to the series that sampled it
+rather than being searched for.
 
 The node id is §12.1. `attr.idx` and `trace.idx` are **sidecars** — `(name,
 bytes)` pairs produced at seal, written and fsynced by `publish` next to the
@@ -423,14 +475,25 @@ response, the client SHOULD retry" — covers exports in flight at a crash. Acki
 earlier is the one window in which data is lost while the client believes it was
 stored. Because acknowledgement latency would otherwise be bounded by the
 caller's own traffic, `max_block_age` (2 s) is a first-class flush trigger
-alongside size; the smoke test measures a 2.03 s round trip for a single-record
-export, which is exactly that bound.
+alongside size. One `curl` of a single-record export at a running instance comes
+back in 2.03–2.05 s, which is that bound and nothing else.
 
 **No WAL.** Publish is write-tmp → fsync files → fsync tmpdir → rename dir →
-fsync parent. Directory rename is atomic on POSIX, so a block is either wholly
-visible or wholly absent. There is no torn state, therefore nothing for recovery
-to replay. Crash recovery is `scan()` — the same `readdir` the read path already
-does — and the sequence counter resumes from the highest published block.
+fsync parent → fsync grandparent. The last one is not belt and braces. Fsyncing
+a directory persists the entries *inside* it, not the entry naming it in its own
+parent, and the first block of every hour creates the partition directory it
+lands in — so with only the parent fsynced, that block is durable inside a
+directory whose own name is unflushed metadata, and the ack is a lie. POSIX does
+not define what fsync on a directory means at all, and no filesystem that
+implements it promises anything about ancestors: a journalling one usually
+commits the parent's entry in the same transaction, but "usually" describes how
+that journal batched that second, not an interface anything may rely on. One
+extra fsync per 32 MB block, against the per-table fsyncs already paid, is
+cheaper than depending on it. Directory rename is atomic on POSIX, so a block is
+either wholly visible or wholly absent. There is no torn state, therefore
+nothing for recovery to replay. Crash recovery is `scan()` — the same `readdir`
+the read path already does — and the sequence counter resumes from the highest
+published block.
 
 **A note on sharding.** The design is one shard per listener/core
 (`SO_REUSEPORT`), not sharding by resource hash. Resource cardinality in real
@@ -548,13 +611,19 @@ cannot have at all: **entity identity**.
 | `span_id` / parent | the record names a span | exact |
 | span link | async or fan-in causality | `span_links` table (with traces) |
 | exemplar | a metric datapoint sampled a trace | exemplar `trace_id` (with metrics) |
-| **entity + time** | **always** | `resources.key`, §7.2 |
+| **entity + time** | **always** | `resources.key`, §7.2 — written at seal, not yet selectable; §7.4 |
 
 The ladder matters more than any single rung. An investigation that starts at an
 untraced error log gets nothing from the first four, and *everything* from the
 fifth. Degrading from "the exact trace" to "everything this pod emitted in the
 surrounding five seconds" is the difference between a correlation feature and a
 correlation demo.
+
+The fifth rung is the one the read surfaces do not reach yet. What answers that
+question today is an attribute predicate on the identifying attribute itself —
+`{"attr": "service.instance.id", "eq": "…"}` and a time range — which the engine
+does answer, over `attr.idx` (§7.4). What it does not do is decide *which*
+identifying attribute the producer set, which is the whole of §7.2.
 
 ### 7.2 Entity identity — `resources.key`
 
@@ -602,7 +671,15 @@ for the same question. This is the OTAP star schema paying for itself, and it is
 the one place Mira's layout produces an asymptotic advantage rather than a
 constant-factor one.
 
-### 7.3 The frame algebra
+### 7.3 The frame algebra — still not built
+
+None of this section is in `crates/`: there is no `Frame` type, no `anchor`, no
+expander and no `fetch`. What answers a correlation question today is a query
+document (§7.6) against one signal at a time, with the caller walking between
+them by hand; §8.1's four MCP tools are that walk, not this. The design is here
+because it is what the storage layout was chosen for, and because
+the pieces the expanders would stand on — time pruning, `resources.key`, the
+trace sidecar — are built or half-built already (§7.4).
 
 A **frame** is a bounded region of telemetry:
 
@@ -615,10 +692,10 @@ Frame {
 }
 ```
 
-Every correlation operation is `Frame → Frame`. Nothing else exists. That closure
-property is the whole design: an investigation is a walk over frames, every
-intermediate state is a legal query, and there is no way to construct something
-that is not executable.
+Every correlation operation is `Frame → Frame`, and the algebra holds nothing
+else. That closure property is the whole point: an investigation is a walk over
+frames, every intermediate state is a legal query, and there is no way to
+construct something that is not executable.
 
 | expander | reads | writes |
 |---|---|---|
@@ -651,9 +728,13 @@ That runs at memory bandwidth and is not worth a sort at seal time.
 ### 7.4 Indexes: what is needed and what is not
 
 - **Time** — directory names. Built.
-- **Entity** — `resources.key`, written at seal. Built. At query time the key set
-  of a block is cached after first read; tens of `u64` per block means ~4 MB for
-  ten thousand blocks, so no on-disk filter is warranted.
+- **Entity** — `resources.key`, written at seal and read by nothing. The write
+  half is built; no read surface exposes an entity selector, so the key-set cache
+  that would make one cheap — tens of `u64` per block, ~4 MB for ten thousand
+  blocks, and therefore no on-disk filter warranted — is not written either. The
+  order is deliberate: a key has to be in the blocks before a reader can use it,
+  so one written today is answerable across the whole retention window on the day
+  a reader lands, and one written then is not.
 - **Trace** — the one that genuinely needs an index. Block level is **built**;
   within-block is not, and does not need to be yet. A block's min/max trace id
   spans the whole range and prunes nothing, so:
@@ -732,15 +813,20 @@ That runs at memory bandwidth and is not worth a sort at seal time.
 order, and every query has a time bound while only some have a trace bound. Time
 wins.
 
-### 7.5 Why this is the agentic surface
+### 7.5 Why the frame algebra is the agentic surface — still not built
 
-The frame algebra *is* the MCP tool set: `anchor`, six expanders, `fetch`,
-`summarize`. An agent handed SQL over a five-table star schema with EAV attribute
-tables will write wrong joins — silently wrong, because a missing `parent_id`
-predicate returns a cross product that looks like data. An agent handed seven
-closed operations cannot express a wrong join at all, and every call returns a
-frame it can bound before materialising. That is the difference between an
-investigation loop and a timeout. §8.1.
+The algebra is designed to *be* the MCP tool set: `anchor`, the seven expanders
+above, `fetch`, `summarize`. What is served instead today is §8.1's four tools,
+which put the query document behind an agent-shaped envelope — enough for "show
+me these records", not enough to stop an agent walking a correlation by hand.
+
+The argument for finishing it is what the alternative costs. An agent handed SQL
+over a five-table star schema with EAV attribute tables will write wrong joins —
+silently wrong, because a missing `parent_id` predicate returns a cross product
+that looks like data. An agent handed ten closed operations cannot express a
+wrong join at all, and every call returns a frame it can bound before
+materialising. That is the difference between an investigation loop and a
+timeout.
 
 ### 7.6 Query, outside correlation
 
@@ -796,6 +882,17 @@ and `max_points` cap what a chart can render rather than cut a list short, so
 it is a broken trace, and an agent handed a third of one will reason about the
 third.
 
+**A name a response hands out is a name the query accepts back.** A histogram or
+a summary reads as two derived series called `<name>.count` and `<name>.sum`, and
+those are the names a chart legend shows and an agent copies out of its own
+previous answer — so the metric name filter has to take them, and it does, by
+retrying against the base name once the descriptor dictionary misses. Exact match
+runs first, so a metric genuinely called `foo.count` keeps winning its own name,
+and the suffix is remembered so only that half of the histogram comes back rather
+than both. The asymmetry a reader will hit: `names()` lists what the dictionary
+holds, which is base names, so `<name>.count` is queryable and is not in the
+list — the round trip is closed in the direction that loses data if it is open.
+
 **"Vector matching" is settled**: it means cross-signal correlation, as above, not
 the PromQL sense (`on`/`ignoring`, `group_left`). The PromQL reading would need a
 full evaluator and a series-major on-disk layout — a different sort order from
@@ -809,6 +906,14 @@ full evaluator and a series-major on-disk layout — a different sort order from
 Three of them — MCP, a browser UI, a terminal UI — and all three go through
 `api.rs`'s parsers and `api::envelope`, so there is one query grammar to keep
 correct rather than three that drift.
+
+That grammar is closed at the top of a document as well as inside a term. A query
+must be a mapping, and a top-level key the endpoint does not implement is a 400
+naming it against the set that endpoint does. Leniency here has no upside and one
+specific downside: `{"signal": "logs", "filters": [...]}` looks like a filter,
+was indistinguishable from no filter at all, and answered 200 over the whole
+window — a wrong answer that looks right, which is the only kind a caller cannot
+see in the response it got.
 
 ### 8.1 Agentic surface
 
@@ -826,8 +931,8 @@ Two decisions worth keeping:
   4 applied to the agent surface: any replica answers any request, and killing one
   loses nothing.
 - **The same read path as the UI.** The tools call `api::search_doc`,
-  `api::series_doc` and `api::bounds` — the same parsers the HTTP API uses — and
-  the same `query`/`series` functions, through the same `envelope()`. A separate
+  `api::series_doc` and `api::window_doc` — the same parsers the HTTP API uses —
+  and the same `query`/`series` functions, through the same `envelope()`. A separate
   "agent API" is a second read path to keep correct, and the first thing it does
   is drift.
 
@@ -860,10 +965,10 @@ wildcard is one path segment deep, so it cannot swallow `/v1/*`, `/api/v1/*` or
 a step taken before committing a UI change. A `build.rs` that shelled out to npm
 would make every Rust build depend on a JavaScript toolchain to produce bytes
 that did not change. Freshness is an ETag over the bytes, not a hash in the URL,
-so an unchanged bundle costs a 304 instead of 54 KB.
+so an unchanged bundle costs three 304s — one per asset — instead of 60 KB.
 
 Owning the UI follows from owning the API. Mira's query shape is not PromQL, not
-LogQL and not SQL — §7.3's frame algebra is the interface — so an off-the-shelf
+LogQL and not SQL — the query document of §7.6 is the interface — so an off-the-shelf
 frontend would have to be taught it, and teaching it means shipping and versioning
 a second thing.
 
@@ -874,15 +979,34 @@ waterfall in the terminal. `mira tui` is kept as an alias, because it is what
 someone types who has not read the usage, and answering that costs one `||` where
 an "unknown flag" costs them a thought. Three decisions:
 
-**No TUI framework.** ratatui is the obvious answer and costs **61 crates** —
-against a tree of 117, whose size is a stated property of the product (§1). What
-it buys is a constraint-solving layout engine and a damage-tracked cell buffer;
-this UI has fixed panes and repaints one screenful per keystroke. So `termios` for
-raw mode, `TIOCGWINSZ` for the size, `poll(2)` for input, ANSI for the rest — on
-`libc`, already in the tree for §9's `statfs` guard. Net crates added: **zero**.
-The cost is `crates/mira/src/term.rs`: a ~200-line terminal and a `Row` type that
-tracks visible width separately from bytes, because inline ANSI makes `len()` a
-lie. Unix only, which is the same bet `mmap` and `SIGTERM` already make.
+**No TUI framework.** ratatui is the obvious answer and costs **35 crates that
+are not already here** — a 30% increase on a tree of 117, whose size is a stated
+property of the product (§1). That figure is this workspace's, not the crate's:
+`rust-version = "1.85"` makes the resolver pick ratatui 0.29, and a project with
+no MSRV gets 0.30 and 47 new crates instead, so raising the MSRV raises this
+number with it. What ratatui buys is a constraint-solving layout engine and a
+damage-tracked cell buffer; this UI has fixed panes and repaints one screenful
+per keystroke. So `termios` for raw mode, `TIOCGWINSZ` for the size, `poll(2)`
+for input, three `sigaction`s, ANSI for the rest — on `libc`, already in the tree
+for §9's `statfs` guard. Net crates added: **zero**.
+
+The signals are what owning the terminal actually costs. SIGWINCH is installed
+for one reason: its default disposition is to *discard* it, and a discarded
+signal interrupts nothing, so without a handler a resize repainted nothing. The
+handler itself does nothing — the delivery is the message, arriving as the
+`EINTR` that sends the loop round to re-read the size. `SA_RESTART` is not set
+and would change nothing if it were: `poll(2)` is on signal(7)'s never-restarted
+list whatever the flag says, and the `read(2)` beside it runs under VMIN 0 /
+VTIME 0, so it never sits in a restartable wait either. SIGTERM and SIGHUP are
+installed so a `kill` or a dropped ssh session hands the terminal back rather
+than leaving a shell in raw mode on the alternate screen, and that is why
+`restore()` is async-signal-safe `libc::write` and not `io::stdout()`, whose lock
+the handler may have interrupted its own thread holding.
+
+The cost is `crates/mira/src/term.rs`: 862 lines, 481 of them before the test
+module, and a `Row` type that tracks visible width separately from bytes, because
+inline ANSI makes `len()` a lie. Unix only, which is the same bet `mmap` and
+`SIGTERM` already make.
 
 **Two transports, one code path.** `--addr host:4318` POSTs to a running replica.
 `--data-dir` calls `mira_core::query` **in-process, with no server anywhere** —
@@ -913,11 +1037,41 @@ corrupts the screen.
 | Crash mid-rename | Directory rename is atomic. Either state is consistent. |
 | Bit rot in a block | CRC32 mismatch on open → typed error, not wrong answers. |
 | Truncated / non-Arrow file | `ARROW1` check → typed error. |
-| Disk full | `publish` fails, waiters get `INTERNAL`, client retries. No partial block is visible. |
+| Disk full | `publish` fails; waiters get `UNAVAILABLE` + `RetryInfo` on 4317 and `503` + `Retry-After` on 4318. No partial block is visible. |
 | Reader holds a block being expired | Safe by POSIX unlink semantics (§6). |
 | **SIGTERM / SIGINT** | Stop accepting, let in-flight exports reach their ack, then close the flusher channels so each open block is sealed and published. Bounded at 15 s. |
 | **Network filesystem** | **Not safe, and refused.** mmap on NFS/CIFS/CephFS raises `SIGBUS` with no recovery path. `block::check_filesystem` runs one `statfs` on the data directory before anything is mapped and fails startup with the filesystem named — by `f_fstypename` on macOS, by `f_type` magic on Linux. FUSE warns instead of refusing: the magic is the same for `gcsfuse` (fatal) and a local userspace filesystem (fine). A heap-read fallback was considered and rejected — it would silently delete the property the whole design is built on, which is a worse failure than not starting. |
 | **Unwritable data directory** | **Refused, at startup.** `create_dir_all` returns `Ok` for a directory that already exists whatever its mode, so a `readOnly` volume mount or a wrong-uid path otherwise reaches a listening socket and fails one export at a time under load. `block::check_writable` writes and removes a pid-named probe file next to the `statfs` call. Both are the same bet: a startup that refuses is cheaper to diagnose than a server that half-works. |
+
+**The status is the retry policy, because OTLP's retryable set is closed.**
+`UNAVAILABLE` is in it and `INTERNAL` is not, so a conformant exporter handed
+`INTERNAL` for a full disk does not wait for the disk to have room — it drops the
+batch it is holding and reports the loss as permanent. Which status a failed
+publish answers with therefore decides whether the data survives, and every
+reason a publish can fail — no space, `EIO`, a volume that went read-only — is
+transient by that test. A panicking flush never reaches the decision at all: the
+release profile is `panic = "abort"`, so it takes the process down and the export
+is retried against the restart, which is the same path as any other crash. The
+one exception is an export that cannot fit an *empty* block: 70,000 distinct
+attribute keys against a `UInt16` dictionary is not going to fit the next one
+either, so it keeps `INTERNAL`/`500`. Telling a sender to keep trying something
+that cannot work is worse than telling it the truth, and it is the only case
+where the truth is permanent.
+
+**Probes are not the UI, and the listening line is not a promise.** `/health` and
+`/readyz` are the same handler — Mira has no warm-up and no cluster to join, so
+there is no state in which it is alive and not ready — answering 200 with the
+per-signal shed and failed counts, so the probe and the log agree about how much
+has been refused. They also exist so that something other than the UI answers at
+those paths: the asset router 404s a path it does not know and deliberately has
+no SPA fallback, because every view in the app lives under the URL hash, so an
+unknown *path* is a probe pointed somewhere wrong rather than a route needing
+rescue. Answering it with 200 and a page of HTML made every wrong guess at a
+probe path report success. Both listen sockets are bound before anything logs
+`mira listening`, for the same reason: during a CrashLoopBackOff the log is all
+the operator has, and a listening line in front of a bind that then fails is
+dishonesty rather than terseness — the error names the address and the likely
+cause instead.
 
 **Shutdown is about duplicates, not loss.** A hard kill loses nothing that was
 acknowledged, because an ack *is* an fsync (§4). What it costs is the other
@@ -932,8 +1086,8 @@ because SIGTERM is what an orchestrator actually sends.
 
 **macOS.** Rust's `File::sync_all()` and `sync_data()` both compile to
 `fcntl(F_FULLFSYNC)` on Apple targets. That is correct durability for free and a
-large throughput cliff, and it is why the smoke test's 2 s is dominated by
-`max_block_age` rather than by the fsync. Docker-for-Mac volumes can return
+large throughput cliff, and it is why a single-record export's 2 s ack (§4) is
+`max_block_age` rather than the fsync. Docker-for-Mac volumes can return
 `EINVAL`/`ENOTSUP`, where std will not fall back; that needs a wrapper that
 degrades to `libc::fsync` and increments a counter, so silent durability loss is
 observable. *Not yet implemented.*
@@ -942,10 +1096,11 @@ observable. *Not yet implemented.*
 
 ## 10. What is deliberately not here
 
-- **The frame expanders of §7.3.** A span query returns its links and a series
-  returns its exemplars, so both out-edges of §7.1 are readable — but the caller
-  follows them itself. `by_link`, `by_exemplar` and `peers` as one-call
-  operations are not here.
+- **The frame algebra of §7.3** — all of it. No `Frame`, no `anchor`, no
+  expander, no `fetch`. A span query returns its links and a series returns its
+  exemplars, so both out-edges of §7.1 are readable, but the caller follows them
+  itself and there is no operation that widens a region rather than answering a
+  question.
 - **A block cache.** Every query re-opens and re-CRCs every block it touches. The
   fix is a process-local `Arc<MappedTable>` map invalidated by `expire`. This was
   assumed to be the next big win and it is not: §11 measures the per-block cost as
@@ -965,16 +1120,20 @@ observable. *Not yet implemented.*
   Related: do **not** depend on `otel-arrow-dfe-pdata`; it pulls
   `datafusion ^53` non-optionally for two imports.
 - **DataFusion.** §1.
-- **The `F_FULLFSYNC` fallback** (§9). On macOS `sync_all` is `fsync(2)`, which
-  returns before the drive's own write cache is flushed; only `F_FULLFSYNC`
-  waits. Linux is the deployment target and is unaffected, so this is a
-  dev-machine honesty gap rather than a production one — but it does mean the
-  ack latencies in §11 are measured against a weaker fsync than the one the
-  design claims. The `statfs` guard beside it in that section **is** now written:
-  `block::check_filesystem`, called once before anything is mapped.
-- **The query-side half of `NO_IDENTITY`.** The sentinel is written (§7.2); the
-  expander that must refuse it does not exist yet, because the query layer does
-  not. It is the first thing that layer owes.
+- **The `F_FULLFSYNC` fallback** (§9). Not a weaker fsync — the opposite, and it
+  was settled by measuring rather than by reading. On this machine
+  `File::sync_all()` costs 4,230 us, `fcntl(F_FULLFSYNC)` 4,213 us and a bare
+  `libc::fsync(2)` 28 us: `sync_all` *is* `F_FULLFSYNC` on Apple targets, so
+  §11's ack latencies are measured against the stronger barrier and nothing is
+  owed for the ordinary case. What is missing is the Docker-for-Mac
+  `EINVAL`/`ENOTSUP` path §9 names, where std does not degrade and the durability
+  loss would therefore be silent. The `statfs` guard beside it in that section
+  **is** written: `block::check_filesystem`, called once before anything is
+  mapped.
+- **The query-side half of `NO_IDENTITY`.** The sentinel is written (§7.2) and
+  the expander that must refuse it is not — not because the query layer is
+  missing, it is not, but because no read surface exposes `resources.key` at all
+  (§7.4). There is nothing yet for the sentinel to be refused by.
 
 ---
 
@@ -990,7 +1149,7 @@ this table is also the load harness: `loadgen --readers N --pid N --data-dir P`
 reports ingest, six classes of query latency, the server's resident set and the
 bytes it added per record from one run. An engine measured one axis at a time is
 an engine that is fast at whichever one its authors were watching.
-[docs/TESTING.md §3](TESTING.md) is how to drive it and how it misleads.
+[docs/TESTING.md §3](TESTING.md) is how to drive it and what it teaches.
 
 Read the two query columns carefully. **Neither is a cold-disk number**: 8.4 GiB
 fits in this machine's page cache, so after one pass everything is resident and
@@ -1002,7 +1161,7 @@ call repeated. The gap between them is virtual-memory work, not I/O.
 | Axis | Target | Measured | |
 |---|---|---|---|
 | Ingest throughput | ≥ 1 M records/s/core | **544,658 records/s / 71.2 MiB/s** aggregate, 0 shed, 0 resets | ✗ |
-| Resident footprint | ≤ 2 × the open block's target size | holds; no `concat_batches` regression | ✓ |
+| Resident footprint | ≤ 2 × the open block's target size | **not measured** — see below | — |
 | Ack latency | — | p50 **498 ms**, p99 **2,371 ms** | see below |
 | Query: attribute value, absent | ≤ 10 ms | **104 ms** first, **6.1 ms** steady, 0 of 69 blocks | ✓ |
 | Query: attribute value, matching | ≤ 10 ms | **17 ms** first, **14.5 ms** steady, 1 of 69 blocks | ~ |
@@ -1010,7 +1169,7 @@ call repeated. The gap between them is virtual-memory work, not I/O.
 | Query: metric names | — | **28 ms** first, **5.5 ms** steady | — |
 | Query: field predicate, no time bound | — | **2.9 s** first, **1.9 s** steady, 69 of 69 blocks, 25.2 M rows | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.31 B/B** hot, **~0.17 B/B** compacted | ✓ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.7 MB** / 117 crates | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **4.73 MiB** / 117 crates | ✓ |
 
 Reading these honestly:
 
@@ -1021,6 +1180,14 @@ Reading these honestly:
   durability (§9), so read-your-writes is free and every e2e test queries with no
   sleep after export. The per-core encode number needs a criterion bench on
   `append_request` with no I/O in the path, which does not exist yet.
+- **Resident footprint is the axis with no number, and saying so is the point of
+  scoring them together.** The harness reports peak RSS — 615 MiB write-only at
+  64 connections in [docs/TESTING.md §3](TESTING.md) — and RSS is not this row:
+  it counts every mapped block page a query touched, and on the write side it
+  covers three signals' builders plus every in-flight decode, not one open block.
+  What actually holds the bound is §5's refusal of `concat_batches`, which is a
+  property of the code and a test, not a measurement. An anonymous-memory figure
+  per open block is owed, and until it exists this axis is an intention.
 - **Blocks not opened is the whole game.** The two sidecar filters (§7.4) took
   the block count from "all of them" to one or zero, which is worth between 60×
   and 1800× and is the reason these rows are in milliseconds at all. Everything
@@ -1111,8 +1278,8 @@ Reading these honestly:
   The absolute numbers move with how much of the corpus is resident — this
   machine has 36 GB of page cache against 8.4 GiB of bench data, so there is no
   genuinely cold measurement here — but the sign does not: compressed is faster
-  in every run. Both the page-fault path (§3.3's `MADV_WILLNEED` over 8× fewer
-  pages) and the CRC32 (over 8× fewer bytes) shrink with the file, and together
+  in every run. Both the page-fault path (the `MADV_WILLNEED` hint above, over 8×
+  fewer pages) and the CRC32 (over 8× fewer bytes) shrink with the file, and together
   they more than pay for decompression. So the cold tier costs the read path nothing measurable
   — only the zero-copy property, which is an allocation cost, not a latency one.
   The threshold is set at one hour for the reason in §3.5, which is that it is
@@ -1139,7 +1306,11 @@ coordination. This is principle 4 — "stateless means no coordination state" �
 cashed out as a deployment topology.
 
 **Shared-nothing ingest, scatter-gather query, discovery borrowed from the
-platform.**
+platform.** Ingest (§12.1) is built, and so is the shared-volume topology of
+§12.5, which answers the same requirement with no fan-out at all. The
+scatter-gather half — §12.2 and §12.3 — is design; the config key it used to name
+is deleted, and the reasoning below says why that is the honest state rather than
+a regression.
 
 ### 12.1 Ingest
 
@@ -1161,12 +1332,20 @@ Two things had to change to make concurrent writers safe, and both are in:
 - Retention tolerates a losing race on `remove_dir_all` (§6). Two replicas
   expiring the same block is not a conflict.
 
-### 12.2 Query
+### 12.2 Query — still not built
 
-A query arriving at any replica is broadcast to `cluster.peers`, executed locally
-on each, and merged. **The frame algebra of §7.3 is what makes this work**: a
-frame is a small value, so broadcasting it is free, and merging two nodes'
-results is a set union.
+A query is answered from the blocks the replica it arrived at can see: every
+writer's, on a shared volume (§12.5); one writer's, shared-nothing. There is no
+fan-out, and `cluster.peers` — which named the peer set in the config file — is
+deleted rather than left in place, because it was parsed, logged and read by
+nothing. An unread key is worse than a missing one: it is a setting an operator
+configures, sees accepted, and believes is in effect, and it sent them to point a
+headless Service at a feature that did not exist.
+
+The design, for when it lands: a query arriving at any replica is broadcast to
+the peer set, executed locally on each, and merged. **The frame algebra of §7.3
+is what makes this work**: a frame is a small value, so broadcasting it is free,
+and merging two nodes' results is a set union.
 
 The reason it is a set union — rather than a distributed join — is the entity
 identity of §7.2, and this is the load-bearing connection between the two
@@ -1180,13 +1359,14 @@ principle forbids it. One decision paid for both features.
 Fan-out uses the same query API as an external client, with a hop flag so a peer
 does not re-broadcast.
 
-**Partial results are reported, never hidden.** A scatter-gather over seven nodes
-with one down must not quietly return six sevenths of the data and let the user
-draw a conclusion from it. Every response names which peers answered.
+**Partial results must be reported, never hidden.** A scatter-gather over seven
+nodes with one down must not quietly return six sevenths of the data and let the
+user draw a conclusion from it. Every response has to name which peers answered,
+and that requirement is why this is not a two-hour feature.
 
-### 12.3 Discovery without membership
+### 12.3 Discovery without membership — still not built
 
-`cluster.peers` is a list of addresses, and in Kubernetes it is a headless
+The peer set is a list of addresses, and in Kubernetes it is a headless
 Service: DNS already enumerates every replica, and the platform already keeps
 that current. Mira stores nothing about the cluster. There is no gossip, no
 heartbeat, no join/leave protocol and no split brain — not because they are
@@ -1199,7 +1379,7 @@ answer is a peer whose data is absent from this answer, and the answer says so.
 |---|---|
 | Ingest throughput | Linear. Nodes are independent. |
 | Storage capacity | Linear. |
-| Query capacity | Linear. Latency for one query is the slowest peer. |
+| Query capacity | Linear; every replica answers independently. On a shared volume that answer covers the whole dataset, shared-nothing it covers that replica's share until §12.2 lands — at which point latency for one query becomes the slowest peer. |
 
 - **No replication.** A lost disk is lost data for that node's share. The answer
   is client-side fan-out — an OTel Collector can export to two Mira replicas —
@@ -1219,13 +1399,68 @@ answer is a peer whose data is absent from this answer, and the answer says so.
 
 ### 12.5 Shared-volume mode
 
-If replicas do share one filesystem (an RWX PVC), the design already works
-unmodified — block names are unique per writer, publishes are independent
-renames, and `scan` sees every writer's blocks, so any node answers any query
-with no fan-out at all. The one gate on it — **mmap over NFS raises SIGBUS with
-no recovery path** — is now enforced rather than warned about: `statfs` at
-startup (§9) refuses the mount. So shared-volume mode works on an RWX PVC backed
-by a *block* device shared between nodes, and is refused on an NFS-backed one,
-which is the honest answer rather than a hopeful one. Object storage is a larger
-question — it forecloses mmap entirely — and is deferred to the market survey
-rather than guessed at here.
+If replicas do share one filesystem, the design works unmodified — block names
+are unique per writer, publishes are independent renames into a staging path
+that is unique per block (§12.6), and `scan` sees every writer's blocks, so any
+node answers any query with no fan-out at all.
+
+The honest scope of that is narrower than it first looks, and the earlier
+version of this section overstated it. The gate is **mmap over a network
+filesystem raises SIGBUS with no recovery path**, enforced by the `statfs` check
+at startup (§9), and it eliminates every RWX PVC anyone actually provisions:
+RWX in practice means NFS, CephFS or Azure Files. Nor is "an RWX PVC backed by a
+block device" the escape hatch it sounds like — a block device is only
+*concurrently* writable through a cluster filesystem (GFS2, OCFS2), because
+mounting ext4 or XFS from two nodes at once corrupts it. Mira has never been run
+on one.
+
+So the supported shape of shared-volume mode is **several processes on one
+host** sharing a local directory: an e2e test covers it, and it is the mode the
+`--node` flag exists for. Across hosts, shared-nothing is the supported shape
+and query fan-out (§12.2, unbuilt) is the answer to covering the whole dataset.
+A cluster filesystem would work in principle and is not claimed. Object storage
+is a larger question — it forecloses mmap entirely — and is deferred to the
+market survey rather than guessed at here.
+
+### 12.6 The staging path is the one place two writers can still collide
+
+Everything above rests on writers never touching each other's bytes, and the
+final block name delivers that: `{min_ts}-{max_ts}-{node}-{seq}` is unique per
+writer by construction. The *staging* name was not. It was
+`.tmp/{signal}-{node}-{seq}`, which is unique only as long as the two writers
+disagree about `node` — and `node` is derived from `--node`, which defaults to
+`mira`. Two replicas started with the defaults share a data directory and walk
+the same sequence from the same starting point.
+
+What that costs, measured on a two-process run over one directory: 2 lost
+publishes in 107, both `ENOTEMPTY` or `ENOENT` from the rename, both surfaced to
+the sender as a retryable NACK. That is the benign half. The other half was
+permitted and simply not observed — B's `remove_dir_all` empties the directory
+A is midway through writing tables into, A keeps writing the rest by path, and
+whichever wins the rename publishes a block whose tables came from two different
+sealed sets. No error anywhere, and the corruption is only visible as a query
+returning rows that never coexisted.
+
+The fix is the cheapest one available: put the timestamp range the final name
+already carries into the staging name too, making the path unique per block
+*content* rather than per writer. A misconfigured `--node` is then merely
+duplicated data, which OTLP's at-least-once contract already permits, instead of
+a silent mix.
+
+Two consequences follow, and both are in the code:
+
+- `create_dir`, not `create_dir_all`, for the staging directory. `create_dir_all`
+  succeeds on a directory that already exists, which is the exact mechanism by
+  which a leftover gets merged into a live publish. Colliding now fails loudly
+  and retryably.
+- A staging name that is never reused is a staging name that nothing ever
+  cleans, so a publish killed between staging and rename leaks a directory.
+  `block::sweep_staging` clears it at boot, filtered by signal *and* node — an
+  unfiltered sweep of `.tmp` would delete another replica's in-flight staging
+  directory, reintroducing the corruption from the other direction.
+
+The general shape is worth naming, because it will recur: **on a shared
+filesystem, every path a writer creates is part of the coordination-free
+argument, not just the ones that survive the write.** Principle 4 buys freedom
+from coordination *state*; it does not buy freedom from thinking about
+concurrency.

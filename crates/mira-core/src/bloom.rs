@@ -183,7 +183,7 @@ impl<'a> Filter<'a> {
         if k == 0 || !words.is_power_of_two() || body.len() != words * 8 {
             return None;
         }
-        // The one check that costs something — 20 KB of CRC against a block
+        // The one check that costs something — 65 KB of CRC against a block
         // read of tens of megabytes. Skipping a block on the word of a corrupt
         // filter is the one outcome worth paying to avoid.
         if crc32fast::hash(body) != crc {
@@ -305,11 +305,14 @@ mod tests {
 
     /// Everything inserted must be found — a false negative is a lost trace —
     /// and the false positive rate has to be near the 0.8% the sizing promises,
-    /// or the filter is a 20 KB file that skips nothing.
+    /// or the filter is a 16 KB file that skips nothing.
     #[test]
     fn no_false_negatives_and_few_false_positives() {
         let n = 10_000u64;
         let f = filter(n);
+        // The size the two "skips nothing" comments quote: 10 bits a key,
+        // rounded up to a power-of-two word count, plus the header.
+        assert_eq!(f.len(), HEADER + 2048 * 8);
         for i in 0..n {
             assert!(may_contain(&f, &id(i)), "false negative at {i}");
         }
@@ -343,7 +346,7 @@ mod tests {
         // A single flipped bit in the bitmap is exactly the case a checksum
         // exists for: it turns a "no" into a wrong "no" with nothing else to
         // notice it.
-        let mut bad = f.clone();
+        let mut bad = f;
         bad[HEADER + 3] ^= 0x40;
         assert!(may_contain(&bad, &probe), "corrupt body");
     }
@@ -352,7 +355,7 @@ mod tests {
     /// timestamp-prefixed id has: constant bytes at both ends, variation in the
     /// middle. Without the finalizer every one of these lands on the same bits
     /// and the filter says "maybe" to everything — which is not a wrong answer,
-    /// just a 20 KB file that skips nothing.
+    /// just a 16 KB file that skips nothing.
     #[test]
     fn structured_ids_still_spread() {
         let structured = |n: u64| {

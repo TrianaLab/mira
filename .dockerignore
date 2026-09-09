@@ -1,5 +1,41 @@
-# The build stage compiles from source; a host `target/` is several GB of
-# wrong-architecture objects.
+# What the build stage actually needs is Cargo.toml, Cargo.lock, crates/ — and
+# crates/mira/ui/dist, which is committed and `include_bytes!`d, so it must NOT
+# be excluded here. Everything below is either rebuilt inside the image or has
+# nothing to do with it, and every byte of it is a byte uploaded to the daemon
+# on each build.
+
+# Several GB of objects for the wrong architecture, and a cache mount inside the
+# image already covers incremental rebuilds.
 target/
+
+# Blocks. A data directory in the context would be baked into a layer.
+data/
+mira-data/
+
 .git/
-ui/node_modules/
+.github/
+.gitignore
+.gitattributes
+
+# The docs site and its virtualenv; nothing under docs/ is `include_str!`d.
+docs/
+site/
+.venv-docs/
+mkdocs.yml
+*.md
+!README.md
+
+# The UI is prebuilt and committed. node_modules is ~50 MB of nothing the
+# image needs; dist/ beside it is what ships.
+crates/mira/ui/node_modules/
+crates/mira/ui/.svelte-kit/
+
+# Release-pipeline scratch. release.yml downloads the matrix tarballs into
+# artifacts/ and unpacks only the two Linux binaries into dist/linux/<arch>/,
+# which is the one thing here the image does want.
+artifacts/
+*.cdx.json
+SHA256SUMS
+
+Dockerfile
+.dockerignore

@@ -89,15 +89,15 @@ async fn handler(State(api): State<Api>, body: String) -> Response {
     match method {
         "initialize" => result(
             &id,
-            format!(
+            &format!(
                 "{{\"protocolVersion\":\"{PROTOCOL}\",\"capabilities\":{{\"tools\":{{}}}},\
                  \"serverInfo\":{{\"name\":\"mira\",\"version\":\"{}\"}}}}",
                 env!("CARGO_PKG_VERSION")
             ),
         ),
-        "tools/list" => result(&id, format!("{{\"tools\":{TOOLS}}}")),
+        "tools/list" => result(&id, &format!("{{\"tools\":{TOOLS}}}")),
         "tools/call" => call(api, &id, params).await,
-        "ping" => result(&id, "{}".into()),
+        "ping" => result(&id, "{}"),
         // A notification has no id and takes no reply. `notifications/initialized`
         // is the one every client sends, and answering it with an error is how a
         // session fails on its second message.
@@ -147,12 +147,12 @@ async fn call(api: Api, id: &Yaml, params: &Yaml) -> Response {
                     Ok(text) => j.str(text),
                     Err(e) => j.str(e),
                 }
-            })
+            });
         });
         j.key("isError");
         j.bool(out.is_err());
     });
-    result(id, j.into_string())
+    result(id, &j.into_string())
 }
 
 /// "Every span of this trace", which is the one query with no useful time
@@ -160,6 +160,10 @@ async fn call(api: Api, id: &Yaml, params: &Yaml) -> Response {
 /// window is therefore all of it, and the block-level trace-id filter is what
 /// makes that affordable.
 fn trace_search(args: &Yaml) -> Result<Search, String> {
+    // The other three tools get this from `search_doc`/`series_doc`/`window_doc`;
+    // this one builds its query by hand, so it has to ask. A misspelled `limit`
+    // is a page size the model believes it set.
+    api::known(args, &["trace_id", "limit"])?;
     let id = args["trace_id"]
         .as_str()
         .ok_or("trace_id is required, as 32 hex characters")?
@@ -201,7 +205,7 @@ async fn blocking(
     }
 }
 
-fn result(id: &Yaml, payload: String) -> Response {
+fn result(id: &Yaml, payload: &str) -> Response {
     json(format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{payload}}}",
         rpc_id(id)
@@ -333,6 +337,11 @@ mod tests {
             ("query_records", r#"{"filters":[]}"#, "unknown query key"),
             ("query_metric", r#"{"step":"1m"}"#, "unknown query key"),
             ("list_metrics", r#"{"name":"http"}"#, "unknown query key"),
+            (
+                "get_trace",
+                r#"{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","limitt":5}"#,
+                "unknown query key",
+            ),
         ];
         for (name, args, want) in bad {
             let (s, body) = rpc(&api, &call(name, args)).await;
@@ -436,6 +445,16 @@ mod tests {
         // A span id is 8 bytes and looks like a trace id to anyone not counting.
         assert!(trace_search(&doc(r#"{"trace_id":"0102030405060708"}"#)).is_err());
         assert!(trace_search(&doc("{}")).unwrap_err().contains("required"));
+        // The key check the other three tools get from their `*_doc` parser: a
+        // dropped `limit` is a page size the model thinks it set.
+        let typo = trace_search(&doc(
+            r#"{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","limitt":5}"#,
+        ))
+        .unwrap_err();
+        assert!(
+            typo.contains("unknown query key") && typo.contains("limitt"),
+            "{typo}"
+        );
 
         let limit = |s: &str| {
             trace_search(&doc(&format!(

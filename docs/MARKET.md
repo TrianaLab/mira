@@ -19,16 +19,16 @@ documentation is linked directly.
 > and reaching it by emulating Loki and Tempo. That is overruled: Mira owns its
 > query API because the storage layout is new, and a query model this different
 > is lossy through anyone else's panel system. Mira therefore ships **its own
-> UI**, served by the same binary, over the same frame API the MCP surface uses.
+> UI**, served by the same binary, over the same query API the MCP surface uses.
 > Loki/Tempo emulation is not cancelled — it is demoted from the foundation to an
 > optional on-ramp for the Grafana installed base, decided later on its own
-> merits (§3 item 2). Everything below is otherwise unchanged.
+> merits (§3 item 2b). Everything below is otherwise unchanged.
 
-**Mira is a single binary that stores OpenTelemetry logs and traces in the
-Resource–Scope–Signal layout itself — immutable Arrow IPC blocks on local disk,
-no index over attribute values, no coordination state of any kind — and serves
-its own query API and its own UI out of that same binary, so the whole
-observability stack is one process and one data directory.** It is for the
+**Mira is a single binary that stores OpenTelemetry logs, traces and metrics in
+the Resource–Scope–Signal layout itself — immutable Arrow IPC blocks on local
+disk, no inverted index over attribute values, no coordination state of any kind
+— and serves its own query API and its own UI out of that same binary, so the
+whole observability stack is one process and one data directory.** It is for the
 platform engineer who already operates an observability stack and has hit one of
 two walls: the cardinality wall, where `k8s.pod.name`, `session_id`, `request_id`
 or an LLM prompt either collapses the log ingester or gets banned by policy
@@ -41,8 +41,11 @@ Against both, the claim neither can make: **ask "show me everything this pod
 emitted in the five seconds around this error" and get an answer when the log
 line carries no `trace_id`** — because entity identity is a stored, stable
 column (`resources.key`), not a hand-written YAML mapping fired at a second
-system. What Mira does not claim, and will not until v2: metrics, PromQL, object
-storage, or any replication of your data.
+system. That column is written at seal and read by nothing yet: the question is
+answerable today only as an attribute predicate — `k8s.pod.name` equals this,
+over that window — and the entity selector that would use the column is v1 item
+7. What Mira does not claim: PromQL, object storage, or any replication of your
+data.
 
 The skeptical Grafana user's question is "why would I run a fourth thing?" The
 answer has to be that Mira *removes* things: it is the Loki and the Tempo, in one
@@ -83,36 +86,39 @@ deal; all of it loses one.
 
 | # | Item | Evidence of demand | Cost | Lands |
 |---|---|---|---|---|
-| 1 | **Traces as a stored, queryable signal** | Logs-only competes with Loki, not with the category. Every challenger survey named it blocking. Principle 3 also decides it internally: a store whose identity is "the layout *is* Resource-Scope-Signal" that implements one of three signals is a log store with an OTLP parser. | ~600 LOC encoder (spans root + `span_events` + `span_links`, reusing the existing ATTRS schema and rebase pass) + query depth | **v1** |
-| 2 | **A UI in the binary** | A store with no screen is not evaluable. Since the query model is Mira's own (§4.5), every existing panel system is a lossy adapter over it, and the bundled UI is what makes the single-binary claim literal: run one binary, open a browser. VictoriaLogs ships VMUI; Honeycomb's UI *is* its differentiation. | Frontend work, plus ~150 LOC to embed the built assets in the binary | **v1** |
+| 1 | **Traces as a stored, queryable signal** | Logs-only competes with Loki, not with the category. Every challenger survey named it blocking. Principle 3 also decides it internally: a store whose identity is "the layout *is* Resource-Scope-Signal" that implements one of three signals is a log store with an OTLP parser. | ~600 LOC encoder (spans root + `span_events` + `span_links`, reusing the existing ATTRS schema and rebase pass) + query depth | **shipped** |
+| 2 | **A UI in the binary** | A store with no screen is not evaluable. Since the query model is Mira's own (§4.5), every existing panel system is a lossy adapter over it, and the bundled UI is what makes the single-binary claim literal: run one binary, open a browser. VictoriaLogs ships VMUI; Honeycomb's UI *is* its differentiation. | Frontend work, plus ~150 LOC to embed the built assets in the binary | **shipped, and a second one in the terminal** |
 | 2b | ~~**Grafana reachability — Loki + Tempo HTTP API emulation**~~ | **Demoted from the foundation** (§1 amendment). Still the cheapest route to the Grafana installed base, and still bends OTLP-first at read time. Decide on its own merits once the native UI and API exist and we know whether adoption is actually blocked on it. | ~4.5k LOC of axum handlers + DSL subsets | **later, gated** |
-| 3 | **Compaction (and, riding it, compression)** | Not user-requested — user-fatal. Mira flushes on a 2 s age trigger and writes 5 files per block: ~9,000 files/hour/shard at steady state. Loki's documented 5.5M-file wall arrives in under a month, and boot is O(blocks). Compaction is also the pass every other index rides. | ~800 LOC, off the hot path; hourly pass is single-digit seconds of one core at 100 GB/day | **v1** |
+| 3 | **Compaction (and, riding it, compression)** | Not user-requested — user-fatal. Mira flushes on a 2 s age trigger and writes one directory per seal: an Arrow file per table that has rows, the Bloom sidecars, and a `cold` marker once compaction has been over it. `publish` skips empty tables, so the count is a range — measured on the smoke corpus, four to seven files for a logs block, seven for traces (five of nine tables written), nine for metrics (eight of thirteen). At a seal every two seconds per signal that is tens of thousands of files an hour per shard, Loki's documented 5.5M-file wall arrives in under a month, and boot is O(blocks). Compaction is also the pass every other index rides. | ~800 LOC, off the hot path; hourly pass is single-digit seconds of one core at 100 GB/day | **compression shipped; the merge that removes files is not** |
 | 4 | **Helm chart** | Complexity/operational overhead is the #1 self-hosted concern (38% in the CNCF-derived numbers the practitioner survey cites). Nothing enters a cluster without a chart. Refusing this while claiming "no operational overhead" is the most self-defeating decision available. | ~300 lines of YAML. One day. | **v1** |
 | 5 | **Self-observability: `/metrics` + one dashboard JSON** | Nobody puts an unproven binary in the ingest path they cannot see. A no-knobs system owes the operator visibility in exchange; "self-driving" without instrumentation is just opaque. | ~150 LOC, ~20 counters, one JSON file | **v1** |
-| 6 | **A durability story that is proven, not described** | Top churn trigger in the practitioner corpus. "No WAL" reads as "loses data" until a crash test says otherwise. Two named holes in `ARCHITECTURE.md` §9 are silent-corruption paths, not documentation gaps: mmap on NFS/CIFS raises `SIGBUS` with no recovery, and Docker-for-Mac volumes return `EINVAL` from `F_FULLFSYNC` where std does not fall back. | ~200 LOC + one CI job that `kill -9`s mid-ingest and asserts every acked export reads back | **v1** |
+| 6 | **A durability story that is proven, not described** | Top churn trigger in the practitioner corpus. "No WAL" reads as "loses data" until a crash test says otherwise. `ARCHITECTURE.md` §9 named two holes, and they were silent-corruption paths rather than documentation gaps. One is closed: `block::check_filesystem` runs a `statfs` before anything is mapped and refuses to start on NFS/CIFS/CephFS, where mmap turns a server hiccup into `SIGBUS`. The other is open — Docker-for-Mac volumes answer `EINVAL`/`ENOTSUP` to `F_FULLFSYNC`, std does not fall back, and the wrapper that would degrade to `fsync(2)` and count it is unwritten. | ~200 LOC + one CI job that `kill -9`s mid-ingest and asserts every acked export reads back | **`statfs` guard shipped; crash test v1** |
 | 7 | **Size-based retention** | Kills the #1 operational churn trigger: the disk fills and the observability stack dies during the outage it existed to explain. | ~50 LOC. `statvfs` the data dir; over a fixed fraction, drop oldest until under. Derived, therefore not a knob. | **v1** |
 | 8 | **Tenant in the block path** | Cheap now, expensive forever. Every protocol Mira will impersonate keys tenancy on `X-Scope-OrgID`. This changes a public identifier, so it must land **before the first tag**, not after. | ~100 LOC + a path-safety check at the trust boundary | **v1, first** |
 | 9 | **SSO/OIDC + RBAC, in the free tier** | "The pilot works, the security review kills it" is a named churn reason. Every commercial competitor monetises exactly this; Mira is Apache-2.0, so shipping it in the box is simultaneously table stakes and the loudest available differentiator. | ~400 LOC: JWKS fetch + JWT verify as axum middleware, claim→role map in the config file. No user table. | **v1** |
 | 10 | **Alerting** | A store you cannot alert on is not a monitoring system. It is the migration exit criterion. | **Zero code.** Once Mira answers as a Loki/Tempo datasource, Grafana-managed rules query it through the same handler. The obligation Mira takes on is honesty about its own latency — hence the query-latency histogram in item 5. | **v1** |
-| 11 | **Trace-by-id, and needle-in-haystack text search** | Both are public, unprompted disqualification tests. valyala's "very slow on needle in the haystack" is Loki's stated fatal flaw; "I can't search all traces for `UploadDoc`" is the same complaint in the trace surface. | ~500 LOC, and the two features share one mechanism: one bloom sidecar per block holding distinct trace ids *and* body/attribute tokens, mapped on demand so zero-file-opens boot survives | **v1** |
+| 11 | **Trace-by-id, and needle-in-haystack text search** | Both are public, unprompted disqualification tests. valyala's "very slow on needle in the haystack" is Loki's stated fatal flaw; "I can't search all traces for `UploadDoc`" is the same complaint in the trace surface. | ~500 LOC, and the two were meant to share one mechanism. The trace half shipped as two sidecars per block — `trace.idx` over distinct trace ids, `attr.idx` over distinct `(key, value)` pairs — read before any Arrow file is opened, so zero-file-opens boot survives. Only equality prunes through them: a body substring is still a scan of every block the time bound leaves, which is the half that is not built. | **trace-by-id shipped; text search still scans** |
 | 12 | **Live tail** | Weak as a switching reason; universal as a first-ten-minutes smoke test. Its absence is noticed within an hour of trial, and v1 is a trial-shaped release. | ~100 LOC: SSE/WebSocket at `/loki/api/v1/tail`, polling the newest sealed blocks. 2 s latency, documented as 2 s. | **v1** |
-| 13 | **Native MCP server** | Now baseline, not a wedge — Tempo ships `/api/mcp`, Grafana ships Assistant, Honeycomb's is free-tier. Its *absence* is read as a gap. | ~800 LOC (`rmcp` on the existing router, frame algebra as the tool set) | **v1, unmarketed** |
-| 14 | **Open-format readability** | The lock-in objection, answered for free. Arrow IPC is a public format: pyarrow, polars and DuckDB open Mira's blocks today with zero code. This also answers "you have no SQL". | One docs page + one CI step that opens a fresh block with a third-party reader. An untested interop claim rots in one release. | **v1** |
-| 15 | **Metrics + PromQL subset** | 65% of orgs invest in Prometheus. Refusing metrics forever means refusing metric dashboards, recording rules and alerts. | Large: multi-datapoint-type encoder + evaluator. See §6.4 for why they must ship in the *same release*. | **v2** |
+| 13 | **Native MCP server** | Now baseline, not a wedge — Tempo ships `/api/mcp`, Grafana ships Assistant, Honeycomb's is free-tier. Its *absence* is read as a gap. | ~450 LOC of hand-rolled JSON-RPC on the existing router — no `rmcp`, no crate spent; it came in at 251 | **shipped, unmarketed** |
+| 14 | **Open-format readability** | The lock-in objection, answered for free — but only as far as the readers actually go. `pyarrow.ipc.open_file` and `polars.read_ipc` open a Mira block today with zero code; both were run against a live one. DuckDB does not: it has no Arrow IPC reader built in, and the community `nanoarrow` extension refuses the schema — *"Schema message field with DictionaryEncoding not supported"* — which is every table carrying an attribute key or a `severity_text`, so four of the five in a logs block. SQL over a block is pyarrow or polars handing DuckDB the table it already read, which is still zero Mira code and worth saying precisely rather than loosely. | One docs page + one CI step that opens a fresh block with a third-party reader. An untested interop claim rots in one release. | **v1** |
+| 15 | **Metrics + PromQL subset** | 65% of orgs invest in Prometheus. Refusing metrics forever means refusing metric dashboards, recording rules and alerts. | Large: multi-datapoint-type encoder + evaluator. §7's v2 item 1 for why they belong in the *same release*. | **encoder shipped; PromQL v2** |
 | 16 | **Object-storage tier** | Cost per GB is one of Mira's own four stated axes, and this is the axis the whole storage segment argues about. Also a procurement checkbox that loses evaluations before a benchmark runs. VictoriaLogs, the one vendor arguing Mira's position, capitulated. | Invasive but clean over immutable blocks. Hand-rolled SigV4 over the existing HTTP client, ~800 LOC, no `aws-sdk-s3`. | **v2** |
 | 17 | **Non-OTLP ingest (Loki push, ES `_bulk`)** | Nobody re-instruments to trial a backend. OTLP-first read as OTLP-only forfeits every migration. | ~400 LOC each; the cost is not LOC, it is the semconv mapping table (see §6.6) | **v2** |
 
-**Honest v1 total: 11–13k LOC.** `ARCHITECTURE.md` §1's "~2,000 LOC of query
-logic" is wrong by roughly 5×, and the schedule should be planned against the
-larger figure. It is still two orders of magnitude under DataFusion's transitive
-tree, which is the only comparison that matters for that decision.
+**Honest v1 total: 11–13k LOC** — the release, not the engine. `ARCHITECTURE.md`
+§1's "~2,000 LOC of query logic" counts only the query engine, and that estimate
+held: `query.rs`, `series.rs` and `api.rs` are ~2,350 non-test lines with the
+metrics reader already in them. The two figures do not disagree; plan the
+schedule against the larger one. It is still two orders of magnitude under
+DataFusion's transitive tree, which is the only comparison that matters for that
+decision.
 
 ### Three bugs that are table stakes because they are already shipped
 
 These are not roadmap items; they are defects in code that exists. **All three
-are now fixed** (see the note after each); they are kept here because the
-reasoning is what decides the equivalent question in the traces and metrics
-encoders.
+are fixed in the write path** (see the note after each); they are kept here
+because the reasoning is what decides the equivalent question in the traces and
+metrics encoders.
 
 1. **`identity.rs` fallback is broken in exactly the way its own docstring
    forbids.** The whole-attribute-set sum at `crates/mira-core/src/identity.rs`
@@ -122,8 +128,10 @@ encoders.
    returns a plausible subset. **Fix: a `key = 0` sentinel meaning "no stable
    identity", and a query layer that refuses an entity selector on `key == 0`
    with a typed error naming the missing attributes.** Fail loud beats a
-   plausible subset. **Fixed:** `identity::NO_IDENTITY` is written and asserted;
-   the refusal is the query layer's first obligation (`ARCHITECTURE.md` §10).
+   plausible subset. **Fixed at the seal:** `identity::NO_IDENTITY` is written
+   and asserted. The refusal is not written, and has nothing to refuse: no read
+   surface takes an entity selector, so `resources.key` reaches disk and stops
+   there (`ARCHITECTURE.md` §10).
 2. **`LogsBuilder::approx_bytes` ignores the string heap** —
    `next_id * 64 + attrs * 48` counts fixed-width columns only. Multi-kilobyte
    GenAI prompts, or any large-body log workload, contribute nothing to the seal
@@ -151,10 +159,11 @@ are retention claims (they matter after the migration).
 **This is the headline, and it costs zero lines of code.** The EAV side tables
 keyed by `parent_id`, with attribute *values* as plain `Utf8` rather than
 dictionary keys, are structurally immune to the failure that makes teams abandon
-Loki and to the mapping explosion that makes them abandon Elasticsearch. There is
-no index over attribute values, so there is no index to explode. High cardinality
-costs a semi-join scan at memory bandwidth, which uncompressed mmap makes as fast
-as that operation can be.
+Loki and to the mapping explosion that makes them abandon Elasticsearch. The only
+structure over attribute values is a per-block Bloom sidecar that stops writing
+itself past a million distinct pairs and leaves the block to be scanned, so there
+is no inverted index to explode. High cardinality costs a semi-join scan at memory
+bandwidth, which uncompressed mmap makes as fast as that operation can be.
 
 The deliverable is not code, it is a benchmark that ships in CI and a demo:
 ingest 1M distinct `session_id` values, assert flat RSS against the §11
@@ -179,17 +188,19 @@ exemplars, span links. Shipping those is *not being embarrassed*, not winning.
 has no `trace_id`.** Most logs in the wild carry none. Everyone else's
 correlation is a client-side join across two databases configured by a
 hand-written YAML mapping, and it fails *open* — the panel returns empty and the
-user concludes there were no logs. Mira has a fifth rung nobody else has:
-`resources.key`, a stable entity identity stored as a column, which turns
-"everything this pod emitted around this error" into an 8 KB `resource_id` bitset
-over one small table per block. That is the one place the layout produces an
-asymptotic advantage rather than a constant factor.
+user concludes there were no logs. Mira has the material for a fifth rung nobody
+else has: `resources.key`, a stable entity identity stored as a column, which
+turns "everything this pod emitted around this error" into an 8 KB `resource_id`
+bitset over one small table per block. That is the one place the layout produces
+an asymptotic advantage rather than a constant factor — and it is unclaimable
+until a read surface selects on that column, which none does. Today the pod
+question is an attribute predicate over the EAV tables, which is a scan.
 
 For "powerful correlation" to be a differentiator rather than a checkbox, all
 five of these must be true. Any one missing and it is a checkbox:
 
-1. **The fifth rung exists and is correct.** Blocked on the `identity.rs` fix in
-   §3. Non-negotiable.
+1. **The fifth rung exists and is correct.** The hash is stable and the column is
+   written (§3); what is missing is the selector that reads it. Non-negotiable.
 2. **Empty is never bare.** `around(d)` that finds nothing returns the window it
    searched and the widening that *would* have hit. ~20 LOC, and it kills the
    single largest churn reason in the correlation segment: users conclude the
@@ -226,9 +237,10 @@ type; "works when the log line has no `trace_id`" goes on the landing page.
 ### 4.3 One binary, and the number that proves it
 
 "Single binary" is occupied — OpenObserve markets it at 21.7k stars with S3 and
-DataFusion inside. The defensible version is not the phrase, it is **2.6 MB and
-107 crates**, published as a figure next to competitors' pod counts. Every
-dependency added for object storage, JWT or Parquet spends it.
+DataFusion inside. The defensible version is not the phrase, it is **4.73 MiB
+stripped and 117 crates**, three signals and two UIs included, published as a
+figure next to competitors' pod counts. Every dependency added for object
+storage, JWT or Parquet spends it.
 
 An asset not enforced in CI erodes one convenient dependency at a time. **Make it
 a build gate: fail CI above 20 MB stripped or above a pinned crate ceiling, and
@@ -243,11 +255,13 @@ architecture:
 
 - **Tool shape is a correctness property.** An agent handed SQL over a five-table
   EAV star schema writes joins that are *silently* wrong: a missing `parent_id`
-  predicate returns a cross product that looks like data. An agent handed seven
-  closed frame operations cannot express a wrong join at all, and every call
-  returns a frame whose cardinality it can bound before materialising. Under ten
-  tools, which is also the ceiling before context-window degradation kills the
-  loop.
+  predicate returns a cross product that looks like data. An agent handed a closed
+  set of frame operations — `ARCHITECTURE.md` §7.3, designed and not yet built —
+  cannot express a wrong join at all, and every call returns a frame whose
+  cardinality it can bound before materialising. The four tools that ship today
+  are the narrow version of the same property: there is no join to get wrong, and
+  every answer carries the blocks and rows it scanned. Under ten tools either way,
+  which is the ceiling before context-window degradation kills the loop.
 - **Unmetered exploration.** Datadog and Dynatrace meter their agent surfaces per
   investigation and per GB scanned. An agent firing 400 exploratory queries at a
   local engine is doing something no SaaS agent can afford. That claim is only
@@ -262,7 +276,7 @@ out.
 
 ### 4.5 The UI, and the state it refuses to keep
 
-Mira serves its own UI from the same binary, over the same frame API the MCP
+Mira serves its own UI from the same binary, over the same query API the MCP
 surface uses. One engine, three consumers: the UI, an agent, and any external
 frontend. That is not a convenience — it is the only way the agentic claim in
 §4.4 stays honest, because a tool surface nobody drives by hand rots quietly.
@@ -280,7 +294,7 @@ normally collides with principle 4, because dashboards and saved views are
 per-user objects that must survive a restart and agree across replicas — the
 first coordination state in the system, and the kind nobody backs up.
 
-- **A frame query fits in a URL.** The link *is* the saved view: shareable,
+- **A query fits in a URL.** The link *is* the saved view: shareable,
   bookmarkable, diffable, and the browser owns the history. An agent hands a
   human a link; a human hands an agent a link back.
 - **Curated dashboards are read-only files** on disk, in KYAML, GitOps'd. Same
@@ -309,11 +323,11 @@ Each with the sentence a user gets.
 | Refused | What the user is told |
 |---|---|
 | **A Grafana datasource plugin** | "Install nothing. Point Grafana's built-in Loki and Tempo datasources at Mira." A signed plugin is a second artifact in a second language, reviewed by a third party, with a signing subscription for out-of-catalogue distribution. There is no version of that where "one binary" is literally true. The demand it carries is fully discharged by emulating the built-in APIs. |
-| **Stored dashboards, saved views, user preferences** | "The link *is* the saved view. Curated dashboards are files you commit." Mira ships its own UI (§4.5) and stores nothing mutable behind it. A saved dashboard is a per-user object that has to survive a restart and agree across replicas — that is precisely the coordination state principle 4 exists to refuse, and it would be the first mutable row in the entire system. A frame query fits in a URL, so sharing is a link and the browser owns the history. Curated dashboards are read-only files on disk, GitOps'd, which is Perses' own model and is strictly better operationally than a database nobody backs up. |
-| **SQL** | "Mira has no SQL. Point DuckDB at the block directory." This is load-bearing, not stylistic: the frame algebra is seven closed operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice and the in-house decision reverses.** DuckDB over Arrow IPC costs zero binary bytes and answers the lock-in objection with the same sentence. |
-| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 68–92 MB binary, against a 2.6 MB baseline. |
+| **Stored dashboards, saved views, user preferences** | "The link *is* the saved view. Curated dashboards are files you commit." Mira ships its own UI (§4.5) and stores nothing mutable behind it. A saved dashboard is a per-user object that has to survive a restart and agree across replicas — that is precisely the coordination state principle 4 exists to refuse, and it would be the first mutable row in the entire system. A query fits in a URL, so sharing is a link and the browser owns the history. Curated dashboards are read-only files on disk, GitOps'd, which is Perses' own model and is strictly better operationally than a database nobody backs up. |
+| **SQL** | "Mira has no SQL. Read the blocks with pyarrow or polars, and hand the table to DuckDB if you want SQL over them." This is load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser — a query document with fixed keys today, the frame algebra of `ARCHITECTURE.md` §7.3 if that is ever built — and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice and the in-house decision reverses.** SQL over a block costs Mira zero binary bytes because it happens in someone else's process, and it answers the lock-in objection with the same sentence — see §3 item 14 for what the sentence may and may not say about DuckDB. |
+| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 68–92 MB binary, against a 4.73 MiB baseline. |
 | **Iceberg / a catalog** | Catalog, manifests and snapshots are coordination state and a second product. Parquet *export* is revisited only when someone names Athena or Trino with a workload attached — it costs ~20 crates against the one number nobody else can match. |
-| **Separation of storage and compute** | Needs a scheduler, a metadata service and membership — three things principle 4 exists to refuse. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
+| **Separation of storage and compute** | Needs a scheduler, a metadata service and membership — three things principle 4 exists to refuse. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. There is no query fan-out, so a replica answers only from the blocks it can see. Sharing a data directory lifts that, but only between processes on one host — across hosts a shared directory is a network filesystem and the `statfs` guard refuses to start on one (`ARCHITECTURE.md` §12.5). |
 | **Prometheus `remote_read`** | "It would forfeit every pushdown the engine exists to do." Remote read makes Mira a dumb sample pipe streaming raw points to a Prometheus that then evaluates locally — the worst possible shape for a columnar store. Prometheus 3's own migration notes flag the storage contract as undefined for third-party implementers. No endpoint, and the docs say why rather than leaving a 404. |
 | **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no Resource, no Scope and no semconv; synthesising them upward puts a lossy import inside a product whose pitch is fidelity, and every synthesised series lands in the no-identity bucket, which is where the correlation story stops being true. Keep the lossy hop outside Mira, where it is visible and maintained by someone else. |
 | **Ingest-side shaping: drop rules, sampling, transforms** | "Shaping belongs in the Collector, and here is a reference `otelcol` config." This is the market's #1 pain and every competitor sells knobs for it, so the refusal has to be argued: shaping rules are a filter graph, and the Collector *already is* a filter graph running upstream. Duplicating it imports exactly the config surface principle 2c forbids, and Chronosphere's own docs admitting pool allocation "does not provide protections for persisted cardinality" is the tell that these knobs do not solve the problem they exist for. What Mira ships instead (v2) is cost *attribution* — bytes-on-disk and attribute cardinality ranked by tenant/service/attribute key, from block footer sketches. The buyer's real question is "who is costing me money", not "give me a quota". |
@@ -359,30 +373,47 @@ answers are the churn reason this whole document is organised against.
 
 ### 6.2 P1 (zero-copy) vs. compression — **bends, at a tier boundary**
 
-**Conflict.** `ARCHITECTURE.md` §3.5 correctly proves compression and mmap
-zero-copy are mutually exclusive. It then draws the wrong conclusion by framing
-this as a whole-store property. Uncompressed forfeits cost-per-GB, one of
+**Conflict.** Compression and mmap zero-copy are mutually exclusive — arrow-rs
+hands back a slice of the mapping when the codec is `None` and allocates when it
+is not, with no in-place path. Uncompressed forfeits cost-per-GB, one of
 principle 1's own four axes, against competitors quoting 10–50×.
 
-**Recommendation.** The collision only exists if you compress the *hot* block.
-ZSTD-3 body compression applied **by the compaction pass only, never at flush**.
-Hot blocks stay raw, 64-byte aligned and mmapped; the n/n-buffers-in-mapping test
-stays green because it tests hot blocks. Cold reads decompress only the projected
-columns into a per-query arena that dies with the query — no global block cache,
-therefore no memory budget and no 2c breach. One codec, no level flag.
+**Resolved at the tier boundary, and built.** The collision only exists if you
+compress the *hot* block, so nothing compresses at flush: an hour after a block's
+newest row the retention sweep rewrites its tables ZSTD-compressed and drops a
+`cold` marker. `ARCHITECTURE.md` §3.5 draws the same boundary — it proves the
+exclusion and then splits the store in two rather than treating compression as a
+whole-store property. Hot blocks stay raw, 64-byte aligned and mmapped, and the
+compaction test asserts both halves of the trade: every buffer inside the mapping
+for the hot block, fewer than every buffer for the cold one. One codec and no
+level flag — the writer names ZSTD and the codec takes its own default, so
+"ZSTD-3" names a level nothing in the tree chooses.
 
-**Restate the guarantee as "zero-copy queries on the hot tier."** And publish the
-ratio with its denominator every time: bytes-on-disk ÷ bytes-of-*OTLP-wire*
-(target ~0.10 post-zstd, against the current 0.35 model). Competitors' 10–50× is
-measured against raw JSON, which is already 2–3× larger than OTLP protobuf.
+What is not built is the narrow read: a cold block decompresses whole tables, not
+just the projected columns. It costs no standing memory, because there is no
+block cache and the allocation dies with the query, but the per-query arena is
+table-shaped rather than column-shaped.
 
-### 6.3 P1 (all four axes) vs. reality today — **the claim is currently false**
+**State the guarantee as "zero-copy queries on the hot tier."** And publish the
+ratio with its denominator every time: bytes-on-disk ÷ bytes-of-*OTLP-wire*,
+against a 0.35 B/B target — measured at **1.31 hot** and **~0.17 compacted**
+(`ARCHITECTURE.md` §11). Competitors' 10–50× is measured against raw JSON, which
+is already 2–3× larger than OTLP protobuf.
 
-Mira cannot claim cost-per-GB parity on local uncompressed disk against
-S3-native peers. The v1 action is not code, it is one sentence of honesty in the
-README: **local-disk hot tier; object-store cold tier in v2.** Claiming four axes
-simultaneously before compaction and offload exist is the kind of claim that gets
-found out in a benchmark thread.
+### 6.3 P1 (all four axes) vs. reality today — **short by two, and not the two this section expected**
+
+Cost per GB is the axis this section was written about, and the cold tier settled
+it: 1.31 B/B hot, ~0.17 B/B once the sweep has been over a block, against a 0.35
+target (§6.2). What is missing there is not a ratio, it is a destination — every
+byte lives on the local volume, so retention is bounded by the PVC and there is
+no HA story. The two axes still open in `ARCHITECTURE.md` §11 are ingest
+throughput, 544k records/s aggregate against a per-core target, and resident
+footprint, which has no number at all and is scored as an intention.
+
+The action on the cost axis is not code, it is one sentence of honesty wherever
+the axes are claimed: **local disk, hot and cold; object storage in v2.**
+Claiming four axes simultaneously while one of them is unmeasured is the kind of
+claim that gets found out in a benchmark thread.
 
 ### 6.4 P2c (no tuning knobs) vs. policy — **restate the principle**
 
@@ -456,9 +487,9 @@ telemetry rather than new state.
 so boot is still one `readdir` with zero file opens and the name still carries
 the whole pruning key. **The bucket is never LISTed on the hot path** — a LIST is
 an explicit offline `mira recover s3://...` after losing the local disk. Offload
-the whole block as **one** object with an index footer, not five: five files per
-block is a 5× PUT-amplification bomb at $0.005/1000 regardless of object size,
-and the read path is range-GET anyway.
+the whole block as **one** object with an index footer, not seven: seven files
+per block is a 7× PUT-amplification bomb at $0.005/1000 regardless of object
+size, and the read path is range-GET anyway.
 
 There is **no cache tier.** A cold block that gets read is re-materialised into
 the data directory as an ordinary local block and its marker flips back; the same
@@ -473,9 +504,10 @@ than a rewrite.
 
 ### 6.9 P4 (single binary) vs. every feature above — **enforce it or lose it**
 
-`rmcp`, zstd, JWT/JWKS, SigV4 and later `promql-parser` will take 107 crates to
-roughly 150–170 and 2.6 MB to an estimated 8–12 MB. That is inside the 20 MB
-budget, but only if the budget is a CI gate rather than a paragraph (§4.3).
+`zstd` is already inside the 117-crate tree. JWT/JWKS, SigV4 and later
+`promql-parser` will take it to roughly 150–170 and 4.73 MiB to an estimated
+8–12 MB. That is inside the 20 MB budget, but only if the budget is a CI gate
+rather than a paragraph (§4.3).
 
 ### 6.10 P4 vs. live tail's in-memory buffer — **avoided, not bent**
 
@@ -510,36 +542,37 @@ identifiers):**
 
 | Order | Item | Est. LOC | Notes |
 |---|---|---|---|
-| 1 | Traces encoder: spans root + `span_events` + `span_links`, exemplar-ready columns | 600 | Largest single item. Everything downstream depends on it. |
-| 2 | Frame algebra + `fetch` + EAV semi-join + time/entity predicates | 3–5k | The query engine. `ARCHITECTURE.md` §7.3/§7.6 as specified. |
-| 3 | Compaction pass + ZSTD-3 + block-shadowing by name arithmetic | 800 | Extend directory names to `<min>-<max>-<node>-<seq_lo>-<seq_hi>`; `scan()` discards any block whose seq range is strictly contained in another's. Merged block shadows its sources the instant it is renamed; a crash before unlink leaves garbage the next pass collects. No manifest, no new atomic primitive. Needs one round-trip merge correctness test. |
-| 4 | Bloom sidecar: trace ids + body/attribute tokens, mapped on demand; cached in-block `trace_id` sort permutation | 500 | Two features, one mechanism. Explicitly not an inverted index: no positions, no ranking, no phrase search. Built in the compaction pass, so ingest throughput is untouched. |
+| 1 | ~~Traces encoder: spans root + `span_events` + `span_links`, exemplar-ready columns~~ **shipped** | 600 | Was the largest single item; everything downstream depended on it, and does. |
+| 2 | ~~EAV semi-join + time predicates~~ + frame algebra + `fetch` + entity predicates | 3–5k | **Half shipped, and the half that shipped is the smaller shape:** a query document with a closed set of keys over `where` terms, ~2,350 non-test lines across `query.rs`, `series.rs` and `api.rs`. The frame algebra of `ARCHITECTURE.md` §7.3 is not built — no `Frame`, no `anchor`, no expander — and no predicate reaches `resources.key`. |
+| 3 | ~~ZSTD rewrite at the tier boundary~~ + the merge that removes files + block-shadowing by name arithmetic | 800 | **The rewrite ships, the merge does not.** An aged block has each of its tables rewritten compressed in place and gains a `cold` marker; nothing is merged, so the file count is what it was at seal plus the marker. The writer names ZSTD and takes the codec's own default, so "ZSTD-3" named a level nothing chooses. Design when the merge lands: extend directory names to `<min>-<max>-<node>-<seq_lo>-<seq_hi>`; `scan()` discards any block whose seq range is strictly contained in another's. Merged block shadows its sources the instant it is renamed; a crash before unlink leaves garbage the next pass collects. No manifest, no new atomic primitive. Needs one round-trip merge correctness test. |
+| 4 | ~~Bloom sidecars: trace ids + attribute pairs~~ + body tokens + cached in-block `trace_id` sort permutation | 500 | Explicitly not an inverted index: no positions, no ranking, no phrase search. Written at seal by `publish`, not in the compaction pass — a block is prunable from the moment it lands, and the cost is an fsync per sidecar of a file that sizes by row count: 24 B to 1 KB on the blocks a quiet node writes, 65 KB at the top end. The body-token half is why substring search still scans (§3 item 11). |
 | — | ~~Loki shim~~ **moved out of v1** (§1 amendment). Kept on the shelf with its design intact: stream identity = the existing `resources.key`, matchers resolve into a 65536-bit `resource_id` bitset, volume comes from a per-block byte counter in `Schema.custom_metadata` at seal. Revisit only if adoption is measurably blocked on reaching Grafana. | 2.5k | later |
 | — | ~~Tempo shim~~ **moved out of v1**. Same gate. `/api/echo` and `/api/status/buildinfo` are five lines each and gate the datasource health check, so this is a cheap thing to bolt on later, not a rewrite. | 2k | later |
-| 5 | Mira UI: frame explorer, trace waterfall, entity view; query state in the URL; built assets embedded in the binary | — | §4.5. No mutable state, no user table. The UI is the first consumer of the frame API, which is what keeps the MCP surface honest. |
+| 5 | ~~Mira UI: record explorer, trace waterfall, metric charts; query state in the URL; built assets embedded in the binary~~ **shipped, twice** | — | §4.5. No mutable state, no user table: the filter and the window live in the hash, and the second UI is a terminal one over the same query API. No entity view, because nothing reads `resources.key` yet. The UI is the first consumer of the query API, which is what keeps the MCP surface honest. |
 | 6 | Read-only KYAML dashboard files, loaded from a directory at boot | 200 | §4.5. GitOps, no database. |
 | 7 | Correlation surface: six expanders, `peers`, `around(d)` with the never-bare-empty rule, RED-on-read | 700 | §4.2. |
 | 8 | Self-observability: `/metrics` text endpoint, ~20 counters, one dashboard JSON | 150 | **Mira never writes its own telemetry into its own data directory by default.** It is a pull target. |
-| 9 | Helm chart: one Deployment (replicas: 1), one PVC, one Service (4317/4318), one ConfigMap | 300 YAML | Not a StatefulSet — a StatefulSet implies identity the stateless model does not have. Publish the resource-count diff against kube-prometheus-stack + Loki + Tempo in the README; that number *is* the pitch. |
-| 10 | Durability: CI `kill -9` crash test, `statfs` guard refusing mmap on network filesystems, `F_FULLFSYNC` fallback with a visible counter, CRC scrub folded into compaction at zero extra IO | 200 | The crash test is the published artifact, not the prose. |
+| 9 | Helm chart: one Deployment (replicas: 1), one PVC, one Service (4317/4318), one ConfigMap | 300 YAML | A Deployment at `replicas: 1` because that is all one PVC supports. Scaling out needs a StatefulSet, and that is not the concession it reads as: `ARCHITECTURE.md` §12.4 is right that a replica's identity *is* its disk, and `volumeClaimTemplates` is the only Kubernetes primitive that gives each replica its own durable one. Stable identity is not consensus — principle 4 refuses coordination state, not ordinals. Publish the resource-count diff against kube-prometheus-stack + Loki + Tempo in the README; that number *is* the pitch. |
+| 10 | Durability: CI `kill -9` crash test, ~~`statfs` guard refusing mmap on network filesystems~~, `F_FULLFSYNC` fallback with a visible counter, CRC scrub folded into compaction at zero extra IO | 200 | The guard ships as `block::check_filesystem`, called once before anything is mapped. The crash test is the published artifact, not the prose, and it is the part still owed. |
 | 11 | OIDC middleware + role-as-frame-constraint + bearer-token hashes in config | 400 | |
 | 12 | Size-based retention from `statvfs`; per-tenant retention and bytes/day | 150 | Quota resets on the epoch-hour partition roll; over-quota returns 429 with the standard OTLP throttling response. |
-| 13 | MCP: `rmcp` on the existing router, frame algebra as tools, read-only, range and result caps | 800 | Ships unmarketed. |
+| 13 | ~~MCP: hand-rolled JSON-RPC on the existing router, read-only, range and result caps~~ **shipped** | 450 | Four tools, 251 lines, unmarketed (§3 item 13). Not the frame algebra as tools — the same four questions the UI asks. |
 | 14 | Live tail: poll newest sealed blocks, serve at `/loki/api/v1/tail` | 100 | Drops under load are counted and reported in the stream, not hidden. |
 | 15 | Docs: "read your own blocks" (pyarrow / DuckDB / polars, including the star-schema join) + CI third-party-reader step | — | |
 | 16 | Benchmarks: 1M-`session_id` cardinality bench vs Loki; GenAI block-size/RSS case; binary-size and crate-count CI gates | — | §4.1 and §4.3. |
 
-**Explicitly not in v1:** metrics (honest `501`), PromQL, object storage,
-non-OTLP ingest, `/patterns`, TraceQL structural operators, TraceQL metrics.
+**Explicitly not in v1:** PromQL, object storage, non-OTLP ingest, `/patterns`,
+TraceQL structural operators, TraceQL metrics.
 
-**If the schedule slips, the cut line is items 13–14.** MCP and live tail are the
-only two whose absence is survivable for one release. Items 1–12 are the floor.
+**If the schedule slips, the cut line is item 14.** Live tail is the only one
+whose absence is survivable for one release; MCP was the other and it is already
+in. Items 1–13 are the floor.
 
 ### v2 — "and the metrics, and the cold tier"
 
 | Order | Item | Why here |
 |---|---|---|
-| 1 | **Metrics encoder + PromQL subset, in one release** | The rule is *never ship a signal you cannot read*. Shipping metrics storage without a reader freezes the hardest block format forever with no query engine ever having exercised it. Store strictly as received — **no delta-to-cumulative conversion at ingest**, because a per-series running total that must survive a restart is precisely the coordination state principle 4 forbids. Temporality reconciliation happens at read, on rows in the frame, where it is stateless. Exemplar `trace_id`/`span_id` are non-optional columns. Parser: `promql-parser` (buy the boring half); evaluator hand-rolled. Subset: instant/range selectors, matchers, `rate`/`increase`/`delta`, the `_over_time` family, `sum`/`avg`/`min`/`max`/`count`/`quantile` with `by`/`without`, `offset`. Per-block series-hash index built at seal — **not** a second sort order, because vector matching operates on already-materialised series, not on disk order. Publish the supported-function table so nobody discovers a gap during an incident. |
+| 1 | **PromQL subset over the stored metrics** | The encoder landed ahead of this plan and landed with its reader — `/api/v1/metrics/names` and `/api/v1/metrics/query` — because the rule is *never ship a signal you cannot read*: metrics storage no query engine has exercised freezes the hardest block format forever. It stores strictly as received, with **no delta-to-cumulative conversion at ingest**, because a per-series running total that must survive a restart is precisely the coordination state principle 4 forbids; a point comes back with its OTLP temporality and the caller subtracts. Exemplar `trace_id`/`span_id` are non-optional columns. What is left is the language. Parser: `promql-parser` (buy the boring half); evaluator hand-rolled. Subset: instant/range selectors, matchers, `rate`/`increase`/`delta`, the `_over_time` family, `sum`/`avg`/`min`/`max`/`count`/`quantile` with `by`/`without`, `offset`. Per-block series-hash index built at seal — **not** a second sort order, because vector matching operates on already-materialised series, not on disk order. Publish the supported-function table so nobody discovers a gap during an incident. |
 | 2 | **Object-storage offload** (§6.8) + retention beyond the local ceiling | Cost axis, procurement checkbox, and the only honest HA story Mira can tell. |
 | 3 | **TraceQL metrics** (`/api/metrics/query_range`) | A real render path in Grafana for RED and the service map with no PromQL behind it. This is the reason the Tempo shim earns its keep. |
 | 4 | **Cost attribution** | Bytes-on-disk and attribute cardinality ranked by tenant/service/attribute key, from block-footer sketches (HLL, t-digest, top-K). The knob-free answer to the market's #1 pain. |
@@ -573,8 +606,8 @@ because a signal without one is a vibe.
 - **Someone runs Mira in production without asking permission first.** One
   unsolicited "we've had this in prod for a month" is worth more than 1,000
   stars. Target: one, by month 3.
-- **Docker pulls ÷ GitHub stars > 5.** Stars measure interest, pulls measure
-  trial. A ratio under 2 means the pitch works and the product does not.
+- **Docker pulls ÷ GitHub stars > 2, by month 3.** Stars measure interest, pulls
+  measure trial. Under it, the pitch works and the product does not.
 - **Issue mix shifts from "how do I install" to "can it do X".** Installation
   questions after the Helm chart ships mean the chart is wrong. Depth requests
   mean people got in.

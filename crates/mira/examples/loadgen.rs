@@ -136,12 +136,12 @@ fn main() {
                     // Timestamps advance with the wall clock so the default
                     // "last hour" window in the UI contains the data.
                     let ts = base + t0.elapsed().as_nanos() as u64;
-                    s.send(&mut conn, "/v1/logs", logs_batch(i, ts).encode_to_vec());
-                    s.send(&mut conn, "/v1/traces", spans_batch(i, ts).encode_to_vec());
+                    s.send(&mut conn, "/v1/logs", &logs_batch(i, ts).encode_to_vec());
+                    s.send(&mut conn, "/v1/traces", &spans_batch(i, ts).encode_to_vec());
                     s.send(
                         &mut conn,
                         "/v1/metrics",
-                        metrics_batch(w, n, ts).encode_to_vec(),
+                        &metrics_batch(w, n, ts).encode_to_vec(),
                     );
                     s.logs += batch() as u64;
                     s.spans += batch() as u64;
@@ -174,7 +174,7 @@ fn main() {
     }
     let mut reads = Reads::default();
     for r in readers {
-        reads.merge(r.join().unwrap());
+        reads.merge(&r.join().unwrap());
     }
     let el = t0.elapsed().as_secs_f64();
 
@@ -250,10 +250,10 @@ struct Stats {
 
 impl Stats {
     /// Retries until accepted, so the record counts the caller keeps are true.
-    fn send(&mut self, conn: &mut Conn, path: &str, body: Vec<u8>) {
+    fn send(&mut self, conn: &mut Conn, path: &str, body: &[u8]) {
         let t = Instant::now();
         loop {
-            let r = conn.post(path, &body);
+            let r = conn.post(path, body);
             self.bytes += r.wrote;
             self.resets += r.resets;
             if r.ok {
@@ -321,7 +321,7 @@ struct Reads {
 }
 
 impl Reads {
-    fn merge(&mut self, o: Reads) {
+    fn merge(&mut self, o: &Reads) {
         for i in 0..CLASSES.len() {
             self.lat[i].0.extend(&o.lat[i].0);
             self.matched[i] += o.matched[i];
@@ -630,7 +630,7 @@ fn push(s: &mut TcpStream, mut buf: &[u8]) -> io::Result<()> {
             // The two kinds that are defined to have transferred nothing.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1))
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) => return Err(e),
         }

@@ -43,9 +43,11 @@ CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
 Use a separate `CARGO_TARGET_DIR` for coverage — it takes the same target-dir
 lock as a normal build, so it will block anything running in parallel.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and a **coverage
-ratchet**. The ratchet is the coverage that existed when the line was last
-edited; raise it when you raise coverage, never lower it.
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the UI's `npm test` and
+build — `git diff --exit-code dist`, so a `.svelte` change that is not rebuilt is
+a red build — and a **coverage ratchet**. The ratchet is the coverage that
+existed when the line was last edited; raise it when you raise coverage, never
+lower it.
 
 End-to-end testing against a live instance, with synthetic data, is
 [docs/TESTING.md](docs/TESTING.md).
@@ -60,8 +62,9 @@ cargo tree -p mira --edges normal --prefix none | awk '{print $1" "$2}' | sort -
 ls -l target/release/mira
 ```
 
-If the number moves, update the README bullet, `docs/ARCHITECTURE.md` §11's
-table, and the "against a tree of N" comments. `zstd-sys` is the only C
+That count includes the three workspace members, so it is three above the number
+the README states. If it moves, update the README bullet, `docs/ARCHITECTURE.md`
+§11's table, and the "against a tree of N" comments. `zstd-sys` is the only C
 dependency and that is a stated property — keep new crates on pure-Rust
 backends.
 
@@ -77,8 +80,10 @@ backends.
 
 ## Driving the TUI headlessly
 
-`mira mira` (alias: `mira tui`) needs a pty, and stdin EOF does **not** close it
-— end the key string with `q` or the process hangs forever:
+`mira mira` (alias: `mira tui`) needs a pty, and stdin EOF does **not** close it.
+`q` quits from the list and backs out one mode anywhere else, so the key string
+needs one `q` per pane it opened or the process hangs forever — `2t\r` opens the
+waterfall and then a span detail, so it takes `qqq`:
 
 ```sh
 printf ']q' | script -q /dev/null ./target/release/mira mira --data-dir ./data 2>&1 \

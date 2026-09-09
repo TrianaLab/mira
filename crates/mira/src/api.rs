@@ -271,7 +271,7 @@ pub fn window_doc(doc: &Yaml, now: i64) -> Result<(i64, i64), String> {
 /// is a confident 200 over the whole window — the one failure a caller cannot
 /// see in the response it gets. `parse_term` has always been this strict one
 /// level down; this is the same rule at the top of the document.
-fn known(doc: &Yaml, keys: &[&str]) -> Result<(), String> {
+pub fn known(doc: &Yaml, keys: &[&str]) -> Result<(), String> {
     // A tool call that carries no `arguments` at all is a legal MCP request and
     // means the same thing as an empty document.
     if doc.is_badvalue() || doc.is_null() {
@@ -380,12 +380,12 @@ fn parse_term(y: &Yaml) -> Result<Term, String> {
             "attr" => {
                 target = Some(Target::Attr(
                     v.as_str().ok_or("`attr` must be a string")?.to_owned(),
-                ))
+                ));
             }
             "field" => {
                 target = Some(Target::Field(
                     v.as_str().ok_or("`field` must be a string")?.to_owned(),
-                ))
+                ));
             }
             other => {
                 let op = Op::parse(other).ok_or(format!(

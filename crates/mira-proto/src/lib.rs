@@ -7,6 +7,13 @@
 //! enable `bytes = "bytes"`, so every trace_id would be a heap allocation.
 
 #![forbid(unsafe_code)]
+// Every doc comment under this crate root except the header above is a comment
+// from upstream's .proto files, reproduced verbatim by prost. Upstream writes
+// `<version>` and `<signal>` as prose placeholders, which rustdoc reads as
+// unclosed HTML. The fix belongs upstream; rewriting generated code in a build
+// script to satisfy a lint would be a worse thing than the lint. Scoped to this
+// crate only, so the same lints still bite on hand-written docs elsewhere.
+#![allow(rustdoc::invalid_html_tags)]
 
 pub mod common {
     pub mod v1 {

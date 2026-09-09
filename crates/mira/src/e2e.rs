@@ -56,7 +56,7 @@ fn wire(name: &str) -> (receiver::Receivers, api::Api, std::path::PathBuf) {
     let recv = receiver::Receivers {
         logs: pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone()).0,
         traces: pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone()).0,
-        metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg.clone()).0,
+        metrics: pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg).0,
         // The shipped default, not a test-only number: the limits these tests
         // assert against are the ones an operator gets out of the box.
         max_request_bytes: crate::config::Config::default().max_request_bytes,

@@ -1,0 +1,153 @@
+site_name: Mira
+# With no social-cards plugin and no og:image, this string is the whole of the
+# shared-link preview. It states the mechanism rather than a category, because
+# "telemetry backend" is the part that is not distinguishing.
+site_description: An OTLP-native telemetry storage engine in a single binary. OTLP in, immutable Arrow IPC blocks out, queried straight from mmap — no cluster membership, no external metadata store.
+site_url: https://trianalab.github.io/mira/
+repo_url: https://github.com/TrianaLab/mira
+repo_name: TrianaLab/mira
+edit_uri: edit/main/docs/
+# Rendered in every page footer, so the licence is answerable without leaving the
+# site. Mirrors LICENSE at the repository root.
+copyright: >-
+  Apache-2.0 licensed —
+  <a href="https://github.com/TrianaLab/mira/blob/main/LICENSE">Copyright &copy; 2026 TrianaLab</a>
+
+docs_dir: docs
+
+theme:
+  name: material
+  # The mark, not the wordmark: the header logo slot is ~24px tall and a wordmark
+  # squashed into it is unreadable. The wordmark appears full size on the home
+  # page instead. Orange on both the white and near-black header, so no per-scheme
+  # swap is needed.
+  logo: assets/mira-mark.svg
+  favicon: assets/mira-mark.svg
+  font:
+    # Space Grotesk has the squared shoulders and single-storey geometry the
+    # wordmark is drawn from; JetBrains Mono keeps the terminal register in code.
+    text: Space Grotesk
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      # Header stays neutral; the exact rust hexes are pinned in
+      # stylesheets/extra.css, because Material only accepts named colours here.
+      primary: white
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - content.action.edit
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+# Under `mkdocs build --strict` these four are the entire broken-link mechanism:
+# a page outside the nav, a nav entry pointing at nothing, a dead cross-reference
+# or a dead #anchor all fail the build. Nothing else checks links, on purpose.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    anchors: warn
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/TrianaLab/mira
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: Anchor link
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      # Without this a missing --8<-- path is silently dropped: the content
+      # vanishes from the built page and `mkdocs build --strict` still exits 0.
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist
+  - pymdownx.tilde
+
+# One plugin. No social cards (site_description above is the link preview), no
+# minify, no redirects — every plugin is a build dependency that can break the
+# docs independently of the docs, and this tree is militant about that.
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/extra.css
+
+# A reader's path, not a directory listing: try it, install it, run it, then
+# understand why it is shaped this way. ARCHITECTURE.md and MARKET.md come last
+# on purpose — they are the reasoning, and a first-time reader should be able to
+# get data in and query it back before absorbing any of it. Filenames stay
+# SCREAMING_CASE because README.md and CLAUDE.md link to them by path, and there
+# is no redirect plugin to cover a rename.
+nav:
+  - Home: index.md
+  - Get started:
+      - Install: install.md
+      - Quickstart: quickstart.md
+  - Operate:
+      - Configuration: CONFIG.md
+      - End-to-end testing: TESTING.md
+  - Understand:
+      - Architecture: ARCHITECTURE.md
+      - Market position: MARKET.md

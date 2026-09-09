@@ -59,6 +59,17 @@ cargo build --release
 
 `4317` is OTLP/gRPC, `4318` is OTLP/HTTP plus the query API, MCP and the UI.
 
+```sh
+curl -s localhost:4318/health
+{"status":"ok","logs":{"shed":0,"failed":0},"traces":{"shed":0,"failed":0},"metrics":{"shed":0,"failed":0}}
+```
+
+`/readyz` is the same answer — there is no warm-up and no cluster to join, so
+there is no state in which Mira is alive and not ready. The two counters are why
+the probe carries a body at all: `shed` is exports refused before the queue,
+`failed` is exports accepted and then NACKed. A node that is up and losing data
+is the case an up/down probe cannot report.
+
 In another shell, fill it:
 
 ```sh
@@ -66,9 +77,10 @@ cargo run --release --example loadgen -- --for 30s --conns 8
 ```
 
 `loadgen` is a fake shop — four services, five routes, logs, spans and metrics
-including a histogram — over OTLP/HTTP. It is deterministic: everything derives
-from a counter, so two runs with the same arguments produce the same bytes and
-are comparable.
+including a histogram — over OTLP/HTTP. Its *content* is deterministic: every
+field derives from a counter, so the nth record is the same record in every run.
+Its *volume* is not — timestamps come from the wall clock and the run ends on a
+deadline, so the record count moves with the machine.
 
 Each connection is its own `service.instance.id`, so `--conns 8` gives eight
 instances of each of the four services. That is deliberate: a cumulative counter
@@ -145,6 +157,7 @@ query    50 queries/s over 1018 queries
          page x10  p50 653.85ms  p99 1101.81ms  p999 1149.39ms  max 1173.31ms  327680 matched  10.0 pages/walk
          series    p50  28.78ms  p99 145.20ms  p999 157.62ms  max 157.81ms      2584 matched
 memory   peak RSS 1062 MiB
+storage  1.77 GiB on disk
 ```
 
 The six query classes are not one shape benchmarked six times. `tail` should
@@ -200,8 +213,9 @@ same line is not a delta, and is the one to watch across a retention sweep.
 Two caveats that are properties of the harness, not the engine. The generator
 runs on the same 12 cores as the server, so every number here is a floor —
 `--conns 64 --readers 8` is 72 client threads competing with the thing they are
-measuring. And a `--conns 0` run reports no ingest section at all, so the
-storage delta on it is zero by construction.
+measuring. And a `--conns 0` run reports no ingest section at all, and its
+storage line is the total only — with nothing written, the `+N GiB this run` and
+`B/record` halves are suppressed rather than reported as zero.
 
 ## 4. telemetrygen — the OpenTelemetry project's own generator
 
@@ -252,8 +266,14 @@ both `POST`.
 ```sh
 curl -s -X POST localhost:4318/api/v1/metrics/names -H 'content-type: application/json' -d '{}'
 curl -s -X POST localhost:4318/api/v1/metrics/query -H 'content-type: application/json' \
-  -d '{"name":"gen","limit":2}'
+  -d '{"name":"gen","max_points":2}'
 ```
+
+Each route implements its own top-level keys and refuses the rest by name, so
+`limit` here is a `400`: `unknown query key "limit"; expected one of name from to
+where max_series max_points`. A key nobody implements used to answer `200` over
+the unfiltered window — `{"signal":"logs","filters":[…]}` looks like a filter,
+is not one, and came back as rows that passed no predicate at all.
 
 Every response carries a `stats` object:
 
@@ -269,8 +289,9 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
   -d '{"signal":"logs","limit":5,"after":"1757241600000000000.2718281828.7.41"}'
 ```
 
-Quote it — it is a string, and unquoted YAML reads it as a float. There is no
-`offset`; §7.6 of the architecture says why.
+Quoted because KYAML quotes every string, not because it has to be — four
+dot-separated fields are not a number to any resolver, and the unquoted form
+parses identically. There is no `offset`; §7.6 of the architecture says why.
 
 `blocks_scanned` well below `blocks_total` is the sidecar pruning working.
 `blocks_scanned == blocks_total` on a filtered query over many blocks means it
@@ -293,7 +314,9 @@ curl -s -X POST localhost:4318/mcp -H 'content-type: application/json' \
 
 `mira mira` with `--data-dir` reads the block directory in-process and needs no
 server; with `--addr` it queries one over HTTP. It needs a real terminal — see
-CLAUDE.md for the headless recipe.
+CLAUDE.md for the headless recipe, and count the `q`s in the key string you feed
+it: each one leaves one mode, so `2t\rq` stops in the trace waterfall and hangs
+until it is killed, where `2t\rqqq` unwinds span, waterfall, list and exits.
 
 ## 6. A stock Collector in front
 

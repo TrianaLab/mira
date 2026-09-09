@@ -874,7 +874,6 @@ dependencies = [
 name = "mira"
 version = "0.0.1"
 dependencies = [
- "arrow-array",
  "axum",
  "bytes",
  "flate2",
@@ -900,7 +899,6 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
- "bytes",
  "crc32fast",
  "libc",
  "memmap2",

@@ -1,66 +1,251 @@
 name: ci
 
+# No trigger-level `paths:` filter, deliberately. A required check that is
+# filtered out at the trigger never starts, never reports, and strict branch
+# protection then waits for it forever — the classic way a repo ends up with
+# PRs that can never merge. Filtering happens in the `changes` job instead,
+# where a skipped leg still resolves the `required` gate at the bottom.
+# scripts/check_ci.py fails the build if anyone reintroduces one.
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  # Superseded pushes to a PR are worth cancelling; superseded pushes to main
+  # are not — main's runs are what the coverage and drift history is made of.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+  # Every job below is a one-line call into the Makefile. That is not a style
+  # choice: the Makefile is the single source of truth for the gates (see its
+  # header), so a contributor running `make check` runs exactly what CI runs.
+  # A command that appears only in this file is a command nobody can reproduce.
 
-  # `dist/` is checked in and `include_bytes!`d, so the bundle in git is what
-  # ships. Two things have to hold: it still builds, and it matches the source
-  # it was built from — a fix landed in `src/` and not rebuilt is a fix nobody
-  # gets. `--test` is Node's own runner; the UI has no test framework and does
-  # not need one for a pure function.
-  ui:
+  changes:
+    name: changes
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mira/ui
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ui: ${{ steps.filter.outputs.ui }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # dorny/paths-filter is the usual answer here. It is also one more
+          # third-party action to pin, review and trust, for something `git
+          # diff` already does in eight lines — and this repo's whole argument
+          # is that a dependency has to earn its place.
+          set -euo pipefail
+          if [ -z "${BASE}" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            # First push to a branch, a force-push past the old tip, or a shallow
+            # base. Unknown means "everything", never "nothing": a filter that
+            # fails open costs CI minutes, one that fails closed ships bugs.
+            echo "base ref '${BASE}' unusable — running every leg"
+            code=true; docs=true; ui=true
+          else
+            files=$(git diff --name-only "${BASE}" HEAD)
+            echo "changed files:"; printf '%s\n' "${files}" | sed 's/^/  /'
+            m() { printf '%s\n' "${files}" | grep -qE "$1" && echo true || echo false; }
+            # A workflow change re-runs everything — the thing most likely to be
+            # wrong about a CI edit is the leg you did not think it touched.
+            W='|^\.github/workflows/'
+            code=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|deny\.toml\$|Makefile\$|scripts/)${W}")
+            docs=$(m "^(docs/|mkdocs\.yml\$|.*\.md\$)${W}")
+            ui=$(m "^crates/mira/ui/${W}")
+          fi
+          printf 'code=%s\ndocs=%s\nui=%s\n' "$code" "$docs" "$ui" | tee -a "$GITHUB_OUTPUT"
+
+  rust:
+    name: rust (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      # Both platforms report even when one fails. macOS is here because the
+      # cfg-gated code is real: `statfs` for the network-filesystem refusal,
+      # `F_FULLFSYNC` for durable publish, `termios`/`TIOCGWINSZ` for the TUI.
+      # A Linux-only matrix does not compile any of the macOS arms.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No toolchain action: rust-toolchain.toml pins the version and its
+      # components, and rustup on the runner honours it on the first cargo
+      # invocation. One less third-party action in the supply chain, and the
+      # toolchain CI uses is the one a contributor gets by cloning.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.os }}
+
+      # Formatting and rustdoc are platform-independent; running them twice
+      # would just be two chances to fail for the same reason.
+      - run: make fmt-check
+        if: matrix.os == 'ubuntu-latest'
+      - run: make lint
+      - run: make test
+      - run: make doc
+        if: matrix.os == 'ubuntu-latest'
+
+  msrv:
+    name: msrv
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
+      # `rust-version` in Cargo.toml is a promise to anyone pinned to an older
+      # toolchain, and a promise nothing compiles against is a wish. `make msrv`
+      # reads the floor out of Cargo.toml, so this stays correct when it moves.
+      - run: rustup toolchain install "$(make --no-print-directory print-msrv)" --profile minimal
+      - run: make msrv
+
+  ui:
+    name: ui
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-      - run: npm ci
-      - run: npm test
-      - run: npm run build
-      - run: git diff --exit-code dist
+          cache: npm
+          cache-dependency-path: crates/mira/ui/package-lock.json
+      # `dist/` is checked in and `include_bytes!`d, so the bundle in git is
+      # what ships. `make ui-check` rebuilds it and diffs: a .svelte fix that
+      # was never rebuilt is a fix nobody gets.
+      - run: make ui-check
 
   coverage:
+    name: coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
+          key: coverage
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: cargo-llvm-cov
+      # The ratchet lives in the Makefile (COVERAGE_MIN), not here, so raising
+      # it is one diff and `make coverage` locally means the same thing.
+      - run: make coverage
 
-      # A ratchet, not a target. The number is the coverage that existed when
-      # this line was last edited; it may only ever go up, and raising it is a
-      # one-line diff a reviewer can see. A gate set to an aspiration is a gate
-      # that gets switched off the first time it goes red.
-      #
-      # Destination is 100. What stands between here and there, worst first:
-      # block.rs (85%, 59 lines) is the I/O error paths; series.rs (93%, 30) and
-      # metrics.rs (94%, 28) are the arms no fixture reaches yet; receiver.rs
-      # (89%, 18) is decode failures.
-      #
-      # Run the same thing locally with:
-      #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 96
+  supply-chain:
+    name: supply-chain
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: cargo-deny,cargo-machete
+      # Advisories, licences, duplicate versions, and the ban on new C-backed
+      # crates that keeps zstd-sys the only one. See deny.toml.
+      - run: make deps
+
+  drift:
+    name: drift
+    needs: changes
+    # Docs are in the trigger set because the numbers being checked are quoted
+    # in six files, five of which are docs. Editing prose is exactly how a
+    # stale figure gets introduced.
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: drift
+      # Builds the release binary, then checks the crate count, the binary size
+      # against the §11 ceiling, the "only C dependency is zstd-sys" promise,
+      # and that every file quoting those numbers quotes the current ones.
+      - run: make drift
+
+  docs:
+    name: docs
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      # `mkdocs build --strict` plus mkdocs.yml's `validation:` block is the
+      # whole link checker — a dead internal link or a missing anchor fails the
+      # build. No separate link-checking action, and none needed.
+      - run: make docs
+
+  meta:
+    name: meta
+    # Never gated. This is the job that checks the other jobs, so a change that
+    # breaks the gate graph must not be able to skip it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: actionlint
+      - run: pip install -r scripts/requirements.txt
+      # Every job in this file must be reachable from the `required` context
+      # below, every `uses:` must be SHA-pinned, and no required workflow may
+      # carry a trigger-level path filter. See scripts/check_ci.py.
+      - run: make workflows
+
+  # The one status context branch protection requires. Every leg above feeds
+  # into it, so adding a job never means remembering to update a setting in the
+  # GitHub UI — and `scripts/check_ci.py` fails if a job is ever added that
+  # this gate cannot see.
+  required:
+    name: required
+    if: always()
+    needs: [changes, rust, msrv, ui, coverage, supply-chain, drift, docs, meta]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every leg green or deliberately skipped
+        run: |
+          set -euo pipefail
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "leg results: ${results}"
+          rc=0
+          for r in ${results}; do
+            case "${r}" in
+              success) ;;
+              # `skipped` is a pass on purpose: it is how the `changes` job
+              # keeps a docs-only PR from paying for a macOS build. This is the
+              # half of the aggregate-gate pattern people get wrong — treating
+              # skipped as failure makes path filtering impossible, and treating
+              # cancelled as success lets a cancelled run merge.
+              skipped) ;;
+              *) echo "::error::a required leg reported '${r}'"; rc=1 ;;
+            esac
+          done
+          exit "${rc}"

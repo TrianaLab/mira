@@ -1,5 +1,5 @@
 <script>
-  import { api, bounds, parseFilter, fmtTime, fmtDur, sevName, svc, STATUS } from './api.js'
+  import { api, bounds, parseFilter, fmtTime, fmtDur, fmtValue, sevName, svc, STATUS } from './api.js'
   import Detail from './Detail.svelte'
 
   let { signal, params, nonce, onstats } = $props()
@@ -99,7 +99,10 @@
             <td class="t">{fmtTime(row.time_unix_nano)}</td>
             <td class="sev-{sevName(row)}">{sevName(row).toUpperCase()}</td>
             <td>{svc(row)}</td>
-            <td class="msg">{row.body ?? ''}</td>
+            <!-- A body that is not a string is stored and returned as
+                 `body_ser`, so reading only `body` blanks the column for
+                 exactly the records whose body carries the most. -->
+            <td class="msg">{fmtValue(row.body ?? row.body_ser)}</td>
           {:else}
             <td class="t">{fmtTime(row.start_time_unix_nano)}</td>
             <td class="num">{fmtDur(row.duration_nano)}</td>

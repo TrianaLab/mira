@@ -1,7 +1,8 @@
 //! A terminal, hand-rolled on `libc`.
 //!
-//! ratatui is the obvious answer, and it costs 61 crates — a 54% increase on a
-//! tree whose size (113 crates, 4.5 MB) is a stated property of the product.
+//! ratatui is the obvious answer, and adding it to this workspace resolves 35
+//! crates that are not already here — a 30% increase on a tree whose size (117
+//! crates, 4.73 MiB) is a stated property of the product.
 //! What it buys over this file is a constraint-solving layout engine and a
 //! damage-tracked cell buffer; the TUI here has fixed panes and redraws one
 //! screenful per keystroke. So: `termios` for raw mode, `TIOCGWINSZ` for the
@@ -11,7 +12,7 @@
 //! Unix only, which is the same bet `mmap`, `SIGTERM` and the filesystem guard
 //! already make.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::sync::OnceLock;
 
 /// The terminal settings as they were before [`Term::enter`].
@@ -35,25 +36,39 @@ pub struct Term {
 
 impl Term {
     pub fn enter() -> io::Result<Term> {
-        if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
+        // Checked before `tcgetattr`, which would otherwise report a redirected
+        // stdin as `ENOTTY` — "Inappropriate ioctl for device" — and says nothing
+        // at all about a redirected stdout, which instead fills the file with
+        // escape sequences.
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not a terminal; the TUI needs stdin and stdout on a tty",
             ));
         }
+        // SAFETY: `termios` is integers and the `c_cc` byte array — no pointer,
+        // no niche, no field for which zero is not a value — so all-zero is a
+        // valid `termios` to hold until `tcgetattr` overwrites it.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `&mut t` is a live, correctly typed, initialised `termios`, and
+        // `tcgetattr` writes nothing past its end.
         if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let _ = ORIG.set(t);
 
         let mut raw = t;
+        // SAFETY: `raw` is a copy of the struct `tcgetattr` just filled, so
+        // `cfmakeraw` reads and writes only initialised fields of a live struct.
         unsafe { libc::cfmakeraw(&mut raw) };
         // VMIN 0 / VTIME 0: `read` returns immediately with whatever is there.
         // Blocking is `poll`'s job, and doing it in both places is how a
         // keystroke ends up waiting for the next one.
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: `raw` is fully initialised — copied out of `tcgetattr`, edited
+        // field by field — and `tcsetattr` only reads it, for the duration of
+        // the call.
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -90,7 +105,14 @@ impl Term {
     /// it exists only to interrupt the `poll` the draw loop is parked in. This
     /// call is what learns the new size, on the frame that interruption paints.
     pub fn size(&self) -> (usize, usize) {
+        // SAFETY: `winsize` is four `u16`s, so zero is a valid value — and it
+        // has to be, because a failing `ioctl` leaves the struct untouched and
+        // the `ws_col == 0` arm below is what reads it back.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ is the request whose argument is `*mut winsize`,
+        // which is exactly what `&mut ws` is. `ioctl` is variadic, so nothing
+        // checks that pairing but this comment — a different request constant
+        // with this argument is the way the call goes wrong.
         if unsafe { libc::ioctl(1, libc::TIOCGWINSZ as _, &mut ws) } != 0 || ws.ws_col == 0 {
             return (80, 24);
         }
@@ -256,18 +278,42 @@ fn csi(seq: &[u8]) -> Key {
 /// is a deadlock at exactly the moment the user wants their terminal back.
 fn restore() {
     if let Some(t) = ORIG.get() {
+        // SAFETY: `t` borrows the `termios` `enter` filled with `tcgetattr` and
+        // nothing has written it since — `OnceLock` hands out no `&mut` after
+        // `set`. Reached from the `bail` handler, and `tcsetattr` is on POSIX's
+        // async-signal-safe list, so interrupting a `tcsetattr` with this one is
+        // defined.
         unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
     }
     const OFF: &[u8] = b"\x1b[?25h\x1b[?1049l";
+    // SAFETY: `OFF` is a `'static` slice, so its pointer is valid for the
+    // `OFF.len()` bytes claimed for as long as the program runs, and `write`
+    // only reads them. Async-signal-safe, which is why this is not `stdout`.
     unsafe { libc::write(1, OFF.as_ptr().cast(), OFF.len()) };
 }
 
-/// Install `h` for `sig`, deliberately without `SA_RESTART`: a syscall the
-/// signal interrupts must fail with `EINTR` rather than be resumed behind the
-/// caller's back, which is the whole mechanism [`poll_in`] relies on.
+/// Install `h` for `sig`, without `SA_RESTART`.
+///
+/// The flag is omitted because it buys nothing here, not because [`poll_in`]
+/// needs it: `poll(2)` is on signal(7)'s list of calls the kernel never
+/// restarts whatever the flag says, and the `read(2)` in the same loop runs
+/// under VMIN 0 / VTIME 0, so it returns immediately and is never sitting in a
+/// restartable wait either. What makes a resize wake `poll_in` is installing a
+/// handler at all — SIGWINCH's default disposition is to discard the signal,
+/// and a discarded signal interrupts nothing.
 fn on_signal(sig: libc::c_int, h: unsafe extern "C" fn(libc::c_int)) {
+    // SAFETY: `sigaction` is POD, and all-zero is its "no flags, SIG_DFL"
+    // value — the one the two writes below then replace.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = h as usize;
+    // SAFETY: `sa` is initialised and outlives the call, which copies it;
+    // `sigemptyset` writes only `sa_mask`. The load-bearing part is `sa_flags`,
+    // left at zero by the `zeroed` above: with SA_SIGINFO clear the kernel calls
+    // `sa_sigaction` with the single `c_int` that `h`'s type declares, so
+    // setting that flag without widening `h`'s signature is what would break
+    // this. A null `oldact` means "do not report the previous disposition",
+    // which `sigaction(2)` permits. Both handlers this is ever called with —
+    // [`winch`] and [`bail`] — are async-signal-safe.
     unsafe {
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(sig, &sa, std::ptr::null_mut());
@@ -286,6 +332,9 @@ unsafe extern "C" fn winch(_: libc::c_int) {}
 /// the status a shell reports for a signal death.
 unsafe extern "C" fn bail(sig: libc::c_int) {
     restore();
+    // SAFETY: `_exit` dereferences nothing and never returns. It is
+    // async-signal-safe, which is the entire reason it is here rather than
+    // `exit` — see the doc above.
     unsafe { libc::_exit(128 + sig) };
 }
 
@@ -295,6 +344,8 @@ fn poll_in(timeout_ms: i32) -> io::Result<bool> {
         events: libc::POLLIN,
         revents: 0,
     };
+    // SAFETY: `&mut p` points at exactly the one initialised `pollfd` the count
+    // of `1` claims, it lives across the call, and `poll` writes only `revents`.
     let n = unsafe { libc::poll(&mut p, 1, timeout_ms) };
     if n >= 0 {
         return Ok(n > 0);
@@ -687,10 +738,20 @@ mod tests {
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
 
+        // SAFETY: flags by value, no pointer argument.
         let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         assert!(master >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: `master` is the fd `posix_openpt` just returned, proved not
+        // -1 by the assert above and closed by nothing until `from_raw_fd`
+        // below; both calls take it by value.
         assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        // SAFETY: as above.
         assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        // SAFETY: `ptsname` returns a NUL-terminated string in a static buffer,
+        // non-null because `master` is a pty master — `grantpt` returned 0 on
+        // it one line up, which it does not for anything else. The buffer is
+        // clobbered by the next `ptsname` on any thread, so the `CStr` is copied
+        // into an owned `String` in this same expression and never held.
         let slave_path = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }
             .to_str()
             .unwrap()
@@ -712,6 +773,9 @@ mod tests {
         };
         let fd = std::os::fd::AsRawFd::as_raw_fd(&slave);
         assert_eq!(
+            // SAFETY: TIOCSWINSZ is the request whose variadic argument is
+            // `*const winsize`, which is what `&ws` is, and `fd` is borrowed
+            // from `slave`, still open here — it is dropped after the spawn.
             unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) },
             0,
             "{}",
@@ -729,6 +793,10 @@ mod tests {
             .unwrap();
         drop(slave);
 
+        // SAFETY: `from_raw_fd` takes ownership, and this is the only owner
+        // `master` ever gets — it is still open (nothing has closed it since
+        // `posix_openpt`), and the child holds dups of the *slave*, not this fd.
+        // `rd` and its `try_clone` are now what will close it.
         let mut rd = unsafe { std::fs::File::from_raw_fd(master) };
         let mut wr = rd.try_clone().unwrap();
         let screen = Arc::new(Mutex::new(String::new()));
@@ -810,10 +878,21 @@ mod tests {
         struct Tid(libc::pthread_t);
         // Handing a thread handle to the thread that will signal with it is the
         // only reason this type exists.
+        // SAFETY: `pthread_t` is a pointer on macOS, which is the only reason
+        // `Tid` is not `Send` already. The receiving thread does one thing with
+        // it — `pthread_kill`, which POSIX requires to be callable from any
+        // thread — and the handle cannot dangle, because this thread is parked
+        // in the `t.key(-1)` below until the signal it sends arrives. Delete
+        // that call and the id can outlive its thread.
         unsafe impl Send for Tid {}
+        // SAFETY: `pthread_self` reads no memory and cannot fail.
         let me = Tid(unsafe { libc::pthread_self() });
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
+            // SAFETY: `me.0` names the thread that is blocked in `poll` waiting
+            // for this — see the `unsafe impl` above for why it is still alive.
+            // SIGWINCH has a handler by now (`Term::enter` installed it), so
+            // delivery interrupts that poll instead of killing the process.
             unsafe { libc::pthread_kill(me.0, libc::SIGWINCH) };
         });
         assert_eq!(t.key(-1).unwrap(), None, "a resize interrupts the poll");
@@ -822,18 +901,22 @@ mod tests {
         // process, and a child that dies of a signal writes no coverage profile
         // and reports nothing back. The failure that actually happened — no
         // handler at all, so a `kill` left the shell in raw mode — is visible
-        // from the disposition.
+        // from the disposition. `SA_RESTART` is not asserted on: see
+        // [`on_signal`] for why the flag has no bearing on either syscall in
+        // this loop, and the wake-up above for the behaviour that does matter.
         for sig in [libc::SIGWINCH, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: POD and all-zero is a valid `sigaction`, as in
+            // [`on_signal`]; here it is only a destination.
             let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a null `act` means "report the disposition without
+            // changing it", so the only pointer that has to be good is `&mut
+            // sa`, a live and correctly typed `sigaction`.
             let got = unsafe { libc::sigaction(sig, std::ptr::null(), &mut sa) };
             assert_eq!(got, 0, "reading the disposition of {sig}");
             assert!(
                 sa.sa_sigaction != libc::SIG_DFL && sa.sa_sigaction != libc::SIG_IGN,
                 "signal {sig} has no handler"
             );
-            // With SA_RESTART the kernel resumes the interrupted `poll` for us
-            // and the wake-up above never reaches `poll_in`.
-            assert_eq!(sa.sa_flags & libc::SA_RESTART, 0, "signal {sig}");
         }
 
         // Each marker is both a frame to assert on and the parent's cue to send

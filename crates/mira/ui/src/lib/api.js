@@ -40,13 +40,21 @@ export const bounds = (range) =>
 // with one. Metrics has no message column — its terms are attribute predicates
 // on data points — so there a bare word is an error rather than a guess.
 
+// Every root column of mira-core's LOGS and SPANS that is worth comparing
+// against. The block-local ids (`id`, `resource_id`, `scope_id`) and `body_ser`
+// are the omissions: the first three name a row inside one block and mean
+// nothing to a person, and the last is protobuf bytes on disk, so no predicate
+// the box can express would match it. Anything missing here is read as an
+// attribute and matches nothing at all, which is why the list must track
+// schema.rs.
 export const FIELDS = {
   logs: ['time_unix_nano', 'observed_time_unix_nano', 'severity_number',
-    'severity_text', 'body', 'trace_id', 'span_id', 'flags',
+    'severity_text', 'event_name', 'body', 'trace_id', 'span_id', 'flags',
     'dropped_attributes_count'],
   traces: ['trace_id', 'span_id', 'parent_span_id', 'trace_state', 'flags',
     'name', 'kind', 'start_time_unix_nano', 'duration_nano', 'status_code',
-    'status_message'],
+    'status_message', 'dropped_attributes_count', 'dropped_events_count',
+    'dropped_links_count'],
   metrics: [],
 }
 
@@ -129,6 +137,15 @@ export function fmtDur(ns) {
 const SEV = ['trace', 'debug', 'info', 'warn', 'error', 'fatal']
 export const sevName = (row) =>
   (row.severity_text || SEV[Math.floor((row.severity_number - 1) / 4)] || '').toLowerCase()
+
+// An OTLP AnyValue can be an array or a kvlist, and the engine goes to the
+// trouble of decoding both back out of the stored protobuf so they arrive here
+// intact. `String()` would undo that — `[object Object]` for a kvlist, a
+// comma-joined run of values for an array — so anything non-scalar is shown as
+// compact JSON, which is at least the shape it was sent in. Scalars stay bare:
+// quoting every string in the detail pane is noise.
+export const fmtValue = (v) =>
+  v !== null && typeof v === 'object' ? JSON.stringify(v) : String(v ?? '')
 
 export const svc = (row) => (row.attributes && row.attributes['service.name']) || ''
 
