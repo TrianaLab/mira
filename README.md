@@ -16,6 +16,99 @@ mira mira --data-dir ./data     # the same views in the terminal, no server need
 No cluster membership, no Raft, no external metadata store, no `protoc` to
 build. The block directory is the only state; the filesystem is the manifest.
 
+## Install
+
+There are no published binaries yet — build it. Rust 1.85 or newer, and a `cc`
+for `zstd-sys`, which vendors its own C source. No `protoc`: the OTLP protos are
+compiled by `protox` in a build script. No node toolchain: the browser UI is
+built and committed under `crates/mira/ui/dist`.
+
+```sh
+git clone https://github.com/TrianaLab/mira && cd mira
+cargo install --locked --path crates/mira        # -> ~/.cargo/bin/mira
+```
+
+Or without installing:
+
+```sh
+cargo build --release                            # -> ./target/release/mira
+```
+
+Or in Docker, where the image is one binary on `distroless/cc` and one volume:
+
+```sh
+docker build -t mira .
+docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data mira
+```
+
+Use a **named volume, not a bind mount**. Mira `mmap`s its blocks, and a bind
+mount on Docker Desktop is FUSE, where an I/O hiccup arrives as `SIGBUS` rather
+than as an error.
+
+## Use it
+
+```sh
+mira --data-dir ./data
+```
+
+That is the whole configuration. It listens on OTLP/gRPC `4317` and OTLP/HTTP
+`4318`, and `4318` also serves the query API, MCP and the UI. Point any OTLP
+exporter at it — no Mira-specific collector component exists, or is needed.
+
+```
+--data-dir PATH            where blocks go            (./mira-data)
+--grpc ADDR --http ADDR    listen addresses           (0.0.0.0:4317 / :4318)
+--retention DURATION       TTL: 7d, 12h, 30m, 500ms   (7d)
+--node NAME                this replica's identity    (mira)
+--config FILE              KYAML; flags override it
+```
+
+Everything a flag sets, the config file sets too, with `${env:VAR,default}`
+interpolation — [docs/CONFIG.md](docs/CONFIG.md) is the whole surface. Two
+replicas can share one volume with no coordination: give each a different
+`--node`.
+
+Fill it, then read it back:
+
+```sh
+cargo run --release --example loadgen -- --for 10s --conns 8
+
+curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
+  -d '{"signal":"logs","where":[{"attr":"service.name","eq":"checkout"}],"limit":5}'
+```
+
+Blocks seal on size or age, so wait a couple of seconds after the last export;
+the server logs `block published` when one lands. Every response carries a
+`stats` object — `{"blocks_total":2,"blocks_scanned":1,...}` — which is the
+sidecar pruning, visible. A response that filled `limit` also carries `next`;
+pass it back as `after` for the following page.
+
+Then the other three surfaces:
+
+```sh
+open http://localhost:4318/           # the UI, served out of the binary
+mira mira --data-dir ./data           # the same views in the terminal
+curl -s -X POST localhost:4318/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+## Test it
+
+```sh
+cargo test --workspace
+```
+
+That includes the in-process end-to-end suite in `crates/mira/src/e2e.rs`, which
+drives the real router — OTLP/HTTP, OTLP/gRPC, the query API, MCP and the UI —
+with no sockets and nothing to clean up. It is the loop to stay in.
+
+For the things a unit test cannot reach — a real socket, a real exporter, real
+volume — [docs/TESTING.md](docs/TESTING.md) is a transcript rather than a plan:
+a live binary fed by the built-in `loadgen`, then the OpenTelemetry project's own
+`telemetrygen`, then a stock Collector in front of it in Docker
+(`docker compose -f docs/e2e/compose.yaml up -d --build`). That last one is the
+test that matters, because it is the only one where the client is not ours.
+
 ## What is true today
 
 - **Logs, traces and metrics**, stored in their own layouts, over **OTLP/gRPC
