@@ -93,8 +93,13 @@ fn main() {
             std::thread::spawn(move || {
                 let mut conn = Conn::connect(&addr);
                 let mut s = Stats::default();
-                let mut i = w as u64;
+                // `n` counts this connection's own batches; `i` interleaves the
+                // connections into one gapless sequence, which is what keeps the
+                // content deterministic. Metrics need `n`: a cumulative counter
+                // reports what its own producer has sent.
+                let mut n = 0u64;
                 while Instant::now() < deadline {
+                    let i = n * conns as u64 + w as u64;
                     // Timestamps advance with the wall clock so the default
                     // "last hour" window in the UI contains the data.
                     let ts = base + t0.elapsed().as_nanos() as u64;
@@ -103,12 +108,12 @@ fn main() {
                     s.send(
                         &mut conn,
                         "/v1/metrics",
-                        metrics_batch(i, ts).encode_to_vec(),
+                        metrics_batch(w, n, ts).encode_to_vec(),
                     );
                     s.logs += batch() as u64;
                     s.spans += batch() as u64;
                     s.points += SERVICES.len() as u64 * 3;
-                    i += conns as u64;
+                    n += 1;
                 }
                 s
             })
@@ -435,9 +440,16 @@ fn spans_batch(i: u64, ts: u64) -> ExportTraceServiceRequest {
     }
 }
 
-/// A counter, a gauge and a histogram per service — one of each kind the read
-/// path knows how to chart.
-fn metrics_batch(i: u64, ts: u64) -> ExportMetricsServiceRequest {
+/// A counter, a gauge and a histogram per service *per connection* — one of
+/// each kind the read path knows how to chart.
+///
+/// The connection is in the series identity, and has to be. A cumulative
+/// counter is owned by exactly one producer; point every connection at one
+/// stream and its value goes backwards on nearly every sample, which a reader
+/// is right to read as a process restart. The chart becomes a sawtooth of
+/// resets and the rate under it is noise. `service.instance.id` is OTel's name
+/// for that owner, so that is the attribute that carries it.
+fn metrics_batch(w: usize, n: u64, ts: u64) -> ExportMetricsServiceRequest {
     let dp = |v: f64, attrs: Vec<KeyValue>| NumberDataPoint {
         attributes: attrs,
         start_time_unix_nano: ts,
@@ -447,7 +459,7 @@ fn metrics_batch(i: u64, ts: u64) -> ExportMetricsServiceRequest {
     };
     // A sine over the batch counter: something with a shape, so a broken axis
     // or a dropped point is visible rather than plausible.
-    let wave = |phase: f64| (i as f64 / 30.0 + phase).sin() * 0.5 + 0.5;
+    let wave = |phase: f64| (n as f64 / 30.0 + phase).sin() * 0.5 + 0.5;
 
     ExportMetricsServiceRequest {
         resource_metrics: SERVICES
@@ -457,6 +469,7 @@ fn metrics_batch(i: u64, ts: u64) -> ExportMetricsServiceRequest {
                 resource: Some(Resource {
                     attributes: vec![
                         kv("service.name", name),
+                        kv("service.instance.id", &format!("{name}-{w:03}")),
                         kv("deployment.environment", "prod"),
                     ],
                     ..Default::default()
@@ -470,7 +483,7 @@ fn metrics_batch(i: u64, ts: u64) -> ExportMetricsServiceRequest {
                             description: "Requests handled".into(),
                             data: Some(metric::Data::Sum(Sum {
                                 data_points: vec![dp(
-                                    (i * batch() as u64) as f64,
+                                    (n * batch() as u64) as f64,
                                     vec![kv("http.method", "GET")],
                                 )],
                                 aggregation_temporality: AggregationTemporality::Cumulative as i32,

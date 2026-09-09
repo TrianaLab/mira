@@ -49,6 +49,12 @@ from a counter, so two runs with the same arguments produce the same bytes and
 are comparable. It prints achieved rate, which is a floor on what the server
 sustained, and it is the front half of the ingest benchmark.
 
+Each connection is its own `service.instance.id`, so `--conns 8` gives eight
+instances of each of the four services. That is deliberate: a cumulative counter
+belongs to one producer, and eight connections reporting their own totals into
+one series would make it fall backwards on nearly every point — which reads as a
+restart, and turns the rate chart into a sawtooth.
+
 ```
 --for 60s      how long to run
 --conns 64     concurrent connections
