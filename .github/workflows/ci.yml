@@ -56,12 +56,11 @@ jobs:
       # one-line diff a reviewer can see. A gate set to an aspiration is a gate
       # that gets switched off the first time it goes red.
       #
-      # Destination is 100. What stands between here and there is now almost
-      # entirely the terminal: term.rs (74%) and tui.rs (77%) are 385 of the 728
-      # uncovered lines and both need a pty — see CLAUDE.md for the `script -q`
-      # recipe that would automate it. After that, main.rs (78%), which is the
-      # rest of the same problem: its uncovered half is the `mira mira` arm.
+      # Destination is 100. What stands between here and there, worst first:
+      # term.rs (74%, 92 lines) is the syscall half — enter, size, draw, key,
+      # restore — and needs a pty; main.rs (78%, 64) is mostly the `mira mira`
+      # arm that calls it; block.rs (85%, 59) is the I/O error paths.
       #
       # Run the same thing locally with:
       #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 92
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 94

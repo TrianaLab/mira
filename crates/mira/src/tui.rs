@@ -51,7 +51,7 @@ pub fn run(src: Source) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Logs,
     Traces,
@@ -118,7 +118,7 @@ impl Tab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     List,
     Filter,
@@ -494,10 +494,14 @@ impl App {
     /// One function rather than one per view because every view's list is a
     /// selected index plus a length, and the clamping is the part that is easy
     /// to get wrong twice.
+    ///
+    /// Clamped in `usize`, not `isize`. The scrolling panes report their length
+    /// as `usize::MAX` — see [`cursor`](App::cursor) — and that is a negative
+    /// `isize`, so an `isize` clamp reads its own upper bound as below its lower
+    /// bound and panics. `j` in the detail pane is the keystroke that did it.
     fn move_by(&mut self, d: isize) {
         let (sel, len) = self.cursor();
-        let next = (sel as isize + d).clamp(0, len.saturating_sub(1) as isize) as usize;
-        self.set_cursor(next);
+        self.set_cursor(sel.saturating_add_signed(d).min(len.saturating_sub(1)));
     }
 
     fn move_to(&mut self, n: usize) {
@@ -1777,6 +1781,17 @@ mod tests {
         assert_eq!(app.sel, 2);
         app.move_by(-10);
         assert_eq!(app.sel, 0);
+
+        // The scrolling panes report `usize::MAX` for their length, which is a
+        // negative `isize`. Clamping there used to panic on the first `j`.
+        for mode in [Mode::Detail, Mode::Help] {
+            app.mode = mode;
+            app.scroll = 0;
+            app.move_by(3);
+            assert_eq!(app.scroll, 3, "{mode:?}");
+            app.move_by(-9);
+            assert_eq!(app.scroll, 0, "{mode:?}");
+        }
     }
 
     /// Painting must never panic and never overrun, whatever the terminal size
@@ -1840,5 +1855,339 @@ mod tests {
                 }
             }
         }
+    }
+
+    const W: usize = 100;
+    const H: usize = 24;
+
+    /// A block directory with all three signals in it, timestamped now, because
+    /// every query the TUI issues is relative to the clock.
+    fn store(name: &str) -> std::path::PathBuf {
+        use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+        use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
+        use mira_proto::metrics::v1::metric::Data;
+        use mira_proto::metrics::v1::{
+            AggregationTemporality, Exemplar, Gauge, Metric, NumberDataPoint, ResourceMetrics,
+            ScopeMetrics, Sum, exemplar, number_data_point,
+        };
+        use mira_proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let dir = std::env::temp_dir().join(format!("mira-tui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = crate::api::now_nanos() as u64;
+        let node = mira_core::block::node_id("a");
+
+        let mut b = mira_core::logs::LogsBuilder::new();
+        b.append_request(&crate::e2e::logs_export(
+            "checkout",
+            now - 60_000_000_000,
+            5,
+        ))
+        .unwrap();
+        mira_core::block::publish(&dir, "logs", node, 0, &b.finish().unwrap()).unwrap();
+
+        // The same trace id `logs_export` stamps on its records, so `t` on a log
+        // line has somewhere to go.
+        let trace_id = vec![0xabu8; 16];
+        let mut b = mira_core::traces::TracesBuilder::new();
+        b.append_request(&ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: (0..4u64)
+                        .map(|i| Span {
+                            trace_id: trace_id.clone().into(),
+                            span_id: vec![i as u8 + 1; 8].into(),
+                            // A tree, not a list: the waterfall's indenting and
+                            // its parent lookup are the point of the view.
+                            parent_span_id: match i {
+                                0 => Vec::new(),
+                                _ => vec![i as u8; 8],
+                            }
+                            .into(),
+                            name: format!("GET /checkout/{i}"),
+                            start_time_unix_nano: now - 60_000_000_000 + i * 1_000_000,
+                            end_time_unix_nano: now - 59_000_000_000 + i * 1_000_000,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        mira_core::block::publish(&dir, "traces", node, 0, &b.finish().unwrap()).unwrap();
+
+        let point = |i: u64| NumberDataPoint {
+            time_unix_nano: now - 60_000_000_000 + i * 1_000_000_000,
+            value: Some(number_data_point::Value::AsDouble(i as f64 * 1.5)),
+            exemplars: vec![Exemplar {
+                time_unix_nano: now - 60_000_000_000,
+                trace_id: trace_id.clone().into(),
+                value: Some(exemplar::Value::AsDouble(1.0)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut b = mira_core::metrics::MetricsBuilder::new();
+        b.append_request(&ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "http.server.duration".into(),
+                            unit: "ms".into(),
+                            data: Some(Data::Gauge(Gauge {
+                                data_points: (0..6).map(point).collect(),
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "http.server.requests".into(),
+                            unit: "1".into(),
+                            data: Some(Data::Sum(Sum {
+                                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                                is_monotonic: true,
+                                data_points: (0..6).map(point).collect(),
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        mira_core::block::publish(&dir, "metrics", node, 0, &b.finish().unwrap()).unwrap();
+        dir
+    }
+
+    /// One turn of the loop in [`run`], minus the terminal.
+    ///
+    /// The order matters and is the reason it is a helper rather than a call to
+    /// `key`: the frame is painted *before* the deferred job runs, so the screen
+    /// that says "running" is on it while the query blocks. Anything asserting on
+    /// what the user sees has to go through the same sequence.
+    fn settle(app: &mut App) -> String {
+        let mut f = app.frame(W, H);
+        for _ in 0..8 {
+            let Some(job) = app.job.take() else {
+                return f.join("\n");
+            };
+            app.run(job, H);
+            f = app.frame(W, H);
+        }
+        panic!("a job kept queueing another one")
+    }
+
+    fn press(app: &mut App, k: Key) -> String {
+        assert!(app.key(k, H), "quit on {k:?}");
+        settle(app)
+    }
+
+    fn typed(app: &mut App, s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            out = press(app, Key::Char(c));
+        }
+        out
+    }
+
+    fn strip(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                for c in it.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The whole app driven by keystrokes against a real block directory, which
+    /// is what `mira mira --data-dir` does with no server anywhere. `run` itself
+    /// is not here — it is this loop plus a `Term`, and a `Term` needs a pty.
+    #[test]
+    fn a_session_walks_the_three_tabs_and_lands_on_a_trace() {
+        let dir = store("session");
+        let mut app = App::new(Source::Local(dir));
+
+        // Opening screen: the logs tab, already loaded, with no key pressed.
+        let f = strip(&settle(&mut app));
+        assert!(f.contains("checkout handled request"), "{f}");
+        assert!(f.contains("ERROR"), "{f}");
+        assert_eq!(app.rows.len(), 5);
+
+        // Detail, scrolled, and back. Esc leaves the mode, it does not quit.
+        let f = strip(&press(&mut app, Key::Enter));
+        assert_eq!(app.mode, Mode::Detail);
+        assert!(f.contains("service.name"), "{f}");
+        press(&mut app, Key::Char('j'));
+        assert_eq!(app.scroll, 1);
+        press(&mut app, Key::Esc);
+        assert_eq!(app.mode, Mode::List);
+
+        // `l` walks right through the tabs; each arrival reloads.
+        let f = strip(&press(&mut app, Key::Char('l')));
+        assert_eq!(app.tab, Tab::Traces);
+        assert!(f.contains("GET /checkout/"), "{f}");
+        assert_eq!(app.rows.len(), 4);
+
+        // Metrics loads names, then loads the first series without being asked —
+        // the two-job sequence `settle` exists to drain.
+        let f = strip(&press(&mut app, Key::Char('l')));
+        assert_eq!(app.tab, Tab::Metrics);
+        assert!(f.contains("http.server.duration"), "{f}");
+        assert!(!app.series.is_empty(), "the first name loaded its series");
+
+        // Tab moves the arrow keys from the name list to the series list.
+        assert!(!app.on_series);
+        press(&mut app, Key::Tab);
+        assert!(app.on_series);
+        press(&mut app, Key::Tab);
+        press(&mut app, Key::Char('j'));
+        assert_eq!(app.nsel, 1);
+        let f = strip(&press(&mut app, Key::Enter));
+        assert!(f.contains("http.server.requests"), "{f}");
+
+        // A metric exemplar carries the trace id of the request that produced
+        // the measurement, and `t` follows it. Three tabs, one key.
+        press(&mut app, Key::Tab);
+        let f = strip(&press(&mut app, Key::Char('t')));
+        assert_eq!(app.mode, Mode::Trace);
+        let t = app.trace.as_ref().unwrap();
+        assert_eq!(t.id, "abababababababababababababababab");
+        assert_eq!(t.spans.len(), 4);
+        assert!(f.contains("GET /checkout/0"), "{f}");
+        // Indented: the waterfall is a tree, not a list.
+        assert!(f.contains("  GET /checkout/1"), "{f}");
+
+        press(&mut app, Key::Down);
+        assert_eq!(app.trace.as_ref().unwrap().sel, 1);
+        // `t` inside a trace is a no-op rather than a reload of the same trace.
+        press(&mut app, Key::Char('t'));
+        assert_eq!(app.mode, Mode::Trace);
+        // `q` leaves the mode. Only `q` on the list quits.
+        press(&mut app, Key::Char('q'));
+        assert_eq!(app.mode, Mode::List);
+
+        // Help is a toggle, and Esc closes it too.
+        let f = strip(&press(&mut app, Key::Char('?')));
+        assert_eq!(app.mode, Mode::Help);
+        assert!(f.contains("open the trace this row points at"), "{f}");
+        press(&mut app, Key::Char('?'));
+        assert_eq!(app.mode, Mode::List);
+
+        assert!(!app.key(Key::Char('q'), H), "q on the list quits");
+    }
+
+    /// The filter bar: typed, edited, applied, and undone. Applying it is the
+    /// only thing here that costs a query, which is why Esc restores the text
+    /// rather than re-running with the old one.
+    #[test]
+    fn the_filter_bar_edits_a_query_and_esc_puts_it_back() {
+        let dir = store("filter");
+        let mut app = App::new(Source::Local(dir));
+        settle(&mut app);
+
+        press(&mut app, Key::Char('/'));
+        assert_eq!(app.mode, Mode::Filter);
+        typed(&mut app, "severity_text=WARN xx");
+        assert_eq!(app.filter, "severity_text=WARN xx");
+        press(&mut app, Key::Ctrl('w'));
+        assert_eq!(app.filter, "severity_text=WARN ");
+        press(&mut app, Key::Backspace);
+        press(&mut app, Key::Backspace);
+        assert_eq!(app.filter, "severity_text=WAR");
+        typed(&mut app, "N");
+
+        let f = strip(&press(&mut app, Key::Enter));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.rows.is_empty());
+        assert!(f.contains("no rows in this window"), "{f}");
+
+        // Esc restores the text that was there before `/`, so an abandoned edit
+        // leaves the view exactly as it was found.
+        press(&mut app, Key::Char('/'));
+        typed(&mut app, " and more");
+        press(&mut app, Key::Esc);
+        assert_eq!(app.filter, "severity_text=WARN");
+        assert_eq!(app.mode, Mode::List);
+
+        press(&mut app, Key::Char('/'));
+        press(&mut app, Key::Ctrl('u'));
+        press(&mut app, Key::Enter);
+        assert_eq!(app.rows.len(), 5, "an empty filter is every row back");
+
+        // A bare word on the metrics tab has no text column to search, so it is
+        // reported rather than quietly dropped.
+        press(&mut app, Key::Char('3'));
+        press(&mut app, Key::Char('/'));
+        typed(&mut app, "checkout");
+        let f = strip(&press(&mut app, Key::Enter));
+        assert!(f.contains("ignored"), "{f}");
+    }
+
+    /// The controls that change the query rather than the view, and the two
+    /// things that can go wrong: a selection that points at nothing to follow,
+    /// and a store that cannot be read.
+    #[test]
+    fn the_window_and_limit_keys_requery_and_failures_stay_on_screen() {
+        let dir = store("window");
+        let mut app = App::new(Source::Local(dir.clone()));
+        settle(&mut app);
+
+        assert_eq!(app.win, 2);
+        press(&mut app, Key::Char('['));
+        assert_eq!(app.win, 1);
+        for _ in 0..9 {
+            press(&mut app, Key::Char(']'));
+        }
+        assert_eq!(app.win, WINDOWS.len() - 1, "clamped at the widest window");
+        let f = strip(&press(&mut app, Key::Char('[')));
+        assert!(f.contains("7d"), "{f}");
+
+        assert_eq!(app.limit, 200);
+        press(&mut app, Key::Char('+'));
+        assert_eq!(app.limit, 400);
+        press(&mut app, Key::Char('-'));
+        press(&mut app, Key::Char('-'));
+        assert_eq!(app.limit, 100);
+        press(&mut app, Key::Char('r'));
+        assert_eq!(app.rows.len(), 5);
+
+        // Paging and the jump keys share one clamp across every pane.
+        press(&mut app, Key::End);
+        assert_eq!(app.sel, 4);
+        press(&mut app, Key::PageUp);
+        assert_eq!(app.sel, 0);
+        press(&mut app, Key::PageDown);
+        assert_eq!(app.sel, 4);
+        press(&mut app, Key::Home);
+        assert_eq!(app.sel, 0);
+
+        // A span row has a trace id; a row that does not exist has nothing.
+        app.rows.clear();
+        let f = strip(&press(&mut app, Key::Char('t')));
+        assert!(app.err);
+        assert!(f.contains("nothing here carries a trace id"), "{f}");
+
+        // The store going away under the session is a message on the status
+        // bar, not a panic and not a blank screen.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        let f = strip(&press(&mut app, Key::Char('r')));
+        assert!(app.err, "{f}");
+        assert!(
+            f.contains("logs"),
+            "the failure names what it could not read: {f}"
+        );
     }
 }
