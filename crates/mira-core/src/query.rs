@@ -330,13 +330,12 @@ pub struct Results {
 
 /// The trace id this search pins down exactly, if it pins one down.
 ///
-/// Only `trace_id = <32 hex chars>` on the traces signal qualifies. Terms are
-/// AND-ed, so one such term is enough no matter what else is in the list: a
-/// block that cannot hold the id cannot hold a row satisfying the conjunction.
+/// Only `trace_id = <32 hex chars>` qualifies, on either signal — logs blocks
+/// carry the same filter as span blocks, so "the logs for this trace" prunes
+/// exactly as hard as "the spans for it". Terms are AND-ed, so one such term is
+/// enough no matter what else is in the list: a block that cannot hold the id
+/// cannot hold a row satisfying the conjunction.
 fn trace_needle(q: &Search) -> Option<[u8; 16]> {
-    if q.signal != Signal::Traces {
-        return None;
-    }
     q.terms.iter().find_map(|t| match (&t.target, t.op) {
         (Target::Field(f), Op::Eq) if f == "trace_id" => unhex(t.value.as_str()?)?.try_into().ok(),
         _ => None,

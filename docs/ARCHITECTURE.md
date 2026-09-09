@@ -268,7 +268,7 @@ Two deliberate deviations from OTAP, both cheap to reverse:
 ```
 <data>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
     logs.arrow  log_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
-    attr.idx
+    attr.idx  trace.idx
 <data>/traces/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
     spans.arrow  span_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
     span_events.arrow  span_event_attrs.arrow  span_links.arrow  span_link_attrs.arrow
@@ -681,6 +681,14 @@ That runs at memory bandwidth and is not worth a sort at seal time.
     The filters cost 65 KB per block — 5.3 MB against 4.1 GB, 0.13%. That warm
     number is the tell: the cost was never paging, it was opening and CRC-checking
     83 blocks that could not have held the trace.
+    **Logs blocks carry the same filter**, over their own `trace_id` column.
+    A trace investigation is two questions — the spans, then the logs written
+    under them — and the second has no more of a time bound than the first. With
+    the filter on only one side, `get_trace` read one block and *"the logs for
+    this trace"* read all of retention, which is the slower half of the pair and
+    the one a human waits on. The column is null for logs outside a trace and
+    those rows index nothing, so a block of untraced logs writes no filter and
+    pays nothing.
   - Within a block: none on disk, and none in memory either — a linear scan of the
     mapped `trace_id` column of one block is the 20 ms above. Sorting and caching
     a permutation is the upgrade if that ever stops being true.

@@ -1008,8 +1008,26 @@ mod tests {
             block::publish(&root, "traces", block::node_id("a"), seq, &sealed).unwrap();
         }
 
-        let lookup = |id: String| Search {
-            signal: Signal::Traces,
+        // The same ids on the logs side. A trace investigation is two questions
+        // — the spans, then the logs written under them — and the second one has
+        // no more of a time bound than the first, so it needs the same filter.
+        for seq in 0..BLOCKS {
+            let mut req = request("checkout", 4, 1_000);
+            for (i, r) in req.resource_logs[0].scope_logs[0]
+                .log_records
+                .iter_mut()
+                .enumerate()
+            {
+                r.trace_id = tid(seq * 4 + i as u64).to_vec().into();
+            }
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&req).unwrap();
+            let sealed = b.finish().unwrap();
+            block::publish(&root, "logs", block::node_id("a"), seq, &sealed).unwrap();
+        }
+
+        let lookup = |signal, id: String| Search {
+            signal,
             from: 0,
             to: i64::MAX,
             terms: vec![Term {
@@ -1022,23 +1040,25 @@ mod tests {
         };
 
         let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        let r = query::search(&root, &lookup(hex(tid(17)))).unwrap();
-        assert_eq!(r.stats.blocks_total, BLOCKS as usize);
-        assert_eq!(r.stats.blocks_scanned, 1, "the filter must skip the rest");
-        assert_eq!(r.stats.rows_matched, 1);
+        for signal in [Signal::Traces, Signal::Logs] {
+            let r = query::search(&root, &lookup(signal, hex(tid(17)))).unwrap();
+            assert_eq!(r.stats.blocks_total, BLOCKS as usize);
+            assert_eq!(r.stats.blocks_scanned, 1, "{signal:?}: skip the rest");
+            assert_eq!(r.stats.rows_matched, 1);
 
-        // An id in no block at all: with 8 filters probed, a false positive is
-        // possible, so this asserts the bound rather than zero.
-        let r = query::search(&root, &lookup(hex(tid(9_999)))).unwrap();
-        assert_eq!(r.stats.rows_matched, 0);
-        assert!(r.stats.blocks_scanned <= 1, "{}", r.stats.blocks_scanned);
+            // An id in no block at all: with 8 filters probed, a false positive
+            // is possible, so this asserts the bound rather than zero.
+            let r = query::search(&root, &lookup(signal, hex(tid(9_999)))).unwrap();
+            assert_eq!(r.stats.rows_matched, 0);
+            assert!(r.stats.blocks_scanned <= 1, "{}", r.stats.blocks_scanned);
+        }
 
         // Deleting a sidecar has to cost a block read, never a lost span.
         let one = block::scan(&root, "traces").unwrap();
         for b in &one {
             std::fs::remove_file(b.dir.join(bloom::TRACE_IDX)).unwrap();
         }
-        let r = query::search(&root, &lookup(hex(tid(17)))).unwrap();
+        let r = query::search(&root, &lookup(Signal::Traces, hex(tid(17)))).unwrap();
         assert_eq!(r.stats.blocks_scanned, BLOCKS as usize);
         assert_eq!(r.stats.rows_matched, 1);
 
@@ -1088,7 +1108,8 @@ mod tests {
             let mut b = logs::LogsBuilder::new();
             b.append_request(&req).unwrap();
             let sealed = b.finish().unwrap();
-            assert_eq!(sealed.sidecars.len(), 1, "logs publish an attribute filter");
+            let names: Vec<_> = sealed.sidecars.iter().map(|(n, _)| *n).collect();
+            assert_eq!(names, [bloom::ATTR_IDX, bloom::TRACE_IDX], "logs sidecars");
             block::publish(&root, "logs", block::node_id("a"), seq, &sealed).unwrap();
         }
 

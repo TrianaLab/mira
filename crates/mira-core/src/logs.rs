@@ -220,6 +220,13 @@ impl LogsBuilder {
     }
 
     fn seal(&mut self) -> Result<Sealed> {
+        // The same trace filter a traces block carries. "The logs for this
+        // trace" is the second half of every trace investigation, and it is the
+        // half with no useful time bound — you look a trace up because you do
+        // not know when it happened. Without this the spans come out of one
+        // block and the logs cost a scan of all of retention.
+        let trace_ids = self.trace_id.finish();
+        let trace_idx = crate::bloom::build(&trace_ids);
         let cols: Vec<ArrayRef> = vec![
             Arc::new(self.id.finish()),
             Arc::new(self.time.finish()),
@@ -228,7 +235,7 @@ impl LogsBuilder {
             self.sev_text.finish(),
             Arc::new(self.body.finish()),
             Arc::new(self.body_ser.finish()),
-            Arc::new(self.trace_id.finish()),
+            Arc::new(trace_ids),
             Arc::new(self.span_id.finish()),
             Arc::new(self.flags.finish()),
             Arc::new(self.dropped.finish()),
@@ -240,12 +247,10 @@ impl LogsBuilder {
             ("log_attrs", self.log_attrs.finish()?),
         ];
         tables.extend(self.rs.finish()?);
-        Ok(Sealed::new(
-            self.next_id as usize,
-            tables,
-            self.min_ts,
-            self.max_ts,
-        ))
+        Ok(
+            Sealed::new(self.next_id as usize, tables, self.min_ts, self.max_ts)
+                .with_sidecar(crate::bloom::TRACE_IDX, trace_idx),
+        )
     }
 }
 
