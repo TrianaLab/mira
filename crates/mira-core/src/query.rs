@@ -493,8 +493,18 @@ pub fn search(root: &Path, q: &Search) -> Result<Results> {
 
         // Trim as we go, so memory is bounded by `limit` rather than by the
         // match count, which is not bounded by anything.
+        //
+        // Partition before sorting. `limit` is a hundred and a broad filter over
+        // one block is hundreds of thousands, so sorting the match set to throw
+        // away all but its head is the dominant cost of the commonest query
+        // there is — "the last 100 records", which matches every row it reads.
+        // `select_nth_unstable` is linear and leaves the head in the first
+        // `limit` slots; only those get ordered.
+        if hits.len() > q.limit {
+            hits.select_nth_unstable_by_key(q.limit, |h| cursor(&refs[h.block], h).key());
+            hits.truncate(q.limit);
+        }
         hits.sort_unstable_by_key(|h| cursor(&refs[h.block], h).key());
-        hits.truncate(q.limit);
     }
 
     let mut j = Json::new();

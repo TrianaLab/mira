@@ -985,6 +985,13 @@ The four axes, each with a target and a measurement. Measured on an Apple M3 Pro
 over loopback — 6.4 GiB on the wire, 8.4 GiB on disk, 25.2 M log records, 25.2 M
 spans, 69 log blocks holding 4.56 GB of log Arrow.
 
+Scoring them together is the point, and it is why the generator that produced
+this table is also the load harness: `loadgen --readers N --pid N --data-dir P`
+reports ingest, six classes of query latency, the server's resident set and the
+bytes it added per record from one run. An engine measured one axis at a time is
+an engine that is fast at whichever one its authors were watching.
+[docs/TESTING.md §3](TESTING.md) is how to drive it and how it misleads.
+
 Read the two query columns carefully. **Neither is a cold-disk number**: 8.4 GiB
 fits in this machine's page cache, so after one pass everything is resident and
 short of `purge` there is no way back. "First" is the first call after a process
@@ -1028,6 +1035,25 @@ Reading these honestly:
   `madvise(MADV_WILLNEED)` at map time — the mapping is about to be read end to
   end, so there is nothing speculative about the hint — took that row from
   **10.1 s to 1.9 s**, and every other query row down with it.
+- **Sorting the match set to keep a hundred of it was the second lever.** A
+  block scan produces every matching row, and the merge then ordered all of them
+  before truncating to `limit`. For the query every session opens with — "the
+  last 100 records", no predicate, so *every* row of the block matches — that is
+  an O(n log n) sort of ~330 K hits to keep 100. `select_nth_unstable` partitions
+  in linear time and only the surviving head is ordered; on the load harness
+  (docs/TESTING.md §3) that took the whole read mix from 35 to 50 queries/s and
+  `tail` p99 from 230 ms to 139 ms.
+
+  What is left is O(n) in the block's row count and cannot be removed without
+  giving up `rows_matched`, which is an honest count of the match set and not of
+  the page — an operator asks "how broad is my filter", and answering it for the
+  page they happen to be on is answering a different question. So the remaining
+  lever on tail latency is `target_block_bytes`: at 32 MiB a logs block holds
+  ~330 K rows and an unfiltered `limit 100` costs ~40 ms uncontended. Halving the
+  target halves that and doubles the block count, which pruning makes nearly
+  free. It is not changed here because the tradeoff runs the other way for
+  compression ratio and directory size, and the number to tune it against is a
+  workload nobody has yet.
 - **A block cache is worth much less than it looks.** It was the obvious next
   lever and the measurement says otherwise: what it saves is the `open` and the
   CRC, and those are the small part of a ~14 ms single-block query. It stays on

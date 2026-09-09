@@ -102,12 +102,34 @@ That includes the in-process end-to-end suite in `crates/mira/src/e2e.rs`, which
 drives the real router — OTLP/HTTP, OTLP/gRPC, the query API, MCP and the UI —
 with no sockets and nothing to clean up. It is the loop to stay in.
 
+The query engine also has a differential test — random stores, random queries,
+and a reference model that shares no code with the engine — which is the closest
+thing here to a proof that pruning never drops a match and that paging visits
+every row exactly once. It is seeded, so a failure replays exactly.
+
 For the things a unit test cannot reach — a real socket, a real exporter, real
 volume — [docs/TESTING.md](docs/TESTING.md) is a transcript rather than a plan:
 a live binary fed by the built-in `loadgen`, then the OpenTelemetry project's own
 `telemetrygen`, then a stock Collector in front of it in Docker
 (`docker compose -f docs/e2e/compose.yaml up -d --build`). That last one is the
 test that matters, because it is the only one where the client is not ours.
+
+### Benchmark it
+
+The same `loadgen` is the load harness, and it scores all four axes in one run —
+because any one of them is easy to win alone:
+
+```sh
+cargo run --release --example loadgen -- \
+  --for 30s --conns 64 --batch 8192 --readers 8 \
+  --pid $(pgrep -n mira) --data-dir ./data
+```
+
+`--conns 0` is read-only, `--readers 0` is write-only, and it prints ingest
+throughput, ack latency, six classes of query latency to p999, the server's peak
+resident set and the bytes it added to disk per record. [docs/TESTING.md
+§3](docs/TESTING.md) is how to read the output and the three ways it will
+mislead you if you do not.
 
 ## What is true today
 
@@ -178,6 +200,16 @@ Measured on an Apple M3 Pro (12 cores), one process, `cargo run --release
 | metric names | 5.5 ms |
 | no time bound, no filter that prunes | 1.9 s — 69 blocks, 25.2M rows, 4.56 GB |
 | bytes on disk per byte on the wire | 1.31 hot, 0.17 once compacted |
+| peak resident set, ingesting at 353k records/s | 615 MiB |
+| peak resident set, 8 readers over 10.6M records | 1.06 GiB |
+
+Resident set is `ps`, sampled from outside the process, because Mira reads
+through `mmap` and a heap counter would miss the page cache that is most of what
+it actually costs a machine.
+
+The query rows were measured before `select_nth_unstable` replaced a full sort
+of the match set in `query::search`; on the harness's store that change took
+`tail` p99 from 230 ms to 139 ms, so treat them as a ceiling.
 
 Ack latency is the block sealing, not the queue: an export is acknowledged when
 its block is durable, so under light load it waits out `max_block_age`.

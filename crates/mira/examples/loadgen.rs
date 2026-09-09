@@ -1,21 +1,36 @@
-//! A synthetic OTLP source: logs, spans and metrics from a fake shop.
+//! The load harness: a synthetic OTLP source, a query driver, and a report on
+//! all four axes at once.
 //!
-//! Two jobs. It fills a dev instance so the UI has something to draw, and it is
-//! the front half of the ingest benchmark — it reports achieved rate, so the
-//! number it prints is a floor on what the server sustained.
+//! Three jobs. It fills a dev instance so the UI has something to draw; it is
+//! the ingest benchmark; and with `--readers` it is the query benchmark, run
+//! *while* ingest is running, because a p99 measured on a quiet store is a
+//! number no operator will ever see.
+//!
+//! §11 scores four axes and the principle is that they are scored together —
+//! ingest throughput per core, resident footprint, query p99, cost per GB. A
+//! harness that reports one of them is how a storage engine ends up fast at
+//! whichever one its authors were looking at. So this reports all four, in one
+//! block, from one command:
+//!
+//!     cargo run --release --example loadgen -- \
+//!       --for 60s --conns 64 --batch 8192 --readers 8 \
+//!       --pid $(pgrep -n mira) --data-dir ./data
+//!
+//! `--conns 0` makes it read-only, which is the number to quote for a cold
+//! store; `--readers 0` (the default) makes it write-only, which is the number
+//! to quote for ingest with nothing competing for the page cache.
 //!
 //! The HTTP client is thirty lines of `TcpStream`. `reqwest` would pull in
 //! hyper, rustls and the rest of the tree into a binary whose entire job is to
 //! write one POST and read one status line, and the four-axes principle starts
 //! with not paying for things we do not use.
 //!
-//!     cargo run --release --example loadgen -- --for 60s --conns 64 --batch 8192
-//!
 //! Everything is derived from a counter, not a random source: the same
 //! arguments produce the same bytes, so two runs are comparable.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use prost::Message;
@@ -48,13 +63,22 @@ const ROUTES: [&str; 5] = [
 /// that it does not, overridable to find where the crossover is.
 static BATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2_000);
 fn batch() -> usize {
-    BATCH.load(std::sync::atomic::Ordering::Relaxed)
+    BATCH.load(Ordering::Relaxed)
 }
+
+/// The highest trace index the writers have sent, so a reader asking for a
+/// trace asks for one that exists. Zero means nothing has been written this run
+/// and the readers fall back to a fixed range — a lookup that misses is a real
+/// query too, and the hit rate is reported either way.
+static TRACES: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let mut addr = "127.0.0.1:4318".to_string();
     let mut secs = 30u64;
     let mut conns = 8usize;
+    let mut readers = 0usize;
+    let mut pid: Option<u32> = None;
+    let mut data_dir: Option<std::path::PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("missing value");
@@ -62,18 +86,27 @@ fn main() {
             "--addr" => addr = v(),
             "--for" => secs = v().trim_end_matches('s').parse().expect("--for"),
             "--conns" => conns = v().parse().expect("--conns"),
-            "--batch" => BATCH.store(
-                v().parse().expect("--batch"),
-                std::sync::atomic::Ordering::Relaxed,
-            ),
+            "--readers" => readers = v().parse().expect("--readers"),
+            "--pid" => pid = Some(v().parse().expect("--pid")),
+            "--data-dir" => data_dir = Some(v().into()),
+            "--batch" => BATCH.store(v().parse().expect("--batch"), Ordering::Relaxed),
             _ => {
                 eprintln!(
-                    "usage: loadgen [--addr host:port] [--for 30s] [--conns 8] [--batch 2000]"
+                    "usage: loadgen [--addr host:port] [--for 30s] [--conns 8] [--batch 2000]\n\
+                     \x20              [--readers 0] [--pid N] [--data-dir PATH]"
                 );
                 std::process::exit(2);
             }
         }
     }
+    assert!(
+        conns + readers > 0,
+        "nothing to do: --conns and --readers are both 0"
+    );
+
+    // Cost per GB is a delta, not a total: run against a store that already has
+    // blocks in it and the total divided by this run's records is meaningless.
+    let disk0 = data_dir.as_deref().map(du).unwrap_or(0);
 
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_secs(secs);
@@ -113,6 +146,9 @@ fn main() {
                     s.logs += batch() as u64;
                     s.spans += batch() as u64;
                     s.points += SERVICES.len() as u64 * 3;
+                    // The newest trace id now on the server, for the readers.
+                    let top = (i * batch() as u64 + batch() as u64 - 1) / 8;
+                    TRACES.fetch_max(top, Ordering::Relaxed);
                     n += 1;
                 }
                 s
@@ -120,33 +156,76 @@ fn main() {
         })
         .collect();
 
+    let readers: Vec<_> = (0..readers)
+        .map(|r| {
+            let addr = addr.clone();
+            std::thread::spawn(move || read_loop(&addr, r, deadline))
+        })
+        .collect();
+
+    // Resident footprint is an axis, and it is the one nothing inside the
+    // process can report honestly — a heap total misses the page cache the mmap
+    // reader lives on. So: the kernel's number, sampled from outside, peak kept.
+    let rss = pid.map(|pid| std::thread::spawn(move || peak_rss(pid, deadline)));
+
     let mut all = Stats::default();
     for w in workers {
         all.merge(w.join().unwrap());
     }
-
+    let mut reads = Reads::default();
+    for r in readers {
+        reads.merge(r.join().unwrap());
+    }
     let el = t0.elapsed().as_secs_f64();
-    let n = all.logs + all.spans + all.points;
-    all.acks.sort_unstable();
-    let pct = |p: f64| all.acks[((all.acks.len() - 1) as f64 * p) as usize] as f64 / 1e6;
-    println!(
-        "{} logs, {} spans, {} points in {el:.1}s over {conns} connections \
-         of {} records\n\
-         {:.0} records/s, {:.1} MiB/s on the wire, {} exports shed, \
-         {} connection resets\n\
-         ack latency p50 {:.1}ms  p99 {:.1}ms  max {:.1}ms",
-        all.logs,
-        all.spans,
-        all.points,
-        batch(),
-        n as f64 / el,
-        all.bytes as f64 / el / (1 << 20) as f64,
-        all.shed,
-        all.resets,
-        pct(0.50),
-        pct(0.99),
-        pct(1.0),
-    );
+
+    if conns > 0 {
+        let n = all.logs + all.spans + all.points;
+        println!(
+            "ingest   {:.0} records/s   {:.1} MiB/s wire   {} shed   {} resets\n\
+             \x20        {} logs + {} spans + {} points in {el:.1}s, \
+             {conns} conns x {} records\n\
+             \x20        ack p50 {:.1}ms  p99 {:.1}ms  max {:.1}ms",
+            n as f64 / el,
+            all.bytes as f64 / el / (1 << 20) as f64,
+            all.shed,
+            all.resets,
+            all.logs,
+            all.spans,
+            all.points,
+            batch(),
+            all.acks.p(0.50),
+            all.acks.p(0.99),
+            all.acks.p(1.0),
+        );
+    }
+    reads.report(el);
+    if let Some(rss) = rss {
+        println!("memory   peak RSS {:.0} MiB", rss.join().unwrap());
+    }
+    if let Some(dir) = &data_dir {
+        // Everything acked is already durable — the server does not answer an
+        // export until the block holding it is fsynced — so this is not a
+        // partial figure. Compaction may still shrink it later; it never grows.
+        let disk = du(dir);
+        let records = all.logs + all.spans + all.points;
+        print!(
+            "storage  {:.2} GiB on disk",
+            disk as f64 / (1u64 << 30) as f64
+        );
+        if records > 0 {
+            // Against the uncompressed protobuf actually sent, so above 1.0 means
+            // the store grew by more than the wire — which the sidecars and an
+            // uncompacted block directory can genuinely make it, briefly.
+            let grew = disk.saturating_sub(disk0);
+            print!(
+                "   +{:.2} GiB this run   {:.0} B/record   {:.2}x the wire bytes",
+                grew as f64 / (1u64 << 30) as f64,
+                grew as f64 / records as f64,
+                grew as f64 / all.bytes.max(1) as f64
+            );
+        }
+        println!();
+    }
 }
 
 #[derive(Default)]
@@ -166,7 +245,7 @@ struct Stats {
     /// Nanoseconds from the first byte written to the 200. Under
     /// ack-after-durability this is the fsync, so it is the number that tells
     /// you whether the sealer is keeping up.
-    acks: Vec<u64>,
+    acks: Hist,
 }
 
 impl Stats {
@@ -174,16 +253,16 @@ impl Stats {
     fn send(&mut self, conn: &mut Conn, path: &str, body: Vec<u8>) {
         let t = Instant::now();
         loop {
-            let (n, ok, resets) = conn.post(path, &body);
-            self.bytes += n;
-            self.resets += resets;
-            if ok {
+            let r = conn.post(path, &body);
+            self.bytes += r.wrote;
+            self.resets += r.resets;
+            if r.ok {
                 break;
             }
             self.shed += 1;
             std::thread::sleep(Duration::from_millis(20));
         }
-        self.acks.push(t.elapsed().as_nanos() as u64);
+        self.acks.0.push(t.elapsed().as_nanos() as u64);
     }
 
     fn merge(&mut self, o: Stats) {
@@ -193,8 +272,233 @@ impl Stats {
         self.bytes += o.bytes;
         self.shed += o.shed;
         self.resets += o.resets;
-        self.acks.extend(o.acks);
+        self.acks.0.extend(o.acks.0);
     }
+}
+
+/// Latencies in nanoseconds. A full sample, not a sketch: at these counts the
+/// memory is a few megabytes and an exact p999 is worth more than a t-digest
+/// whose error is largest exactly where the interesting number is.
+#[derive(Default)]
+struct Hist(Vec<u64>);
+
+impl Hist {
+    /// Milliseconds at quantile `q`. Sorts on the way, which is free the second
+    /// time and keeps the ordering invariant off the caller.
+    fn p(&mut self, q: f64) -> f64 {
+        if self.0.is_empty() {
+            return 0.0;
+        }
+        self.0.sort_unstable();
+        self.0[((self.0.len() - 1) as f64 * q) as usize] as f64 / 1e6
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The read side.
+// ---------------------------------------------------------------------------
+
+/// The query mix, in the order a reader cycles it.
+///
+/// Not a microbenchmark of one shape. Each of these costs something different —
+/// `tail` should read one block and stop, `errors` has no choice but to scan the
+/// window, `trace` has no useful time bound at all and lives or dies on the
+/// sidecar filter, `page` is the deep-paging case a keyset cursor exists for —
+/// and an engine can be fast at any one of them while being unusable.
+const CLASSES: [&str; 6] = ["tail", "attr", "errors", "trace", "page x10", "series"];
+/// Index of the paging class in [`CLASSES`], which is the one that is more than
+/// a single request.
+const PAGING: usize = 4;
+
+#[derive(Default)]
+struct Reads {
+    lat: [Hist; CLASSES.len()],
+    /// `rows_matched` from the first response of each query: what the filter
+    /// found. A query mix that matches nothing measures the empty path and
+    /// reports beautiful numbers, so this column is not decoration.
+    matched: [u64; CLASSES.len()],
+    pages: u64,
+}
+
+impl Reads {
+    fn merge(&mut self, o: Reads) {
+        for i in 0..CLASSES.len() {
+            self.lat[i].0.extend(&o.lat[i].0);
+            self.matched[i] += o.matched[i];
+        }
+        self.pages += o.pages;
+    }
+
+    fn report(&mut self, el: f64) {
+        let total: usize = self.lat.iter().map(|h| h.0.len()).sum();
+        if total == 0 {
+            return;
+        }
+        println!(
+            "query    {:.0} queries/s over {total} queries",
+            total as f64 / el
+        );
+        for (i, label) in CLASSES.iter().enumerate() {
+            let n = self.lat[i].0.len();
+            if n == 0 {
+                continue;
+            }
+            let matched = self.matched[i] as f64 / n as f64;
+            let extra = if i == PAGING {
+                format!("  {:.1} pages/walk", self.pages as f64 / n as f64)
+            } else {
+                String::new()
+            };
+            println!(
+                "\x20        {label:<9} p50 {:>6.2}ms  p99 {:>6.2}ms  p999 {:>6.2}ms  \
+                 max {:>6.2}ms  {matched:>7.0} matched{extra}",
+                self.lat[i].p(0.50),
+                self.lat[i].p(0.99),
+                self.lat[i].p(0.999),
+                self.lat[i].p(1.0),
+            );
+        }
+    }
+}
+
+fn read_loop(addr: &str, worker: usize, deadline: Instant) -> Reads {
+    let mut conn = Conn::connect(addr);
+    let mut out = Reads::default();
+    let mut n = worker as u64;
+    while Instant::now() < deadline {
+        for class in 0..CLASSES.len() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let t = Instant::now();
+            let matched = ask(&mut conn, class, n, &mut out.pages);
+            out.lat[class].0.push(t.elapsed().as_nanos() as u64);
+            out.matched[class] += matched;
+            n += 1;
+        }
+    }
+    out
+}
+
+/// One query of one class. Returns `rows_matched` from the first response.
+fn ask(conn: &mut Conn, class: usize, n: u64, pages: &mut u64) -> u64 {
+    let (path, body) = document(class, n);
+    let r = conn.post(path, body.as_bytes());
+    assert!(r.ok, "{path} {body}: {}", r.body);
+    let matched = field(&r.body, "\"rows_matched\":");
+    if class != PAGING {
+        return matched;
+    }
+    // Walk the cursor. Page ten costing what page one cost is the whole claim of
+    // a keyset cursor, and it is only true if someone measures it.
+    *pages += 1;
+    let mut next = after(&r.body);
+    for _ in 0..9 {
+        let Some(c) = next else { break };
+        let doc = format!(
+            "{{\"signal\":\"logs\",\"from\":\"-1h\",\"to\":\"now\",\"limit\":100,\"after\":\"{c}\"}}"
+        );
+        let r = conn.post("/api/v1/query", doc.as_bytes());
+        assert!(r.ok, "page: {}", r.body);
+        *pages += 1;
+        next = after(&r.body);
+    }
+    matched
+}
+
+fn document(class: usize, n: u64) -> (&'static str, String) {
+    const Q: &str = "/api/v1/query";
+    match class {
+        // The session opener. Blocks are ordered newest first and `limit` cuts
+        // the scan short, so this should touch one block whatever is on disk.
+        0 => (Q, r#"{"signal":"logs","from":"-5m","to":"now","limit":100}"#.into()),
+        // An attribute equality: the case the block filter is for.
+        1 => (
+            Q,
+            format!(
+                r#"{{"signal":"logs","from":"-1h","to":"now","limit":100,"where":[{{"attr":"http.route","eq":"{}"}}]}}"#,
+                ROUTES[(n % 5) as usize]
+            ),
+        ),
+        // One in fifty rows, on a column with no index: the honest scan.
+        2 => (
+            Q,
+            r#"{"signal":"logs","from":"-1h","to":"now","limit":100,"where":[{"field":"severity_number","gte":17}]}"#.into(),
+        ),
+        // Correlation. No useful time bound — a trace id says nothing about
+        // when — so every block is a candidate and only `trace.idx` prunes.
+        3 => (
+            Q,
+            format!(
+                r#"{{"signal":"traces","from":"-24h","to":"now","limit":200,"where":[{{"field":"trace_id","eq":"{}"}}]}}"#,
+                trace_hex(n % TRACES.load(Ordering::Relaxed).max(100_000))
+            ),
+        ),
+        PAGING => (Q, r#"{"signal":"logs","from":"-1h","to":"now","limit":100}"#.into()),
+        _ => (
+            "/api/v1/metrics/query",
+            r#"{"name":"http.server.requests","from":"-15m","to":"now"}"#.into(),
+        ),
+    }
+}
+
+/// An unsigned field out of the response envelope, without a JSON parser. The
+/// envelope is written by `api::envelope` as a fixed format string, so this is
+/// reading a known shape rather than guessing at one.
+fn field(body: &str, key: &str) -> u64 {
+    body.split(key)
+        .nth(1)
+        .map(|s| {
+            s.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn after(body: &str) -> Option<String> {
+    Some(
+        body.split("\"next\":\"")
+            .nth(1)?
+            .split('"')
+            .next()?
+            .to_owned(),
+    )
+}
+
+/// Peak resident set of the server, in MiB, sampled from outside it.
+///
+/// From outside on purpose. Mira reads through `mmap`, so most of what it costs
+/// a machine is page cache the process never allocated — a heap counter would
+/// report a number that is flattering and wrong.
+fn peak_rss(pid: u32, deadline: Instant) -> f64 {
+    let mut peak = 0u64;
+    while Instant::now() < deadline {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            && let Ok(kib) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>()
+        {
+            peak = peak.max(kib);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    peak as f64 / 1024.0
+}
+
+/// Bytes under a directory. `du -s` in eight lines, because parsing `du` across
+/// two platforms is more code than walking it.
+fn du(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => du(&e.path()),
+            _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+        })
+        .sum()
 }
 
 /// One keep-alive connection, one POST at a time.
@@ -215,14 +519,18 @@ impl Conn {
         }
     }
 
-    /// Returns the bytes written, whether the export was accepted, and how many
-    /// times the connection had to be rebuilt — so the caller can report wire
-    /// throughput, backpressure and client-side damage separately.
-    fn post(&mut self, path: &str, body: &[u8]) -> (u64, bool, u64) {
+    /// The bytes written, whether it was accepted, how many times the
+    /// connection had to be rebuilt, and the response — so the caller can report
+    /// wire throughput, backpressure and client-side damage separately, and a
+    /// reader can find its cursor.
+    fn post(&mut self, path: &str, body: &[u8]) -> Reply {
         let mut resets = 0;
         loop {
             match self.attempt(path, body) {
-                Ok((n, ok)) => return (n, ok, resets),
+                Ok(mut r) => {
+                    r.resets = resets;
+                    return r;
+                }
                 // The socket is in an unknown state — a `send` that failed may
                 // have queued part of the request, and nothing on this side can
                 // tell how much. The only way back to a known state is a new
@@ -237,9 +545,14 @@ impl Conn {
         }
     }
 
-    fn attempt(&mut self, path: &str, body: &[u8]) -> io::Result<(u64, bool)> {
+    fn attempt(&mut self, path: &str, body: &[u8]) -> io::Result<Reply> {
+        // OTLP/HTTP is protobuf; everything else here is a KYAML query document.
+        let ct = match path.starts_with("/v1/") {
+            true => "application/x-protobuf",
+            false => "application/yaml",
+        };
         let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-protobuf\r\n\
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: {ct}\r\n\
              Content-Length: {}\r\n\r\n",
             self.addr,
             body.len()
@@ -277,8 +590,20 @@ impl Conn {
             "{path}: {status}: {}",
             String::from_utf8_lossy(&msg)
         );
-        Ok(((head.len() + body.len()) as u64, ok))
+        Ok(Reply {
+            wrote: (head.len() + body.len()) as u64,
+            ok,
+            resets: 0,
+            body: String::from_utf8_lossy(&msg).into_owned(),
+        })
     }
+}
+
+struct Reply {
+    wrote: u64,
+    ok: bool,
+    resets: u64,
+    body: String,
 }
 
 fn dial(addr: &str) -> TcpStream {
@@ -526,6 +851,10 @@ fn metrics_batch(w: usize, n: u64, ts: u64) -> ExportMetricsServiceRequest {
             })
             .collect(),
     }
+}
+
+fn trace_hex(k: u64) -> String {
+    trace_id(k).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn trace_id(k: u64) -> bytes::Bytes {
