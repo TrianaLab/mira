@@ -227,7 +227,7 @@ async fn query(app: &Router, doc: &str) -> String {
     body
 }
 
-fn logs_export(service: &str, base_ts: u64, n: usize) -> ExportLogsServiceRequest {
+pub(crate) fn logs_export(service: &str, base_ts: u64, n: usize) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {

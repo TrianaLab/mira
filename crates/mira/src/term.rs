@@ -489,6 +489,116 @@ mod tests {
         assert_eq!(keys(&[0xa9]), vec![Key::Char('é')]);
     }
 
+    /// Every sequence in the `csi` table, because terminals disagree about which
+    /// one they send for the same physical key and the table exists to absorb
+    /// that. An unrecognised one is `Esc`, not a dropped byte: the app treats
+    /// `Esc` as "cancel", which is the safe reading of a key we do not know.
+    #[test]
+    fn one_key_arrives_in_as_many_spellings_as_there_are_terminals() {
+        fn key(bytes: &[u8]) -> Key {
+            match parse(&mut bytes.to_vec()) {
+                Parsed::Key(k) => k,
+                Parsed::Need => panic!("incomplete: {bytes:?}"),
+            }
+        }
+        for (bytes, want) in [
+            (&b"\x1b[H"[..], Key::Home),
+            (b"\x1b[1~", Key::Home),
+            (b"\x1b[7~", Key::Home),
+            (b"\x1b[F", Key::End),
+            (b"\x1b[4~", Key::End),
+            (b"\x1b[8~", Key::End),
+            (b"\x1b[Z", Key::BackTab),
+            (b"\x1b[C", Key::Right),
+            (b"\x1bOA", Key::Up),
+            // Not in the table, and not worth guessing at.
+            (b"\x1b[200~", Key::Esc),
+            (b"\t", Key::Tab),
+            (b"\x08", Key::Backspace),
+            (b"\n", Key::Enter),
+        ] {
+            assert_eq!(key(bytes), want, "{bytes:?}");
+        }
+
+        // Alt+x: the modifier is dropped and the key kept, so the next call sees
+        // a bare `x` rather than both bytes being swallowed.
+        let mut b = b"\x1bx".to_vec();
+        assert!(matches!(parse(&mut b), Parsed::Need));
+        assert_eq!(key(&b), Key::Char('x'));
+
+        // What `key` falls back to when a sequence never completes: the first
+        // byte for what it is, then resynchronise. A lone ESC is the case that
+        // matters — it is how the filter box gets cancelled.
+        for (byte, want) in [
+            (0x1b, Key::Esc),
+            (0x03, Key::Ctrl('c')),
+            (b'q', Key::Char('q')),
+        ] {
+            let mut b = vec![byte, b'!'];
+            assert_eq!(take_one(&mut b), want);
+            assert_eq!(b, b"!");
+        }
+    }
+
+    /// The three things `Row` does that `put` does not: reserve space from the
+    /// right, re-emit an already-rendered line without re-counting its escapes,
+    /// and pad under a style so a selected row's background reaches the edge.
+    #[test]
+    fn a_row_composes_out_of_other_rows_without_recounting_their_escapes() {
+        // A right-aligned field reserves its space by moving the right edge in,
+        // writing the left side, then letting it back out.
+        let mut r = Row::new(20);
+        r.plain("left").cap(20).pad_to(12).plain("right");
+        assert_eq!(strip(&r.done()), "left        right   ");
+
+        // `raw` takes the caller's word for the width. `put` would have counted
+        // the 4 escape bytes of RED as 4 columns and rewritten them to `·`.
+        let inner = {
+            let mut i = Row::new(5);
+            i.put(RED, "ab");
+            i.done()
+        };
+        let mut outer = Row::new(10);
+        outer.raw(&inner, 5).plain("xy");
+        let s = outer.done();
+        assert!(s.contains(RED), "the inner styling survived byte for byte");
+        assert_eq!(strip(&s), "ab   xy   ");
+
+        // `repeat` clips like `put` does, and a zero-width repeat writes nothing
+        // at all — not an empty style pair, which would still be bytes.
+        let mut r = Row::new(4);
+        r.repeat(DIM, '-', 99);
+        assert_eq!(strip(&r.done()), "----");
+        let mut r = Row::new(0);
+        r.repeat(DIM, '-', 3).put(RED, "x");
+        assert_eq!(r.done(), RESET, "nothing fits, so nothing is written");
+
+        // `fill` re-opens the style over the padding: the highlight on a selected
+        // row has to reach the right edge, not stop where the text does.
+        let mut r = Row::new(6);
+        r.plain("ab");
+        let s = r.fill(REV);
+        assert!(s.ends_with(&format!("{REV}    {RESET}")), "{s:?}");
+    }
+
+    /// The syscall half of this file — `enter`, `size`, `draw`, `key`, `restore`
+    /// — needs a pty, and a test that took one would put the runner's own
+    /// terminal into raw mode. The guard that keeps it from trying is testable,
+    /// and it is the branch that actually fires in anger: `mira mira` in a
+    /// pipeline, in CI, or under a process supervisor.
+    ///
+    /// ponytail: the rest is covered by driving the real binary under
+    /// `script -q /dev/null` — see CLAUDE.md. Worth automating when the TUI's
+    /// input handling grows past `parse`.
+    #[test]
+    fn the_tui_refuses_a_stdin_that_is_not_a_terminal() {
+        let Err(e) = Term::enter() else {
+            panic!("cargo test does not run on a tty")
+        };
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        assert!(e.to_string().contains("needs stdin and stdout on a tty"));
+    }
+
     fn strip(s: &str) -> String {
         let mut out = String::new();
         let mut it = s.chars();

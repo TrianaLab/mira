@@ -335,3 +335,197 @@ async fn retention(cfg: Arc<Config>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mira_core::logs::LogsBuilder;
+    use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
+    use mira_proto::common::v1::{AnyValue, KeyValue, any_value};
+    use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+    fn cfg(name: &str) -> (Arc<Config>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mira-pipe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            Arc::new(Config {
+                data_dir: dir.clone(),
+                // Short enough that a test can wait out the age timer, long
+                // enough that two submits still land in one `recv_many`.
+                max_block_age: Duration::from_millis(50),
+                ..Default::default()
+            }),
+            dir,
+        )
+    }
+
+    fn blocks(dir: &std::path::Path) -> usize {
+        block::scan(dir, "logs").map_or(0, |b| b.len())
+    }
+
+    /// One record carrying `n` attributes with distinct keys. The key dictionary
+    /// is the thing with a ceiling, and distinct keys are the only way to reach
+    /// it — a million records sharing one key never do.
+    fn wide(n: usize) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000,
+                        attributes: (0..n)
+                            .map(|i| KeyValue {
+                                key: format!("k{i}"),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::StringValue("v".into())),
+                                }),
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// A request that does not fit the open block is deferred into the next one,
+    /// never refused and never reordered.
+    ///
+    /// Both submits are acknowledged, so neither caller loses its data, and both
+    /// blocks land — which is the difference between "the dictionary is full" and
+    /// "your export is rejected". The second is what a client sees as a permanent
+    /// failure for data whose real cardinality was fine.
+    #[tokio::test]
+    async fn a_request_that_does_not_fit_lands_in_the_next_block() {
+        let (c, dir) = cfg("carry");
+        let (tx, h) = spawn::<LogsBuilder>(c);
+        // 40k distinct keys each: the first fits an empty block, the second
+        // cannot join it, and 80k would overflow the u16 dictionary.
+        let (a, b) = tokio::join!(tx.submit(wide(40_000)), tx.submit(wide(40_000)));
+        assert!(a.is_ok() && b.is_ok(), "both callers must be acknowledged");
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(blocks(&dir), 2, "the deferred request got its own block");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the headroom hint deliberately cannot answer: one request that
+    /// is too wide for *any* block. Sealing first cannot help, so the append is
+    /// attempted and its failure is the caller's answer — after which the
+    /// builder has to be usable again, or the node rejects everything until it
+    /// is restarted.
+    #[tokio::test]
+    async fn an_impossible_request_fails_only_itself() {
+        let (c, dir) = cfg("toowide");
+        let (tx, h) = spawn::<LogsBuilder>(c);
+        match tx.submit(wide(70_000)).await {
+            Err(Rejected::Failed(e)) => {
+                assert!(e.contains("65535") || e.contains("dictionary"), "{e}")
+            }
+            _ => panic!("70k distinct keys cannot fit a u16 dictionary"),
+        }
+        // The next export proves the builder was replaced, not poisoned.
+        tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
+            .await
+            .unwrap_or_else(|_| panic!("the pipeline is still open for business"));
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(blocks(&dir), 1, "only the good export was published");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An export with no records is legal and the Collector sends them. There is
+    /// nothing in it to make durable, so parking its caller behind a block that
+    /// will never be sealed strands them for as long as they are willing to wait.
+    #[tokio::test]
+    async fn an_empty_export_is_acknowledged_without_a_block() {
+        let (c, dir) = cfg("empty");
+        let (tx, h) = spawn::<LogsBuilder>(c);
+        // No timeout needed: if this ever blocks, it blocks forever, and the
+        // test harness reports the hang for what it is.
+        tx.submit(ExportLogsServiceRequest::default())
+            .await
+            .unwrap_or_else(|_| panic!("an empty export is not an error"));
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(blocks(&dir), 0, "nothing to seal, so nothing was sealed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shedding is a fast NACK before the decode work, and it has to be
+    /// distinguishable from shutdown: `Busy` is retryable and `Closed` is not,
+    /// and an exporter that confuses them either drops good data or hammers a
+    /// draining node.
+    #[tokio::test]
+    async fn a_full_queue_sheds_and_a_closed_one_says_so() {
+        let (tx, rx) = mpsc::channel::<Job<ExportLogsServiceRequest>>(1);
+        let ingest = Ingest { tx };
+        let req = || ExportLogsServiceRequest::default();
+
+        // Nothing is reading, so the first send fills the channel and the
+        // second finds no permit. The first never returns; that is the point.
+        let pending = tokio::spawn({
+            let i = ingest.clone();
+            async move { i.submit(req()).await }
+        });
+        while rx.capacity() > 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(ingest.submit(req()).await, Err(Rejected::Busy)));
+
+        // The flusher is gone. In flight becomes `Closed` because the ack sender
+        // dropped with it; new work becomes `Closed` because the channel did.
+        drop(rx);
+        assert!(matches!(pending.await.unwrap(), Err(Rejected::Closed)));
+        assert!(matches!(ingest.submit(req()).await, Err(Rejected::Closed)));
+    }
+
+    /// A data directory that cannot be scanned stops the flusher at startup
+    /// rather than at the first flush. Sequence numbers are resumed from what is
+    /// on disk, so a pipeline that could not read it would reuse a sequence and
+    /// never publish again — failing loudly here is the cheaper end of that.
+    #[tokio::test]
+    async fn an_unreadable_data_directory_stops_the_flusher_at_startup() {
+        let (c, dir) = cfg("unscannable");
+        std::fs::write(dir.join("logs"), b"not a directory").unwrap();
+        let (tx, h) = spawn::<LogsBuilder>(c);
+        h.await.unwrap();
+        assert!(matches!(
+            tx.submit(ExportLogsServiceRequest::default()).await,
+            Err(Rejected::Closed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Retention runs on a timer, and `interval` fires its first tick straight
+    /// away — so a zero TTL expires everything on the first pass, with no clock
+    /// to advance and no sleep to wait out.
+    #[tokio::test]
+    async fn retention_drops_expired_blocks_on_its_first_pass() {
+        let (c, dir) = cfg("retention");
+        let (tx, h) = spawn::<LogsBuilder>(Arc::clone(&c));
+        tx.submit(crate::e2e::logs_export("checkout", 1_000, 4))
+            .await
+            .unwrap_or_else(|_| panic!("export"));
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(blocks(&dir), 1);
+
+        spawn_retention(Arc::new(Config {
+            data_dir: dir.clone(),
+            retention: Duration::ZERO,
+            ..Default::default()
+        }));
+        // The sweep is a `spawn_blocking`, so yielding is not enough to see it.
+        for _ in 0..200 {
+            if blocks(&dir) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(blocks(&dir), 0, "a block older than its TTL is unlinked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -57,10 +57,10 @@ jobs:
       # that gets switched off the first time it goes red.
       #
       # Destination is 100. What stands between here and there, worst first:
-      # tui/source.rs (44%), term.rs (63%), pipeline.rs (63%) — no test kills a
-      # flusher mid-flight — tui.rs (77%) and query.rs (86%), which is the one
-      # that matters: it is the read path.
+      # term.rs (74%) and tui.rs (77%) — both need a pty, see CLAUDE.md for the
+      # `script -q` recipe that would automate it — main.rs (78%), and
+      # query.rs (86%), which is the one that matters: it is the read path.
       #
       # Run the same thing locally with:
       #   cargo llvm-cov --workspace --summary-only
-      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 88
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 90

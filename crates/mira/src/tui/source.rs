@@ -202,4 +202,126 @@ mod tests {
         );
         assert_eq!(d["stats"]["blocks_scanned"].as_i64().unwrap(), 1);
     }
+
+    /// The claim that pays for this whole module: a block directory answers with
+    /// nothing running. No server, no port, no process that has to have survived
+    /// — a detached PVC is still readable.
+    ///
+    /// All four route arms go through here because the field name each one puts
+    /// in the envelope (`rows`, `series`, `names`) is what the TUI reads back
+    /// out, and a route that answered under the wrong key would look like an
+    /// empty result rather than an error.
+    #[test]
+    fn a_local_source_answers_out_of_a_directory_with_no_server() {
+        let dir = std::env::temp_dir().join(format!("mira-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut b = mira_core::logs::LogsBuilder::new();
+        b.append_request(&crate::e2e::logs_export("checkout", 1_000, 6))
+            .unwrap();
+        let sealed = b.finish().unwrap();
+        mira_core::block::publish(&dir, "logs", mira_core::block::node_id("a"), 0, &sealed)
+            .unwrap();
+
+        let src = Source::Local(dir.clone());
+        assert!(src.label().starts_with("local "));
+
+        let d = src
+            .post(QUERY, r#"{"signal":"logs","from":0,"to":100000,"limit":2}"#)
+            .unwrap();
+        assert_eq!(d["rows"].as_vec().unwrap().len(), 2);
+        assert_eq!(d["stats"]["rows_matched"].as_i64().unwrap(), 6);
+
+        // No metrics in this directory, so these answer empty — which is the
+        // point: they answer, under their own key, rather than erroring.
+        for (route, field) in [(SERIES, "series"), (NAMES, "names")] {
+            let d = src.post(route, r#"{"name":"anything"}"#).unwrap();
+            assert!(d[field].as_vec().unwrap().is_empty(), "{route}");
+            assert_eq!(d["stats"]["blocks_total"].as_i64().unwrap(), 0);
+        }
+
+        // A malformed document is the engine's error, reported verbatim rather
+        // than swallowed into "query failed".
+        let e = src.post(QUERY, r#"{"signal":"nope"}"#).unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        assert!(
+            src.post("/api/v1/nope", "{}")
+                .unwrap_err()
+                .contains("route")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enough HTTP to read an answer, and no more — so what it does with the
+    /// three replies it can get has to be pinned down here.
+    ///
+    /// A non-200 carrying a JSON body is handed up rather than reported as a
+    /// number, because the body is the error envelope and the message inside it
+    /// is the only useful thing on the screen.
+    #[test]
+    fn a_remote_source_reports_what_the_server_actually_said() {
+        // One canned reply per connection, in order. The listener lives as long
+        // as the thread, which ends when the replies run out.
+        fn serve(replies: Vec<&'static str>) -> String {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            std::thread::spawn(move || {
+                for reply in replies {
+                    let Ok((mut s, _)) = l.accept() else { return };
+                    // The whole request, head then body. Replying while the
+                    // body is still unread closes the socket with data in the
+                    // receive queue, which is an RST on the client rather than
+                    // the answer — a real server has the same obligation.
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while std::io::Read::read(&mut s, &mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let len: usize = String::from_utf8_lossy(&head)
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: ")?.trim().parse().ok())
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; len];
+                    let _ = std::io::Read::read_exact(&mut s, &mut body);
+                    let _ = s.write_all(reply.as_bytes());
+                }
+            });
+            addr
+        }
+
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rows\":[],\
+                  \"stats\":{\"blocks_total\":0,\"blocks_scanned\":0,\"rows_scanned\":0,\
+                  \"rows_matched\":0}}";
+        let bad = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":\"unknown signal \\\"nope\\\"\"}";
+        let plain = "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream is down";
+        let truncated = "HTTP/1.1 200 OK\r\nContent-Type: application/json";
+
+        let src = Source::Remote(serve(vec![ok, bad, plain, truncated]));
+        assert!(src.label().starts_with("http "));
+
+        let d = src.post(QUERY, "{}").unwrap();
+        assert!(d["rows"].as_vec().unwrap().is_empty());
+        // 400, but the message is what reaches the status bar, not the number.
+        assert_eq!(
+            src.post(QUERY, "{}").unwrap_err(),
+            r#"unknown signal "nope""#
+        );
+        let e = src.post(QUERY, "{}").unwrap_err();
+        assert!(e.contains("502") && e.contains("upstream is down"), "{e}");
+        assert!(
+            src.post(QUERY, "{}").unwrap_err().contains("terminator"),
+            "a reply with no blank line is not an empty answer"
+        );
+
+        // Nothing listening at all. The address is in the message because the
+        // usual cause is a typo in `--addr`.
+        let dead = Source::Remote("127.0.0.1:1".into());
+        let e = dead.post(QUERY, "{}").unwrap_err();
+        assert!(e.starts_with("127.0.0.1:1: "), "{e}");
+    }
 }
