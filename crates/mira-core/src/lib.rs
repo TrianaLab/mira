@@ -1453,6 +1453,118 @@ mod tests {
             Err(Error::BadChecksum { .. })
         ));
 
+        // Truncated from the front, and not an Arrow file at all. arrow-rs seeks
+        // straight to the trailer and never looks at the magic, so both of these
+        // reach the decoder as garbage unless we check first.
+        for junk in [&b"ARROW"[..], &[0u8; 64][..]] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                matches!(block::open_table(&path), Err(Error::BadMagic { .. })),
+                "{junk:?} decoded as a block"
+            );
+        }
+
+        // A real Arrow file, written by arrow-rs rather than by us, so the magic
+        // and the footer are both valid and only the checksum is absent. Reading
+        // it would be reading something no version of Mira wrote.
+        let batch = sealed.table("logs").unwrap();
+        let mut w = arrow_ipc::writer::FileWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            &batch.schema(),
+        )
+        .unwrap();
+        w.write(batch).unwrap();
+        w.finish().unwrap();
+        let Err(e) = block::open_table(&path) else {
+            panic!("a file with no checksum in it was read as a block")
+        };
+        assert!(matches!(e, Error::MissingMetadata { .. }), "{e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The block directory is the manifest, which means everything else on the
+    /// volume is noise it has to survive: a `.DS_Store`, a directory somebody
+    /// else made, a block half-published by a process that was killed.
+    ///
+    /// None of these are hypothetical. Replicas share a volume by design (§10),
+    /// and the catalog is rebuilt by `readdir` on every start.
+    #[test]
+    fn the_catalog_ignores_everything_it_did_not_write() {
+        let root = std::env::temp_dir().join(format!("mira-junk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let node = block::node_id("a");
+
+        let seal = |base: u64| {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request("checkout", 4, base)).unwrap();
+            b.finish().unwrap()
+        };
+        let published = block::publish(&root, "logs", node, 0, &seal(1_000)).unwrap();
+        let partition = published.dir.parent().unwrap().to_path_buf();
+        let name = published.dir.file_name().unwrap().to_str().unwrap();
+
+        // A file where a partition directory should be, a directory whose name
+        // is not a block name, and a block name with one field too many — which
+        // is what a future format version would look like from here.
+        std::fs::write(root.join("logs").join(".DS_Store"), b"junk").unwrap();
+        for junk in ["not-a-block", &format!("{name}-1")] {
+            std::fs::create_dir_all(partition.join(junk)).unwrap();
+        }
+        assert_eq!(block::scan(&root, "logs").unwrap(), vec![published.clone()]);
+
+        // A publish killed between staging and rename leaves the staging
+        // directory behind, under the name the *next* publish of that sequence
+        // will stage into. It must be cleared rather than merged with.
+        let stale = root.join(".tmp").join(format!("logs-{node:08x}-{:012}", 1));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("logs.arrow"), b"leftovers").unwrap();
+        let second = block::publish(&root, "logs", node, 1, &seal(2_000)).unwrap();
+        assert!(block::open_table(&second.dir.join("logs.arrow")).is_ok());
+        assert_eq!(block::scan(&root, "logs").unwrap().len(), 2);
+
+        // And retention takes the block, not the junk beside it.
+        assert_eq!(block::expire(&root, "logs", i64::MAX).unwrap(), 2);
+        assert!(block::scan(&root, "logs").unwrap().is_empty());
+        assert!(partition.join("not-a-block").is_dir());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every codec writes a file the reader reads back identically. LZ4 is not
+    /// written by the engine — it exists so the `tier` example can price the
+    /// pure-Rust codec against the C one — and an untested writer is how that
+    /// comparison ends up measuring a bug.
+    #[test]
+    fn every_codec_round_trips_the_same_rows() {
+        let dir = std::env::temp_dir().join(format!("mira-codec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut b = logs::LogsBuilder::new();
+        b.append_request(&request("checkout", 500, 1_000)).unwrap();
+        let sealed = b.finish().unwrap();
+        let batch = sealed.table("logs").unwrap();
+
+        type Writer = fn(&std::path::Path, &arrow_array::RecordBatch) -> Result<()>;
+        let write: [(&str, Writer); 3] = [
+            ("plain", block::write_table),
+            ("zstd", block::write_table_zstd),
+            ("lz4", block::write_table_lz4),
+        ];
+        let mut sizes = Vec::new();
+        for (name, f) in write {
+            let path = dir.join(format!("{name}.arrow"));
+            f(&path, batch).unwrap();
+            let read = block::open_table(&path).unwrap();
+            assert_eq!(read.batches, vec![batch.clone()], "{name}");
+            sizes.push((name, std::fs::metadata(&path).unwrap().len()));
+        }
+        let plain = sizes[0].1;
+        for (name, size) in &sizes[1..] {
+            assert!(*size < plain, "{name} is {size} against {plain} plain");
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
