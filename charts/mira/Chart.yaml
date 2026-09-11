@@ -31,6 +31,10 @@ sources:
   - https://github.com/TrianaLab/mira/tree/main/charts/mira
   - https://github.com/TrianaLab/mira
 annotations:
+  # `monitoring-logging` is one of Artifact Hub's fixed categories and is how
+  # anyone browsing rather than searching arrives here. Unset, a chart lands in
+  # no category at all rather than in a sensible default.
+  artifacthub.io/category: monitoring-logging
   artifacthub.io/license: Apache-2.0
   artifacthub.io/links: |
     - name: support

@@ -717,11 +717,15 @@ async fn a_cursor_taken_from_the_open_block_survives_the_seal() {
     // however long the other tests' fsyncs take. Two seconds is enough on an
     // idle machine and is a flake on a loaded one, which is the worst of both —
     // the test fails for a reason that has nothing to do with cursors.
-    assert_eq!(
-        seal(&root, "logs").await.len(),
-        1,
-        "the block never sealed, so this test proves nothing"
-    );
+    //
+    // Its return value is deliberately dropped. [`seal`] carries its own
+    // deadline, so reaching the next line already means a block was published —
+    // and asserting on *how many* is the one thing that cannot be relied on
+    // here: `max_block_age` is 100ms and the 16th record opens a block of its
+    // own, so a runner that starves this task for longer than that publishes
+    // two before the poll next looks. Which of them exist is not what this test
+    // is about.
+    seal(&root, "logs").await;
 
     // Now finish the read with the cursor from before the seal. The 16th
     // record is deliberately outside the window: what is being asserted is

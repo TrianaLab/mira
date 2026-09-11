@@ -254,7 +254,11 @@ jobs:
     name: image
     needs: changes
     if: needs.changes.outputs.image == 'true'
-    runs-on: ubuntu-latest
+    # Same pin as `e2e` and `release-dry-run`: `make scan-image` goes through
+    # `dist-image`, which puts this runner's binary in the image and asserts its
+    # glibc floor. Scanning an image built from a binary that could not ship is
+    # scanning something else.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -301,7 +305,12 @@ jobs:
     # compose file and the collector config live there, so editing them has to
     # re-run the thing they describe.
     if: needs.changes.outputs.image == 'true' || needs.changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, the same pin and the same reason as release.yml's two linux
+    # legs: this is the only job in the tree that *runs* the release binary
+    # inside the release image, so building it against a glibc newer than the
+    # distroless base makes it the only job that can catch that — and building
+    # it on `ubuntu-latest` made it the job that caused it instead.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -318,7 +327,11 @@ jobs:
     name: release-dry-run
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    # Same pin, because a rehearsal on a different runner than the performance
+    # rehearses the wrong thing: `make dist` asserts the tarball's glibc floor,
+    # and that assertion is only meaningful against the toolchain that will
+    # actually cut the release.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
