@@ -46,6 +46,15 @@ HAS_WGET="$(type wget >/dev/null 2>&1 && echo true || echo false)"
 # runners, which surfaces as a spurious "version not found" during tag lookup.
 # Download URLs (the release CDN) are not rate-limited and are left
 # unauthenticated on purpose.
+#
+# These two are expanded below through the `[@]+` form rather than plainly
+# quoted, and that is not a style choice. Under `set -u`, bash before 4.4 treats
+# an empty array expanded with `[@]` as an unbound variable and exits; macOS
+# still ships 3.2.57 as /bin/bash, frozen there by bash 4.0's move to GPLv3, and
+# `curl ... | bash` runs exactly that. So the failing case was the common one —
+# a Mac, no token, empty array — and it failed before printing anything.
+# The `+` form expands to nothing when the array is empty and to the quoted
+# elements otherwise, which is what the plain expansion was meant to do.
 GH_API_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 CURL_AUTH=()
 WGET_AUTH=()
@@ -107,26 +116,34 @@ verifySupported() {
 fetch() {
   # $1 url, $2 output path ("-" for stdout)
   if [ "$HAS_CURL" = "true" ]; then
-    if [ "$2" = "-" ]; then curl -fsSL "${CURL_AUTH[@]}" "$1"; else curl -fsSL "$1" -o "$2"; fi
+    if [ "$2" = "-" ]; then curl -fsSL ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$1"; else curl -fsSL "$1" -o "$2"; fi
   else
-    if [ "$2" = "-" ]; then wget "${WGET_AUTH[@]}" -qO- "$1"; else wget -qO "$2" "$1"; fi
+    if [ "$2" = "-" ]; then wget ${WGET_AUTH[@]+"${WGET_AUTH[@]}"} -qO- "$1"; else wget -qO "$2" "$1"; fi
   fi
 }
 
 checkDesiredVersion() {
   if [ -z "$DESIRED_VERSION" ]; then
-    TAG=$(fetch "$API_URL/latest" - | grep -E '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    # `|| true`, because every part of this pipeline fails for an ordinary
+    # reason: `curl -f` on a 404 when the repository has no release yet, and
+    # `grep` with no match when the API answered with a rate-limit document
+    # instead. Without it `set -o pipefail` aborts the substitution and the
+    # message below — the one that says which of those it was — never prints.
+    TAG=$(fetch "$API_URL/latest" - 2>/dev/null | grep -E '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
     if [ -z "$TAG" ]; then
-      echo "Failed to fetch latest version" >&2
+      echo "No release found for $REPO." >&2
+      echo "  Either the repository has not published one yet, or the anonymous" >&2
+      echo "  API limit (60/hour per IP) was hit — set GH_TOKEN and retry to rule" >&2
+      echo "  that out. To build from source instead: https://miradb.dev/install/" >&2
       exit 1
     fi
   else
     TAG="$DESIRED_VERSION"
     status_code=0
     if [ "$HAS_CURL" = "true" ]; then
-      status_code=$(curl -sSL "${CURL_AUTH[@]}" -o /dev/null -w "%{http_code}" "$API_URL/tags/$TAG")
+      status_code=$(curl -sSL ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -o /dev/null -w "%{http_code}" "$API_URL/tags/$TAG")
     else
-      status_code=$(wget "${WGET_AUTH[@]}" --server-response --spider -q "$API_URL/tags/$TAG" 2>&1 | awk '/HTTP\//{print $2}')
+      status_code=$(wget ${WGET_AUTH[@]+"${WGET_AUTH[@]}"} --server-response --spider -q "$API_URL/tags/$TAG" 2>&1 | awk '/HTTP\//{print $2}')
     fi
     if [ "$status_code" != "200" ]; then
       echo "Version $TAG not found in $REPO releases" >&2

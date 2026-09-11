@@ -413,6 +413,44 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 	actionlint
 	$(PYTHON) scripts/check_ci.py
 
+.PHONY: install-script
+install-script: ## The published one-liner installer still parses, lints and runs
+	@# `docs/install.sh` is a symlink to this file, so what the docs site serves
+	@# at miradb.dev/install.sh is these bytes — which makes it the one script
+	@# here that strangers run, unreviewed, as their first contact with the
+	@# project. It had no gate at all until it broke in the field.
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "error: shellcheck is not installed."; \
+		echo "  macOS: brew install shellcheck"; \
+		echo "  else:  https://github.com/koalaman/shellcheck#installing"; \
+		exit 1; }
+	shellcheck scripts/get-mira.sh
+	@# The failure shellcheck does not have an opinion about, and no runner here
+	@# can reproduce: `"$${a[@]}"` on an *empty* array is an unbound variable
+	@# under `set -u` on bash before 4.4. macOS ships 3.2.57 as /bin/bash and
+	@# `curl ... | bash` runs it, so "a Mac with no GH_TOKEN" — the common case —
+	@# exited before printing anything, while every ubuntu runner (bash 5.x)
+	@# found the same line perfectly legal. Hence a grep rather than a test.
+	@# The safe form contains the unsafe one as its own second half, so the
+	@# safe form is deleted before looking for what is left.
+	@! sed 's/\$${[A-Z_]*\[@\]+"\$${[A-Z_]*\[@\]}"}//g' scripts/get-mira.sh \
+	    | grep -nE '"\$$\{[A-Z_]+\[@\]\}"' || { \
+		echo "error: expand possibly-empty arrays as \$${a[@]+\"\$${a[@]}\"}."; \
+		echo "  the plain quoted form aborts under \`set -u\` on bash < 4.4,"; \
+		echo "  which is what macOS ships as /bin/bash and what the one-liner runs."; \
+		exit 1; }
+	@# And it reaches its version lookup and fails there in its own words. Port 1
+	@# refuses immediately, so this needs neither the network nor a published
+	@# release — and it is the whole path that broke: argv assembly, `fetch`,
+	@# and the `set -o pipefail` interaction that used to swallow the message.
+	@out=$$(API_URL=http://127.0.0.1:1/releases bash scripts/get-mira.sh --no-sudo 2>&1 || true); \
+	case "$$out" in \
+	  *"No release found"*) ;; \
+	  *) echo "error: the installer did not reach its version lookup cleanly:"; \
+	     printf '%s\n' "$$out" | sed 's/^/    /'; exit 1 ;; \
+	esac
+	@echo "installer: shellcheck clean, arrays expand safely, version lookup reached."
+
 .PHONY: print-msrv
 print-msrv: ## Print the declared MSRV (CI installs the toolchain from this)
 	@echo $(MSRV)
@@ -561,7 +599,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 

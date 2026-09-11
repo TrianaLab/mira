@@ -29,7 +29,7 @@ curl -fsSL https://miradb.dev/install.sh | bash
 
 The installer picks your target, checks the release's `SHA256SUMS`, and — if the GitHub
 CLI is on `PATH` — verifies the SLSA provenance attestation before it moves anything into
-place. `--version v0.1.0` pins, `--no-sudo` installs without root, `MIRA_INSTALL_DIR`
+place. `--version v0.0.1` pins, `--no-sudo` installs without root, `MIRA_INSTALL_DIR`
 picks the directory.
 
 ```sh

@@ -81,7 +81,11 @@ jobs:
             # `overrides/` is the mkdocs theme override directory — one file, the
             # landing hero — and a Jinja error in it fails `mkdocs build --strict`
             # like any page would.
-            docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|.*\.md\$)${W}")
+            # `scripts/get-mira.sh` is here rather than only in `code` because
+            # `docs/install.sh` is a symlink to it: the docs site *publishes*
+            # it, so it is a documentation artefact that happens to be a script,
+            # and this is the leg that checks it.
+            docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$)${W}")
             # `Makefile$` for the same reason it is in `code` and `image`: both
             # of this leg's steps are make targets, so an edit to `ui-check` or
             # `ui-demo` is a change to what this job asserts.
@@ -257,6 +261,11 @@ jobs:
       # whole link checker — a dead internal link or a missing anchor fails the
       # build. No separate link-checking action, and none needed.
       - run: make docs
+      # The other thing this site publishes: `docs/install.sh` is a symlink to
+      # `scripts/get-mira.sh`, so these are the bytes strangers pipe into bash.
+      # shellcheck is preinstalled on the runner image. See the target for the
+      # one class of bug it checks that no runner here can reproduce.
+      - run: make install-script
 
   image:
     name: image

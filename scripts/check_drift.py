@@ -122,6 +122,21 @@ CHART_YAML = "charts/mira/Chart.yaml"
 # that fails for a reader who did exactly what the page said.
 CHART_VERSION_SITES = ["docs/install.md"]
 
+# The other version in the prose: the *binary's*, in the two commands a reader
+# copies rather than reads — `--version vX.Y.Z` and the `V=` that opens the
+# manual download block. Checked the opposite way round from the chart sites
+# above, which only assert the current version appears *somewhere* in the file
+# and so are satisfied by a file that also carries a stale one. Here any release
+# version that is not the current one is the failure, because there is no reason
+# for a second: `v0.1.0` sat in three copy-pasteable blocks while the workspace
+# was at 0.0.1, and each was a 404 on a stranger's first contact with Mira.
+#
+# Anchored on `--version v` and `V=` rather than on bare `vX.Y.Z` so that naming
+# some *other* project's version in prose — a Rust release, a Helm version — is
+# not a build failure.
+RELEASE_VERSION_SITES = ["README.md", "docs/install.md"]
+RELEASE_VERSION_RE = re.compile(r"(?:--version\s+v|^V=)(\d+\.\d+\.\d+)")
+
 # The Artifact Hub ownership proof, pushed to the chart repository under a
 # reserved tag by release.yml. Artifact Hub does not report a wrong or missing
 # `repositoryID` as an error: it just leaves the repository unverified, quietly,
@@ -351,6 +366,18 @@ def check_chart_version(crate_version: str) -> None:
                 f"({crate_version}). It pins `helm install --version` at the old "
                 "one, which is an install that fails for whoever copies it."
             )
+
+    for rel in RELEASE_VERSION_SITES:
+        for lineno, line in enumerate((ROOT / rel).read_text().splitlines(), 1):
+            for m in RELEASE_VERSION_RE.finditer(line):
+                if m.group(1) != crate_version:
+                    fail(
+                        f"{rel}:{lineno} names release v{m.group(1)}, but the "
+                        f"workspace is at {crate_version}.\n"
+                        "    That line is a command someone copies, so a stale "
+                        "version is a 404 rather than a typo. Bump it with the "
+                        "crate version."
+                    )
 
     repo_yml = ROOT / ARTIFACTHUB_REPO_YML
     if not repo_yml.exists():
