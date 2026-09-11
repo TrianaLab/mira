@@ -311,6 +311,27 @@ ui-demo: ## Build the recorded-snapshot UI the docs site hosts at /play
 	@# src/lib/fixtures.json instead of from a server, so it belongs on the
 	@# site and nowhere near the binary. `make site` picks it up.
 	cd $(UI_DIR) && npm ci && VITE_REPLAY=1 npm run build -- --outDir dist-demo
+	@# And the asset URLs point at /play, which is the one thing about this
+	@# build that nothing else can check. `make site` copies the directory into
+	@# site/play *after* mkdocs has run, so `mkdocs --strict` — the whole link
+	@# checker — structurally cannot see it; and a bundle built with the wrong
+	@# `base` does not 404, it serves a 200 whose body is an empty
+	@# `<div id="app">` and two 404s in a console nobody has open. That shipped
+	@# once. It is asserted here rather than in `site` because this is the half
+	@# a pull request can afford to run: node, and no rustdoc.
+	@grep -oE '(src|href)="/[^"]+"' $(UI_DIR)/dist-demo/index.html \
+	  | sed -e 's/^[a-z]*="//' -e 's/"$$//' \
+	  | while read -r u; do \
+	      case "$$u" in \
+	        /play/*) [ -f "$(UI_DIR)/dist-demo$${u#/play}" ] && continue ;; \
+	      esac; \
+	      echo "error: the recorded snapshot's index.html asks for $$u."; \
+	      echo "  it is served from /play/, so every asset URL in it has to be"; \
+	      echo "  /play/<file> and name a file this build produced. See the"; \
+	      echo "  VITE_REPLAY branch of \`base\` in $(UI_DIR)/vite.config.js."; \
+	      exit 1; \
+	    done
+	@echo "recorded snapshot: assets resolve under /play."
 
 .PHONY: ui-fixtures
 ui-fixtures: ## Re-record src/lib/fixtures.json from a live Mira
@@ -540,7 +561,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check deps drift workflows chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 

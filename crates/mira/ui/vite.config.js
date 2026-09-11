@@ -13,6 +13,11 @@ import { svelte } from '@sveltejs/vite-plugin-svelte'
 // bundle that ends up inside `mira`.
 export default defineConfig({
   plugins: [svelte()],
+  // The binary serves the bundle at `/`, the documentation site serves it at
+  // `/play/`, and vite writes the script and stylesheet URLs into index.html as
+  // root-absolute paths — so a bundle built for one is a blank page under the
+  // other, with two 404s in a console nobody has open. Same build, two bases.
+  base: process.env.VITE_REPLAY ? '/play/' : '/',
   define: { __REPLAY__: JSON.stringify(!!process.env.VITE_REPLAY) },
   build: {
     outDir: 'dist',

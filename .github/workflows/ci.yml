@@ -82,7 +82,10 @@ jobs:
             # landing hero — and a Jinja error in it fails `mkdocs build --strict`
             # like any page would.
             docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|.*\.md\$)${W}")
-            ui=$(m "^crates/mira/ui/${W}")
+            # `Makefile$` for the same reason it is in `code` and `image`: both
+            # of this leg's steps are make targets, so an edit to `ui-check` or
+            # `ui-demo` is a change to what this job asserts.
+            ui=$(m "^(crates/mira/ui/|Makefile\$)${W}")
             # The image is the binary plus the base image, so anything that
             # changes the binary changes what Trivy is looking at. Dockerfile
             # and .dockerignore are here for the obvious reason; Cargo.lock is
@@ -174,6 +177,11 @@ jobs:
       # what ships. `make ui-check` rebuilds it and diffs: a .svelte fix that
       # was never rebuilt is a fix nobody gets.
       - run: make ui-check
+      # The second build of the same source — the recorded snapshot the site
+      # hosts at /play. Only `docs.yml` builds it otherwise, and that runs after
+      # the merge, so a snapshot that renders a blank page was a green pull
+      # request. The target asserts its own asset URLs; see the comment there.
+      - run: make ui-demo
 
   coverage:
     name: coverage
