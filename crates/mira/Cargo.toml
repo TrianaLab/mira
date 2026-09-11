@@ -1,0 +1,59 @@
+[package]
+name = "mira"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mira: an OTLP-native telemetry storage engine in a single binary"
+
+[[bin]]
+name = "mira"
+path = "src/main.rs"
+
+[dependencies]
+mira-core.workspace = true
+mira-proto.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-types = "0.14"
+axum.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+# The webhook dispatcher (`alert.rs`). Both are already in the tree under axum
+# and tonic, so naming them here costs no crates — only the right to call them.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+# Direct https:// webhook targets. Off by default: this is eleven crates
+# against a tree of 117 and `ring` is a second C dependency, and both of those
+# numbers are stated product properties (README, section 11). Without it an https
+# target is refused at load with a message naming this feature.
+hyper-rustls = { version = "0.27", default-features = false, optional = true, features = [
+  "http1",
+  "ring",
+  "webpki-tokio",
+  "tls12",
+] }
+# The terminal UI's whole backend: termios, TIOCGWINSZ, poll and localtime_r.
+# ratatui is the alternative and costs 61 crates, against a tree of 117.
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yaml-rust2 = { version = "0.12.0", default-features = false }
+
+[features]
+default = []
+webhook-tls = ["dep:hyper-rustls"]
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+# `start_paused`, so the tests that exercise `ADMIT_WAIT` and the sweep timers
+# spend their five and sixty seconds on the test's clock. A feature of a crate
+# already in the graph, so it costs no crates — and it is dev-only, so the
+# released binary does not carry the mock clock.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mira chart values",
+  "description": "additionalProperties is false at every level the chart owns. Mira's own config parser refuses an unknown key at boot rather than ignoring it (docs/CONFIG.md), and a chart that is laxer than the binary turns `--set persistence.sizee=100Gi` into a 20Gi volume nobody notices until it fills. The k8s-shaped pass-throughs (securityContext, resources, affinity, tolerations, extraEnv) stay open, because the API server owns those schemas and this one must not be a second, staler copy of them.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "global": {
+      "type": "object",
+      "description": "Present only so that mira can be a subchart; nothing here reads it."
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        },
+        "tag": {
+          "type": "string"
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["name"]
+      }
+    },
+    "nameOverride": {
+      "type": "string",
+      "maxLength": 63
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "maxLength": 63
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "automount": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "name": { "type": "string", "maxLength": 63 }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "podSecurityContext": {
+      "type": "object",
+      "properties": {
+        "runAsNonRoot": { "type": "boolean" },
+        "runAsUser": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minimum 1: uid 0 is refused here rather than by the kubelet at scheduling time, since the image has no root-owned path to run from anyway."
+        },
+        "runAsGroup": { "type": "integer", "minimum": 1 },
+        "fsGroup": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Without this the PVC is mounted root-owned and Mira cannot write its first block."
+        },
+        "seccompProfile": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["RuntimeDefault", "Localhost"]
+            }
+          }
+        }
+      }
+    },
+    "securityContext": {
+      "type": "object",
+      "properties": {
+        "allowPrivilegeEscalation": { "type": "boolean" },
+        "readOnlyRootFilesystem": { "type": "boolean" },
+        "runAsNonRoot": { "type": "boolean" },
+        "runAsUser": { "type": "integer", "minimum": 1 },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "drop": { "type": "array", "items": { "type": "string" } },
+            "add": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "limits": { "type": "object" },
+        "requests": { "type": "object" }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "size": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(E|P|T|G|M|k|Ei|Pi|Ti|Gi|Mi|Ki)?$",
+          "description": "A Kubernetes quantity. Caught here rather than by the API server so that `helm template` fails too."
+        },
+        "accessMode": {
+          "type": "string",
+          "enum": ["ReadWriteOnce", "ReadWriteOncePod"],
+          "description": "ReadWriteMany is absent on purpose: every backend it is in practice is a network filesystem, and Mira refuses to start on one because mmap over it raises SIGBUS."
+        },
+        "storageClass": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        },
+        "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "httpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "paths"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1 },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "pathType"],
+                  "properties": {
+                    "path": { "type": "string", "minLength": 1 },
+                    "pathType": {
+                      "type": "string",
+                      "enum": ["Exact", "Prefix", "ImplementationSpecific"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "secretName": { "type": "string" },
+              "hosts": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Rendered into Mira's KYAML config file. These keys are the closed set from docs/CONFIG.md and nothing else parses.",
+      "properties": {
+        "node": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Hashed into every block directory name, so it must differ per replica sharing a volume."
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "retention": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h|d)?$",
+              "description": "ms | s | m | h | d, and a bare number is seconds. Mira's own parser; `7 days` or `1w` are startup errors."
+            }
+          }
+        },
+        "ingest": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxRequestBytes": {
+              "type": "string",
+              "pattern": "^[0-9]+([bB]|[kKmMgG]([iI]?[bB]?)?)?$",
+              "description": "Binary units: MB means MiB. Mira's own parser."
+            },
+            "queue": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Exports that may wait for one signal's flusher. Times maxRequestBytes times three signals is the worst-case resident cost."
+            },
+            "wal": {
+              "type": "boolean",
+              "description": "A bool here; rendered into the config file as the quoted string Mira demands."
+            }
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "self": {
+              "type": "boolean",
+              "description": "Store this node's own counters in this node, as ordinary metrics. A bool here; rendered as the quoted string Mira demands."
+            },
+            "interval": {
+              "type": "string",
+              "pattern": "^[0-9]+(ms|s|m|h|d)?$",
+              "description": "How often it samples. Same duration syntax as storage.retention."
+            }
+          }
+        },
+        "alerts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rules": {
+              "type": "string",
+              "description": "The rules document inline, in KYAML. Refused at replicaCount > 1: nothing elects an evaluator, so every replica would page."
+            }
+          }
+        }
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "startupProbeFailureThreshold": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" }
+  }
+}

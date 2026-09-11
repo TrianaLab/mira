@@ -1,0 +1,44 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+4318 only. It carries the UI, the query API and MCP, all of which are HTTP/1.1
+and all of which an Ingress controller routes without being told anything.
+
+OTLP/gRPC on 4317 is deliberately not here. Routing it needs a backend-protocol
+annotation whose spelling differs per controller and an h2c-capable data path,
+and getting that wrong fails as a stalled exporter rather than as an error. In
+cluster, exporters should talk to the Service directly anyway.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "mira.fullname" . }}
+  labels:
+    {{- include "mira.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "mira.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.httpPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

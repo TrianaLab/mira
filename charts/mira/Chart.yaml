@@ -1,0 +1,42 @@
+apiVersion: v2
+name: mira
+description: OTLP-native telemetry storage engine in a single binary — OTLP in, immutable Arrow blocks out, queried straight from mmap. One StatefulSet, one data directory, no sidecar and nothing to coordinate.
+type: application
+# version and appVersion are the same number and are stamped from the workspace
+# Cargo.toml. There is one binary and one chart, so two version lines would only
+# ever be a question ("which one do I read?") with no useful answer.
+# scripts/check_drift.py fails the build if they disagree with Cargo.toml.
+version: 0.0.1
+appVersion: "0.0.1"
+# StatefulSet, seccompProfile and networking.k8s.io/v1 Ingress are all much
+# older than this; 1.25 is where PodSecurity admission went GA, which is what
+# the hardened securityContext defaults are written against.
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - otlp
+  - opentelemetry
+  - observability
+  - traces
+  - metrics
+  - logs
+  - arrow
+  - mcp
+icon: https://raw.githubusercontent.com/TrianaLab/mira/refs/heads/main/docs/assets/mira-mark.svg
+home: https://miradb.dev/
+maintainers:
+  - name: edu-diaz
+    url: https://edudiaz.dev
+    email: edudiazasencio@gmail.com
+sources:
+  - https://github.com/TrianaLab/mira/tree/main/charts/mira
+  - https://github.com/TrianaLab/mira
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: support
+      url: https://github.com/TrianaLab/mira/issues
+    - name: documentation
+      url: https://miradb.dev/
+  artifacthub.io/images: |
+    - name: mira
+      image: ghcr.io/trianalab/mira:0.0.1

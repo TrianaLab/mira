@@ -1,0 +1,22 @@
+# Who gets requested on a pull request. Last matching pattern wins, so the
+# specific lines below override the global one.
+#
+# Every line names the same person today, which makes the split look redundant.
+# It is not: these are the three areas where a wrong review is expensive — the
+# supply chain, the reasoning of record, and the format on disk — so the split
+# is written now, while it costs nothing, rather than after the second
+# maintainer arrives.
+
+*                       @edu-diaz
+
+# Workflows, dependabot and the templates: the paths that can change what CI
+# trusts without changing a line of Rust.
+/.github/               @edu-diaz
+
+# docs/ARCHITECTURE.md is the record of why the tree looks like this, and every
+# number in the README is a promise. Neither drifts unreviewed.
+/docs/                  @edu-diaz
+
+# mira-core owns the Arrow schemas and the block format. A change here is a
+# change to what is already written on somebody's disk.
+/crates/mira-core/      @edu-diaz

@@ -1,0 +1,36 @@
+# One replica evaluating rules, which is the only supported alerting shape:
+# nothing elects an evaluator, so a second replica pointed at the same rules
+# would page a second time. The chart refuses that combination outright.
+#
+# The rules document is KYAML and is passed to Mira verbatim; this one is the
+# shape of docs/e2e/alerts.kyaml, trimmed to one rule.
+persistence:
+  enabled: false
+config:
+  alerts:
+    rules: |
+      {
+        every: 15s,
+        link_base: "http://mira.observability.svc:4318",
+        notify: [
+          { name: oncall, url: "http://alertmanager.observability.svc:9093/hook", format: json },
+        ],
+        rules: [
+          {
+            name: shop-error-rate,
+            query: { signal: traces, where: [ { field: status_code, eq: 2 } ] },
+            of:    { signal: traces },
+            over:  1m,
+            when:  "ratio > 2%",
+            for:   30s,
+            severity: critical,
+          },
+        ],
+      }
+extraEnv:
+  - name: PD_ROUTING_KEY
+    valueFrom:
+      secretKeyRef:
+        name: mira-pagerduty
+        key: routingKey
+        optional: true

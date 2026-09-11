@@ -1,0 +1,150 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.badgesSection" . }}
+
+{{ template "chart.description" . }}
+
+## What it installs
+
+| Resource | Why |
+|---|---|
+| `StatefulSet` | One container, no sidecar, no init container. See [Why a StatefulSet](#why-a-statefulset). |
+| `ConfigMap` | Mira's config file, in KYAML, rendered from `config.*`. Optionally the alert rules beside it. |
+| `Service` | ClusterIP, ports 4317 (OTLP/gRPC) and 4318 (OTLP/HTTP, query API, MCP, UI). |
+| `Service` (headless) | Per-pod DNS. The only way to address one replica, which matters because a query is answered from that replica's own blocks. |
+| `ServiceAccount` | Identity only — no Role, no ClusterRole, and no token mounted. Mira never calls the API server. |
+| `Ingress` | Optional, off by default, 4318 only. |
+
+There is no operator, no CRD, no leader election, no metadata store and no
+migration job, and none of those are gaps: Mira holds **no coordination state**.
+The block directory is the manifest.
+
+## Install
+
+```bash
+helm install mira oci://ghcr.io/trianalab/charts/mira \
+  --namespace observability --create-namespace
+```
+
+Pin the version:
+
+```bash
+helm install mira oci://ghcr.io/trianalab/charts/mira \
+  --version {{ template "chart.version" . }} \
+  --namespace observability --create-namespace
+```
+
+Point an exporter at `mira.observability.svc:4317`, then port-forward 4318 for
+the UI, the query API and MCP:
+
+```bash
+kubectl port-forward -n observability svc/mira 4318:4318
+```
+
+## Why a StatefulSet
+
+Mira reads every block through `mmap`. On a network filesystem an I/O hiccup is
+delivered as `SIGBUS` — a signal, not an `io::Error`, with nothing to catch and
+no way to unwind — so Mira `statfs`es its data directory at startup and
+**refuses to boot on NFS, SMB, CIFS, CephFS, 9P or AFS**.
+
+That rules out the one shape a `Deployment` could use: a single RWX PVC shared
+by every pod, since every backend an RWX PVC is in practice is on that list.
+What is left is one RWO volume per replica, which is `volumeClaimTemplates`, which
+is a StatefulSet. Ordinal identity then comes free, and it is the honest model
+anyway — nothing replicates and nothing rebalances, so a pod that came back
+bound to a different volume would come back having lost its blocks.
+
+Set `persistence.storageClass` to a local or block-backed class (`local-path`,
+EBS `gp3`, GCE PD, Azure Disk). `persistence.enabled=false` swaps in an
+`emptyDir` for kind, CI and demos.
+
+## Sizing
+
+The defaults below — `500m` CPU, `512Mi` requested, `2Gi` limit, a `20Gi` PVC —
+are the "a team's services" row of
+[the sizing table](https://miradb.dev/CONFIG/#sizing), which is measured rather
+than guessed and gives CPU, memory and disk per day against the record rate.
+Two things it will tell you that are not obvious from here: memory tracks the
+number of concurrent exporters and not the ingest rate at all, and the on-disk
+cost per record is 8x higher above ~38k records/s per signal, where compaction
+stops keeping up.
+
+## Replicas
+
+`replicaCount` defaults to 1, and more replicas do not mean higher availability.
+Every replica is a whole Mira with its own store: ingest through the Service is
+spread across all of them, and a query through the Service is answered by
+whichever one kube-proxy picked, from that replica's blocks only. There is no
+fan-out and no replication. Scale up when one core cannot keep up with the
+export rate; address a specific replica through the headless Service's per-pod
+name when you need to read what it stored.
+
+## Configuration
+
+Mira's config file is KYAML (a strict subset of YAML 1.2, so a JSON superset).
+The chart renders `config.*` into it and mounts it at `/etc/mira/mira.yaml`; the
+pod's whole command line is `--config /etc/mira/mira.yaml`. The keys under
+`config` are the closed set from
+[Configuration](https://miradb.dev/CONFIG/) —
+an unknown key stops Mira at boot rather than being ignored, and this chart's
+`values.schema.json` is closed for the same reason.
+
+`listen` and `storage.dir` are deliberately not values: the container always
+listens on `0.0.0.0:4317` and `0.0.0.0:4318` and always writes to `/data`. A
+Service already remaps ports and a `volumeMount` already remaps paths; making
+them values would only let you break the probes.
+
+### Alerting
+
+`config.alerts.rules` takes the rules document inline; the chart writes it into
+the same ConfigMap and points `alerts.rules` at it. It is **refused at
+`replicaCount > 1`**: nothing elects an evaluator, so every replica would
+evaluate the same rules and page separately. Run the evaluating replica as its
+own single-replica release.
+
+## Health
+
+| Probe | Path | Why |
+|---|---|---|
+| startup | `/health` | Mira replays its write-ahead log before serving either port. A liveness probe alone would kill it mid-replay, forever. |
+| liveness | `/health` | A constant 200. A flusher that stops takes the process with it, so answering at all is the liveness answer. |
+| readiness | `/readyz` | Goes false on a *sustained* flush stall — a full or unwritable volume — which takes the replica out of the Service so exporters retry somewhere that can store them. Restarting it would fix nothing. |
+
+All three are HTTP on 4318 and none of them can be `exec`: the image is
+distroless, with no shell and no `curl`.
+
+There is no `ServiceMonitor` in this chart, because Mira exposes no Prometheus
+endpoint to scrape — `/api/v1/stats` answers JSON, and the terminal UI's node
+pane reads it. There is no `PodDisruptionBudget` either: with one replica the
+only PDB that means anything blocks every node drain, and the data survives the
+reschedule.
+
+## Security
+
+The defaults are the hardened ones, and they describe the image rather than
+constrain it: `distroless:nonroot`, uid 65532, no shell.
+
+- `runAsNonRoot`, `runAsUser: 65532`, `fsGroup: 65532` (without which a fresh
+  PVC stays root-owned and Mira cannot write its first block)
+- `readOnlyRootFilesystem: true` — Mira writes to `/data` and nowhere else
+- `capabilities: drop: [ALL]` — both ports are above 1024
+- `seccompProfile: RuntimeDefault`
+- `automountServiceAccountToken: false` — Mira never calls the API server
+
+## Verifying the chart
+
+The chart and the image are signed with [cosign](https://docs.sigstore.dev/)
+using keyless (OIDC) signing:
+
+```bash
+cosign verify \
+  --new-bundle-format=false \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
+  ghcr.io/trianalab/charts/mira:{{ template "chart.version" . }}
+```
+
+{{ template "chart.valuesSection" . }}
+
+{{ template "chart.maintainersSection" . }}

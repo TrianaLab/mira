@@ -1,0 +1,111 @@
+# Alert rules for `make demo`, and a worked example of the whole schema.
+#
+# Point a node at this with `alerts.rules` in mira.yaml, or `--alerts <path>`.
+# A node with no rules file evaluates nothing and pages nobody, which is why
+# `/api/v1/alerts` answering an empty list means "alerting is off here" rather
+# than "everything is fine" — see docs/CONFIG.md.
+#
+# KYAML, so this is a JSON document with comments and unquoted keys. Every
+# `query` below is a `/api/v1/query` document, verbatim: one filter grammar for
+# the UI, the API, an agent and a rule, so a threshold cannot quietly count
+# something different from what the link opens.
+
+{
+  # How often every rule is evaluated. Each evaluation is one or two counts and
+  # a count is a scan with no rows materialised, so this is cheap enough to be
+  # a matter of how fast you want to know.
+  every: 15s,
+
+  # Where a webhook's link points. The UI keeps all its view state in the
+  # location hash, so a link is a pure function of the rule — no saved view is
+  # created and nothing has to be kept in sync. Leave it out and alerts carry
+  # no link.
+  link_base: "http://localhost:4318",
+
+  # Where alerts go. Omitted here on purpose: the demo has nothing to POST to,
+  # and a rule with no target still evaluates and still shows up in the TUI's
+  # `a` pane and in `/api/v1/alerts`. Uncomment to dispatch for real.
+  #
+  # notify: [
+  #   { name: oncall,  url: "http://127.0.0.1:8080/slack",  format: slack },
+  #   { name: chat,    url: "http://127.0.0.1:8080/discord", format: discord },
+  #   { name: pager,   url: "http://127.0.0.1:8080/pd",      format: pagerduty,
+  #     key: "${env:PD_ROUTING_KEY}" },
+  # ],
+  #
+  # A direct `https://` target needs `--features webhook-tls`, which is eleven
+  # crates and a C dependency; the default build refuses one at load rather
+  # than at the first page. Point it at a local egress proxy instead and the
+  # default build is enough.
+
+  rules: [
+    # ---- a ratio rule -----------------------------------------------------
+    #
+    # Two counts: `query` over `of`. The demo breaks one trace in thirteen and
+    # five of its eight hops fail, so this sits around 4.8% and fires.
+    {
+      name: shop-error-rate,
+      query: { signal: traces, where: [ { field: status_code, eq: 2 } ] },
+      of:    { signal: traces },
+      over:  1m,
+      when:  "ratio > 2%",
+      for:   30s,          # a sustained breach, not a single noisy evaluation
+      severity: critical,
+    },
+
+    # ---- a percentile, written as the ratio it is -------------------------
+    #
+    # `p95(duration) > 250ms` is exactly `|{d > 250ms}| / |d| > 5%`. Not an
+    # approximation — the two are the same inequality — which is why there is
+    # no t-digest in this engine and no `p95(...)` in this grammar.
+    {
+      name: checkout-p95-latency,
+      query: {
+        signal: traces,
+        where: [
+          { attr: "service.name", eq: checkout },
+          { field: duration_nano, gt: 250000000 },
+        ],
+      },
+      of: { signal: traces, where: [ { attr: "service.name", eq: checkout } ] },
+      over: 5m,
+      when: "ratio > 5%",
+      severity: warning,
+    },
+
+    # ---- a count rule -----------------------------------------------------
+    #
+    # No `of`, so the threshold is the number of matching records itself. The
+    # demo's payment failures carry an exception event, and its attributes are
+    # searchable at every level.
+    {
+      name: card-declines,
+      query: {
+        signal: traces,
+        where: [ { attr: "exception.type", eq: "payments.CardDeclined" } ],
+      },
+      over: 5m,
+      when: "count > 20",
+      severity: warning,
+    },
+
+    # ---- a rule that should stay quiet ------------------------------------
+    #
+    # Here because an alerting screen has to be able to show "watching, and not
+    # firing". A rule that never appears until it fires cannot answer the
+    # question an operator has at 3am: is this even running?
+    {
+      name: inventory-outage,
+      query: {
+        signal: logs,
+        where: [
+          { attr: "service.name", eq: inventory },
+          { field: severity_number, gte: 21 },   # FATAL and above
+        ],
+      },
+      over: 1m,
+      when: "count >= 1",
+      severity: critical,
+    },
+  ],
+}

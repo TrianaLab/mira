@@ -1,0 +1,53 @@
+[package]
+name = "mira-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mira storage engine: OTLP -> Arrow encoding, immutable block writer, zero-copy mmap reader"
+
+[dependencies]
+mira-proto.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+prost.workspace = true
+memmap2.workspace = true
+# Already in the graph under memmap2; direct only for `statfs` (block.rs).
+libc.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+# `encode_bench` builds OTLP requests to feed the encoder and encodes one to
+# measure the decode side. Both are already non-dev dependencies of this crate;
+# listing them again is what lets a `[[bench]]` use them.
+mira-proto.workspace = true
+prost.workspace = true
+
+# No criterion. It is ~40 crates of dev-dependency for a harness that would
+# report the same three percentiles this one prints, and the dependency budget
+# is a product property (docs/ARCHITECTURE.md section 11) — dev-dependencies still
+# have to be downloaded and built by anyone who runs the test suite. The
+# upgrade path is criterion the day someone needs its regression tracking.
+[[bench]]
+name = "wal_bench"
+harness = false
+# `cargo test` should not run a bench. Timing loops are slow and they measure,
+# they do not assert anything the test suite is responsible for.
+test = false
+
+# The per-core encode number section 11 scores and had never measured. Same reasons for
+# `harness = false` and `test = false` as above.
+[[bench]]
+name = "encode_bench"
+harness = false
+test = false
+
+[lints]
+workspace = true

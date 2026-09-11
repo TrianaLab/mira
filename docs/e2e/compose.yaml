@@ -1,0 +1,80 @@
+# Mira behind a stock collector, for the end-to-end recipe in docs/TESTING.md.
+#
+# Both containers share a compose network so the collector can resolve `mira`.
+# Running Mira on the host and the collector in Docker does not work on Docker
+# Desktop for Mac — `host.docker.internal` resolves to an IPv6 ULA that is not
+# routable from the container, and the bridge gateway is no better.
+services:
+  mira:
+    build:
+      context: ../..
+    ports:
+      # Published so telemetrygen and curl can reach Mira directly from the
+      # host too, without going through the collector.
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      # A named volume, not a bind mount: Mira mmaps its blocks and a Docker
+      # Desktop bind mount is FUSE, where an I/O hiccup arrives as SIGBUS
+      # rather than an error (docs/ARCHITECTURE.md section 9).
+      - mira-data:/data
+
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "14317:4317"
+      - "14318:4318"
+    depends_on:
+      - mira
+
+  # The three generators below are why `up -d` on its own is a real test: without
+  # them this file brings up two idle containers and proves nothing. They are the
+  # OpenTelemetry project's own generator, so the bytes on the wire are not our
+  # idea of a span, and they are aimed at the *collector*, so every record makes
+  # the full trip through the stock exporter before Mira sees it.
+  #
+  # `restart: on-failure` is the readiness wait. `depends_on` only waits for the
+  # container to start, not for the receiver to bind, and both images are
+  # distroless — no shell, so there is nowhere to put a retry loop or a
+  # `healthcheck`. A generator that loses the race exits non-zero and Docker runs
+  # it again; one that succeeds exits 0 and stays stopped, which is what a
+  # one-shot service should do.
+  #
+  # `--rate 0` is not optional: the default is one item per second per worker, so
+  # `--logs 500` without it takes eight minutes and looks like a hang.
+  telemetrygen-traces:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    # Two trace runs rather than one because `--status-code` is per-process:
+    # 200 ordinary traces and 40 failing ones. A store where every span failed
+    # exercises the error path and never the normal one, which is the shape that
+    # hides an error filter matching everything.
+    command: ["traces", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure", "--rate", "0", "--traces", "200", "--child-spans", "3", "--service", "checkout"]
+    depends_on: [otelcol]
+    restart: on-failure
+
+  telemetrygen-errors:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    command: ["traces", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure", "--rate", "0", "--traces", "40", "--child-spans", "3", "--service", "checkout", "--status-code", "Error"]
+    depends_on: [otelcol]
+    restart: on-failure
+
+  # Logs over HTTP, traces and metrics over gRPC — the same split the collector
+  # config makes, so one `up` exercises both of Mira's listeners twice: once from
+  # the generator into the collector, once from the collector into Mira.
+  telemetrygen-logs:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    command: ["logs", "--otlp-endpoint", "otelcol:4318", "--otlp-insecure", "--otlp-http", "--rate", "0", "--logs", "500", "--service", "checkout"]
+    depends_on: [otelcol]
+    restart: on-failure
+
+  telemetrygen-metrics:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    command: ["metrics", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure", "--rate", "0", "--metrics", "300", "--service", "checkout"]
+    depends_on: [otelcol]
+    restart: on-failure
+
+volumes:
+  mira-data:

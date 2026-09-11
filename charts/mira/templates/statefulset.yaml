@@ -1,0 +1,171 @@
+{{/*
+A StatefulSet, not a Deployment, and the reason is storage rather than identity.
+
+Mira mmaps its blocks, so it refuses to start on a network filesystem — which
+rules out the one shape a Deployment could use, a single RWX PVC shared by every
+pod. What is left is one RWO volume per replica, and that is `volumeClaimTemplates`.
+Ordinal identity then comes for free and is the honest model anyway: nothing
+replicates and nothing rebalances, so replica 2's blocks are replica 2's, and a
+pod that came back bound to a different volume would come back having lost them.
+
+A Deployment's rolling update would also try to schedule the new pod before the
+old one released the RWO volume, and deadlock.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mira.fullname" . }}
+  labels:
+    {{- include "mira.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "mira.headlessServiceName" . }}
+  # Parallel: there is no join, no quorum and no order to come up in. Ordered
+  # startup would only make a five-replica rollout five WAL replays long.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "mira.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # A config change is a restart. Without this, `helm upgrade --set
+        # config.storage.retention=30d` rewrites the ConfigMap and changes
+        # nothing at all until something else happens to restart the pods.
+        #
+        # Over the two documents rather than over the rendered ConfigMap, which
+        # is the usual spelling: that one also hashes the ConfigMap's labels and
+        # its comments, so editing a comment in this chart would restart every
+        # Mira in the fleet.
+        checksum/config: {{ printf "%s\n%s" (include "mira.config" .) .Values.config.alerts.rules | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "mira.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mira.serviceAccountName" . }}
+      # Repeated from the ServiceAccount so it still holds when
+      # `serviceAccount.create` is false and the pod falls back to `default`.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: mira
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The whole command line. Everything else is in the file, because
+          # config split across two places is config nobody can read.
+          args:
+            - --config
+            - /etc/mira/mira.yaml
+          env:
+            # `${env:POD_NAME}` in the config resolves against this. The
+            # downward API rather than HOSTNAME: HOSTNAME is set by the
+            # container runtime, not promised by Kubernetes, and a missing
+            # `${env:...}` stops Mira at boot rather than defaulting to "".
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: http
+              containerPort: 4318
+              protocol: TCP
+          # All three probes are HTTP on 4318. They cannot be exec: the image is
+          # distroless, with no shell and no curl, and adding either to run a
+          # probe would double the image to check something the kubelet can
+          # already ask over the network.
+          #
+          # Startup and liveness are `/health`, readiness is `/readyz`, and the
+          # split is deliberate upstream: liveness is a constant 200, because a
+          # flusher that stops takes the process with it, so answering at all is
+          # the liveness answer. `/readyz` goes false on a *sustained* flush
+          # stall — a full or unwritable volume — which takes the replica out of
+          # the Service's endpoints so exporters retry somewhere that can store
+          # them. Restarting that pod would fix nothing, which is exactly why
+          # the two are different endpoints.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: {{ .Values.startupProbeFailureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/mira
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "mira.fullname" . }}
+        {{- if not .Values.persistence.enabled }}
+        # emptyDir is the kind/CI/demo path: it passes the startup filesystem
+        # check, and every block in it dies with the pod.
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          - {{ .Values.persistence.accessMode }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

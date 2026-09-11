@@ -1,0 +1,98 @@
+version: 2
+
+# Four ecosystems, because the repo has four: the Rust workspace, the workflows,
+# the Svelte UI under crates/mira/ui, and the pinned MkDocs requirements under
+# docs/. Everything is grouped, because an ungrouped weekly run on a tree this
+# size opens a dozen PRs nobody reads, and a dependency bot that gets ignored is
+# worse than none — it trains you to ignore the one that matters.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      # A dependency matches the first group it fits, so the sets that must
+      # move together are declared before the catch-all.
+      #
+      # Arrow is pinned as one version across the workspace: arrow_array::
+      # RecordBatch from two majors is two different types, and the error is
+      # unreadable. One PR for all of them or none.
+      arrow:
+        patterns:
+          - arrow-*
+        update-types:
+          - major
+          - minor
+          - patch
+      # tonic, tonic-prost and prost share a generated-code contract; bumping
+      # one alone breaks the build script.
+      grpc:
+        patterns:
+          - prost*
+          - tonic*
+        update-types:
+          - major
+          - minor
+          - patch
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # Majors outside the two pinned sets arrive one PR at a time, on purpose:
+    # each one is a read of a changelog, not a merge button.
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The UI's build output is committed and CI checks it with
+  # `git diff --exit-code dist`. A vite or svelte bump can change the bundle,
+  # so these PRs go red until someone runs `make ui` and commits dist on the
+  # branch. That is the gate working: the bundle in git is what ships, and it
+  # has to be built by the toolchain that is actually pinned.
+  - package-ecosystem: npm
+    directory: /crates/mira/ui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ui
+    groups:
+      ui-toolchain:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # The docs site's pinned requirements. One PR a week for the whole set — a
+  # docs build either passes or it does not, and bisecting which mkdocs plugin
+  # broke it is cheaper than five PRs.
+  - package-ecosystem: pip
+    directory: /docs
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: docs
+    groups:
+      mkdocs:
+        patterns:
+          - "*"

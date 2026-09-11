@@ -1,0 +1,12 @@
+# The kind/CI shape: no PVC, so the whole store dies with the pod, and small
+# enough to schedule on a laptop's node. `ci/*-values.yaml` is chart-testing's
+# convention, so `ct install` picks these up as extra install permutations for
+# free; `make helm-template` renders them either way.
+persistence:
+  enabled: false
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

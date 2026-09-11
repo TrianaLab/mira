@@ -1,0 +1,671 @@
+/* ===========================================================================
+   Mira docs theme.
+
+   One accent — "hot rust", #F74C00, the colour of the wordmark — and neutral
+   surfaces either side of it. The header stays white/near-black (set by the
+   palette in mkdocs.yml); this file only retints the accent, the dark surfaces
+   and the code blocks, so there is a single place to change the brand.
+
+   The register is 8-bit: square corners, hard offset shadows instead of blur,
+   two-pixel rules, and a scanlined CRT panel on the landing page. That is the
+   same era the wordmark is drawn in — the mark's horizontal cuts are literal
+   scanlines — and it is carried through the whole site rather than left on the
+   home page, so the documentation reads as one thing. It is geometry, not a
+   pixel font in the body copy: 8-bit type at paragraph size is a costume, and
+   this site is mostly command lines somebody has to read.
+   =========================================================================== */
+
+/* ---- Brand tokens ---------------------------------------------------------
+   #F74C00 measures 3.5:1 on white — under the 4.5:1 WCAG AA floor for body
+   text — and 5.4:1 on the near-black below. So the light scheme uses the
+   deeper --mira-rust-deep (5.4:1 on white) wherever the colour carries text or
+   sits behind white text, and keeps the brand hex for marks and decoration.
+   The dark scheme has no such problem and uses the brand hex throughout. */
+:root {
+  --mira-rust: #f74c00;
+  --mira-rust-deep: #c23a00;
+  --mira-rust-darker: #9c2f00;
+  /* Dark surfaces, matched to the #0d1117 used elsewhere in the project. */
+  --mira-surface: #0d1117;
+  --mira-surface-code: #161b22;
+  --mira-surface-footer: #090c10;
+  /* The pixel. Every offset shadow and every chunky rule below is a multiple
+     of it, so the whole site's blockiness has one knob. */
+  --mira-px: 3px;
+  /* The one pixel face, and it is rationed: the hero's eyebrow, the chart's
+     caption and the chart's figures. Nothing at reading size, nothing longer
+     than a few words. All three live in overrides/home.html, which is where
+     the <link> that fetches it is — every other page would pay for a font it
+     never draws. `theme.font` in mkdocs.yml was the other candidate and it
+     takes exactly one text family and one code family, both already spoken
+     for. The fallback is the theme's mono, so a blocked font degrades to
+     small-caps monospace rather than to body text. */
+  --mira-pixel-font: "Press Start 2P", "JetBrains Mono", monospace;
+}
+
+/* The comparison panel's nine colours are tokens rather than literals because
+   the panel follows the palette toggle. It was near-black in both schemes at
+   first — a CRT is dark, and the dark one is the better-looking of the two —
+   but a black rectangle on a white page is the one element that does not move
+   when a reader flips the switch, and it reads as a screenshot pasted into the
+   page rather than as part of it. The 8-bit register is the geometry — square
+   corners, hard shadow, discrete cells, scanlines — and all of it survives the
+   palette; only the colours change. */
+[data-md-color-scheme="default"] {
+  --md-accent-fg-color: var(--mira-rust-deep);
+  --md-typeset-a-color: var(--mira-rust-deep);
+  --mira-shadow: rgba(13, 17, 23, 0.22);
+
+  /* Not white: the panel has to be a distinct surface from the page or the
+     border is the only thing holding it together. */
+  --mira-chart-bg: #f1f2f4;
+  --mira-chart-ink: #0d1117;
+  --mira-chart-dim: #57606a;
+  --mira-chart-cell: rgba(13, 17, 23, 0.1);
+  --mira-chart-bar: #6e7681;
+  --mira-chart-rule: rgba(13, 17, 23, 0.14);
+  /* A hard near-black edge, not the theme's hairline: this is the one framed
+     object on the page and the frame is most of the era it is drawn in. */
+  --mira-chart-edge: var(--mira-surface);
+  /* The deep rust, for the same reason the wordmark uses it here — #F74C00 is
+     3.5:1 on this surface and these are figures somebody reads. */
+  --mira-chart-accent: var(--mira-rust-deep);
+  --mira-chart-scan: rgba(13, 17, 23, 0.05);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-accent-fg-color: var(--mira-rust);
+  --md-typeset-a-color: var(--mira-rust);
+  --mira-shadow: rgba(0, 0, 0, 0.6);
+
+  /* One step up from the page, the same way the light panel is one step down
+     from it — the border and the shadow are enough to find the panel, but with
+     an identical background it reads as a region of the page that happens to
+     have a line round it rather than as an object sitting on it. */
+  --mira-chart-bg: var(--mira-surface-code);
+  --mira-chart-ink: #e6edf3;
+  --mira-chart-dim: #8b949e;
+  --mira-chart-cell: rgba(201, 209, 217, 0.16);
+  --mira-chart-bar: #6e7681;
+  --mira-chart-rule: rgba(201, 209, 217, 0.16);
+  --mira-chart-edge: var(--md-default-fg-color--lightest);
+  --mira-chart-accent: var(--mira-rust);
+  --mira-chart-scan: rgba(0, 0, 0, 0.06);
+}
+
+/* ---- Dark surfaces --------------------------------------------------------
+   Material's slate scheme tints every surface blue, which reads muddy under an
+   orange accent. Retint to the project's near-black so the site sits on the
+   same surface as the UI and the terminal. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: var(--mira-surface);
+  --md-default-bg-color--light: hsla(0, 0%, 100%, 0.7);
+  --md-default-bg-color--lighter: hsla(0, 0%, 100%, 0.3);
+  --md-default-bg-color--lightest: hsla(0, 0%, 100%, 0.12);
+  --md-code-bg-color: var(--mira-surface-code);
+  --md-footer-bg-color: var(--mira-surface-footer);
+  --md-footer-bg-color--dark: var(--mira-surface-footer);
+}
+
+/* ---- Typography -----------------------------------------------------------
+   Space Grotesk (set in mkdocs.yml) is drawn for display, so headings get the
+   tighter tracking the wordmark has and body text keeps the default. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+/* An h2 opens a section, so it gets the two-pixel rule that is this site's
+   only recurring ornament — square, full width, accent-tinted at the left. */
+.md-typeset h2 {
+  padding-bottom: 0.35rem;
+  border-bottom: 2px solid var(--md-default-fg-color--lightest);
+  background-image: linear-gradient(90deg, var(--md-accent-fg-color) 0 2.5rem, transparent 2.5rem);
+  background-repeat: no-repeat;
+  background-position: 0 100%;
+  background-size: 100% 2px;
+}
+
+/* Selection in the accent, both schemes. A detail, but the default blue is the
+   one piece of another brand's colour left on the page. */
+::selection {
+  background: var(--mira-rust);
+  color: #fff;
+}
+
+/* ---- Square corners -------------------------------------------------------
+   Material rounds ten different things. The list is explicit rather than a
+   universal `* { border-radius: 0 }`, because that also flattens the palette
+   toggle's switch and the search suggestion chips into something unreadable. */
+.md-typeset .md-button,
+.md-typeset pre > code,
+.md-typeset .highlight,
+.md-typeset .highlighttable,
+.md-typeset .admonition,
+.md-typeset details,
+.md-typeset .tabbed-set > label,
+.md-typeset table:not([class]),
+.md-typeset code,
+.md-search__form,
+.md-search__output,
+.md-typeset img {
+  border-radius: 0;
+}
+
+/* ---- Nav, tabs and buttons ------------------------------------------------
+   The primary colour is neutral, so Material would draw all of these in
+   black/white. Pin them to the accent instead. */
+.md-nav__link--active,
+.md-nav__link:hover,
+.md-tabs__link--active,
+.md-tabs__link:hover {
+  color: var(--md-accent-fg-color);
+  opacity: 1;
+}
+
+/* A button is a physical key: square, offset shadow, and it travels the offset
+   when pressed. The transform is the whole affordance — the shadow shrinking
+   without the button moving reads as a rendering bug. */
+.md-typeset .md-button {
+  box-shadow: var(--mira-px) var(--mira-px) 0 var(--mira-shadow);
+  transition: transform 0.08s steps(2), box-shadow 0.08s steps(2),
+    background-color 0.2s, color 0.2s, border-color 0.2s;
+}
+.md-typeset .md-button:active {
+  transform: translate(var(--mira-px), var(--mira-px));
+  box-shadow: 0 0 0 var(--mira-shadow);
+}
+
+.md-typeset .md-button--primary {
+  background-color: var(--md-accent-fg-color);
+  border-color: var(--md-accent-fg-color);
+  color: #fff;
+}
+.md-typeset .md-button--primary:hover,
+.md-typeset .md-button--primary:focus {
+  background-color: var(--mira-rust-darker);
+  border-color: var(--mira-rust-darker);
+  color: #fff;
+}
+[data-md-color-scheme="slate"] .md-typeset .md-button--primary {
+  color: var(--mira-surface);
+}
+
+/* ---- Admonitions, details, tables ----------------------------------------
+   Same treatment, so a note, a collapsed block and a table all read as the
+   same kind of object: square, two-pixel edge, hard shadow, no blur anywhere. */
+.md-typeset .admonition,
+.md-typeset details {
+  border-width: 2px;
+  border-left-width: var(--mira-px);
+  box-shadow: var(--mira-px) var(--mira-px) 0 var(--mira-shadow);
+}
+.md-typeset table:not([class]) {
+  border: 2px solid var(--md-default-fg-color--lightest);
+  box-shadow: var(--mira-px) var(--mira-px) 0 var(--mira-shadow);
+}
+.md-typeset table:not([class]) th {
+  border-bottom: 2px solid var(--md-default-fg-color--lightest);
+}
+
+/* ---- Code -----------------------------------------------------------------
+   Most of this site is command lines and KYAML documents, so the code block is
+   the page. Give it a two-pixel border in both schemes — on dark, #161b22 on
+   #0d1117 is only just distinguishable — and keep the mono at a size that does
+   not force the 96-column examples to wrap. */
+.md-typeset pre > code {
+  border: 2px solid var(--md-default-fg-color--lightest);
+  box-shadow: var(--mira-px) var(--mira-px) 0 var(--mira-shadow);
+}
+.md-typeset code,
+.md-typeset pre {
+  font-size: 0.75rem;
+}
+/* Inline code: tinted toward the accent so it is told apart from the prose by
+   more than a background, without competing with links. */
+.md-typeset a > code {
+  color: inherit;
+}
+
+/* ---- No footer meta bar ---------------------------------------------------
+   Material renders `.md-footer-meta` on every page whether or not there is
+   anything to put in it, and with no `copyright:` and no `extra.social` there
+   is not: it draws as an empty dark band under the prev/next links. Hidden
+   here rather than by forking `partials/footer.html`, because a forked partial
+   silently stops matching the theme at the next upgrade and one rule cannot.
+   The prev/next nav above it stays — that is navigation, not chrome. */
+.md-footer-meta {
+  display: none;
+}
+
+/* ---- Landing hero (overrides/home.html) -----------------------------------
+   A CRT: a phosphor grid behind everything, a rust glow bloom, and a two-column
+   split with the copy left and the evidence right. Elements fade up on load,
+   and every animation here is off under prefers-reduced-motion. */
+.mira-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 3.5rem 1rem 3rem;
+}
+/* The grid is the background of the era: two one-pixel rules repeated on a
+   32px pitch, faint enough to read as texture rather than as a table, and
+   masked to fade out before it reaches the copy. */
+.mira-hero__grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--md-default-fg-color--lightest) 1px, transparent 1px),
+    linear-gradient(90deg, var(--md-default-fg-color--lightest) 1px, transparent 1px);
+  background-size: 32px 32px;
+  opacity: 0.55;
+  -webkit-mask-image: radial-gradient(closest-side at 50% 40%, #000 30%, transparent 100%);
+  mask-image: radial-gradient(closest-side at 50% 40%, #000 30%, transparent 100%);
+  pointer-events: none;
+  z-index: 0;
+}
+.mira-hero__glow {
+  position: absolute;
+  top: -12rem;
+  left: 18%;
+  width: 46rem;
+  max-width: 130vw;
+  height: 34rem;
+  transform: translateX(-50%);
+  background: radial-gradient(
+    closest-side,
+    rgba(247, 76, 0, 0.2),
+    rgba(247, 76, 0, 0) 70%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+[data-md-color-scheme="slate"] .mira-hero__glow {
+  background: radial-gradient(
+    closest-side,
+    rgba(247, 76, 0, 0.26),
+    rgba(247, 76, 0, 0) 70%
+  );
+}
+/* Copy left, chart right. One column below 60rem, and the chart stays second
+   in the source so the reading order is the same either way. */
+.mira-hero__inner {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  gap: 3rem;
+  align-items: center;
+  max-width: 64rem;
+  margin: 0 auto;
+}
+@media screen and (max-width: 60em) {
+  .mira-hero__inner {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2.25rem;
+  }
+}
+.mira-hero__wordmark {
+  display: block;
+  width: 13rem;
+  max-width: 55vw;
+  height: auto;
+  margin: 0 0 1.4rem;
+  /* The deeper rust on white: the brand hex is 3.5:1 there, and a 16-unit stroke
+     at this size is closer to text than to decoration. */
+  color: var(--mira-rust-deep);
+  animation: mira-fade-up 0.6s ease both;
+}
+[data-md-color-scheme="slate"] .mira-hero__wordmark {
+  color: var(--mira-rust);
+}
+.mira-hero .mira-hero__eyebrow {
+  margin: 0 0 1rem;
+  font-family: var(--mira-pixel-font);
+  font-size: 0.56rem;
+  line-height: 1.8;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--mira-rust-deep);
+  animation: mira-fade-up 0.6s ease 0.08s both;
+}
+[data-md-color-scheme="slate"] .mira-hero .mira-hero__eyebrow {
+  color: var(--mira-rust);
+}
+.mira-hero .mira-hero__title {
+  margin: 0;
+  max-width: 16ch;
+  font-size: clamp(2rem, 4.4vw, 3rem);
+  font-weight: 600;
+  line-height: 1.06;
+  letter-spacing: -0.02em;
+  color: var(--md-default-fg-color);
+  animation: mira-fade-up 0.6s ease 0.16s both;
+}
+/* The cursor. A solid block in the accent, blinking on the 530ms a VT100 did,
+   with `steps(1)` so it snaps rather than fades. */
+.mira-hero__caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 0.86em;
+  margin-left: 0.12em;
+  vertical-align: -0.06em;
+  background: var(--md-accent-fg-color);
+  animation: mira-blink 1.06s steps(1) infinite;
+}
+.mira-hero .mira-hero__tagline {
+  margin: 1.15rem 0 0;
+  max-width: 34rem;
+  font-size: 1.02rem;
+  line-height: 1.6;
+  color: var(--md-default-fg-color--light);
+  animation: mira-fade-up 0.6s ease 0.24s both;
+}
+.mira-hero__actions {
+  margin-top: 1.9rem;
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  animation: mira-fade-up 0.6s ease 0.32s both;
+}
+.mira-hero .mira-hero__note {
+  margin: 1.1rem 0 0;
+  max-width: 34rem;
+  font-size: 0.7rem;
+  line-height: 1.65;
+  color: var(--md-default-fg-color--light);
+  animation: mira-fade-up 0.6s ease 0.4s both;
+}
+.mira-hero .md-button {
+  border-color: var(--md-default-fg-color--lighter);
+  color: var(--md-default-fg-color);
+}
+.mira-hero .md-button:hover,
+.mira-hero .md-button:focus {
+  background-color: var(--mira-rust-darker);
+  border-color: var(--mira-rust-darker);
+  color: #fff;
+}
+.mira-hero .md-button--primary,
+.mira-hero .md-button--primary:hover,
+.mira-hero .md-button--primary:focus {
+  color: #fff;
+}
+
+/* ---- The evidence panel ---------------------------------------------------
+   A screen inside the page: its own surface, two-pixel edge, hard shadow,
+   scanlines over the whole thing, and every colour a token so it follows the
+   palette toggle. The bars are drawn as discrete cells with a repeating
+   gradient rather than as a solid fill, which is what makes them read as a
+   loading bar from 1985 instead of a chart from a dashboard. */
+.md-typeset .mira-chart {
+  position: relative;
+  margin: 0;
+  /* Material centres every `figure` in `.md-typeset`, which centres each label
+     over its own bar and reads as six unrelated captions. `.md-typeset figure`
+     is (0,1,1), so the class alone loses to it. */
+  text-align: left;
+  padding: 1.4rem 1.3rem 1.1rem;
+  background: var(--mira-chart-bg);
+  border: 2px solid var(--mira-chart-edge);
+  box-shadow: var(--mira-px) var(--mira-px) 0 var(--mira-shadow);
+  color: var(--mira-chart-dim);
+  animation: mira-fade-up 0.6s ease 0.24s both;
+}
+/* Scanlines. 3px pitch, and the tint is per-scheme: 6% black over near-black
+   is a texture, 6% black over light grey is a stripe. Both are gone by the
+   time they reach the text — anything stronger makes the figures fuzzy. */
+.mira-chart::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    180deg,
+    var(--mira-chart-scan) 0 1px,
+    transparent 1px 3px
+  );
+  pointer-events: none;
+}
+/* ---- Axis tabs ------------------------------------------------------------
+   Three radios, three labels, three panels, no script. The radios stay in the
+   accessibility tree and stay focusable — `opacity: 0`, not `display: none`,
+   because a hidden-by-display input cannot be tabbed to and the whole set
+   would be keyboard-dead. They are the first children of the figure so that
+   `:checked ~ .mira-chart__panel--*` can reach every panel. */
+.mira-chart__radio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.mira-chart__tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 1.2rem;
+}
+.md-typeset .mira-chart__tabs label {
+  padding: 0.34rem 0.62rem;
+  font-family: var(--mira-pixel-font);
+  font-size: 0.5rem;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--mira-chart-dim);
+  border: 2px solid var(--mira-chart-rule);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.md-typeset .mira-chart__tabs label:hover {
+  color: var(--mira-chart-ink);
+  border-color: var(--mira-chart-dim);
+}
+/* One pair of rules per axis, spelled out rather than generated: `:checked ~`
+   cannot carry the id along, so the label has to be named. Adding a fourth
+   axis means adding it here as well as in overrides/home.html. */
+#mira-axis-ingest:checked ~ .mira-chart__tabs label[for="mira-axis-ingest"],
+#mira-axis-binary:checked ~ .mira-chart__tabs label[for="mira-axis-binary"],
+#mira-axis-memory:checked ~ .mira-chart__tabs label[for="mira-axis-memory"] {
+  color: var(--mira-chart-bg);
+  background: var(--mira-chart-accent);
+  border-color: var(--mira-chart-accent);
+}
+/* The focus ring belongs on the label, since the input it is really on is a
+   1px transparent square in the corner of the panel. */
+#mira-axis-ingest:focus-visible ~ .mira-chart__tabs label[for="mira-axis-ingest"],
+#mira-axis-binary:focus-visible ~ .mira-chart__tabs label[for="mira-axis-binary"],
+#mira-axis-memory:focus-visible ~ .mira-chart__tabs label[for="mira-axis-memory"] {
+  outline: 2px solid var(--mira-chart-accent);
+  outline-offset: 2px;
+}
+.mira-chart__panel {
+  display: none;
+}
+#mira-axis-ingest:checked ~ .mira-chart__panel--ingest,
+#mira-axis-binary:checked ~ .mira-chart__panel--binary,
+#mira-axis-memory:checked ~ .mira-chart__panel--memory {
+  display: block;
+}
+
+.mira-chart .mira-chart__cap {
+  margin: 0 0 1.1rem;
+  font-family: var(--mira-pixel-font);
+  font-size: 0.54rem;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--mira-chart-accent);
+}
+/* Three classes deep, and it has to be: Material indents lists with
+   `[dir=ltr] .md-typeset ol` and `[dir=ltr] .md-typeset ol li`, which are
+   (0,2,1) and (0,2,2). A two-class selector loses to both and the rows sit
+   30px right of the caption they belong to. */
+.md-typeset .mira-chart .mira-chart__rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.md-typeset .mira-chart .mira-chart__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.15rem 0.6rem;
+  margin: 0 0 0.85rem;
+}
+.md-typeset .mira-chart .mira-chart__row:last-child {
+  margin-bottom: 0;
+}
+.mira-chart__name {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--mira-chart-ink);
+}
+/* Second in the source, not third: grid auto-placement is sequential, and the
+   full-width track between the name and the figure would put the figure on a
+   row of its own. Reading order gains from it too — "Mira, 1,458,967". */
+.mira-chart__val {
+  font-family: var(--mira-pixel-font);
+  font-size: 0.54rem;
+  align-self: end;
+  text-align: right;
+  color: var(--mira-chart-dim);
+}
+.mira-chart__row--mira .mira-chart__name,
+.mira-chart__row--mira .mira-chart__val {
+  color: var(--mira-chart-accent);
+}
+.mira-chart__track {
+  --cell: 9px;
+  position: relative;
+  grid-column: 1 / -1;
+  height: 0.7rem;
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--mira-chart-cell) 0 calc(var(--cell) - 2px),
+    transparent calc(var(--cell) - 2px) var(--cell)
+  );
+}
+.mira-chart__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--fill);
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--mira-chart-bar) 0 calc(var(--cell) - 2px),
+    transparent calc(var(--cell) - 2px) var(--cell)
+  );
+  /* Cell by cell, like a tape loading. `steps` on the count of cells the widest
+     bar has, so every bar advances on the same tick. */
+  animation: mira-load 1.1s steps(24) 0.35s both;
+}
+.mira-chart__row--mira .mira-chart__fill {
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--mira-chart-accent) 0 calc(var(--cell) - 2px),
+    transparent calc(var(--cell) - 2px) var(--cell)
+  );
+}
+.mira-chart__note {
+  grid-column: 1 / -1;
+  font-size: 0.62rem;
+  line-height: 1.5;
+  color: var(--mira-chart-dim);
+}
+.mira-chart .mira-chart__foot {
+  margin: 1.2rem 0 0;
+  padding-top: 0.8rem;
+  border-top: 2px solid var(--mira-chart-rule);
+  font-size: 0.62rem;
+  line-height: 1.55;
+  color: var(--mira-chart-dim);
+}
+.mira-chart .mira-chart__foot a {
+  color: var(--mira-chart-accent);
+}
+
+@keyframes mira-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes mira-load {
+  from {
+    width: 0;
+  }
+  to {
+    width: var(--fill);
+  }
+}
+
+@keyframes mira-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* Scroll-driven reveal: the hero dissolves upward as the first screen scrolls, so it
+   can take a full screen without costing a reader who wants the documentation. Pure
+   progressive enhancement — a browser without scroll-driven animations keeps the
+   compact static hero above, and opacity/transform only, so it stays on the
+   compositor. No blur in the exit: a CRT switching off collapses, it does not
+   defocus. Knobs: min-height (how much of the first screen the hero takes),
+   animation-range (where the dissolve starts and ends) and the hold keyframe. */
+@supports (animation-timeline: scroll()) {
+  @media (prefers-reduced-motion: no-preference) and (min-width: 60em) {
+    .mira-hero {
+      min-height: 88svh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      animation: mira-hero-dissolve linear both;
+      animation-timeline: scroll(root);
+      /* Starts at 15vh so a nudge of the wheel does not move the headline while it is
+         still the only thing on screen. */
+      animation-range: 15vh 90vh;
+      will-change: opacity, transform;
+    }
+  }
+}
+@keyframes mira-hero-dissolve {
+  /* The hold makes the exit read as deliberate rather than as the page sliding
+     the moment you scroll. */
+  0%,
+  30% {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-3rem) scale(0.985);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mira-hero,
+  .mira-hero__wordmark,
+  .mira-hero__caret,
+  .mira-hero .mira-hero__eyebrow,
+  .mira-hero .mira-hero__title,
+  .mira-hero .mira-hero__tagline,
+  .mira-hero .mira-hero__note,
+  .mira-hero__actions,
+  .mira-chart,
+  .mira-chart__fill {
+    animation: none;
+  }
+}

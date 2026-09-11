@@ -1,0 +1,35 @@
+{{/*
+The ingest Service. Any replica accepts any export — nothing has to land on a
+particular node — so round-robin across the endpoints is correct for 4317 and
+4318's OTLP half.
+
+A *query* through this Service is not: there is no fan-out, so it is answered
+from whichever replica the kube-proxy picked, out of that replica's own blocks.
+At replicaCount: 1 that distinction does not exist; above it, query through the
+headless Service's per-pod name.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mira.fullname" . }}
+  labels:
+    {{- include "mira.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: otlp-grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: otlp-grpc
+      protocol: TCP
+      appProtocol: grpc
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+  selector:
+    {{- include "mira.selectorLabels" . | nindent 4 }}

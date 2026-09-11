@@ -1,0 +1,17 @@
+# Pinned to an exact release, not to `stable`.
+#
+# `make lint` runs clippy with `-D warnings`, so a floating channel means a new
+# lint in next month's compiler turns a PR red for reasons that have nothing to
+# do with the PR. Pinning also makes "works on my machine" a fact rather than a
+# joke: rustup reads this file on the first cargo invocation, so a fresh clone
+# and CI compile with the same compiler.
+#
+# Bumping is a deliberate one-line PR — Dependabot does not watch this file.
+#
+# This is the *build* toolchain, not the floor. The floor is `rust-version` in
+# Cargo.toml, and `make msrv` is what actually compiles against it; a declared
+# MSRV that nothing builds with is a wish, not a promise.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

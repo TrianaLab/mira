@@ -1,0 +1,265 @@
+# What this suite is for: the StatefulSet is where a silent breakage costs the
+# most. A probe pointed at the wrong port, a volumeClaimTemplate that quietly
+# stopped rendering, a securityContext someone relaxed to make a debug session
+# work — none of those fail `helm lint`, and all of them are found in production.
+suite: statefulset
+templates:
+  - templates/statefulset.yaml
+# A named release, so the assertions below read like the resources an operator
+# will actually see rather than like RELEASE-NAME-mira.
+release:
+  name: mira
+  namespace: observability
+tests:
+  - it: is a StatefulSet, one replica, governed by the headless Service
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.serviceName
+          value: mira-headless
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+
+  - it: defaults the image tag to the chart appVersion
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/trianalab/mira:0.0.1
+
+  - it: honours an image tag override
+    set:
+      image.tag: v9.9.9
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/trianalab/mira:v9.9.9
+
+  - it: runs on the config file and nothing else
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - --config
+            - /etc/mira/mira.yaml
+
+  - it: names the pod through the downward API, not HOSTNAME
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0].name
+          value: POD_NAME
+      - equal:
+          path: spec.template.spec.containers[0].env[0].valueFrom.fieldRef.fieldPath
+          value: metadata.name
+
+  - it: appends extraEnv after POD_NAME
+    set:
+      extraEnv:
+        - name: PD_ROUTING_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pagerduty
+              key: routingKey
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[1].name
+          value: PD_ROUTING_KEY
+      - equal:
+          path: spec.template.spec.containers[0].env[1].valueFrom.secretKeyRef.name
+          value: pagerduty
+
+  - it: exposes 4317 and 4318 under the names the probes and Services use
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0]
+          value:
+            name: otlp-grpc
+            containerPort: 4317
+            protocol: TCP
+      - equal:
+          path: spec.template.spec.containers[0].ports[1]
+          value:
+            name: http
+            containerPort: 4318
+            protocol: TCP
+
+  # The probes are three HTTP gets on 4318 and two distinct paths. This is the
+  # assertion that catches readiness being wired back to /health, which would
+  # silently discard the only thing that takes a full-disk replica out of the
+  # Service.
+  - it: probes 4318 over HTTP, liveness and readiness on different paths
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet
+          value:
+            path: /readyz
+            port: http
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe.exec
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe.exec
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 60
+
+  - it: hardens the container and the pod
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+      - equal:
+          path: spec.template.spec.securityContext
+          value:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+
+  - it: renders resources
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            limits:
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits.cpu
+
+  - it: honours a resources override
+    set:
+      resources:
+        requests:
+          cpu: "4"
+          memory: 8Gi
+        limits:
+          memory: 16Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "4"
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.memory
+          value: 16Gi
+
+  - it: claims a volume per replica when persistence is on
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.accessModes[0]
+          value: ReadWriteOnce
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 20Gi
+      - notExists:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0]
+          value:
+            name: data
+            mountPath: /data
+
+  - it: sets the storage class when one is named
+    set:
+      persistence.storageClass: gp3
+      persistence.size: 100Gi
+      persistence.accessMode: ReadWriteOncePod
+      persistence.annotations:
+        example.com/backup: "true"
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: gp3
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 100Gi
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.accessModes[0]
+          value: ReadWriteOncePod
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.annotations["example.com/backup"]
+          value: "true"
+
+  # The negative half. An emptyDir where a PVC should be is the failure mode
+  # that looks fine for a week and then loses everything on a node drain.
+  - it: has no volumeClaimTemplates and an emptyDir when persistence is off
+    set:
+      persistence.enabled: false
+    asserts:
+      - notExists:
+          path: spec.volumeClaimTemplates
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+
+  # A checksum of the rendered ConfigMap, so a `--set config.*` upgrade actually
+  # restarts something. Asserted as a shape rather than a literal digest: a
+  # literal would fail on every comment edit in configmap.yaml and teach whoever
+  # hit it to delete the assertion.
+  - it: rolls the pods when the config changes
+    asserts:
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: "^[0-9a-f]{64}$"
+
+  - it: keeps podAnnotations beside the checksum
+    set:
+      podAnnotations:
+        prometheus.io/scrape: "false"
+      podLabels:
+        team: platform
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+          value: "false"
+      - exists:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - equal:
+          path: spec.template.metadata.labels.team
+          value: platform
+
+  - it: gives SIGTERM time to seal the open blocks
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+
+  - it: refuses alert rules on more than one replica
+    set:
+      replicaCount: 3
+      config.alerts.rules: "{ rules: [] }"
+    asserts:
+      - failedTemplate:
+          errorPattern: "nothing elects an evaluator"

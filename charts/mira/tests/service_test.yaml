@@ -1,0 +1,97 @@
+# Two Services and they are not interchangeable: the first load-balances ingest
+# across replicas, the second hands out the per-pod DNS that is the only way to
+# query one replica's blocks. Both port pairs have to stay 4317/4318 by name,
+# because the probes and the container ports refer to them by name.
+suite: services
+templates:
+  - templates/service.yaml
+  - templates/service-headless.yaml
+release:
+  name: mira
+  namespace: observability
+tests:
+  - it: exposes OTLP/gRPC and everything-else on the ingest Service
+    template: templates/service.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: metadata.name
+          value: mira
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports[0]
+          value:
+            name: otlp-grpc
+            port: 4317
+            targetPort: otlp-grpc
+            protocol: TCP
+            appProtocol: grpc
+      - equal:
+          path: spec.ports[1]
+          value:
+            name: http
+            port: 4318
+            targetPort: http
+            protocol: TCP
+            appProtocol: http
+      - notExists:
+          path: spec.clusterIP
+
+  - it: honours the Service type and ports
+    template: templates/service.yaml
+    set:
+      service.type: LoadBalancer
+      service.httpPort: 8080
+      service.annotations:
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.ports[1].port
+          value: 8080
+      # The container port is not a knob, so the target stays named.
+      - equal:
+          path: spec.ports[1].targetPort
+          value: http
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "true"
+
+  - it: gives every replica a stable name, ready or not
+    template: templates/service-headless.yaml
+    asserts:
+      - equal:
+          path: metadata.name
+          value: mira-headless
+      - equal:
+          path: spec.clusterIP
+          value: None
+      # A replica whose volume filled still answers queries, and that is exactly
+      # when someone needs to reach it by name.
+      - equal:
+          path: spec.publishNotReadyAddresses
+          value: true
+      - equal:
+          path: spec.ports[0].port
+          value: 4317
+      - equal:
+          path: spec.ports[1].port
+          value: 4318
+
+  - it: keeps the headless Service on the container ports whatever the Service ports are
+    template: templates/service-headless.yaml
+    set:
+      service.httpPort: 8080
+      service.grpcPort: 9090
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 4317
+      - equal:
+          path: spec.ports[1].port
+          value: 4318

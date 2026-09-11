@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mira.fullname" . }}
+  labels:
+    {{- include "mira.labels" . | nindent 4 }}
+data:
+  # Always rendered, and the pod's only argument is `--config` pointing at it.
+  # Flags would work too — precedence is flag > file > default — but then half
+  # the configuration would live in a StatefulSet's args and half in a
+  # ConfigMap, and `kubectl get cm` would be a lie.
+  mira.yaml: |
+    {{- include "mira.config" . | nindent 4 }}
+{{- with .Values.config.alerts.rules }}
+  # A separate document because the config file is a closed set of quoted
+  # scalars and a rules list is a list of maps — a shape it refuses on purpose.
+  alerts.kyaml: |
+    {{- . | nindent 4 }}
+{{- end }}

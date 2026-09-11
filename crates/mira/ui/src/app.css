@@ -1,0 +1,122 @@
+/* Dark by default -- this is a console someone stares at for an hour -- with a
+   light variant for the people who read it in daylight. Everything downstream
+   is a custom property, so the two themes are one block of overrides. */
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --line: #30363d;
+  --fg: #e6edf3;
+  --dim: #8b949e;
+  --accent: #1f6feb;
+  --warn: #d29922;
+  --err: #f85149;
+  --ok: #3fb950;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --line: #d1d9e0;
+    --fg: #1f2328;
+    --dim: #636c76;
+    --accent: #0969da;
+    --warn: #9a6700;
+    --err: #cf222e;
+    --ok: #1a7f37;
+    color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  /* Monospace throughout: every column here is an id, a timestamp or a number,
+     and proportional digits make them impossible to scan. */
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* The recorded-snapshot build only; `App.svelte` renders nothing here in the
+   build that ships inside the binary. Above the sticky header and not sticky
+   itself, so it scrolls away once read and leaves the `th` offset alone. */
+.replay {
+  margin: 0;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--bg);
+  background: #f74c00;
+  border-bottom: 1px solid var(--line);
+}
+.replay a { color: var(--bg); text-decoration: underline; }
+
+/* ------------------------------------------------------------ tables */
+
+table { width: 100%; border-collapse: collapse; }
+
+th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--dim);
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 41px; /* clears the sticky header */
+  background: var(--bg);
+}
+
+td {
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+tbody tr:hover { background: var(--panel); cursor: pointer; }
+tr.detail:hover { background: var(--panel); cursor: default; }
+tr.detail td { white-space: normal; }
+
+/* Rows are focusable, so they need a focus indicator that is not the browser's
+   default -- which several browsers decline to paint on a `tr` under
+   `border-collapse` at all. The outline is inset so it is not eaten by the
+   neighbouring row's border, and the background is a second, independent
+   signal for exactly the case where the outline is dropped. */
+tbody tr:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--panel);
+}
+
+.t { color: var(--dim); width: 1%; }
+.num { text-align: right; width: 1%; font-variant-numeric: tabular-nums; }
+
+/* The message column absorbs the leftover width and clips; the full value is
+   one click away in the detail row, so truncating here costs nothing. */
+.msg {
+  width: 100%;
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------ severity */
+
+.sev-trace, .sev-debug { color: var(--dim); }
+.sev-info { color: var(--fg); }
+.sev-warn { color: var(--warn); }
+.sev-error, .sev-fatal { color: var(--err); }
+
+/* ------------------------------------------------------------ states */
+
+/* Both are whole-block placeholders standing in for content that is not there —
+   never state modifiers on something that is. They carry padding, so an element
+   that already has a size wears one at its peril; `bad` is the modifier for "this
+   thing is in a bad state" and it only sets colour. */
+.empty, .err { padding: 40px 0; text-align: center; color: var(--dim); }
+.err { color: var(--err); text-align: left; padding: 16px 0; white-space: pre-wrap; }

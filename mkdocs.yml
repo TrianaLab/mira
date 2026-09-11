@@ -1,0 +1,172 @@
+site_name: Mira
+# With no social-cards plugin and no og:image, this string is the whole of the
+# shared-link preview. It states the mechanism rather than a category, because
+# "telemetry backend" is the part that is not distinguishing.
+site_description: An OTLP-native telemetry storage engine and short-term memory layer for AI agents. One binary — logs, traces and metrics in; a web UI, a terminal UI and an MCP server out, all reading the same mmapped blocks.
+site_url: https://miradb.dev/
+repo_url: https://github.com/TrianaLab/mira
+repo_name: TrianaLab/mira
+edit_uri: edit/main/docs/
+# No `copyright:`. Material renders it as a line under the footer nav on every
+# page, and the licence is already stated where someone looks for it: the badge
+# and the licence section in the README, LICENSE at the repository root, and the
+# hero's own note. A third copy in the chrome of all twelve pages is furniture.
+
+docs_dir: docs
+
+theme:
+  name: material
+  # The landing hero lives in overrides/home.html; docs/index.md opts in with
+  # `template: home.html` in its front matter. Every other page uses the stock
+  # Material templates, so this directory holds exactly one file.
+  custom_dir: overrides
+  # The mark, not the wordmark: the header logo slot is ~24px tall and a wordmark
+  # squashed into it is unreadable. The wordmark appears full size on the home
+  # page instead. Orange on both the white and near-black header, so no per-scheme
+  # swap is needed.
+  logo: assets/mira-mark.svg
+  favicon: assets/mira-mark.svg
+  font:
+    # Space Grotesk has the squared shoulders and single-storey geometry the
+    # wordmark is drawn from; JetBrains Mono keeps the terminal register in code.
+    text: Space Grotesk
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      # Header stays neutral; the exact rust hexes are pinned in
+      # stylesheets/extra.css, because Material only accepts named colours here.
+      primary: white
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - content.action.edit
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+# Under `mkdocs build --strict` these four are the entire broken-link mechanism:
+# a page outside the nav, a nav entry pointing at nothing, a dead cross-reference
+# or a dead #anchor all fail the build. Nothing else checks links, on purpose.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    anchors: warn
+
+extra:
+  # No "Made with Material for MkDocs" line. Nothing else lives under `extra:`:
+  # `social:` was the GitHub icon in the footer meta bar, and that whole bar is
+  # gone (see `.md-footer-meta` in docs/stylesheets/extra.css) — the header
+  # already carries a repository link, so the icon was a second copy of it.
+  generator: false
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      permalink_title: Anchor link
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      # Without this a missing --8<-- path is silently dropped: the content
+      # vanishes from the built page and `mkdocs build --strict` still exits 0.
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist
+  - pymdownx.tilde
+
+# One plugin. No social cards (site_description above is the link preview), no
+# minify, no redirects — every plugin is a build dependency that can break the
+# docs independently of the docs, and this tree is militant about that.
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/extra.css
+
+# A reader's path, not a directory listing: see it work, install it, use it, look
+# something up, then understand why it is shaped this way. `demo.md` is first
+# because the question a first-time reader actually has is "what does this look
+# like", and no amount of prose answers it. ARCHITECTURE.md and MARKET.md come
+# last for the same reason — they are the reasoning, and nobody needs the
+# reasoning before the thing. Filenames stay SCREAMING_CASE because README.md and
+# CLAUDE.md link to them by path, and there is no redirect plugin to cover a
+# rename.
+nav:
+  - Home: index.md
+  - Get started:
+      - See it work: demo.md
+      - Install: install.md
+      - Quickstart: quickstart.md
+  - Guides:
+      - Connect an agent: agents.md
+      - Configuration: CONFIG.md
+      - End-to-end testing: TESTING.md
+  # Generated by scripts/gen_reference.py from the binary and the source, and
+  # `git diff --exit-code`'d in CI, so these three cannot drift from the code.
+  # The Rust API is rustdoc, published from the same build at /api.
+  - Reference:
+      - CLI: reference/cli.md
+      - HTTP API: reference/http.md
+      - Rust API: https://miradb.dev/api/
+  - Understand:
+      # A symlink to the repository-root MANIFESTO.md rather than a copy: it is
+      # linked from the README and from GitHub's file list, and two files saying
+      # the same thing is one file saying it wrong within a release.
+      - Manifesto: manifesto.md
+      - Architecture: ARCHITECTURE.md
+      - Market position: MARKET.md

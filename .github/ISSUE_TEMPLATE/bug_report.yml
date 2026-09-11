@@ -1,0 +1,163 @@
+name: Bug report
+description: Something Mira stored, returned, refused or crashed on is wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Mira is a database, so the questions below are the ones that actually
+        narrow a bug down: which surface, which signal, which filesystem, and
+        whether it survives a clean data directory. Answering them is usually
+        faster than the round trip of us asking.
+
+        **Do not paste real telemetry.** Exports and query results carry
+        customer data. Redact, or synthesise a payload with
+        `cargo run --release --example loadgen`.
+
+        Found a security issue? Do not file it here — use
+        [private reporting](https://github.com/TrianaLab/mira/security/advisories/new).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        What you did, what Mira did, and what you expected instead. If it is a
+        wrong answer rather than a crash, say what the right answer was and how
+        you know.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `mira --version`, or the commit you built.
+      placeholder: mira 0.0.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was built and run
+      options:
+        - cargo install --locked --path crates/mira
+        - cargo build --release
+        - cargo run (debug)
+        - Docker image built from this tree
+        - Other (say so below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - Linux aarch64
+        - macOS Apple Silicon
+        - macOS Intel
+        - Other (say so below)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: signals
+    attributes:
+      label: Signals involved
+      options:
+        - label: Logs
+        - label: Traces
+        - label: Metrics
+        - label: Not signal-specific
+
+  - type: checkboxes
+    id: surface
+    attributes:
+      label: Which surface
+      description: Where the wrong behaviour was observed, not where you think it originates.
+      options:
+        - label: OTLP/gRPC 4317
+        - label: OTLP/HTTP 4318
+        - label: Query API (`/api/v1/query`)
+        - label: MCP (`/mcp`)
+        - label: Browser UI
+        - label: Terminal UI (`mira mira`)
+        - label: Startup, config or CLI
+        - label: Retention, compaction or the block directory
+
+  - type: dropdown
+    id: clean-dir
+    attributes:
+      label: Does it reproduce from an empty data directory?
+      description: >-
+        `mira --data-dir "$(mktemp -d)"`, then re-send the export. This is the
+        single most useful line in the report: it separates an ingest or query
+        bug from a bug in reading something already on disk.
+      options:
+        - "Yes — empty directory, still happens"
+        - "No — only against a directory with existing blocks"
+        - "Not tried"
+    validations:
+      required: true
+
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem holding --data-dir
+      description: >-
+        `df -T` on Linux, `mount | grep` on macOS, or "named Docker volume" /
+        "bind mount". Mira `mmap`s its blocks, so this matters more here than
+        it would elsewhere.
+      placeholder: ext4 / apfs / overlayfs / named docker volume
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: >-
+        The KYAML passed to `--config`, and the flags on the command line.
+        Redact anything sensitive. "Defaults, no config file" is a complete
+        answer.
+      render: yaml
+
+  - type: textarea
+    id: payload
+    attributes:
+      label: The request that triggers it
+      description: >-
+        The query document, the MCP call, or a minimal OTLP export. Synthetic,
+        not real telemetry.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server output
+      description: >-
+        Run with `RUST_LOG=debug` and paste the relevant lines. Include the
+        full backtrace if it panicked — `RUST_BACKTRACE=1`, and note that the
+        release profile sets `panic = "abort"`, so a panic kills the process.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >-
+        Ingest rate, block count, retention setting, how long it had been
+        running, screenshots for a UI bug.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: This report contains no real telemetry, credentials or personal data.
+          required: true

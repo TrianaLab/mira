@@ -1,0 +1,35 @@
+# Adds Mira to the OpenTelemetry Demo's compose project.
+#
+#   docker build -t mira .                       # from this repo's root
+#   cp docs/e2e/demo/otelcol-config-extras.yml <demo>/src/otel-collector/
+#   docker compose -f <demo>/compose.yaml \
+#                  -f docs/e2e/demo/compose.mira.yaml up -d
+#
+# `image:` rather than `build:`, because compose resolves a relative build
+# context against the *first* `-f` file's directory — which is the demo's, not
+# ours. Building the image first sidesteps the whole question and is one command
+# either way.
+services:
+  mira:
+    image: mira:latest
+    container_name: mira
+    restart: unless-stopped
+    ports:
+      # Published so `curl`, `telemetrygen` and `mira mira --addr` can reach it
+      # from the host. The demo's own collector publishes 4317/4318 to *random*
+      # host ports, so there is nothing to collide with.
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      # Named, not a bind mount: Mira mmaps its blocks and a Docker Desktop bind
+      # mount is FUSE, where an I/O hiccup arrives as SIGBUS rather than as an
+      # error (docs/ARCHITECTURE.md section 9).
+      - mira-data:/data
+
+  otel-collector:
+    depends_on:
+      mira:
+        condition: service_started
+
+volumes:
+  mira-data:

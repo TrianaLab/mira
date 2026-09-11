@@ -1,0 +1,264 @@
+# Every default below has a reason written next to it. Mira has one binary, one
+# data directory and no coordination state, so most of what a chart usually
+# configures does not exist here — there is no leader, no metadata store, no
+# sidecar and no init job, and none of those are omissions.
+
+# -- Replicas. One, because a replica is a whole Mira: it holds no coordination
+# state (principle 4), so a second one is a second, independent store. Two
+# replicas double ingest capacity and *halve* what any one query can see, since
+# a query is answered from that replica's own blocks with no fan-out. Raise this
+# when one core cannot keep up with the export rate, not for availability.
+replicaCount: 1
+
+image:
+  # -- One binary on `distroless/cc`. The published image carries the same bytes
+  # as the release tarball rather than a second compile, so one attestation
+  # covers both.
+  repository: ghcr.io/trianalab/mira
+  # -- `IfNotPresent`, because the tag is an immutable release version: re-pulling
+  # it on every restart costs a registry round trip and can never return
+  # anything different. Use `Always` only if you retag.
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion). Deliberately
+  # empty: the chart version, the app version and the image tag are one number
+  # (`scripts/check_drift.py` enforces it), so pinning it here would only be a
+  # fourth place for it to drift.
+  tag: ""
+
+# -- Pull secrets, for a private mirror of the image. Empty because the public
+# image needs none.
+imagePullSecrets: []
+
+# -- Override the chart name in resource names and labels.
+nameOverride: ""
+# -- Override the full release name.
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a ServiceAccount. Mira needs no RBAC whatsoever — it never calls
+  # the API server — but a named identity is what a NetworkPolicy, a PodSecurity
+  # exemption or an audit rule binds to, and sharing `default` with everything
+  # else in the namespace makes all three meaningless.
+  create: true
+  # -- No API token in the pod. Mira never talks to the API server, so a mounted
+  # credential is pure blast radius: it is the difference between a compromised
+  # ingest process and a compromised cluster client.
+  automount: false
+  # -- Annotations on the ServiceAccount (IRSA, Workload Identity).
+  annotations: {}
+  # -- Name override (defaults to the fullname).
+  name: ""
+
+# -- Extra annotations on the pod. The config checksum is added automatically,
+# so a `helm upgrade` that only changes `config` still rolls the pods.
+podAnnotations: {}
+# -- Extra labels on the pod.
+podLabels: {}
+
+podSecurityContext:
+  # -- The image is `distroless:nonroot`, so this is a statement of what is
+  # already true rather than a constraint being imposed: a pod that suddenly
+  # needs root has been tampered with and should fail to schedule.
+  runAsNonRoot: true
+  # -- uid 65532 — `nonroot` in the distroless base, and the owner of `/data` in
+  # the image.
+  runAsUser: 65532
+  # -- gid 65532, matching the image.
+  runAsGroup: 65532
+  # -- The one that is load-bearing rather than decorative. A freshly provisioned
+  # PVC is mounted root-owned; without `fsGroup` the CSI driver never chowns it,
+  # Mira cannot create its first block directory, and the failure surfaces as a
+  # permission error per export minutes after a pod that looked healthy.
+  fsGroup: 65532
+  seccompProfile:
+    # -- `RuntimeDefault`. Mira makes ordinary syscalls — `mmap`, `statfs`,
+    # `fsync`, sockets — and needs no exemption from the default filter.
+    type: RuntimeDefault
+
+securityContext:
+  # -- Nothing in this image is setuid and there is no shell to escalate into.
+  allowPrivilegeEscalation: false
+  capabilities:
+    # -- Drop everything. Mira binds 4317 and 4318, both above 1024, so it does
+    # not even want `NET_BIND_SERVICE`.
+    drop:
+      - ALL
+  # -- Read-only root filesystem. Mira writes to exactly one place, the data
+  # directory, and that is a volume — so a writable root would only ever be used
+  # by something that is not Mira.
+  readOnlyRootFilesystem: true
+  # -- Repeated at container level so the guarantee survives someone loosening
+  # the pod-level context.
+  runAsNonRoot: true
+  # -- uid 65532, as above.
+  runAsUser: 65532
+
+resources:
+  limits:
+    # -- A memory ceiling is safe here and worth having: Mira reads blocks
+    # through `mmap`, and mapped file pages are clean and reclaimable, so the
+    # cgroup reclaims them under pressure instead of OOM-killing. Without a
+    # limit the resident set looks unbounded to the scheduler and the node
+    # evicts something else instead.
+    memory: 2Gi
+  requests:
+    # -- Ingest is CPU-bound (decode, encode, compress). Half a core is what one
+    # replica needs to keep up with a stock collector's default batch rate.
+    cpu: 500m
+    # -- Enough for the open blocks of all three signals plus the query working
+    # set; everything else is page cache.
+    memory: 512Mi
+# There is deliberately no CPU limit. Throttling the ingest path does not shed
+# load, it queues it, and a queued export becomes a retried export and then a
+# dropped one. Add one only where a quota forces it.
+
+persistence:
+  # -- A PVC per replica, via `volumeClaimTemplates`. A replica's identity *is*
+  # its data: nothing replicates and nothing rebalances, so a pod that comes
+  # back on an empty volume comes back having lost that node's share of the
+  # history. Turn this off only for kind, CI or a demo.
+  enabled: true
+  # -- 20Gi holds roughly a week of a small service's telemetry at Mira's
+  # on-disk cost. Size it from `retention` x your export rate; a full volume
+  # takes the replica out of the Service via `/readyz` rather than losing data.
+  size: 20Gi
+  # -- `ReadWriteOnce` is the only mode that works, and it is a knob only so that
+  # `ReadWriteOncePod` (stricter, 1.29+) can be chosen. There is no RWX option:
+  # every backend an RWX PVC is in practice — NFS, EFS, Filestore, CephFS, Azure
+  # Files — is refused at boot, because `mmap` over a network filesystem
+  # delivers an I/O hiccup as SIGBUS, a signal with nothing to catch.
+  accessMode: ReadWriteOnce
+  # -- Empty means the cluster default StorageClass. **Point this at a local or
+  # block-backed class** (`local-path`, EBS `gp3`, GCE PD, Azure Disk). Mira
+  # mmaps every block it reads: on a network-backed class the process does not
+  # get an error, it gets SIGBUS and dies mid-query — which is why Mira checks
+  # the filesystem type at startup and refuses to run on NFS, SMB, CephFS or 9P
+  # at all.
+  storageClass: ""
+  # -- Annotations on the generated PVCs. Note that PVCs outlive `helm
+  # uninstall` by Kubernetes' own default, which for a telemetry store is the
+  # right way round — delete them by hand when you mean it.
+  annotations: {}
+
+service:
+  # -- `ClusterIP`. OTLP is an in-cluster protocol: collectors and SDKs are
+  # pods. Expose 4318 through `ingress` below if a browser needs the UI.
+  type: ClusterIP
+  # -- OTLP/gRPC. The Service port; the container port is fixed at 4317 because
+  # the image, the probes and every doc say so.
+  grpcPort: 4317
+  # -- OTLP/HTTP *and* the query API *and* MCP *and* the UI. One port, because
+  # it is one binary and one axum router.
+  httpPort: 4318
+  # -- Annotations on the Service (internal load balancer, topology hints).
+  annotations: {}
+
+ingress:
+  # -- Off. The UI, the query API and MCP all live on 4318, so an Ingress is how
+  # a human reaches Mira from outside the cluster — but it publishes an
+  # unauthenticated read surface, so turning it on is a decision.
+  enabled: false
+  # -- IngressClass name.
+  className: ""
+  # -- Annotations on the Ingress. Only 4318 is routed: OTLP/gRPC needs a
+  # per-controller backend-protocol annotation and an h2c-capable data path, so
+  # gRPC ingress is left to whoever knows which controller they run.
+  annotations: {}
+  # -- Hosts and paths.
+  hosts:
+    - host: mira.local
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- TLS blocks, verbatim.
+  tls: []
+
+# Mira's config file. It is KYAML (principle 5) and the chart renders these
+# values into it verbatim; the keys below map one-for-one onto docs/CONFIG.md's
+# closed set, which is closed on purpose — an unknown key stops the process at
+# boot rather than being ignored.
+#
+# `listen` and `storage.dir` are the only two of that set not here: the
+# container always listens on 0.0.0.0:4317 and 0.0.0.0:4318 and always writes to
+# /data, because a Service already remaps ports and a volumeMount already remaps
+# paths. Making them values would only let you break the probes.
+config:
+  # -- This replica's name. It is hashed into every block directory name, which
+  # is what lets replicas share a volume without coordinating, so it has to be
+  # unique per pod. `POD_NAME` comes from the downward API rather than
+  # `HOSTNAME`, which is set by the container runtime and not guaranteed by
+  # Kubernetes — and a missing `${env:...}` with no default is a startup error,
+  # by design, so guessing is not an option.
+  node: "${env:POD_NAME}"
+  storage:
+    # -- How long to keep data. Units are `ms`, `s`, `m`, `h` or `d`, and a bare
+    # number is seconds. Seven days is the default the engine ships with; it is
+    # the only knob standing between an export rate and a full volume.
+    retention: "7d"
+  ingest:
+    # -- The largest export Mira will decode, on either port. 16MiB is eight
+    # times axum's default and four times tonic's, and comfortably above what a
+    # stock collector produces at its own default batch size. Too low is worse
+    # than it sounds: 4318 answers 413, which OTLP classes as permanent, so the
+    # exporter drops the batch instead of retrying it.
+    maxRequestBytes: "16MiB"
+    # -- How many exports may be waiting for one signal's flusher. A full queue
+    # parks the next export for up to five seconds rather than refusing it, so
+    # this buys burst absorption and not throughput. Each slot can hold a
+    # decoded export, so the worst case is this times `maxRequestBytes` times
+    # three signals resident — check it against `resources.limits.memory`
+    # before raising it.
+    queue: 128
+    # -- Write-ahead log. Off means an export is acknowledged only once it is in
+    # a sealed, fsynced block — p99 around 2.4s, and read-your-writes holds. On
+    # means acknowledged once written to the log — p99 under 5ms, survives the
+    # process dying, does not survive the machine dying for up to 250ms, and
+    # what you just sent is not queryable yet. Both are correct; no measurement
+    # here can pick for you, so this is the binary's own default rather than a
+    # second opinion from the chart.
+    wal: true
+  telemetry:
+    # -- Mira storing its own counters, in itself, as ordinary metrics. No
+    # exporter, no scrape endpoint, no second port and no collector: turn it on
+    # and the metrics tab has content within one interval. It is the fastest
+    # way to see the engine work, and the cost is one export per interval
+    # competing with real ingest for the same flusher.
+    self: false
+    # -- How often it samples, when `self` is on. Same duration syntax as
+    # `storage.retention`.
+    interval: "15s"
+  alerts:
+    # -- The alert rules document, inline, in KYAML. Empty means this node
+    # evaluates nothing and pages nobody, which is the default and is why an
+    # empty `/api/v1/alerts` means "alerting is off here" rather than "all
+    # clear". The chart writes it into the same ConfigMap and points
+    # `alerts.rules` at the file. It is refused at `replicaCount > 1`: nothing
+    # elects an evaluator, so three replicas would send three of every page.
+    # docs/CONFIG.md has the schema.
+    rules: ""
+
+# -- Extra environment variables, verbatim `core/v1` EnvVar entries. The reason
+# this exists: an alert rule that pages PagerDuty reads its routing key with
+# `${env:PD_ROUTING_KEY}`, and that belongs in a Secret, not in values.
+extraEnv: []
+
+# -- How long the kubelet waits for a startup probe, in units of 5 seconds. Mira
+# replays its write-ahead log before it serves either port, so a node with a
+# large log is legitimately slow to answer — and a liveness probe on its own
+# would kill it mid-replay, forever. 60 x 5s = five minutes.
+startupProbeFailureThreshold: 60
+
+# -- Seconds Kubernetes waits after SIGTERM. Mira drains: it stops accepting,
+# finishes the exports in flight and seals the open block of each signal, so
+# killing it early is how you turn a clean shutdown into a WAL replay on the way
+# back up.
+terminationGracePeriodSeconds: 60
+
+# -- Node selector for the pods.
+nodeSelector: {}
+# -- Tolerations for the pods.
+tolerations: []
+# -- Affinity rules. Worth setting when `replicaCount > 1` and the volumes are
+# node-local: two replicas on one node share that node's disk bandwidth and die
+# together.
+affinity: {}

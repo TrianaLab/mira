@@ -1,0 +1,9 @@
+# Pinned with == so a docs build is reproducible and a theme release cannot turn
+# a green build red on its own. Two packages: mkdocs-material pulls
+# pymdown-extensions, Pygments and the rest transitively, and pinning those here
+# too would be a second place to forget to update.
+#
+# No `mike`: this is a single unversioned site. Adding mike means a gh-pages
+# branch, a version selector and an alias policy, none of which exist.
+mkdocs==1.6.1
+mkdocs-material==9.7.7

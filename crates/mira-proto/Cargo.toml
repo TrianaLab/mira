@@ -1,0 +1,39 @@
+[package]
+name = "mira-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OTLP protobuf/gRPC bindings for Mira, generated from vendored .proto files"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+protox = "0.9"
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+
+# Every dependency of this crate is used from code that does not exist at the
+# time cargo-machete looks: the runtime four are referenced only by the
+# generated modules under `OUT_DIR` that `src/lib.rs` `include!`s, and the
+# build three only by `build.rs`. Machete scans `src/`, so it reports all
+# seven as unused. Deleting any of them fails the build immediately — the
+# check is real, this crate is just shaped wrong for it.
+[package.metadata.cargo-machete]
+ignored = [
+    "prost",
+    "tonic",
+    "tonic-prost",
+    "bytes",
+    "protox",
+    "prost-build",
+    "tonic-prost-build",
+]
+
+[lints]
+workspace = true

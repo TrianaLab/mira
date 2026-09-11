@@ -1,0 +1,25 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+*.tmproj
+.vscode/
+# The helm-unittest suites are a build-time gate, not something an installed
+# release needs. Shipping them only makes the tarball bigger.
+tests/
+README.md.gotmpl
+# chart-testing's install permutations. Same reasoning as tests/: they are inputs
+# to `make helm-template` and `ct install`, never to a release.
+ci/

@@ -1,0 +1,62 @@
+suite: ingress
+templates:
+  - templates/ingress.yaml
+release:
+  name: mira
+  namespace: observability
+tests:
+  # Off by default: 4318 is an unauthenticated read surface, so publishing it is
+  # a decision someone has to make on purpose.
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: routes 4318 and only 4318
+    set:
+      ingress.enabled: true
+      ingress.className: nginx
+      ingress.hosts:
+        - host: mira.example.com
+          paths:
+            - path: /
+              pathType: Prefix
+    asserts:
+      - isKind:
+          of: Ingress
+      - equal:
+          path: apiVersion
+          value: networking.k8s.io/v1
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+      - equal:
+          path: spec.rules[0].host
+          value: mira.example.com
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.name
+          value: mira
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 4318
+
+  - it: follows the Service port when it moves
+    set:
+      ingress.enabled: true
+      service.httpPort: 8080
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 8080
+
+  - it: passes TLS through verbatim
+    set:
+      ingress.enabled: true
+      ingress.tls:
+        - secretName: mira-tls
+          hosts:
+            - mira.example.com
+    asserts:
+      - equal:
+          path: spec.tls[0].secretName
+          value: mira-tls

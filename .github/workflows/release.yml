@@ -1,0 +1,660 @@
+name: release
+
+# Mira is a single binary, so the release artifacts *are* the product's front
+# door. The whole file therefore has one rule: nothing is published until every
+# platform has built. The matrix produces tarballs, one job checksums and
+# attests them, one job turns the same bytes into a multi-arch image, one
+# packages the chart, and only then does the GitHub Release appear — followed by
+# `verify-release`, which re-downloads what was actually published and checks
+# it, because a release job that reports green having published nothing is a
+# failure mode both this project and its neighbours have shipped.
+#
+# Two invariants, both fail-closed and both learned the expensive way:
+#
+#   * A published coordinate is immutable. Every publisher asks the registry
+#     whether the coordinate already exists and refuses rather than overwriting
+#     it, so a re-run of a released tag is a red run and not a silent swap of
+#     bytes somebody already verified against SHA256SUMS.
+#   * Everything published is signed over its *digest*, never over a tag. A tag
+#     is a mutable pointer; a signature over one says nothing about the bytes
+#     that came back.
+#
+# The steps that build artifacts are `make` targets, not shell in this file, for
+# the reason the Makefile header gives: ci.yml's `release-dry-run` leg runs the
+# same targets on every pull request, so the release path is rehearsed rather
+# than first executed in anger. `workflow_dispatch` then runs the whole thing
+# with publishing switched off, so the first real tag is never the first test.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not cancel-in-progress. A cancelled release is a half-published one: some
+  # assets uploaded, an image pushed under `latest` that no release points at,
+  # an attestation for a tarball nobody can download. Letting a superseded run
+  # finish is strictly cheaper than reconciling that by hand.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/trianalab/mira
+  # The chart lives beside the image, not under it. `helm push` appends the
+  # chart name to whatever repository it is given, so this is the parent and
+  # every coordinate below is `${CHARTS}/mira` — nesting charts inside the
+  # image repository would make `ghcr.io/trianalab/mira` a directory and a
+  # manifest at once, which is legal and confusing in equal measure.
+  CHARTS: ghcr.io/trianalab/charts
+
+jobs:
+  # Everything downstream keys off these three strings, so they are computed
+  # once. Deriving them per-job is how a release ends up tagged v0.2.0 with a
+  # binary that prints 0.1.0.
+  meta:
+    name: meta
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: v
+        run: |
+          set -euo pipefail
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+            # The tag and Cargo.toml have to agree, because `mira --version`
+            # prints CARGO_PKG_VERSION and nothing downstream can fix that
+            # afterwards. Fail here, before anything is uploaded.
+            if [ "${version}" != "${crate}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match the workspace version ${crate} in Cargo.toml"
+              exit 1
+            fi
+          else
+            version="${crate}-dev.${GITHUB_SHA::7}"
+            publish=false
+          fi
+
+          # Pre-release covers both readings: an explicit -rc/-beta suffix, and
+          # 0.x, where CHANGELOG.md already says the block format and the query
+          # document may change under you. `latest` still moves — a 0.x project
+          # whose `latest` tag points nowhere is worse than an honest badge.
+          case "${version}" in
+            0.*|*-*) prerelease=true ;;
+            *)       prerelease=false ;;
+          esac
+
+          printf 'version=%s\npublish=%s\nprerelease=%s\n' \
+            "${version}" "${publish}" "${prerelease}" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: meta
+    strategy:
+      # One red platform should not hide the state of the other three.
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not 24.04, on purpose. zstd-sys is the only C
+          # dependency in the tree and it is compiled against the runner's
+          # glibc, so the runner picks the floor: 22.04 gives a binary whose
+          # highest required symbol is GLIBC_2.34 (measured with `objdump -T`),
+          # which runs on RHEL 9, Amazon Linux 2023, Debian 12, Ubuntu 22.04
+          # and the distroless/cc-debian12 base the image uses. Building on
+          # 24.04 links __isoc23_* at GLIBC_2.38 and silently drops all of them.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native arm64 rather than a cross-compile: cross-compiling means a
+          # C cross-toolchain for zstd-sys, which is exactly the machinery this
+          # project refuses to carry. The runner label is free on public repos.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-15
+          # Cross-compiled from the arm64 runner. This one is safe where the
+          # Linux equivalent is not: the macOS SDK carries both slices, so
+          # clang cross-compiles zstd with -arch x86_64 and no extra toolchain.
+          - target: x86_64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    env:
+      # cargo honours this, so `make build` needs no --target and the Makefile
+      # stays the single source of truth. Output lands under target/<triple>/.
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No toolchain action, matching ci.yml: rustup on the runner resolves
+      # rust-toolchain.toml on the first cargo invocation. `target add` is a
+      # no-op for the two native legs and the whole story for the other two.
+      - run: rustup target add "${CARGO_BUILD_TARGET}"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      # The one build command in the repo. `[profile.release] strip = "symbols"`
+      # in Cargo.toml means the artifact is already stripped, so there is no
+      # strip step here to drift away from what `make drift` measures.
+      # `make dist-tarball` also runs `make build`. The smoke test, the licence,
+      # the AppleDouble suppression and the size line in the run summary all
+      # live in that target now, together with the reasons — and, more to the
+      # point, ci.yml's `release-dry-run` leg runs the same target on every pull
+      # request. VERSION comes from the tag; TARGET the Makefile derives from
+      # CARGO_BUILD_TARGET, which is already set on this job.
+      - env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: make dist-tarball
+
+      # The SBOM describes the dependency graph, which is identical on all four
+      # targets, so it is generated once on the leg that has already compiled
+      # rather than in a job that would compile a fifth time. `make build` from
+      # the sbom target is a cache hit here.
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: make dist-sbom
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # Checksums and provenance over the finished set, not per-leg: one SHA256SUMS
+  # is what a user actually verifies against, and one attestation call covering
+  # every subject in it is what `gh attestation verify` then checks.
+  package:
+    name: package
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # Checked out only for the Makefile. `make dist-sums` is the same target
+      # the dry run exercises, and the reasoning about why the file is written
+      # outside dist/ and with bare names lives beside it rather than here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - run: make dist-sums
+
+      - run: |
+          set -euo pipefail
+          {
+            echo '### Release assets'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # subject-checksums attests every file named in SHA256SUMS in one
+      # statement — the tarballs and the SBOM. Runs on dry runs too, because an
+      # attestation step that only ever executes on a tag is untested.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  image:
+    name: image
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # id-token is doing two jobs here: the SLSA attestation below, and
+      # cosign's keyless signing, which exchanges this job's OIDC token for a
+      # short-lived Fulcio certificate. Neither holds a private key anywhere.
+      id-token: write
+      attestations: write
+    outputs:
+      # The digest, not the tag, is what `verify-release` re-checks at the end.
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*-unknown-linux-gnu
+          merge-multiple: true
+          path: artifacts
+
+      # The image gets the same bytes the tarball got, rather than a second
+      # compile inside the Dockerfile. That is faster, but mainly it means the
+      # provenance statement over the tarball and the one over the image are
+      # about one artifact, and `docker cp` out of the image reproduces a file
+      # that is in SHA256SUMS.
+      - env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}"; triple="${pair##*:}-unknown-linux-gnu"
+            mkdir -p "dist/linux/${arch}"
+            tar -xzf "artifacts/mira-${VERSION}-${triple}.tar.gz" \
+              -C "dist/linux/${arch}" --strip-components=1 \
+              "mira-${VERSION}-${triple}/mira"
+          done
+          ls -l dist/linux/*/mira
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A published coordinate is immutable, and nothing else in this run
+      # enforces that for the image. `gh release create` further down refuses a
+      # tag that already has a release — but by then the push below has already
+      # replaced ghcr.io/trianalab/mira:<ver> and moved :latest, so the failure
+      # arrives after the damage. Ask first.
+      #
+      # Four lines rather than an OCI ledger with adopt/conflict states: this
+      # workflow publishes three coordinates from one linear DAG and never needs
+      # to resume mid-flight. The ceiling is that two runs racing on the same
+      # tag can both pass this check; concurrency above is not
+      # cancel-in-progress, so they would queue instead, and a registry with
+      # immutable tags configured is the real fix if that ever stops being true.
+      - name: refuse to overwrite a published coordinate
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${VERSION} is already published — refusing to overwrite an immutable tag. Bump the version in Cargo.toml and tag again."
+            exit 1
+          fi
+          echo "${IMAGE}:${VERSION} is free"
+
+      # No QEMU. With BIN=prebuilt neither the prebuilt stage nor the runtime
+      # stage runs a command, so a linux/amd64 + linux/arm64 build is buildx
+      # copying files the host already has.
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BIN=prebuilt
+            VERSION=${{ needs.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          # `outputs:` rather than the `push:` input, because a dry run still
+          # builds both platforms and needs an explicit exporter — the default
+          # docker exporter cannot hold a manifest list. Written as an
+          # interpolation, not a `&&/||` ternary: the false branch of one of
+          # those would have to be the empty string, which GitHub evaluates as
+          # falsy, so the ternary would collapse and nothing would ever push.
+          outputs: type=image,push=${{ needs.meta.outputs.publish }}
+          # buildkit's own inline attestations would be a second, weaker
+          # provenance record next to the SLSA one attached below.
+          provenance: false
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # Both, not either. The SLSA attestation above is the stronger statement —
+      # it says which workflow, at which commit, produced these bytes — but it
+      # is GitHub's format and `gh attestation verify` is how you read it.
+      # cosign is what a Kubernetes admission controller (Sigstore policy
+      # controller, Kyverno, Connaisseur) and Artifact Hub already speak. An
+      # artifact only one of the two audiences can check is an artifact half the
+      # world treats as unsigned.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: needs.meta.outputs.publish == 'true'
+
+      - name: sign the image
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Over the digest, never `${IMAGE}:${VERSION}`. A tag is a mutable
+          # pointer, so a signature naming one certifies whatever that pointer
+          # happens to address when the verifier looks — which is not a
+          # statement about bytes at all.
+          #
+          # --new-bundle-format=false --use-signing-config=false: cosign v3
+          # defaults to writing a Sigstore bundle into the OCI referrers API,
+          # which is the better artifact and which Artifact Hub's indexer does
+          # not read. It reads the legacy `sha256-<digest>.sig` tag cosign has
+          # written since 2021, and the chart job below has the same
+          # requirement, so the image uses the same format for one story rather
+          # than two.
+          #
+          # ponytail: both flags are deprecated in cosign v3 — `--help` hides
+          # them and the deprecation text says the new format "will be the only
+          # supported format in future versions". So this has a hard ceiling: a
+          # cosign that drops them breaks this step, loudly and on a tag. The
+          # upgrade path is to delete both flags here and in `verify-release`
+          # the day Artifact Hub speaks referrers, and until then the choice is
+          # between a deprecated flag and a signature the world indexes as
+          # absent. Bumping cosign-installer is therefore not a routine bump.
+          cosign sign --yes \
+            --new-bundle-format=false \
+            --use-signing-config=false \
+            "${IMAGE}@${DIGEST}"
+
+  # The chart is a second OCI artifact in the same registry, with the same two
+  # rules: refuse an existing coordinate, sign the digest. `needs: image`
+  # because a chart whose appVersion names an image that failed to push is a
+  # chart that installs a CrashLoopBackOff.
+  chart:
+    name: chart
+    needs: [meta, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # The same pin ci.yml uses. They have to move together.
+          version: v3.22.0
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: needs.meta.outputs.publish == 'true'
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Packaged on a dry run too, and only the push is gated — a `helm package`
+      # that has never run until a tag is exactly the class of failure this
+      # workflow's dry run exists to remove.
+      - env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # --version and --app-version both from the tag: the chart ships the
+          # binary it was cut with, and `meta` has already proved the tag and
+          # Cargo.toml agree. Passing them here rather than editing Chart.yaml
+          # keeps the working tree clean, which is what makes it safe for the
+          # dry run to do the identical thing.
+          mkdir -p chart-dist
+          helm package charts/mira \
+            --version "${VERSION}" \
+            --app-version "${VERSION}" \
+            --destination chart-dist
+          ls -l chart-dist
+
+      - name: refuse to overwrite a published chart
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if helm show chart "oci://${CHARTS}/mira" --version "${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${CHARTS}/mira:${VERSION} is already published — refusing to overwrite an immutable chart version."
+            exit 1
+          fi
+          echo "${CHARTS}/mira:${VERSION} is free"
+
+      - id: push
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # helm push prints `Digest: sha256:…` on stderr and nothing useful on
+          # stdout, so the digest has to be scraped. It is worth scraping: it is
+          # what gets signed, and signing `:${VERSION}` instead would leave the
+          # same tag-is-mutable hole the image job avoids.
+          helm push "chart-dist/mira-${VERSION}.tgz" "oci://${CHARTS}" 2>&1 | tee push.log
+          digest=$(sed -n 's/^Digest: //p' push.log | tail -1)
+          [ -n "${digest}" ] || { echo "::error::helm push printed no digest"; exit 1; }
+          echo "digest=${digest}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: sign the chart
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Same two flags and the same reason as the image: the verifiers in
+          # the field read the legacy `.sig` tag, not the referrers API.
+          cosign sign --yes \
+            --new-bundle-format=false \
+            --use-signing-config=false \
+            "${CHARTS}/mira@${DIGEST}"
+
+      # No Artifact Hub ownership handshake here. Adopting an OCI-hosted chart
+      # needs a `repositoryID` that Artifact Hub only issues once the repository
+      # exists there, and the repository can only be created against a chart
+      # that is already published — so the handshake cannot be part of the
+      # release that first publishes the chart. It lands in its own change,
+      # after this one has run once.
+
+  # Created last, on purpose. The GitHub Release is the only coordinate a human
+  # reads as "this shipped", so it must not exist until the image and the chart
+  # already do — the other order produces release notes pointing at a pull that
+  # 404s.
+  release:
+    name: release
+    needs: [meta, package, image, chart]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      # gh is preinstalled on the runner and does exactly this, so there is no
+      # third-party release action to pin and review.
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # The Keep a Changelog section for this version, if there is one:
+          # everything between `## [x.y.z]` and the next `## `. A missing
+          # section degrades to --generate-notes rather than failing, because a
+          # release with autogenerated notes beats a tag with no release.
+          notes_arg=(--generate-notes)
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="${VERSION}" '
+              $0 ~ "^## \\[" v "\\]" { f = 1; next }
+              f && /^## / { exit }
+              f { print }
+            ' CHANGELOG.md > NOTES.md
+            if [ -s NOTES.md ]; then
+              notes_arg=(--notes-file NOTES.md)
+            else
+              echo "::warning::no '## [${VERSION}]' section in CHANGELOG.md — using generated notes"
+            fi
+          fi
+
+          # `if`, not `[ x ] && y=z`. bash exempts the AND-list form from
+          # `set -e` here, so it happens to work — but it evaluates to 1 on the
+          # non-prerelease path, and the day someone moves it to the end of a
+          # step that becomes a red release for a 1.0.0 tag. Write the form
+          # that has no such edge.
+          prerelease_arg=()
+          if [ "${PRERELEASE}" = true ]; then
+            prerelease_arg=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --title "mira ${VERSION}" \
+            --verify-tag \
+            "${notes_arg[@]}" \
+            "${prerelease_arg[@]}" \
+            dist/*
+
+  # Everything above verifies its own inputs. Nothing above verifies the
+  # *output*, and the failure mode that gap allows is a run that is green having
+  # published nothing usable: an asset list that silently lost a leg, a
+  # signature raised over a digest the registry no longer serves, an attestation
+  # whose subject name does not match the file people actually download.
+  #
+  # So this job throws away every artifact and every output the run produced,
+  # re-downloads what a stranger would download, and checks it with the same
+  # commands docs/install.md tells a stranger to run. It is the only job here
+  # whose inputs are not this workflow's own state — which is the entire point.
+  verify-release:
+    name: verify-release
+    needs: [meta, image, chart, release]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      # No id-token: verification is a read. cosign's keyless verify reads the
+      # Rekor transparency log and Fulcio's roots, and needs no identity of its
+      # own — a verifier that has to authenticate is a verifier nobody runs.
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+
+      # A ghcr package is private until somebody makes it public, and the first
+      # release creates it — so an anonymous pull here would fail on exactly the
+      # release this job exists to check. `packages: read` and a login make the
+      # step independent of a setting nobody in this file can see. It weakens
+      # the check slightly (it no longer proves the package is *public*), and
+      # that is the right trade: visibility is an availability question, and
+      # this job is asking a supply-chain one.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: the release assets are the ones that were checksummed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" --dir verify
+          cd verify
+          ls -l
+          # sha256sum -c is the whole check, and it fails on a missing file as
+          # well as on a wrong one, so a lost matrix leg is caught here too.
+          sha256sum -c SHA256SUMS
+
+      - name: the tarballs carry SLSA provenance from this repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # One subject is enough to prove the attestation exists and resolves;
+          # `package` raised a single statement over every name in SHA256SUMS,
+          # so if this one verifies the rest were in the same statement. x86_64
+          # linux because it is the artifact the install instructions reach for
+          # first.
+          gh attestation verify \
+            "verify/mira-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            --repo "${REPO}"
+
+      - name: the image digest is signed by this workflow
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The identity is pinned to this workflow file on a tag ref, not left
+          # to `--certificate-identity-regexp '.*'`. A signature by *somebody*
+          # with a GitHub OIDC token is not a signature by us, and the loose
+          # regexp is the commonest way a verify step ends up proving nothing.
+          #
+          # --new-bundle-format=false has to be repeated on the verify side:
+          # cosign v3 defaults it to true on *both* sign and verify, so a
+          # verifier left on the default looks in the referrers API and reports
+          # a correctly signed artifact as unsigned. That is precisely the trap
+          # Artifact Hub is in, which is why this step exists at all.
+          cosign verify \
+            --new-bundle-format=false \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp="^https://github\.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
+            "${IMAGE}@${DIGEST}" > /dev/null
+          echo "image ${IMAGE}@${DIGEST} verified"
+
+      - name: the chart is pullable and its digest is signed
+        env:
+          DIGEST: ${{ needs.chart.outputs.digest }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `helm show chart` is the round trip a user makes: it pulls the
+          # manifest anonymously and parses it. It also proves the appVersion
+          # that was stamped is the one that came back.
+          helm show chart "oci://${CHARTS}/mira" --version "${VERSION}"
+          # --new-bundle-format=false for the same reason as the image above:
+          # the chart is signed in the legacy format Artifact Hub indexes, so a
+          # verifier on cosign's default looks in the wrong place.
+          cosign verify \
+            --new-bundle-format=false \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp="^https://github\.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
+            "${CHARTS}/mira@${DIGEST}" > /dev/null
+          echo "chart ${CHARTS}/mira@${DIGEST} verified"
+
+      - run: |
+          set -euo pipefail
+          {
+            echo '### Verified after publication'
+            echo
+            echo '- SHA256SUMS matches every asset attached to the release'
+            echo '- SLSA provenance resolves for the linux x86_64 tarball'
+            echo '- the image digest carries a cosign signature from this workflow'
+            echo '- the chart pulls and its digest carries the same signature'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,291 @@
+{% extends "main.html" %}
+
+{# Landing hero. Rendered only for pages carrying `template: home.html` metadata, which
+   today is docs/index.md alone. It sits in the tabs block, so the page's markdown renders
+   below it as usual. Copy lives here — headline, tagline, the three calls to action and
+   the chart's numbers. Styles are the `.mira-hero__*` and `.mira-chart__*` blocks in
+   docs/stylesheets/extra.css.
+
+   The register is a CRT: a phosphor grid, scanlines over the panel, square corners and
+   hard offset shadows rather than blur. It is a two-column hero — copy left, evidence
+   right — because a centred stack of headline/tagline/buttons is the shape every
+   documentation landing page has, and the chart is the thing worth looking at.
+
+   Jinja comments, not HTML ones: an HTML comment inside a rendered block is served to
+   every visitor. These notes are for whoever edits the template. #}
+{# The pixel face, fetched here rather than from an `@import` in extra.css so it is
+   requested in parallel with the rest of the head instead of after the stylesheet
+   that asks for it, and so the twelve pages that never draw it never fetch it.
+   `display=swap` means the eyebrow and the chart's figures render in the theme's
+   mono immediately and snap to the pixel face when it lands — the fallback is a
+   monospace at the same size, so nothing reflows enough to notice. #}
+{% block extrahead %}
+  {{ super() }}
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap">
+{% endblock %}
+
+{% block tabs %}
+  {{ super() }}
+  {# Named, because a <section> is only a landmark once it has an accessible name.
+     Unnamed, a screen reader jumping by region skips the whole hero. #}
+  <section class="mira-hero md-typeset" aria-label="Introduction">
+    <div class="mira-hero__grid" aria-hidden="true"></div>
+    <div class="mira-hero__glow" aria-hidden="true"></div>
+    <div class="mira-hero__inner">
+      <div class="mira-hero__copy">
+        {# The wordmark inline rather than <img>, so the stroke can be currentColor and
+           follow the scheme instead of staying one fixed orange on both. The horizontal
+           bars are the mask that cuts the scanlines — the 80s register the mark is drawn
+           in. Geometry is identical to docs/assets/mira-wordmark.svg; change both. #}
+        <svg class="mira-hero__wordmark" xmlns="http://www.w3.org/2000/svg"
+             viewBox="-10.4 5 222.7 83" role="img" aria-label="Mira">
+          <mask id="mira-hero-scanlines">
+            <rect x="-80" y="-40" width="600" height="220" fill="#fff"/>
+            <g fill="#000">
+              <rect y="28" width="600" height="4"/>
+              <rect y="41" width="600" height="4"/>
+              <rect y="54" width="600" height="4"/>
+              <rect y="67" width="600" height="4"/>
+              <rect y="80" width="600" height="4"/>
+            </g>
+          </mask>
+          <g transform="skewX(-8)">
+            <path d="M10 80V46Q10 30 17 30H37Q44 30 44 46V80M44 46Q44 30 51 30H71Q78 30 78 46V80M102 80V30M102 13v0M128 80V46Q128 30 135 30H149M205 30V80M205 30A29.24 25 0 1 0 205 80"
+                  fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"
+                  stroke-linejoin="round" mask="url(#mira-hero-scanlines)"/>
+          </g>
+        </svg>
+        {# The categorising noun, and the only place above the fold that carries one.
+           "Storage engine", not "observability platform": there is no agent, no
+           collector and no dashboard-as-a-product here, and the word platform
+           promises all three. #}
+        <p class="mira-hero__eyebrow">OTLP-native telemetry storage engine</p>
+        {# This is the page's only <h1>. Material injects one when the rendered markdown
+           has no h1, and on this page that injection lands as a meaningless "Home".
+           docs/index.md therefore opens with a `hidden` h1 whose only job is to suppress
+           it — change the headline here and there together.
+
+           The trailing block is a terminal cursor, decorative and aria-hidden: a screen
+           reader announcing "black square" after the headline is noise. #}
+        <h1 class="mira-hero__title">Short-term memory for autonomous
+          systems<span class="mira-hero__caret" aria-hidden="true"></span></h1>
+        {# Both halves, in order: what goes in, and who reads it back. The three readers
+           are the differentiator and they are concrete, so they are named rather than
+           summarised as "multiple interfaces". #}
+        <p class="mira-hero__tagline">
+          Logs, traces and metrics in. Immutable blocks out, read straight from the
+          page cache by a browser, a terminal, or an agent over MCP — in milliseconds,
+          from one binary, with no cluster and no database beside it.
+        </p>
+        {# "Open the UI" is primary because it costs the reader nothing and it is the
+           real bundle — the same `crates/mira/ui` that ships inside the binary, served
+           answers a real Mira gave. The label says "recorded", and the page itself says
+           it again in a banner, because a demo that implies it is measuring something it
+           is not gets found out in one click. "See it work" is the page of captures from
+           `make demo`; "Quickstart" is for the reader already convinced. #}
+        <div class="mira-hero__actions">
+          <a href="{{ 'play/' | url }}" class="md-button md-button--primary">Open the UI (recorded)</a>
+          <a href="{{ 'demo/' | url }}" class="md-button">See it work</a>
+          <a href="{{ 'quickstart/' | url }}" class="md-button">Quickstart</a>
+          <a href="{{ 'agents/' | url }}" class="md-button">Connect an agent</a>
+        </div>
+        {# Numbers above the fold, because each is unusual enough to be the reason
+           someone keeps reading. The binary size is checked by scripts/check_drift.py
+           against the actual artifact; the resident figure is the demo page's own run,
+           which is the one a visitor can reproduce in a single command. The ingest rate
+           is the shed-free row from the README's table, quoted with the cores it took
+           because the cores are the surprising half. #}
+        <p class="mira-hero__note">
+          One 5.62&nbsp;MiB binary. 1,458,967&nbsp;records/s on 1.78&nbsp;cores.
+          A 65&nbsp;MiB peak taking 51,237 records, answering queries in milliseconds.
+          Apache-2.0, and every number is reproducible with one command.
+        </p>
+      </div>
+
+      {# The evidence panel. Every row is a figure its own vendor published, transcribed
+         with its citation in docs/MARKET.md — this template holds no number that is not
+         in one of that document's tables, and the footnote sends the reader there rather
+         than implying the rows are one benchmark. They are not: different hardware,
+         different corpora, different record sizes, and MARKET.md's `=` column marks
+         every non-Mira row as not directly comparable. The bars are a shape, not a
+         claim, and are aria-hidden; the label and the figure either side of them carry
+         the whole content.
+
+         Three axes, not one, because ingest alone is the weakest of the three — it is
+         the axis MARKET.md's own "Where Mira is not ahead" opens with. The two absent
+         axes are absent on purpose: the query table there begins "this table is context
+         rather than comparison", and the cost table has no Mira row at all, so neither
+         belongs in a widget whose whole shape says "comparison".
+
+         Tabs are radio inputs and labels, no script: the panel that shows is the one
+         whose radio is `:checked`, which is a CSS combinator away. Every id below is
+         load-bearing for those selectors in docs/stylesheets/extra.css.
+
+         `--fill` is the row's percentage of the largest bar on its own tab, computed by
+         hand — the largest is 100% by construction and the rest divide into it. Ingest
+         is out of 1,458,967; binary out of 144.29; resident out of 4,362. Recompute a
+         whole tab if its largest row moves. Two conversions, both exact arithmetic on a
+         published figure rather than new measurements: GiB to MiB is x1024, and
+         GreptimeDB's 408 MB is 389 MiB (its row says so). #}
+      <figure class="mira-chart">
+        <input class="mira-chart__radio" type="radio" name="mira-axis" id="mira-axis-ingest" checked>
+        <input class="mira-chart__radio" type="radio" name="mira-axis" id="mira-axis-binary">
+        <input class="mira-chart__radio" type="radio" name="mira-axis" id="mira-axis-memory">
+        {# A radio group, not `role="tablist"`. Faking the ARIA tab pattern also promises
+           its keyboard contract — arrow keys move between tabs, Tab leaves the set — and
+           that contract needs script. A radio group already behaves that way natively
+           and announces "1 of 3". #}
+        <div class="mira-chart__tabs" role="group" aria-label="Comparison axis">
+          <label for="mira-axis-ingest">Ingest</label>
+          <label for="mira-axis-binary">Binary</label>
+          <label for="mira-axis-memory">Memory</label>
+        </div>
+
+        <div class="mira-chart__panel mira-chart__panel--ingest">
+          <p class="mira-chart__cap">Ingest &mdash; records per second</p>
+          <ol class="mira-chart__rows">
+            <li class="mira-chart__row mira-chart__row--mira" style="--fill: 100%">
+              <span class="mira-chart__name">Mira</span>
+              <span class="mira-chart__val">1,458,967</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">1.78 cores busy, nothing shed</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 42.6%">
+              <span class="mira-chart__name">GreptimeDB&nbsp;1.0</span>
+              <span class="mira-chart__val">621,367</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">16-core M4 Max</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 37.0%">
+              <span class="mira-chart__name">otel&#8209;arrow OTAP</span>
+              <span class="mira-chart__val">540,309</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">transport only, stores nothing</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 15.1%">
+              <span class="mira-chart__name">Elasticsearch&nbsp;7</span>
+              <span class="mira-chart__val">220,000</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">3 nodes, 24 vCPU, 135&nbsp;B docs</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 5.1%">
+              <span class="mira-chart__name">Loki&nbsp;2.9</span>
+              <span class="mira-chart__val">73,800</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">872&nbsp;B docs, 2.75 vCPU</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 2.3%">
+              <span class="mira-chart__name">Quickwit</span>
+              <span class="mira-chart__val">33,000</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">872&nbsp;B docs, index to GCS</span>
+            </li>
+          </ol>
+        </div>
+
+        {# The strongest of the three, and the only one that is genuinely like-for-like:
+           a byte count has no hardware, no workload and no denominator to argue about.
+           Shorter bar is better here, so Mira's is the short one — inverting the scale
+           to make it the long one would be a chart that lies about its own axis. #}
+        <div class="mira-chart__panel mira-chart__panel--binary">
+          <p class="mira-chart__cap">Stripped binary &mdash; MiB, less is better</p>
+          <ol class="mira-chart__rows">
+            <li class="mira-chart__row mira-chart__row--mira" style="--fill: 3.9%">
+              <span class="mira-chart__name">Mira</span>
+              <span class="mira-chart__val">5.62</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">3 signals, API, MCP, two UIs</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 11.3%">
+              <span class="mira-chart__name">VictoriaLogs&nbsp;1.52</span>
+              <span class="mira-chart__val">16.26</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">logs only; add traces and it is 32.44</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 65.1%">
+              <span class="mira-chart__name">Grafana Tempo&nbsp;3.0.3</span>
+              <span class="mira-chart__val">93.94</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">traces only, arm64 Linux</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 71.6%">
+              <span class="mira-chart__name">otel&#8209;arrow OTAP</span>
+              <span class="mira-chart__val">103.35</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">transport only, arm64 Linux</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 95.9%">
+              <span class="mira-chart__name">Grafana Loki&nbsp;3.7.7</span>
+              <span class="mira-chart__val">138.34</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">logs only, 407 Go modules</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 100%">
+              <span class="mira-chart__name">Quickwit&nbsp;0.9.0</span>
+              <span class="mira-chart__val">144.29</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">1,171 lockfile entries</span>
+            </li>
+          </ol>
+        </div>
+
+        {# The honest one, and the row to read carefully. Mira's figure is the
+           *one-connection* row of the README's table, not the plateau: at 1,458,967
+           records/s it is 862 MiB and by eight connections 2,040 MiB, above ClickHouse. The note column is what makes
+           either honest — every peer that publishes RSS publishes it at 10,000 to
+           20,000 records or spans per second, so no row here is at the same load as
+           any other. Dropping vlagent, which beats it, would make this a
+           better-looking chart and a worse one. #}
+        <div class="mira-chart__panel mira-chart__panel--memory">
+          <p class="mira-chart__cap">Resident set &mdash; MiB, less is better</p>
+          <ol class="mira-chart__rows">
+            <li class="mira-chart__row" style="--fill: 0.6%">
+              <span class="mira-chart__name">vlagent</span>
+              <span class="mira-chart__val">27.9</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">10k logs/s, forwards and stores nothing</span>
+            </li>
+            <li class="mira-chart__row mira-chart__row--mira" style="--fill: 5.6%">
+              <span class="mira-chart__name">Mira</span>
+              <span class="mira-chart__val">244</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">604k rec/s &mdash; 30x the load, uncapped</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 8.9%">
+              <span class="mira-chart__name">GreptimeDB&nbsp;0.12</span>
+              <span class="mira-chart__val">389</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">20k rows/s &mdash; published as 408&nbsp;MB</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 26.3%">
+              <span class="mira-chart__name">ClickHouse</span>
+              <span class="mira-chart__val">1,147</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">10k spans/s, inside a cgroup</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 27.0%">
+              <span class="mira-chart__name">VictoriaLogs</span>
+              <span class="mira-chart__val">1,178</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">10k spans/s, inside a cgroup</span>
+            </li>
+            <li class="mira-chart__row" style="--fill: 100%">
+              <span class="mira-chart__name">Grafana Tempo</span>
+              <span class="mira-chart__val">4,362</span>
+              <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
+              <span class="mira-chart__note">10k spans/s, then OOM</span>
+            </li>
+          </ol>
+        </div>
+
+        <p class="mira-chart__foot">
+          Each engine's own published number, on its own hardware, at its own record
+          size. Not one benchmark &mdash;
+          <a href="{{ 'MARKET/' | url }}">what each row measures, and why they are not one&#8209;to&#8209;one</a>.
+        </p>
+      </figure>
+    </div>
+  </section>
+{% endblock %}

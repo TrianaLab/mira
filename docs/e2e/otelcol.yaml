@@ -1,0 +1,31 @@
+# A stock OpenTelemetry Collector in front of Mira. Nothing here is
+# Mira-specific: it is the `otlp` exporter out of the box, pointed at a
+# hostname. That is the whole integration story.
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+processors:
+  batch: {}
+
+exporters:
+  # `compression` is not set because the default is already gzip on both of
+  # these, and that is the point of running this: it proves Mira accepts what
+  # the stock exporter actually sends, on both transports, without being told.
+  otlp:
+    endpoint: mira:4317
+    tls: { insecure: true }
+  otlphttp:
+    endpoint: http://mira:4318
+
+service:
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    # Split across transports on purpose: traces and metrics go over gRPC,
+    # logs over HTTP, so one run exercises both of Mira's listeners.
+    traces: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+    metrics: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+    logs: { receivers: [otlp], processors: [batch], exporters: [otlphttp] }

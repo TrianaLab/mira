@@ -1,0 +1,7 @@
+# Everything scripts/ needs. Pinned, because a CI-validating script that
+# changes behaviour when a transitive parser updates is worse than no script.
+#
+# One entry, and it hurts to have even that: nothing in the Python standard
+# library parses YAML, and hand-rolling a parser to check YAML files is a
+# trade nobody wins. Keep this list at one line if you possibly can.
+PyYAML==6.0.2

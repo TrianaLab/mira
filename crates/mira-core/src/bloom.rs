@@ -1,0 +1,460 @@
+//! Block-level "might contain this" filters.
+//!
+//! Block names prune by time, which answers every question that has a time
+//! bound and none of the ones that do not. Two queries have no useful time
+//! bound at all, and both of them read every block on disk without a filter:
+//!
+//! * *"Every span of trace `0000…6eaa`."* You do not know when the trace
+//!   happened — that is why you are looking it up.
+//! * *"Any record with `k8s.pod.name = api-7f9`."* A predicate that matches
+//!   nothing has no early exit: `limit` never fills, so the scan runs to the
+//!   end of retention to prove a negative.
+//!
+//! A sidecar per block, written next to the Arrow tables at publish and read
+//! before any of them, turns both into "open the blocks that can answer".
+//! Measured on this machine over 4.1 GB / 69 blocks:
+//!
+//! ```text
+//!                                       blocks   rows scanned   time
+//! every span of one trace, without         84      25,000,000   14.3 s
+//!                          with             1         212,992    250 ms cold, 20 warm
+//! absent attribute value,  without         69      24,961,024   10.4 s
+//!                          with             0               0      5 ms
+//! ```
+//!
+//! [`TRACE_IDX`] costs 65 KB per block, 0.13% of the data. [`ATTR_IDX`] is
+//! sized by the block's *distinct* `(key, value)` pairs, so it is a few KB for
+//! ordinary attributes and grows only where pruning pays best.
+//!
+//! Both go through a splitmix64 finalizer before Kirsch-Mitzenmacher double
+//! hashing, and that is not optional. W3C only requires a trace id to be
+//! non-zero, and plenty of real ones are structured rather than random: X-Ray
+//! puts an epoch in the first four bytes, a counter-derived id leaves whole
+//! bytes constant. The bit index is `(h1 + i*h2) & mask`, so it reads only the
+//! *low* bits of the halves; ids that vary in their middle bytes would map every
+//! trace in a block onto the same handful of bits and the filter would answer
+//! "maybe" to everything. Five ops per half buys immunity to that.
+//!
+//! Everything here fails open. A short, corrupt or unrecognized file means
+//! "scan the block", never "skip it" — a false positive costs one wasted block
+//! read, a false negative silently loses data from a correct query.
+
+use std::collections::HashSet;
+
+use arrow_array::{Array, FixedSizeBinaryArray};
+
+/// Filenames inside a published block. Part of the on-disk format.
+pub const TRACE_IDX: &str = "trace.idx";
+pub const ATTR_IDX: &str = "attr.idx";
+
+const MAGIC: [u8; 4] = *b"MBLM";
+const VERSION: u8 = 1;
+/// magic 4 | version 1 | k 1 | flags 1 | pad 1 | words 4 | crc32 4
+const HEADER: usize = 16;
+
+/// Set in [`ATTR_IDX`] when the block holds at least one `double`-typed
+/// attribute.
+///
+/// Doubles are the one type not indexed. The canonical text of a float is not
+/// unique — `200`, `200.0` and `2e2` are the same number and three different
+/// strings, and a query writing one of the forms the writer did not would be
+/// pruned away. So the block declares that it has some, and any query whose
+/// value could be read as a number scans it. Blocks with no double attributes,
+/// which is most of them, pay nothing for the rule.
+pub const HAS_DOUBLE: u8 = 1;
+
+/// Bits per inserted key. 10 with k=7 is the textbook ~0.8% false positive
+/// rate.
+const BITS_PER_KEY: usize = 10;
+const K: u32 = 7;
+
+/// Build a filter over a `FixedSizeBinary(16)` column. `None` when there is
+/// nothing to index, in which case no file is written and the reader's
+/// fail-open path scans the block.
+///
+/// The column holds one row per *span*, and a trace is eight of them. Sizing on
+/// the row count would make every filter eight times bigger than the key set it
+/// holds, and the read path pays that on every block it probes. Runs of the
+/// same id collapse — spans of a trace arrive in one export and land adjacent —
+/// which is a 16-byte compare per row against a hash set that would cost an
+/// allocation and a probe. Interleaved traces just fall back to the row count,
+/// which is the size we would have had anyway.
+pub fn build(ids: &FixedSizeBinaryArray) -> Option<Vec<u8>> {
+    if ids.value_length() != 16 {
+        return None;
+    }
+    let keys = || Runs {
+        ids,
+        i: 0,
+        prev: None,
+    };
+    let n = keys().count();
+    encode(n, 0, keys().map(halves))
+}
+
+/// A set of hashed keys, deduplicated so the filter is sized by what it holds.
+///
+/// The trace filter gets its dedup from adjacency and needs none of this. An
+/// attribute filter cannot: `http.route = GET /cart` recurs on a third of the
+/// rows in a block and nowhere near adjacently, so without a set the filter
+/// would be sized for a million rows holding five values.
+#[derive(Default)]
+pub struct Keys {
+    seen: HashSet<(u64, u64)>,
+    flags: u8,
+    full: bool,
+}
+
+/// Beyond this many distinct keys the filter stops being a rounding error on
+/// the block — 1M keys is 1.25 MB — and a block that diverse prunes little
+/// anyway. Past it we write nothing, which the reader reads as "scan me".
+const MAX_KEYS: usize = 1 << 20;
+
+impl Keys {
+    pub fn insert(&mut self, h: (u64, u64)) {
+        if self.seen.len() < MAX_KEYS {
+            self.seen.insert(h);
+        } else {
+            self.full = true;
+        }
+    }
+
+    pub fn flag(&mut self, bit: u8) {
+        self.flags |= bit;
+    }
+
+    pub fn build(&self) -> Option<Vec<u8>> {
+        if self.full {
+            return None;
+        }
+        encode(self.seen.len(), self.flags, self.seen.iter().copied())
+    }
+}
+
+fn encode(n: usize, flags: u8, keys: impl Iterator<Item = (u64, u64)>) -> Option<Vec<u8>> {
+    if n == 0 {
+        return None;
+    }
+    let words = ((n * BITS_PER_KEY).div_ceil(64)).next_power_of_two();
+    let mut bits = vec![0u64; words];
+    // A power-of-two word count makes the modulo an `and`, which matters: this
+    // runs seven times per key on the seal path.
+    let mask = (words as u64 * 64) - 1;
+    for (h1, h2) in keys {
+        for i in 0..K {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) & mask;
+            bits[bit as usize / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    let mut out = Vec::with_capacity(HEADER + words * 8);
+    out.extend_from_slice(&MAGIC);
+    out.push(VERSION);
+    out.push(K as u8);
+    out.push(flags);
+    out.push(0);
+    out.extend_from_slice(&(words as u32).to_le_bytes());
+    let body: Vec<u8> = bits.iter().flat_map(|w| w.to_le_bytes()).collect();
+    out.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// A filter checked out, with its header validated once.
+pub struct Filter<'a> {
+    body: &'a [u8],
+    k: u32,
+    mask: u64,
+    pub flags: u8,
+}
+
+impl<'a> Filter<'a> {
+    /// `None` for anything unreadable, which every caller must treat as "scan
+    /// the block".
+    pub fn open(file: &'a [u8]) -> Option<Filter<'a>> {
+        if file.len() < HEADER || file[..4] != MAGIC || file[4] != VERSION {
+            return None;
+        }
+        let k = file[5] as u32;
+        let flags = file[6];
+        let words = u32::from_le_bytes(file[8..12].try_into().expect("4 bytes")) as usize;
+        let crc = u32::from_le_bytes(file[12..16].try_into().expect("4 bytes"));
+        let body = &file[HEADER..];
+        if k == 0 || !words.is_power_of_two() || body.len() != words * 8 {
+            return None;
+        }
+        // The one check that costs something — 65 KB of CRC against a block
+        // read of tens of megabytes. Skipping a block on the word of a corrupt
+        // filter is the one outcome worth paying to avoid.
+        if crc32fast::hash(body) != crc {
+            return None;
+        }
+        Some(Filter {
+            body,
+            k,
+            mask: (words as u64 * 64) - 1,
+            flags,
+        })
+    }
+
+    pub fn may_contain(&self, (h1, h2): (u64, u64)) -> bool {
+        for i in 0..self.k {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) & self.mask;
+            let word = u64::from_le_bytes(
+                self.body[(bit as usize / 64) * 8..][..8]
+                    .try_into()
+                    .expect("slice of 8"),
+            );
+            if word & (1 << (bit % 64)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Could this block contain `id`? Anything unreadable answers yes.
+pub fn may_contain(file: &[u8], id: &[u8; 16]) -> bool {
+    Filter::open(file).is_none_or(|f| f.may_contain(halves(id)))
+}
+
+/// Hash one `(key, canonical value)` pair for [`ATTR_IDX`].
+///
+/// The value is the *text* of the scalar, not its typed bytes, and that is what
+/// makes one probe enough. A query scalar is compared against whatever type the
+/// column happens to hold — `{attr: http.status_code, eq: "200"}` matches a
+/// stored integer `200`, because the comparison parses rather than requiring the
+/// query to know the SDK's choice. Indexing the decimal text makes the filter
+/// agree with that rule instead of quietly disagreeing with it, which would be a
+/// false negative and therefore a lost row.
+pub fn attr_hash(key: &str, value: &[u8]) -> (u64, u64) {
+    let k = crate::identity::hash64(key.as_bytes());
+    let v = crate::identity::hash64(value);
+    (
+        mix(k ^ v.rotate_left(17)),
+        mix(k.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ v) | 1,
+    )
+}
+
+/// Non-null values, with adjacent duplicates dropped.
+struct Runs<'a> {
+    ids: &'a FixedSizeBinaryArray,
+    i: usize,
+    prev: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for Runs<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        while self.i < self.ids.len() {
+            let i = self.i;
+            self.i += 1;
+            if self.ids.is_null(i) {
+                continue;
+            }
+            let v = self.ids.value(i);
+            if self.prev != Some(v) {
+                self.prev = Some(v);
+                return Some(v);
+            }
+        }
+        None
+    }
+}
+
+fn halves(id: &[u8]) -> (u64, u64) {
+    let h1 = mix(u64::from_le_bytes(id[..8].try_into().expect("16-byte id")));
+    // Odd, so the probe sequence walks the whole filter instead of landing on
+    // the same bit whenever the second half happens to be even.
+    let h2 = mix(u64::from_le_bytes(
+        id[8..16].try_into().expect("16-byte id"),
+    )) | 1;
+    (h1, h2)
+}
+
+/// splitmix64's finalizer: every input bit reaches every output bit.
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::FixedSizeBinaryArray;
+
+    fn id(n: u64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        // Not a counter: the filter's whole premise is that trace ids are
+        // uniform, so a test over 0,1,2,… would measure a case that cannot
+        // happen and hide a probe sequence that clusters.
+        b[..8].copy_from_slice(&crate::identity::hash64(&n.to_le_bytes()).to_le_bytes());
+        b[8..].copy_from_slice(&crate::identity::hash64(&(!n).to_le_bytes()).to_le_bytes());
+        b
+    }
+
+    fn filter(n: u64) -> Vec<u8> {
+        let ids: Vec<[u8; 16]> = (0..n).map(id).collect();
+        let arr = FixedSizeBinaryArray::try_from_iter(ids.iter().map(|v| v.as_slice())).unwrap();
+        build(&arr).unwrap()
+    }
+
+    /// Everything inserted must be found — a false negative is a lost trace —
+    /// and the false positive rate has to be near the 0.8% the sizing promises,
+    /// or the filter is a 16 KB file that skips nothing.
+    #[test]
+    fn no_false_negatives_and_few_false_positives() {
+        let n = 10_000u64;
+        let f = filter(n);
+        // The size the two "skips nothing" comments quote: 10 bits a key,
+        // rounded up to a power-of-two word count, plus the header.
+        assert_eq!(f.len(), HEADER + 2048 * 8);
+        for i in 0..n {
+            assert!(may_contain(&f, &id(i)), "false negative at {i}");
+        }
+        let probes = 100_000u64;
+        let fp = (n..n + probes).filter(|&i| may_contain(&f, &id(i))).count();
+        let rate = fp as f64 / probes as f64;
+        assert!(rate < 0.02, "false positive rate {rate}");
+    }
+
+    /// Every way the file can be wrong has to answer "scan it". This is the
+    /// property the whole thing rests on: a filter is an optimization, and an
+    /// optimization that can lose data is a bug.
+    #[test]
+    fn a_damaged_filter_says_maybe() {
+        let f = filter(1_000);
+        let probe = id(999_999);
+        assert!(!may_contain(&f, &probe), "test needs a known-absent id");
+
+        assert!(may_contain(&[], &probe), "empty");
+        assert!(may_contain(&f[..HEADER - 1], &probe), "truncated header");
+        assert!(may_contain(&f[..f.len() - 8], &probe), "truncated body");
+
+        let mut bad = f.clone();
+        bad[0] = b'X';
+        assert!(may_contain(&bad, &probe), "wrong magic");
+
+        let mut bad = f.clone();
+        bad[4] = VERSION + 1;
+        assert!(may_contain(&bad, &probe), "future version");
+
+        // A word count of zero is the one header field that is not merely
+        // wrong but *unrepresentable*: `mask` is `words * 64 - 1`, so a filter
+        // that got this far with no bits at all would underflow — a panic in
+        // debug, a `u64::MAX` mask and an out-of-bounds body index in release.
+        // The power-of-two check is what stands between a single zeroed byte
+        // and that, so it is worth its own case rather than being folded into
+        // "truncated body".
+        let mut bad = f.clone();
+        bad[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(may_contain(&bad, &probe), "no bits at all");
+
+        // Not a power of two, so the `and` that stands in for the modulo would
+        // address words the body does not have.
+        let mut bad = f.clone();
+        bad[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(may_contain(&bad, &probe), "word count not a power of two");
+
+        // k = 0 probes nothing and therefore answers "no" to everything, which
+        // is the one answer a filter is never allowed to get wrong.
+        let mut bad = f.clone();
+        bad[5] = 0;
+        assert!(may_contain(&bad, &probe), "no hash functions");
+
+        // A single flipped bit in the bitmap is exactly the case a checksum
+        // exists for: it turns a "no" into a wrong "no" with nothing else to
+        // notice it.
+        let mut bad = f;
+        bad[HEADER + 3] ^= 0x40;
+        assert!(may_contain(&bad, &probe), "corrupt body");
+    }
+
+    /// [`halves`] reads bytes 0..8 and 8..16 of whatever it is handed, so a
+    /// column of any other width is an index out of bounds — a panic on the
+    /// seal path, which takes the process down with `panic = "abort"` and loses
+    /// the whole open block. Refusing to index it writes no file, and no file
+    /// means "scan the block".
+    #[test]
+    fn a_column_that_is_not_a_16_byte_id_indexes_nothing() {
+        let narrow = [[7u8; 8].as_slice(), [9u8; 8].as_slice()];
+        let arr = FixedSizeBinaryArray::try_from_iter(narrow.into_iter()).unwrap();
+        assert_eq!(arr.value_length(), 8);
+        assert!(build(&arr).is_none());
+        assert!(build(&FixedSizeBinaryArray::new_null(32, 4)).is_none());
+    }
+
+    /// Past [`MAX_KEYS`] the filter stops being a rounding error on the block,
+    /// so the writer gives up and writes nothing. Giving up has to fail *open*:
+    /// the reader sees a block with no sidecar, which is the same thing it sees
+    /// for a block published before the filter existed, and it scans.
+    ///
+    /// The boundary is asserted from both sides because the interesting bug is
+    /// off-by-one in the other direction — a filter dropped one key early is
+    /// invisible, since the answer is still correct and only slower.
+    #[test]
+    fn too_many_distinct_keys_write_no_filter_rather_than_a_huge_one() {
+        let mut keys = Keys::default();
+        for i in 0..MAX_KEYS as u64 {
+            keys.insert((i, i | 1));
+        }
+        assert!(keys.build().is_some(), "MAX_KEYS keys still fit");
+
+        keys.insert((u64::MAX, 1));
+        assert!(keys.build().is_none(), "one key past the cap");
+    }
+
+    /// The ids the load generator emits, and the shape every counter-derived or
+    /// timestamp-prefixed id has: constant bytes at both ends, variation in the
+    /// middle. Without the finalizer every one of these lands on the same bits
+    /// and the filter says "maybe" to everything — which is not a wrong answer,
+    /// just a 16 KB file that skips nothing.
+    #[test]
+    fn structured_ids_still_spread() {
+        let structured = |n: u64| {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&(n as u32 as u64).to_be_bytes());
+            b[8..].copy_from_slice(&(0x5555_5555_5500_0000 | n).to_be_bytes());
+            b
+        };
+        let ids: Vec<[u8; 16]> = (0..10_000u64).map(structured).collect();
+        let arr = FixedSizeBinaryArray::try_from_iter(ids.iter().map(|v| v.as_slice())).unwrap();
+        let f = build(&arr).unwrap();
+
+        for i in 0..10_000u64 {
+            assert!(may_contain(&f, &structured(i)), "false negative at {i}");
+        }
+        let probes = 100_000u64;
+        let fp = (10_000..10_000 + probes)
+            .filter(|&i| may_contain(&f, &structured(i)))
+            .count();
+        let rate = fp as f64 / probes as f64;
+        assert!(rate < 0.02, "false positive rate {rate}");
+    }
+
+    /// Eight spans per trace is the ordinary shape of a block, and the filter
+    /// has to be sized for the traces, not the spans — otherwise every probe on
+    /// the read path pays 8x for nothing.
+    #[test]
+    fn adjacent_duplicates_do_not_inflate_the_filter() {
+        let ids: Vec<[u8; 16]> = (0..1_000u64).flat_map(|n| [id(n); 8]).collect();
+        let arr = FixedSizeBinaryArray::try_from_iter(ids.iter().map(|v| v.as_slice())).unwrap();
+        let fanned = build(&arr).unwrap();
+        assert_eq!(fanned.len(), filter(1_000).len());
+        for i in 0..1_000u64 {
+            assert!(may_contain(&fanned, &id(i)), "false negative at {i}");
+        }
+    }
+
+    /// An empty column writes no file, and the reader treats a missing one as
+    /// "scan the block" — the same path a block from an older writer takes.
+    #[test]
+    fn nothing_to_index_writes_nothing() {
+        assert!(build(&FixedSizeBinaryArray::new_null(16, 0)).is_none());
+        assert!(build(&FixedSizeBinaryArray::new_null(16, 100)).is_none());
+    }
+}

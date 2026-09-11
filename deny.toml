@@ -1,0 +1,137 @@
+# cargo-deny: the dependency budget with teeth.
+#
+# CLAUDE.md calls the crate count and the "zstd-sys is the only C dependency"
+# rule product properties. scripts/check_drift.py checks the count; this file
+# checks everything about those crates that a count cannot see — that none of
+# them has an open advisory, that none of them has a licence Mira cannot ship
+# under, that none of them arrived from somewhere other than crates.io, and
+# that the tree has not quietly grown two copies of the same library.
+#
+# Run it with `make audit`.
+
+[graph]
+# Every platform .github/workflows/release.yml publishes. Checking only the
+# host is how a Linux-only C dependency walks past a macOS developer and a
+# macOS-only one walks past Linux CI.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Every feature, because every feature is a build somebody can run: the only
+# optional one is `webhook-tls` (docs/CONFIG.md), and a supported build whose
+# dependencies were never audited is the worst of both — off by default, so
+# nobody notices, and buildable, so somebody ships it. `make audit` passes
+# `--all-features` too; this line is here so a bare `cargo deny check` cannot
+# quietly answer a different question.
+#
+# The C-backed `flate2` and `zstd` backends are *not* reachable this way. They
+# are features of those crates, not of Mira's, and the workspace pins the
+# pure-Rust ones.
+all-features = true
+
+[advisories]
+version = 2
+# A yanked crate is a maintainer saying "do not use this version". Treating
+# that as a warning means the lockfile keeps using it forever.
+yanked = "deny"
+# Every entry here is a known-vulnerable dependency we are shipping anyway.
+# It needs a link, a reason, and ideally a date by which it goes away.
+ignore = []
+
+[licenses]
+version = 2
+# Mira ships as Apache-2.0. Everything below is either compatible with
+# distributing a compiled binary under that licence, or public-domain
+# equivalent. Notably absent and absent on purpose: GPL/AGPL/LGPL of any
+# version, and anything with a "no commercial use" rider.
+#
+# This list is exactly what the tree contains today, and no more. An allow-list
+# padded with licences nobody uses is not a policy, it is a pre-approval: the
+# next dependency slips in under a line somebody added speculatively. Adding a
+# licence here should be a decision with a name on it.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Zlib",
+    "Unlicense",
+    # The Unicode data tables under `unicode-ident` and friends. Permissive,
+    # and unavoidable for anything that touches identifiers or normalisation.
+    "Unicode-3.0",
+    # `--features webhook-tls` only. ISC is `ring`, `rustls-webpki` and
+    # `untrusted`; it is the two-clause BSD text with the clauses merged, and
+    # the FSF and OSI both classify it as permissive. There is no pure-Rust TLS
+    # stack that avoids it — `ring` is under aws-lc-rs too.
+    "ISC",
+    # `--features webhook-tls` only. `webpki-roots` is the Mozilla CA bundle,
+    # which is data rather than code, and CDLA-Permissive-2.0 is the licence
+    # written for exactly that: use and redistribute, no share-alike, no
+    # attribution rider.
+    "CDLA-Permissive-2.0",
+]
+# The default is 0.8, which happily matches a mangled licence text. Raising it
+# means an unrecognised licence fails loudly instead of being guessed at.
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+# Two versions of the same crate is two copies in the binary, and binary size
+# is one of the four axes (docs/ARCHITECTURE.md section 11). It is also the early
+# warning for the failure the Arrow pin exists to prevent: two majors of
+# arrow-array means `RecordBatch` is two different types and the compiler
+# error is unreadable.
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# The C-backed crates most likely to arrive by accident, usually because
+# someone enabled a default feature. scripts/check_drift.py catches the general
+# case by walking `cc`'s reverse dependencies; this list exists so the common
+# ones fail with a message that says what to do instead.
+deny = [
+    { crate = "openssl-sys", reason = "use rustls; OpenSSL would be the second C dependency and would break static musl builds" },
+    { crate = "libz-sys", reason = "flate2 is pinned to its rust_backend for exactly this reason" },
+    { crate = "libz-ng-sys", reason = "same as libz-sys" },
+    { crate = "bzip2-sys", reason = "Arrow's compression features are zstd and lz4 only; see the workspace arrow-ipc pin" },
+    { crate = "lzma-sys", reason = "same as bzip2-sys" },
+    { crate = "protobuf-src", reason = "mira-proto uses protox so that building Mira needs no protoc" },
+]
+
+skip = [
+    # `--features webhook-tls` only, and the one place that build is measurably
+    # worse than the default: `ring` pins getrandom 0.2 while arrow's `ahash`
+    # is on 0.3, so a TLS binary carries two copies of a syscall wrapper. The
+    # published artifacts are the default build (README, docs/CONFIG.md), so
+    # nothing anybody downloads pays for this. It goes away when `ring` moves
+    # to getrandom 0.3.
+    { crate = "getrandom@0.2", reason = "ring, behind the optional webhook-tls feature; not in the published binaries" },
+]
+
+# `multiple-versions` is about binary size, and a crate that is not linked into
+# the binary cannot cost any. Both entries below are trees that run at build
+# time or test time and then go away — checked with
+# `cargo tree --workspace --edges normal,build -i <crate>@<version>`.
+#
+# This is a skip list, not an amnesty. Everything in the *runtime* graph still
+# has to be single-version, which is the check worth having: the day arrow-array
+# and arrow-ipc disagree about hashbrown, two copies land in the shipped binary
+# and `make audit` says so.
+skip-tree = [
+    { crate = "protox", reason = "build-dependency of mira-proto — the pure-Rust protoc replacement, dragging logos and prost-reflect with it. All of it runs in a build script and none of it is linked; it is why building Mira needs no protoc." },
+    { crate = "prost-build", reason = "the other half of mira-proto's build script, via tonic-prost-build. Its petgraph pulls hashbrown 0.15 against arrow's 0.17 — again, build time only." },
+    { crate = "tempfile", reason = "dev-dependency only. Its getrandom 0.4 against arrow's transitive getrandom 0.3 is two versions in the test binary and zero in the shipped one." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependencies. A git dependency is a crate with no version, no
+# publication, no yank mechanism and no audit trail — every property this file
+# is trying to enforce.
+allow-git = []

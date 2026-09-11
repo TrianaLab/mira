@@ -1,0 +1,30 @@
+{{/*
+The StatefulSet's governing Service, and the only way to address one replica.
+
+`publishNotReadyAddresses: true` because a not-ready Mira is a Mira whose volume
+has filled: it still answers every query out of the blocks it already has, and
+that is precisely when someone needs to reach it by name. Dropping it from DNS
+would take the diagnosis away at the moment of the incident. The ingest Service
+above keeps the normal semantics and stops sending it exports.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mira.headlessServiceName" . }}
+  labels:
+    {{- include "mira.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+    - name: http
+      port: 4318
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "mira.selectorLabels" . | nindent 4 }}

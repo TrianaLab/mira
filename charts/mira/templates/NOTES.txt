@@ -1,0 +1,52 @@
+Mira is installed as {{ include "mira.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+1. Point exporters at it. Any replica accepts any export:
+
+   OTLP/gRPC   {{ include "mira.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.grpcPort }}
+   OTLP/HTTP   http://{{ include "mira.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+
+2. Open the UI, the query API and MCP — all on {{ .Values.service.httpPort }}, because it is one binary:
+
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "mira.fullname" . }} 4318:{{ .Values.service.httpPort }}
+   open http://localhost:4318/
+
+3. Or read a replica from the terminal, without a browser:
+
+   mira mira --addr localhost:4318
+
+{{- if gt (int .Values.replicaCount) 1 }}
+
+WARNING: {{ .Values.replicaCount }} replicas. A replica answers queries only from
+   its own blocks — there is no fan-out and no replication, both consequences of
+   holding no coordination state. Ingest through the Service above is spread
+   across all {{ .Values.replicaCount }}; a query through it sees whichever one
+   kube-proxy picked. Address a specific replica instead:
+
+   {{ include "mira.fullname" . }}-0.{{ include "mira.headlessServiceName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+{{- end }}
+
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is off, so /data is an emptyDir. Every block goes away with
+   the pod — a node drain, an upgrade or an OOM kill loses the lot. This mode is
+   for kind, CI and demos. Set persistence.enabled=true for anything else.
+{{- end }}
+
+{{- if regexMatch "(?i)(nfs|efs|filestore|azure-?file|cephfs|smb|cifs|juicefs|gluster|lustre|s3|goofys)" (default "" .Values.persistence.storageClass) }}
+
+WARNING: persistence.storageClass is {{ .Values.persistence.storageClass | quote }}, which looks
+   network-backed. Mira mmaps every block it reads, and on a network filesystem
+   an I/O hiccup arrives as SIGBUS — a signal, with nothing to catch and no way
+   to unwind. Mira statfs()es the volume at startup and will refuse to run on
+   NFS, SMB, CIFS, CephFS or 9P rather than die mid-query later. Use a local or
+   block-backed class.
+   (This warning is a match on the class *name* — a heuristic, and the startup
+   check is the real gate. A local class named "efs-like" trips it harmlessly.)
+{{- end }}
+
+{{- if not .Values.config.alerts.rules }}
+
+Alerting is off: config.alerts.rules is empty, so this node evaluates no rules
+and pages nobody. /api/v1/alerts answering an empty list means "off here", not
+"all clear".
+{{- end }}

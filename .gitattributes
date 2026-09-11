@@ -1,0 +1,51 @@
+# Normalise every text file to LF in the repository. The binary reads config
+# and query documents off disk and off the wire, and a CRLF that arrived
+# because someone cloned on Windows is a parser bug report that is not a parser
+# bug.
+* text=auto eol=lf
+
+# Better hunk headers: git's built-in drivers know what a `fn` and a heading
+# are, so `@@` lines name the function or section instead of the nearest brace.
+*.rs diff=rust
+*.md diff=markdown
+
+# The browser UI's build output. It is committed rather than gitignored because
+# it is `include_bytes!`d into the binary, so `cargo install` and the Docker
+# image ship a working UI with no Node toolchain. It is rebuilt by `make ui`
+# and gated by `git diff --exit-code dist`, so it is never hand-edited.
+#
+# `linguist-generated=true` collapses it in pull request diffs and keeps it out
+# of GitHub's language statistics — without it a few hundred KB of minified
+# bundle makes this repository look like a JavaScript project rather than a
+# Rust one, which is both wrong and the first thing a visitor sees.
+crates/mira/ui/dist/** linguist-generated=true
+
+# A verbatim copy of the upstream OpenTelemetry protos, compiled by protox in a
+# build script so the tree needs no `protoc`. Vendored, not authored: it is
+# excluded from language stats, and the point of the copy is that it stays
+# diffable against upstream, so nothing here is reformatted.
+crates/mira-proto/proto/** linguist-vendored=true
+
+# Lockfiles: committed, machine-written, and never read in a review. Collapsed
+# in diffs; the interesting question about a lockfile change is what `make deps`
+# and `make audit` say about it, not which line moved.
+Cargo.lock                     linguist-generated=true
+crates/mira/ui/package-lock.json linguist-generated=true
+
+# ARCHITECTURE.md is the reasoning of record and CONFIG.md is the whole config
+# surface — prose, not code. Counting them as a language would misreport the
+# tree in both directions.
+docs/** linguist-documentation=true
+
+# No binary file is tracked today. These are declared anyway, because the first
+# one to arrive will be a screenshot in an issue-driven PR, and the failure mode
+# — `text=auto` guessing wrong and corrupting it on checkout — is silent.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff  binary
+*.woff2 binary
+*.zst  binary
+*.arrow binary

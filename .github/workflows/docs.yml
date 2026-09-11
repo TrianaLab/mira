@@ -1,0 +1,89 @@
+name: docs
+
+# Publishing only. The *validation* — `mkdocs build --strict`, which is the
+# whole link checker — is a required leg of `ci`, so a dead link fails the pull
+# request rather than this job. Running it here too would be a second copy of
+# the gate that nobody could merge past anyway.
+#
+# A trigger-level `paths:` filter is safe here and forbidden in `ci` for the
+# same reason: this workflow is not a required status context, so a run that
+# never starts blocks nothing. scripts/check_ci.py enforces both halves.
+on:
+  push:
+    branches: [main]
+    # `overrides/` is the theme override directory. The last two are the targets
+    # of the two symlinks under `docs/`: git records the link, not the file it
+    # points at, so an edit to either would otherwise leave the site stale.
+    paths:
+      - "docs/**"
+      - "overrides/**"
+      - "MANIFESTO.md"
+      - "scripts/get-mira.sh"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+      # The API reference under /api is rustdoc, so a doc comment is a docs
+      # change. Without this line the published mechanics stay at whatever the
+      # last prose edit happened to build.
+      - "crates/**"
+  workflow_dispatch:
+
+# The site is a build artefact of the repository, so nothing here writes to the
+# contents. `id-token` is what lets `deploy-pages` prove to Pages that the
+# upload came from this workflow on this commit.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy half-way: `deploy-pages` interrupted between the upload
+# and the swap leaves the site serving a partial build until the next push.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      # `enablement: true` turns Pages on the first time this runs, using this
+      # job's token. Enabling it by hand needs repository-admin rights that the
+      # people who write the docs do not necessarily have, and a setting nobody
+      # can reproduce from the repository is exactly what this tree avoids.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        with:
+          enablement: true
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: docs
+      # For the /demo build. `make site` builds the UI a second time with
+      # VITE_REPLAY=1, which answers from the committed fixtures instead of
+      # from a server — see crates/mira/ui/src/lib/replay.js.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/mira/ui/package-lock.json
+      # Through `make`, never `mkdocs` directly: the Makefile owns the venv and
+      # the pinned requirements, so this builds what `make docs` builds locally.
+      #
+      # `site`, not `docs`: it is the same mkdocs build plus rustdoc mounted at
+      # /api, and the recorded UI snapshot at /play. The architecture pages
+      # link into rustdoc by symbol, so publishing the prose without it would
+      # ship a site full of 404s — which is why the generator checks those
+      # links against `target/doc` in `ci`.
+      - run: make site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - id: pages
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
