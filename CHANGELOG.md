@@ -97,7 +97,9 @@ here may change: the block format, the query document, the config keys, the
 - **A distroless Docker image**, one binary and one volume, on
   `base-nossl-debian12` plus the one library the binary actually needs.
 - **A Helm chart**, `charts/mira`, published as a signed OCI artifact to
-  `oci://ghcr.io/trianalab/charts/mira`.
+  `oci://ghcr.io/trianalab/charts/mira` and listed on
+  [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira), with a closed
+  `values.schema.json` and the ownership metadata pushed alongside it.
 - **An install script**, `curl -fsSL https://miradb.dev/install.sh | bash`, which picks the
   target triple, checks `SHA256SUMS` and verifies the SLSA provenance
   attestation when the GitHub CLI is on `PATH`.

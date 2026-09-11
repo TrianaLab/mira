@@ -456,19 +456,34 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          # Same two flags and the same reason as the image: the verifiers in
-          # the field read the legacy `.sig` tag, not the referrers API.
+          # Same two flags and the same reason as the image: Artifact Hub reads
+          # the legacy `.sig` tag, not the referrers API, and an unsigned-looking
+          # chart is the one thing the badge does not forgive.
           cosign sign --yes \
             --new-bundle-format=false \
             --use-signing-config=false \
             "${CHARTS}/mira@${DIGEST}"
 
-      # No Artifact Hub ownership handshake here. Adopting an OCI-hosted chart
-      # needs a `repositoryID` that Artifact Hub only issues once the repository
-      # exists there, and the repository can only be created against a chart
-      # that is already published — so the handshake cannot be part of the
-      # release that first publishes the chart. It lands in its own change,
-      # after this one has run once.
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        if: needs.meta.outputs.publish == 'true'
+
+      # The ownership handshake. An OCI repository has no `index.yaml` to carry
+      # `artifacthub-repo.yml` beside, so Artifact Hub looks for it under a
+      # reserved tag on the chart repository itself. Getting the tag or either
+      # media type wrong does not fail anything here — it just silently leaves
+      # the repository unverified — so all three are copied from Artifact Hub's
+      # docs verbatim and none of them is ours to pick.
+      #
+      # Pushed on every release rather than once, because the tag is mutable and
+      # a repository that loses it loses the badge. Idempotent by construction:
+      # the same bytes produce the same digest.
+      - name: publish the Artifact Hub repository metadata
+        if: needs.meta.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          oras push "${CHARTS}/mira:artifacthub.io" \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
 
   # Created last, on purpose. The GitHub Release is the only coordinate a human
   # reads as "this shipped", so it must not exist until the image and the chart
@@ -648,6 +663,26 @@ jobs:
             "${CHARTS}/mira@${DIGEST}" > /dev/null
           echo "chart ${CHARTS}/mira@${DIGEST} verified"
 
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: the Artifact Hub ownership metadata came back
+        run: |
+          set -euo pipefail
+          # The one thing in this release whose loss nothing else notices: a
+          # missing `artifacthub-repo.yml`, or one under a tag Artifact Hub does
+          # not read, costs the Verified Publisher badge and reports nothing
+          # anywhere. So it is fetched back from the coordinate the indexer
+          # actually looks at.
+          #
+          # The assertion is a real UUID rather than a diff against the tree,
+          # because this job deliberately has no checkout: everything it looks
+          # at comes back off the wire. `scripts/check_drift.py` is what holds
+          # the ID to the right one; this holds the push to having happened.
+          oras pull "${CHARTS}/mira:artifacthub.io" --output pulled
+          grep -Eq '^repositoryID: [0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' \
+            pulled/artifacthub-repo.yml
+          echo "${CHARTS}/mira:artifacthub.io carries an owner proof"
+
       - run: |
           set -euo pipefail
           {
@@ -657,4 +692,5 @@ jobs:
             echo '- SLSA provenance resolves for the linux x86_64 tarball'
             echo '- the image digest carries a cosign signature from this workflow'
             echo '- the chart pulls and its digest carries the same signature'
+            echo '- the Artifact Hub ownership metadata round-trips'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -95,7 +95,10 @@ run in this repository, which a checksum published next to the artifact cannot.
 
 The linux builds come off `ubuntu-22.04`, so the glibc floor is **2.34** — RHEL
 9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+ and the
-`distroless/base-nossl-debian12` base the image uses. There is deliberately no
+`distroless/base-nossl-debian12` base the image uses. That is a measurement, not
+a hope: `make glibc-floor` reads the highest `GLIBC_` symbol version the binary
+actually references and fails the build above 2.34, so a runner image that moves
+under us is a red pull request rather than a binary that will not start. There is deliberately no
 musl build: it compiles, but
 musl's mallocng costs the ingest path more than the Alpine coverage is worth,
 and fixing that means linking jemalloc and giving up "`zstd-sys` is the one C
@@ -182,6 +185,11 @@ cosign verify \
 The chart's own
 [README](https://github.com/TrianaLab/mira/blob/main/charts/mira/README.md) has
 every value, why it defaults where it does, and the argument for a StatefulSet.
+It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira),
+which renders that README, the signature above and the image's current CVE
+report against the same coordinate. Every value is covered by a closed
+`values.schema.json`, so `helm install` rejects a typo'd key before the cluster
+sees it — the same rule Mira's own config file follows.
 
 ## Where it will refuse to start
 

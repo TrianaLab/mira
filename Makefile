@@ -579,6 +579,44 @@ DIST_BIN     = $(if $(CARGO_BUILD_TARGET),target/$(CARGO_BUILD_TARGET)/release/m
 # GNU coreutils and BSD spell it differently, and the release runs on both.
 SHA256       = $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
 
+# The floor the README's platform table promises, and the reason release.yml's
+# two linux legs pin `ubuntu-22.04` rather than taking `ubuntu-latest`:
+# `zstd-sys` is compiled against the runner's glibc, so the runner picks the
+# floor for the whole binary. A build on 24.04 links `__isoc23_*` at
+# GLIBC_2.38 and pulls the requirement up to 2.39, which is above
+# `distroless/base-nossl-debian12` (2.36) — and the symptom is not a build
+# error. It is `/mira: version 'GLIBC_2.39' not found` on the container's first
+# line, four minutes of the collector failing to resolve a service whose
+# container has already exited, and a gate that reports "the pipeline is
+# broken". So the floor is asserted on the bytes instead of trusted to a runner
+# label that moves on its own.
+GLIBC_FLOOR ?= 2.34
+
+.PHONY: glibc-floor
+glibc-floor: build ## The Linux binary still runs on the glibc the README promises
+	@# A no-op wherever `build` did not produce an ELF — on macOS the answer is
+	@# "Mach-O", which is not a failure, it is a different question.
+	@head -c 4 "$(DIST_BIN)" | grep -q ELF || { \
+		echo "glibc floor: $(DIST_BIN) is not ELF, so there is nothing to check on this host."; \
+		exit 0; }; \
+	command -v objdump >/dev/null 2>&1 || { \
+		echo "error: objdump (binutils) is not installed, so the glibc floor cannot be checked."; \
+		echo "  it is on every ubuntu runner and comes with the \`cc\` zstd-sys needs anyway."; \
+		exit 1; }; \
+	max=$$(objdump -T "$(DIST_BIN)" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1); \
+	[ -n "$$max" ] || { \
+		echo "error: $(DIST_BIN) references no GLIBC_ symbol version at all."; \
+		echo "  that is either a static link or a parse this target no longer understands."; \
+		exit 1; }; \
+	[ "$$(printf '%s\n%s\n' "$$max" "$(GLIBC_FLOOR)" | sort -V | tail -1)" = "$(GLIBC_FLOOR)" ] || { \
+		echo "error: $(DIST_BIN) needs GLIBC_$$max, but the floor is $(GLIBC_FLOOR)."; \
+		echo "  it will not start on RHEL 9, Amazon Linux 2023, Debian 12, Ubuntu 22.04"; \
+		echo "  or the distroless base the image is built on. Build it the way"; \
+		echo "  release.yml does — on ubuntu-22.04 — or move the floor in the README,"; \
+		echo "  docs/install.md and GLIBC_FLOOR here, together."; \
+		exit 1; }; \
+	echo "glibc floor: GLIBC_$$max, at or under $(GLIBC_FLOOR)"
+
 .PHONY: dist
 dist: ## Everything a release publishes, for this host, into dist/
 	@# Recursive $(MAKE) rather than prerequisites: dist-sums hashes whatever is
@@ -590,7 +628,7 @@ dist: ## Everything a release publishes, for this host, into dist/
 	$(MAKE) dist-sums
 
 .PHONY: dist-tarball
-dist-tarball: build ## Tarball the $(TARGET) binary into dist/
+dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 	@name="mira-$(VERSION)-$(TARGET)"; \
 	bin="$(DIST_BIN)"; \
 	if [ "$(TARGET)" = "$(HOST_TRIPLE)" ]; then "$$bin" --version; fi; \
@@ -651,7 +689,7 @@ E2E_COMPOSE := docs/e2e/compose.yaml
 DOCKER_ARCH  = $(if $(filter aarch64 arm64,$(shell uname -m)),arm64,amd64)
 
 .PHONY: dist-image
-dist-image: build ## Build the image the way the release does — from the built binary
+dist-image: build glibc-floor ## Build the image the way the release does — from the built binary
 	@# BIN=prebuilt rather than a compile inside the Dockerfile, for the same
 	@# reason release.yml does it: the bytes in the image are then the bytes in
 	@# the tarball that was checksummed and attested, so `make scan-image` scans
@@ -737,7 +775,17 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 	@# of compiling a second time inside the Dockerfile; everything else about
 	@# the stack is exactly what a reader of that section types.
 	docker compose -f $(E2E_COMPOSE) build --build-arg BIN=prebuilt mira
-	@trap 'rc=$$?; [ $$rc -eq 0 ] || docker compose -f $(E2E_COMPOSE) logs --no-color --tail 100 mira otelcol; \
+	@# Every service, not `mira otelcol`, and `ps -a` before the logs. The two
+	@# things the narrow version could not show are the two that matter when
+	@# this fails: which containers are still up (a name that stops resolving is
+	@# a container that exited, not a network fault), and whether the generators
+	@# ever reached the collector. `--tail 100` is per container, and the one
+	@# line that explains the whole run is usually the container's first, so the
+	@# dead one gets its log in full.
+	@trap 'rc=$$?; [ $$rc -eq 0 ] || { \
+	         echo "--- containers"; docker compose -f $(E2E_COMPOSE) ps -a; \
+	         echo "--- mira"; docker compose -f $(E2E_COMPOSE) logs --no-color mira; \
+	         echo "--- everything else"; docker compose -f $(E2E_COMPOSE) logs --no-color --tail 100; }; \
 	       docker compose -f $(E2E_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; \
 	       exit $$rc' EXIT; \
 	docker compose -f $(E2E_COMPOSE) up -d; \

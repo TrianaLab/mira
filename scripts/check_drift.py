@@ -122,6 +122,15 @@ CHART_YAML = "charts/mira/Chart.yaml"
 # that fails for a reader who did exactly what the page said.
 CHART_VERSION_SITES = ["docs/install.md"]
 
+# The Artifact Hub ownership proof, pushed to the chart repository under a
+# reserved tag by release.yml. Artifact Hub does not report a wrong or missing
+# `repositoryID` as an error: it just leaves the repository unverified, quietly,
+# forever. So the two ways to get there — the file gone, or the ID still the
+# placeholder someone pasted before the repository existed — are checked here
+# instead.
+ARTIFACTHUB_REPO_YML = "artifacthub-repo.yml"
+PLACEHOLDER_REPOSITORY_ID = "00000000-0000-0000-0000-000000000000"
+
 failures: list[str] = []
 notes: list[str] = []
 
@@ -343,6 +352,23 @@ def check_chart_version(crate_version: str) -> None:
                 "one, which is an install that fails for whoever copies it."
             )
 
+    repo_yml = ROOT / ARTIFACTHUB_REPO_YML
+    if not repo_yml.exists():
+        fail(
+            f"{ARTIFACTHUB_REPO_YML} is gone. release.yml pushes it to "
+            "`ghcr.io/trianalab/charts/mira:artifacthub.io`, and without it the "
+            "chart repository loses its Verified Publisher badge at the next "
+            "release — silently, because Artifact Hub reports a missing owner "
+            "proof as 'unverified' rather than as an error."
+        )
+    elif PLACEHOLDER_REPOSITORY_ID in repo_yml.read_text():
+        fail(
+            f"{ARTIFACTHUB_REPO_YML} still carries the placeholder "
+            f"`repositoryID: {PLACEHOLDER_REPOSITORY_ID}`. Artifact Hub matches "
+            "the ID it issued against the one it finds; a mismatch is the same "
+            "silent 'unverified' as no file at all. Copy the real ID from the "
+            "repository's Artifact Hub control panel."
+        )
 
 
 # A comment saying "section 7.3" is a link with no href: nothing resolves it,
