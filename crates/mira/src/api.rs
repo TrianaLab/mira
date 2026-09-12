@@ -60,15 +60,14 @@ impl Api {
     ///
     /// Awaited before the query rather than inside it: this is where
     /// read-your-writes is bought, and paying for it here keeps the scan itself
-    /// synchronous and off the runtime. A `Vec` of at most one, because that is
-    /// what `search_open` takes: this node has one open block per signal, but
-    /// the signature is the general one so a future compaction or a second
-    /// writer needs no new plumbing.
+    /// synchronous and off the runtime. One entry per flusher shard, which is
+    /// what `search_open` takes — the plumbing was already the general one
+    /// before a signal had more than one open block at a time.
     pub(crate) async fn open(&self, signal: &str) -> Vec<Arc<mira_core::signal::Open>> {
         let Some(i) = pipeline::SIGNALS.iter().position(|s| *s == signal) else {
             return Vec::new();
         };
-        self.open[i].fresh().await.into_iter().collect()
+        self.open[i].fresh().await
     }
 
     /// Every signal's open block, in [`pipeline::SIGNALS`] order.
@@ -1128,8 +1127,7 @@ mod tests {
             max_block_age: std::time::Duration::from_secs(3_600),
             ..Default::default()
         });
-        let (ingest, logs_slot, flusher) =
-            pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
+        let (ingest, logs_slot, flusher) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&pcfg);
         assert!(
             ingest
                 .submit(crate::e2e::logs_export("checkout", 1_000, 3))

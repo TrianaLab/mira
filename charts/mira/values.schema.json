@@ -223,7 +223,13 @@
             "queue": {
               "type": "integer",
               "minimum": 1,
-              "description": "Exports that may wait for one signal's flusher. Times maxRequestBytes times three signals is the worst-case resident cost."
+              "description": "Exports that may wait for one signal's flushers. Times maxRequestBytes times three signals is the worst-case resident cost."
+            },
+            "shards": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 16,
+              "description": "Flusher tasks per signal; 0 takes one per two cores. 16 is pipeline::MAX_SHARDS, the ceiling the engine enforces. Shards split queue rather than multiplying it."
             },
             "wal": {
               "type": "boolean",

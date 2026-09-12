@@ -599,7 +599,7 @@ DEFAULT = re.compile(r"^\s{12}([a-z_]+): (.+),$", re.M)
 FLAG = re.compile(r'"(--[a-z-]+)" => cfg\.([a-z_]+)')
 
 # When the Rust type is ambiguous, the parser the arm calls is not.
-PARSED = {"positive": "count"}
+PARSED = {"positive": "count", "whole": "count"}
 
 # How a Rust type reads to an operator writing KYAML.
 TYPES = {
@@ -662,9 +662,9 @@ def config_table() -> str:
         return ""
     keys = re.findall(r'"([^"]+)"', known.group(1))
     setters = {k: f for k, f, _ in KEY.findall(text)}
-    # Two `usize` keys mean two different things, and the Rust type cannot say
-    # which: `max_request_bytes` is bytes and `queue` is slots. The parser the
-    # arm calls can, so it is the one asked.
+    # Three `usize` keys mean three different things, and the Rust type cannot
+    # say which: `max_request_bytes` is bytes, `queue` is slots and `shards` is
+    # tasks. The parser the arm calls can, so it is the one asked.
     parsed = {f: p for _, f, p in KEY.findall(text)}
 
     types = {f: t.strip() for f, t in FIELD.findall(text)}

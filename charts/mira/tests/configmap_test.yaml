@@ -31,6 +31,7 @@ tests:
               "ingest": {
                 "max_request_bytes": "16MiB",
                 "queue": "128",
+                "shards": "0",
                 "wal": "true",
               },
               "telemetry": {
@@ -45,6 +46,7 @@ tests:
       config.storage.retention: 720h
       config.ingest.maxRequestBytes: 64MiB
       config.ingest.queue: 1024
+      config.ingest.shards: 4
       config.ingest.wal: false
       config.telemetry.self: true
       config.telemetry.interval: 60s
@@ -65,6 +67,7 @@ tests:
               "ingest": {
                 "max_request_bytes": "64MiB",
                 "queue": "1024",
+                "shards": "4",
                 "wal": "false",
               },
               "telemetry": {
@@ -86,6 +89,17 @@ tests:
       - matchRegex:
           path: data["mira.yaml"]
           pattern: '"self": "true",'
+
+  # `shards` is an integer in values because an operator sets it from a CPU
+  # limit, and 16 is the ceiling the engine enforces — so this is the schema's
+  # upper bound and the quoting rule in one case.
+  - it: quotes a pinned shard count
+    set:
+      config.ingest.shards: 16
+    asserts:
+      - matchRegex:
+          path: data["mira.yaml"]
+          pattern: '"shards": "16",'
 
   - it: says nothing about alerts by default
     asserts:

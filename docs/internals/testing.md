@@ -5,7 +5,7 @@ whether a PR has enough of them. For *reproducing the published numbers* against
 a live binary, see [End-to-end testing](e2e.md) — that page is a transcript, this
 one is the map.
 
-Mira has 306 cargo tests, 22 UI tests and 35 chart tests, and every one of them
+Mira has 318 cargo tests, 22 UI tests and 36 chart tests, and every one of them
 runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
@@ -21,13 +21,13 @@ the least agreement in the industry, so it does not appear here.
 
 | # | Level | Count | Lives in | Runs from |
 |---|---|---|---|---|
-| 1 | Unit, in-source | 118 core + 151 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 124 core + 157 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 34 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 2 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
-| 7 | Chart rendering | 35 in 5 suites | `charts/mira/tests/*_test.yaml` | `make helm-unittest` |
+| 7 | Chart rendering | 36 in 5 suites | `charts/mira/tests/*_test.yaml` | `make helm-unittest` |
 | 8 | Live, over real sockets | asserted, not counted | `docs/e2e/compose.yaml` | `make e2e` |
 
 Levels 1–5 are one `cargo test --workspace`. That is deliberate: the loop a
@@ -139,18 +139,26 @@ tests do. Each exists because something got through.
 
 | Target | What it refuses |
 |---|---|
-| `drift` | The README's crate count or binary size no longer matching the tree that builds |
+| `section` | A U+00A7 section sign anywhere authored — including the PR title and body |
+| `fmt-check` | Anything unformatted |
+| `lint` | A clippy warning anywhere in the workspace, over all targets |
+| `features` | `webhook-tls`, which nothing else compiles, failing to lint |
+| `doc` | A rustdoc warning, private items included — a dead intra-doc link is a dead link |
 | `reference-check` | A generated reference page (`docs/reference/`, `docs/config.md`) that the code has moved past |
 | `ui-check` | A `.svelte` change whose rebuilt bundle was not committed |
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
-| `docs` | A dead link, a dead anchor, a page outside the nav, or a route with a capital letter in it |
-| `install-script` | The published one-liner no longer parsing, linting or running |
+| `deps` | An advisory, licence, ban or source `cargo-deny` refuses, or a dependency nothing imports |
+| `drift` | The README's crate count or binary size no longer matching the tree that builds |
 | `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
-| `section` | A U+00A7 section sign anywhere authored — including the PR title and body |
-| `features` | `webhook-tls`, which nothing else compiles, failing to lint |
-| `msrv` | A construct newer than the declared minimum Rust |
-| `glibc-floor` | A Linux binary that will not start on the glibc the README promises |
-| `scan-image` | A fixable HIGH or CRITICAL in the release image |
+| `install-script` | The published one-liner no longer parsing, linting or running |
+| `docs` | A dead link, a dead anchor, a page outside the nav, or a route with a capital letter in it |
+
+Listed in `make check`'s own order, which is the order they fail fastest. It
+runs `test`, `chart` and `coverage` alongside these — the levels above and the
+ratchet below — and leaves out the four `make ci` picks up: `msrv` refuses a
+construct newer than the declared minimum Rust, `scan-image` a fixable HIGH or
+CRITICAL in the release image, `dist` a Linux binary that will not start on the
+glibc the README promises (through `glibc-floor`), and `e2e` is level 8.
 
 `section` has a `--selftest`, because every way that gate can break makes it
 pass. `workflows` runs two things that do not subsume each other: actionlint

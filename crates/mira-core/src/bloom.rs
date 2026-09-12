@@ -12,19 +12,21 @@
 //!
 //! A sidecar per block, written next to the Arrow tables at publish and read
 //! before any of them, turns both into "open the blocks that can answer".
-//! Measured on this machine over 4.1 GB / 69 blocks:
+//! Measured on this machine, each query against its own corpus (section 11):
 //!
 //! ```text
 //!                                       blocks   rows scanned   time
+//! 4.1 GB / 25M spans / 84 blocks
 //! every span of one trace, without         84      25,000,000   14.3 s
 //!                          with             1         212,992    250 ms cold, 20 warm
+//! 6.4 GB / 25M logs / 69 blocks
 //! absent attribute value,  without         69      24,961,024   10.4 s
-//!                          with             0               0      5 ms
+//!                          with             0               0    71 ms cold, 5.7 warm
 //! ```
 //!
 //! [`TRACE_IDX`] costs 65 KB per block, 0.13% of the data. [`ATTR_IDX`] is
-//! sized by the block's *distinct* `(key, value)` pairs, so it is a few KB for
-//! ordinary attributes and grows only where pruning pays best.
+//! sized by the block's *distinct* `(key, value)` pairs, so on that corpus it is
+//! 70 bytes per block and it grows only where pruning pays best.
 //!
 //! Both go through a splitmix64 finalizer before Kirsch-Mitzenmacher double
 //! hashing, and that is not optional. W3C only requires a trace id to be

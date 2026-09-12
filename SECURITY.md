@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Mira is pre-1.0 — `0.0.2`. Two things are supported: the latest release and
+Mira is pre-1.0 — `0.0.3`. Two things are supported: the latest release and
 the tip of `main`. Fixes land on `main` and ship in the next release; there are
 no backport branches to ask about, and this table will not gain a third row.
 

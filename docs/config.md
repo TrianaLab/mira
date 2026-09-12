@@ -1,9 +1,10 @@
 # Configuration
 
 **For:** whoever runs the process. <!-- BEGIN GENERATED: count -->
-11
+12
 <!-- END GENERATED: count -->
-keys, and none of them tune the engine.
+keys. One of them changes how the engine runs, and it is there to correct a
+number the runtime can read wrong, not to tune anything.
 
 Precedence is **flag > file > default**. Everything works with no config file at
 all; the file exists for what a flag cannot express, chiefly interpolation. The
@@ -26,6 +27,7 @@ so `{ "cluster": {} }` is `unknown key "cluster"`.
 | [`storage.retention`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.retention) | `--retention` | duration | `7d` | How long a block is kept. Retention is a delete of whole blocks, so the oldest data disappears in block-sized steps rather than row by row. |
 | [`ingest.max_request_bytes`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.max_request_bytes) | `--max-request-bytes` | size | `16MiB` | The largest export either listener will decode. See `receiver::Receivers::max_request_bytes` for why it is one number. |
 | [`ingest.queue`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.queue) | `--queue` | count | `128` | How many exports may be queued for one signal's flusher before the next one has to wait for a slot — and is shed with a 503 only if none frees up within `pipeline::ADMIT_WAIT`. |
+| [`ingest.shards`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.shards) | `--shards` | count | `0` | How many flushers a signal runs, or 0 for "one per two cores". |
 | [`ingest.wal`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.wal) | `--wal` | boolean | `true` | Acknowledge an export once it is a frame in the write-ahead log, rather than once the block holding it has been published. |
 | [`telemetry.self`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.self_telemetry) | `--self-telemetry` | boolean | `false` | Store this node's own telemetry in this node, as ordinary metrics. |
 | [`telemetry.interval`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.telemetry_interval) | `--telemetry-interval` | duration | `15s` | How often `Config::self_telemetry` samples this node's counters. |
@@ -46,7 +48,10 @@ There is no block size, flush interval, buffer depth, cache size or compaction
 threshold, and there will not be. That is the *self-driving* half of principle 2
 in [Architecture section 1](architecture.md#1-principles-and-the-mechanism-each-one-buys):
 the two numbers an operator would most want to tune are constants in the binary,
-with no path from this file to either.
+with no path from this file to either. `ingest.shards` is not the exception it
+looks like: the engine sizes it from the core count on its own, and the key
+exists to tell it something `available_parallelism` cannot see rather than to
+search for a better value.
 
 ## The file
 
@@ -71,6 +76,7 @@ it; no YAML parser can guess about it.
   "ingest": {
     "max_request_bytes": "16MiB",
     "queue": "128",
+    "shards": "0",
     "wal": "true",
   },
 
@@ -231,7 +237,8 @@ error messages name this key.
 
 ## `ingest.queue`
 
-How many exports may be waiting for one signal's flusher. Full does not mean
+How many exports may be waiting for one signal's flushers, across all of them —
+see `ingest.shards` below for how the depth is divided up. Full does not mean
 refused: the next export waits up to five seconds (`pipeline::ADMIT_WAIT`) for a
 slot, and only gets a `503` if none frees up. OTLP classes that as retryable, so
 a collector backs off and sends it again — correct backpressure, and not a loss.
@@ -246,14 +253,45 @@ consecutive runs of the sweep since — see [End-to-end testing section
 3](internals/e2e.md#3-the-load-harness) for the numbers and the box they were measured
 on.
 
-So this knob buys queueing, not throughput. The flusher drains at the rate it
-drains, and a queue deep enough to hide a permanently overloaded node has only
+So this knob buys queueing, not throughput. The flushers drain at the rate they
+drain, and a queue deep enough to hide a permanently overloaded node has only
 moved the shed into a latency tail. Size it to absorb a burst, not to avoid a
 `503`: each slot can hold a decoded export, so the worst case is
 `ingest.queue * ingest.max_request_bytes * 3` resident — 6 GiB at the defaults,
 and eight times that at 1024. Raising it spends memory an operator has and the
 engine cannot know whether they have it, which is the whole reason it is a key
 rather than a constant.
+
+## `ingest.shards`
+
+How many flusher tasks each signal runs. `0`, the default, means one per two
+cores as the process sees them, capped at 16 (`pipeline::MAX_SHARDS`) — six per
+signal on the 12-core box the numbers here were taken on, sixteen on anything
+from 32 cores up.
+
+Per two cores, because a flusher is a consumer and the protobuf decode in front
+of it is the producer: a single flusher per signal absorbed 1.35M records/s in
+[the A/B in End-to-end testing section 3](internals/e2e.md#3-the-load-harness),
+and the anchors below burn 1.75 cores to produce that — so a flusher per core
+would leave most of them waiting on the decode.
+[Architecture section 4](architecture.md#4-ingest-path) is the rest
+of it, including why a shard may be keyed on the core count and on nothing about
+the data.
+
+So this is not a throughput knob: the engine already reads the number it wants,
+and this key is here for the case where what it reads is a lie. A cgroup CPU
+quota is invisible to `available_parallelism`, so a 96-core host running Mira at
+2 CPUs would otherwise start the full sixteen flushers per signal and publish
+sixteen files per seal window. Set it to the quota; `1` is the pre-shard
+behaviour, exactly.
+
+Shards **split** `ingest.queue` rather than multiplying it — each gets
+`queue / shards` slots — so the worst-case resident bytes in the section above
+are the same whatever this is. What setting it too high costs is blocks and
+cores instead: a shard that takes work carries its own open block and publishes
+its own file per seal window, and flushers past the core count compete with the
+decode that feeds them. Setting it to `1` on a wide machine puts one flusher
+back on the critical path of every export for that signal.
 
 ## `telemetry.self`
 
@@ -293,28 +331,29 @@ interpolation and nothing more.
 | Workload | Ingest | Exporters | CPU | Memory | Disk/day |
 |---|---|---|---|---|---|
 | Laptop, CI, one service | ≤ 10k records/s | 1 | `250m` | `256Mi` | 16 GiB |
-| A team's services | 100k records/s | 1–2 | `500m` | `512Mi` | 158 GiB |
+| A team's services | 100k records/s | 1–2 | `500m` | `512Mi` | 1.3 TiB |
 | A cluster | 600k records/s | 1–2 | `1` | `512Mi` | 7.7 TiB |
-| A busy cluster | 1.5M records/s | 4 | `2` | `1536Mi` | 19 TiB |
-| Past the plateau | 1.5M records/s | 8+ | `2500m` | `2560Mi` | 19 TiB |
+| A busy cluster | 1.5M records/s | 4 | `2` | `1024Mi` | 19 TiB |
+| Past the plateau | 1.5M records/s | 8+ | `2500m` | `2048Mi` | 19 TiB |
 
 Multiply the last column by `storage.retention` — 7 days by default — for the
 volume. `records/s` is logs plus spans plus data points, which is what the
 harness counts and what `/api/v1/stats` reports.
 
-**CPU is the record rate over one number.** The engine's own rate is 891k
-records/s per core at one exporter and falls monotonically to 461k at 96, so
-budget **500k records/s per core** and you are covered anywhere on that curve;
-under four exporters you will get closer to 800k. The measured anchors are 0.68
-cores at 604k records/s, 1.78 at 1.46M and 2.18 at 1.57M. There is deliberately
+**CPU is the record rate over one number.** The engine's own rate is 886k
+records/s per core at one exporter and falls to 515k at 96, so budget
+**500k records/s per core** and you are covered anywhere on that curve; under
+four exporters you will get closer to 850k. The measured anchors are 0.71 cores
+at 629k records/s, 1.75 at 1.35M and 2.23 at 1.54M. There is deliberately
 no CPU limit in the chart, for the reason its comment gives: throttling the
 ingest path does not shed load, it queues it.
 
-**Memory is the exporter count, not the rate.** Peak RSS goes 244 MiB at one
-exporter, 363 at two, 862 at four, 2,040 at eight — and then stops: 2,261 MiB at
-32 and 2,244 at 96, while the throughput over that same range *falls*. What the
-extra connections buy is in-flight decodes, not work, which is why the memory
-column tracks the middle column and not the one beside it. Sizing from RSS is
+**Memory is the exporter count, not the rate.** Peak RSS goes 232 MiB at one
+exporter, 314 at two, 689 at four, 1,243 at eight — and then flattens: 1,575 MiB
+at 16, 1,495 at 32 and 1,648 at 96, while the throughput over that same range
+rises 2% and then *falls* by a quarter. What the extra connections buy is
+in-flight decodes, not work, which is why the memory column tracks the middle
+column and not the one beside it. Sizing from RSS is
 conservative on purpose: Mira reads blocks through `mmap`, mapped pages are
 clean, and a cgroup reclaims them under pressure instead of OOM-killing — which
 is why a memory *limit* is safe here when it usually is not.
@@ -323,12 +362,15 @@ is why a memory *limit* is safe here when it usually is not.
 hot block costs 164 bytes on disk per 137-byte wire record; compaction rewrites
 it ZSTD at 8.38x an hour later, taking the same record to about 20 bytes. But
 the sweep compacts at most 8 blocks per signal per minute
-(`block::MAX_COMPACT_PER_SWEEP`) and a block is ~47 MB, so one signal can be
-compacted at ~370 MB/min — **about 38k records/s**. Below that, size the volume
+(`block::MAX_COMPACT_PER_SWEEP`), and a block is sealed at a 32 MiB target,
+which is ~205k rows ([End-to-end testing section
+3](internals/e2e.md#3-the-load-harness)) — so one signal can be compacted at
+~1.6M rows/min, **about 27k records/s**, which for the usual half-logs
+half-spans stream is about 55k records/s in total. Below that, size the volume
 at 20 B/record; above it compaction is permanently behind and the cost stays at
-164. The first two rows above are the compacted number, the last three the hot
-one, and that step is the whole reason the column jumps 50x between rows that
-differ 6x in rate.
+164. The first row above is the compacted number, the last four the hot one,
+and that step is the whole reason the column jumps 80x between rows that
+differ 10x in rate.
 
 A full volume takes the replica out of the Service via `/readyz` rather than
 losing data, so the failure mode of under-sizing is a stopped intake and not a

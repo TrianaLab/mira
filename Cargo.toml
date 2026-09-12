@@ -3,7 +3,7 @@ members = ["crates/mira-proto", "crates/mira-core", "crates/mira"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -74,8 +74,8 @@ uninlined_format_args = "warn"
 # everywhere: workspace crates, their own integration tests and benches, and a
 # stranger who runs `cargo add miradb-core`. No source file knows the registry
 # exists, and none had to change for this.
-mira-core = { package = "miradb-core", path = "crates/mira-core", version = "0.0.2" }
-mira-proto = { package = "miradb-proto", path = "crates/mira-proto", version = "0.0.2" }
+mira-core = { package = "miradb-core", path = "crates/mira-core", version = "0.0.3" }
+mira-proto = { package = "miradb-proto", path = "crates/mira-proto", version = "0.0.3" }
 
 # Arrow. Pinned as one version across the workspace: arrow_array::RecordBatch
 # from two different major versions is two different types, and the error you

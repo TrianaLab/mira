@@ -32,9 +32,9 @@ transformation step for a field to fall out of.
 | | |
 |---|---|
 | **Zero-copy reads** | Hot blocks are uncompressed and 64-byte aligned, so a query reads Arrow buffers straight out of the mapping. A test walks every buffer of every column and requires all of them to point inside the `mmap`. |
-| **The filesystem is the manifest** | Blocks are named `{min_ts}-{max_ts}-{node}-{seq}`, so the time index is the directory listing. No catalogue to keep in sync with the data. |
+| **The filesystem is the manifest** | Blocks are named `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`, so the time index is the directory listing. No catalogue to keep in sync with the data. |
 | **No coordination state** | No Raft, no membership, no external metadata store. Two active replicas share one volume by having different `--node` names. |
-| **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 5.62 MiB stripped, 117 crates, no `protoc` and no node toolchain to build it. |
+| **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 5.63 MiB stripped, 117 crates, no `protoc` and no node toolchain to build it. |
 | **Agents read, not export** | `POST /mcp` is eight tools over that read path. An agent sitting next to the data skips the protocol entirely — `mira mira --data-dir` maps the blocks with no server, no port and no serialisation. |
 
 ## What it is deliberately not
@@ -43,15 +43,16 @@ transformation step for a field to fall out of.
   that is a property of protobuf, not something to engineer around. The ingest
   goal is allocation-lean instead — one unavoidable copy of the request body.
 - **Not a query language.** No SQL, no PromQL, no TraceQL. DataFusion would have
-  given SQL for free, at 47 direct dependencies and a 68–92 MB binary; Mira
+  given SQL for free, at 47 direct dependencies and a 50.0 MiB binary; Mira
   hand-rolls the ~2,000 lines of query logic it actually needs.
 - **Not clustered.** A query reads the block directory it was pointed at and
   nothing scatters it. There is no peer list, because there is nothing to
   configure one against.
-- **Not tunable.** There is no block size, flush interval, buffer depth or cache
-  size to set, and there will not be. The config file describes *where the
-  process runs* — eleven keys — and holds no value that affects how the engine
-  performs.
+- **Not tunable.** There is no block size, flush interval or cache size to set,
+  and there will not be. The config file describes *where the process runs* —
+  twelve keys — and the two that reach the engine do not tune it: `ingest.queue`
+  buys burst room with memory, and `ingest.shards` is there to pin a core count
+  the runtime reads wrong.
 
 ## Where to go next
 
@@ -61,7 +62,7 @@ transformation step for a field to fall out of.
 | [Install](install.md) | one script, a container, or `cargo install` |
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
 | [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
-| [Configuration](config.md) | eleven keys, KYAML, `${env:…}` interpolation |
+| [Configuration](config.md) | twelve keys, KYAML, `${env:…}` interpolation |
 | [End-to-end testing](internals/e2e.md) | a live binary, a real collector, the load harness |
 | [Architecture](architecture.md) | the reasoning behind every non-obvious choice |
 | [Market position](market.md) | who else is in this space, and where the line is |

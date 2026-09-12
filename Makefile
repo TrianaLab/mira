@@ -59,8 +59,10 @@ LOADGEN := target/release/examples/loadgen
 #
 # Set a tenth of a point below the Mac figure for the host drift documented
 # above, not as slack: raise it off a green Linux run in CI, where the real
-# ceiling is legible.
-COVERAGE_MIN ?= 99.20
+# ceiling is legible. 99.21 is read off run 34723128743, which measured 99.22 on
+# Linux (21,969 lines, 172 uncovered) against 99.25 on this Mac — the drift is
+# real and is why the Mac figure is never the one written here.
+COVERAGE_MIN ?= 99.21
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
 # count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor

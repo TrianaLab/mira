@@ -150,7 +150,7 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
 
 - [Connect an agent](agents.md) — the MCP wiring, the eight tools, and one
   investigation worked end to end.
-- [Configuration](config.md) — the eleven keys, and how much machine to give it.
+- [Configuration](config.md) — the twelve keys, and how much machine to give it.
 - [End-to-end testing](internals/e2e.md) — a live binary, `telemetrygen`, and a stock
   Collector in front of it in Docker.
 - [The load harness](internals/e2e.md#3-the-load-harness) — `loadgen` without

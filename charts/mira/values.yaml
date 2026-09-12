@@ -202,15 +202,26 @@ config:
     # than it sounds: 4318 answers 413, which OTLP classes as permanent, so the
     # exporter drops the batch instead of retrying it.
     maxRequestBytes: "16MiB"
-    # -- How many exports may be waiting for one signal's flusher. A full queue
+    # -- How many exports may be waiting for one signal's flushers. A full queue
     # parks the next export for up to five seconds rather than refusing it, so
     # this buys burst absorption and not throughput. Each slot can hold a
     # decoded export, so the worst case is this times `maxRequestBytes` times
     # three signals resident — check it against `resources.limits.memory`
     # before raising it.
     queue: 128
+    # -- How many flusher tasks each signal runs, or 0 for one per two cores as
+    # the process sees them. A `resources.limits.cpu` quota is read correctly on
+    # its own, so leave this at 0 if you set one. It is for the cases that are
+    # not a quota: a `cpu.shares`/`cpu.weight` relative weight, or no limit at
+    # all on a large node, both of which read as the whole machine — on a
+    # 96-core node that is the capped sixteen flushers per signal for a pod that
+    # will get two cores. Set it to the whole cores the pod actually gets.
+    # Shards split `queue` between them rather than multiplying it, so the
+    # memory arithmetic above does not move; 16 is the ceiling the engine
+    # enforces.
+    shards: 0
     # -- Write-ahead log. Off means an export is acknowledged only once it is in
-    # a sealed, fsynced block — p99 around 2.4s, and read-your-writes holds. On
+    # a sealed, fsynced block — p99 around 2.6s, and read-your-writes holds. On
     # means acknowledged once written to the log — p99 under 5ms, survives the
     # process dying, does not survive the machine dying for up to 250ms, and
     # what you just sent is not queryable yet. Both are correct; no measurement

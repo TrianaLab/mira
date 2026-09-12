@@ -13,7 +13,7 @@ is no daemon, agent or sidecar to run alongside any of them.
 $ mira --help
 mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
      [--data-dir PATH] [--retention DURATION]
-     [--max-request-bytes SIZE] [--queue N] [--wal]
+     [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
      [--self-telemetry] [--telemetry-interval DURATION]
      [--alerts FILE] [--version]
 

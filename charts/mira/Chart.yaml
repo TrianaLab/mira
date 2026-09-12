@@ -6,8 +6,8 @@ type: application
 # Cargo.toml. There is one binary and one chart, so two version lines would only
 # ever be a question ("which one do I read?") with no useful answer.
 # scripts/check_drift.py fails the build if they disagree with Cargo.toml.
-version: 0.0.2
-appVersion: "0.0.2"
+version: 0.0.3
+appVersion: "0.0.3"
 # StatefulSet, seccompProfile and networking.k8s.io/v1 Ingress are all much
 # older than this; 1.25 is where PodSecurity admission went GA, which is what
 # the hardened securityContext defaults are written against.
@@ -43,4 +43,4 @@ annotations:
       url: https://miradb.dev/
   artifacthub.io/images: |
     - name: mira
-      image: ghcr.io/trianalab/mira:0.0.2
+      image: ghcr.io/trianalab/mira:0.0.3

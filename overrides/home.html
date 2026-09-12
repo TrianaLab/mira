@@ -95,10 +95,11 @@
            someone keeps reading. The binary size is checked by scripts/check_drift.py
            against the actual artifact; the resident figure is the demo page's own run,
            which is the one a visitor can reproduce in a single command. The ingest rate
-           is the shed-free row from the README's table, quoted with the cores it took
-           because the cores are the surprising half. #}
+           is the four-connection row from the README's table — the shape that
+           reproduces, not the 32-connection peak the chart below plots — quoted with the
+           cores it took because the cores are the surprising half. #}
         <p class="mira-hero__note">
-          One 5.62&nbsp;MiB binary. 1,458,967&nbsp;records/s on 1.78&nbsp;cores.
+          One 5.63&nbsp;MiB binary. 1,350,502&nbsp;records/s on 1.75&nbsp;cores.
           A 65&nbsp;MiB peak taking 51,237 records, answering queries in milliseconds.
           Apache-2.0, and every number is reproducible with one command.
         </p>
@@ -125,7 +126,7 @@
 
          `--fill` is the row's percentage of the largest bar on its own tab, computed by
          hand — the largest is 100% by construction and the rest divide into it. Ingest
-         is out of 1,458,967; binary out of 144.29; resident out of 4,362. Recompute a
+         is out of 1,537,875; binary out of 144.29; resident out of 4,362. Recompute a
          whole tab if its largest row moves. Two conversions, both exact arithmetic on a
          published figure rather than new measurements: GiB to MiB is x1024, and
          GreptimeDB's 408 MB is 389 MiB (its row says so). #}
@@ -148,35 +149,35 @@
           <ol class="mira-chart__rows">
             <li class="mira-chart__row mira-chart__row--mira" style="--fill: 100%">
               <span class="mira-chart__name">Mira</span>
-              <span class="mira-chart__val">1,458,967</span>
+              <span class="mira-chart__val">1,537,875</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
-              <span class="mira-chart__note">1.78 cores busy, nothing shed</span>
+              <span class="mira-chart__note">2.23 cores busy, nothing shed</span>
             </li>
-            <li class="mira-chart__row" style="--fill: 42.6%">
+            <li class="mira-chart__row" style="--fill: 40.4%">
               <span class="mira-chart__name">GreptimeDB&nbsp;1.0</span>
               <span class="mira-chart__val">621,367</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">16-core M4 Max</span>
             </li>
-            <li class="mira-chart__row" style="--fill: 37.0%">
+            <li class="mira-chart__row" style="--fill: 35.1%">
               <span class="mira-chart__name">otel&#8209;arrow OTAP</span>
               <span class="mira-chart__val">540,309</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">transport only, stores nothing</span>
             </li>
-            <li class="mira-chart__row" style="--fill: 15.1%">
+            <li class="mira-chart__row" style="--fill: 14.3%">
               <span class="mira-chart__name">Elasticsearch&nbsp;7</span>
               <span class="mira-chart__val">220,000</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">3 nodes, 24 vCPU, 135&nbsp;B docs</span>
             </li>
-            <li class="mira-chart__row" style="--fill: 5.1%">
+            <li class="mira-chart__row" style="--fill: 4.8%">
               <span class="mira-chart__name">Loki&nbsp;2.9</span>
               <span class="mira-chart__val">73,800</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">872&nbsp;B docs, 2.75 vCPU</span>
             </li>
-            <li class="mira-chart__row" style="--fill: 2.3%">
+            <li class="mira-chart__row" style="--fill: 2.1%">
               <span class="mira-chart__name">Quickwit</span>
               <span class="mira-chart__val">33,000</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
@@ -194,7 +195,7 @@
           <ol class="mira-chart__rows">
             <li class="mira-chart__row mira-chart__row--mira" style="--fill: 3.9%">
               <span class="mira-chart__name">Mira</span>
-              <span class="mira-chart__val">5.62</span>
+              <span class="mira-chart__val">5.63</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">3 signals, API, MCP, two UIs</span>
             </li>
@@ -232,8 +233,8 @@
         </div>
 
         {# The honest one, and the row to read carefully. Mira's figure is the
-           *one-connection* row of the README's table, not the plateau: at 1,458,967
-           records/s it is 862 MiB and by eight connections 2,040 MiB, above ClickHouse. The note column is what makes
+           *one-connection* row of the README's table, not the plateau: at 1,350,502
+           records/s it is 689 MiB and by eight connections 1,243 MiB, above ClickHouse. The note column is what makes
            either honest — every peer that publishes RSS publishes it at 10,000 to
            20,000 records or spans per second, so no row here is at the same load as
            any other. Dropping vlagent, which beats it, would make this a
@@ -247,11 +248,11 @@
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
               <span class="mira-chart__note">10k logs/s, forwards and stores nothing</span>
             </li>
-            <li class="mira-chart__row mira-chart__row--mira" style="--fill: 5.6%">
+            <li class="mira-chart__row mira-chart__row--mira" style="--fill: 5.3%">
               <span class="mira-chart__name">Mira</span>
-              <span class="mira-chart__val">244</span>
+              <span class="mira-chart__val">232</span>
               <span class="mira-chart__track" aria-hidden="true"><span class="mira-chart__fill"></span></span>
-              <span class="mira-chart__note">604k rec/s &mdash; 30x the load, uncapped</span>
+              <span class="mira-chart__note">629k rec/s &mdash; 30x the load, uncapped</span>
             </li>
             <li class="mira-chart__row" style="--fill: 8.9%">
               <span class="mira-chart__name">GreptimeDB&nbsp;0.12</span>

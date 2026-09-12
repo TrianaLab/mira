@@ -26,12 +26,12 @@ is the only state there is.
 
 | | |
 |---|---|
-| **1,458,967 records/s** | ingest, on **1.78 of 12 cores** — 891k/s/core at one connection |
-| **1.5 ms** | to prove a value is in **none** of 87 blocks, zero blocks opened |
-| **13.3 ms** | every span of one trace, out of 28.8M spans on disk |
+| **1,537,875 records/s** | ingest, on **2.23 of 12 cores** — 886k/s/core at one connection |
+| **2.6 ms** | to prove a value is in **none** of 137 blocks, zero blocks opened |
+| **4.7 ms** | every span of one trace, out of 27.1M spans on disk |
 | **7 µs** | the durable log append inside an acknowledgement |
 | **0.14** | bytes on disk per byte on the wire, once compacted |
-| **5.62 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
+| **5.63 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 Apple M3 Pro, one process, reproducible with the load harness in this
 repository. The full sweep:
@@ -62,7 +62,7 @@ docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:l
 helm install mira oci://ghcr.io/trianalab/charts/mira
 ```
 
-Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.2` pins the
+Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.3` pins the
 installer to a release; every one of them ships a CycloneDX SBOM, `SHA256SUMS`,
 a cosign signature and a SLSA provenance attestation.
 

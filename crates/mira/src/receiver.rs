@@ -436,7 +436,8 @@ mod tests {
         // `Full`, which is what an ingest queue that is not draining looks like.
         let held = tx.clone().reserve_owned().await.ok();
         let ingest = Ingest {
-            tx,
+            tx: [tx].into(),
+            turn: std::sync::Arc::default(),
             rejects: &crate::pipeline::REJECTS[0],
             wal: None,
             signal: wal::Signal::Logs,
