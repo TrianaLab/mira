@@ -250,7 +250,8 @@ pub struct Rejects {
     /// first row, or 0 if nothing is open. An age that keeps growing past
     /// `max_block_age` is a flusher that is not flushing.
     ///
-    /// Derived from [`clocks`](Self::clocks) and not written directly by a
+    /// Derived from [`shard_open_since`](Self::shard_open_since) and not
+    /// written directly by a
     /// flusher: with more than one shard per signal, a shard that has just
     /// sealed would otherwise clear a sibling's clock and the stuck flusher
     /// this number exists to expose would read as healthy. The oldest of them,
