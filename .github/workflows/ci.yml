@@ -32,14 +32,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Every job below is a one-line call into the Makefile. That is not a style
-  # choice: the Makefile is the single source of truth for the gates (see its
-  # header), so every gate here is reproducible with one `make` target.
-  # A command that appears only in this file is a command nobody can reproduce.
+  # This file is a dispatcher. Every `run:` below is a `make ci-*` target
+  # defined in `ci.mk`, and `scripts/check_ci.py` fails the build if one ever is
+  # not — so every leg here is one command on a laptop, and there is no shell in
+  # YAML for anyone to debug by pushing commits.
   #
-  # `make check` is the fast path and covers most of them. The four it leaves to
-  # CI are `msrv`, `scan-image`, `e2e` and `dist`: each needs a toolchain, a
-  # daemon or several minutes that a pre-push check should not assume.
+  # `make ci` runs the whole list on one host. `make check` is the faster subset
+  # to run before pushing: everything that needs no second toolchain, no docker
+  # daemon and no several minutes.
 
   changes:
     name: changes
@@ -55,51 +55,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Locally: `make ci-changes`, which defaults the base to the merge-base
+      # with origin/main. The regexes and the fail-open behaviour are in
+      # scripts/ci-changes.sh, with the reasoning.
       - id: filter
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          # dorny/paths-filter is the usual answer here. It is also one more
-          # third-party action to pin, review and trust, for something `git
-          # diff` already does in eight lines — and this repo's whole argument
-          # is that a dependency has to earn its place.
-          set -euo pipefail
-          if [ -z "${BASE}" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            # First push to a branch, a force-push past the old tip, or a shallow
-            # base. Unknown means "everything", never "nothing": a filter that
-            # fails open costs CI minutes, one that fails closed ships bugs.
-            echo "base ref '${BASE}' unusable — running every leg"
-            code=true; docs=true; ui=true; image=true; chart=true
-          else
-            files=$(git diff --name-only "${BASE}" HEAD)
-            echo "changed files:"; printf '%s\n' "${files}" | sed 's/^/  /'
-            m() { printf '%s\n' "${files}" | grep -qE "$1" && echo true || echo false; }
-            # A workflow change re-runs everything — the thing most likely to be
-            # wrong about a CI edit is the leg you did not think it touched.
-            W='|^\.github/workflows/'
-            code=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|deny\.toml\$|Makefile\$|scripts/)${W}")
-            # `overrides/` is the mkdocs theme override directory — one file, the
-            # landing hero — and a Jinja error in it fails `mkdocs build --strict`
-            # like any page would.
-            # `scripts/get-mira.sh` is here rather than only in `code` because
-            # `docs/install.sh` is a symlink to it: the docs site *publishes*
-            # it, so it is a documentation artefact that happens to be a script,
-            # and this is the leg that checks it.
-            docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$)${W}")
-            # `Makefile$` for the same reason it is in `code` and `image`: both
-            # of this leg's steps are make targets, so an edit to `ui-check` or
-            # `ui-demo` is a change to what this job asserts.
-            ui=$(m "^(crates/mira/ui/|Makefile\$)${W}")
-            # The image is the binary plus the base image, so anything that
-            # changes the binary changes what Trivy is looking at. Dockerfile
-            # and .dockerignore are here for the obvious reason; Cargo.lock is
-            # here because a dependency bump is exactly the change that
-            # introduces the advisory this leg exists to catch.
-            image=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|\.dockerignore\$|Makefile\$)${W}")
-            chart=$(m "^charts/${W}")
-          fi
-          printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\n' \
-            "$code" "$docs" "$ui" "$image" "$chart" | tee -a "$GITHUB_OUTPUT"
+        run: make ci-changes CI_BASE="${BASE}"
 
   rust:
     name: rust (${{ matrix.os }})
@@ -135,19 +97,13 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      # Formatting and rustdoc are platform-independent; running them twice
-      # would just be two chances to fail for the same reason.
-      - run: make fmt-check
+      # Two targets, because formatting, the feature swap and rustdoc are
+      # platform-independent and running them three times would be three
+      # chances to fail for the same reason. ci.mk says which is which.
+      - run: make ci-rust
         if: matrix.os == 'ubuntu-latest'
-      - run: make lint
-      # One platform: the feature swaps in a pure-Rust TLS connector, which has
-      # no per-OS arms of its own, and paying for it on three runners buys
-      # nothing.
-      - run: make features
-        if: matrix.os == 'ubuntu-latest'
-      - run: make test
-      - run: make doc
-        if: matrix.os == 'ubuntu-latest'
+      - run: make ci-rust-portable
+        if: matrix.os != 'ubuntu-latest'
 
   msrv:
     name: msrv
@@ -160,10 +116,9 @@ jobs:
         with:
           key: msrv
       # `rust-version` in Cargo.toml is a promise to anyone pinned to an older
-      # toolchain, and a promise nothing compiles against is a wish. `make msrv`
-      # reads the floor out of Cargo.toml, so this stays correct when it moves.
-      - run: rustup toolchain install "$(make --no-print-directory print-msrv)" --profile minimal
-      - run: make msrv
+      # toolchain, and a promise nothing compiles against is a wish. The target
+      # reads the floor out of Cargo.toml, installs exactly it, and builds.
+      - run: make ci-msrv
 
   ui:
     name: ui
@@ -178,14 +133,11 @@ jobs:
           cache: npm
           cache-dependency-path: crates/mira/ui/package-lock.json
       # `dist/` is checked in and `include_bytes!`d, so the bundle in git is
-      # what ships. `make ui-check` rebuilds it and diffs: a .svelte fix that
-      # was never rebuilt is a fix nobody gets.
-      - run: make ui-check
-      # The second build of the same source — the recorded snapshot the site
-      # hosts at /play. Only `docs.yml` builds it otherwise, and that runs after
-      # the merge, so a snapshot that renders a blank page was a green pull
-      # request. The target asserts its own asset URLs; see the comment there.
-      - run: make ui-demo
+      # what ships: `ui-check` rebuilds it and diffs, and `ui-demo` builds the
+      # recorded snapshot the site hosts at /play. Only `docs.yml` builds that
+      # otherwise, and that runs after the merge, so a snapshot that renders a
+      # blank page used to be a green pull request.
+      - run: make ci-ui
 
   coverage:
     name: coverage
@@ -197,13 +149,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: coverage
-      - run: rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-llvm-cov
       # The ratchet lives in the Makefile (COVERAGE_MIN), not here, so raising
       # it is one diff and `make coverage` locally means the same thing.
-      - run: make coverage
+      - run: make ci-coverage
 
   supply-chain:
     name: supply-chain
@@ -217,7 +168,7 @@ jobs:
           tool: cargo-deny,cargo-machete
       # Advisories, licences, duplicate versions, and the ban on new C-backed
       # crates that keeps zstd-sys the only one. See deny.toml.
-      - run: make deps
+      - run: make ci-supply-chain
 
   drift:
     name: drift
@@ -232,18 +183,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: drift
-      # Builds the release binary, then checks the crate count, the binary size
-      # against the section 11 ceiling, the "only C dependency is zstd-sys"
-      # promise, and that every file quoting those numbers quotes the current
-      # ones.
-      - run: make drift
-      # The other half of the same question: the reference pages are generated
-      # from the binary's `--help`, the router's `.route(` calls and the config
-      # parser's key list, and this regenerates them and diffs. A pull request
-      # that adds an endpoint and not its row goes red here. It lands in this
-      # job because the generator needs the release binary and this is the job
-      # that already has one.
-      - run: make reference-check
+      # Two halves of one question, and they share a release binary. `drift`
+      # checks the crate count, the binary size against the section 11 ceiling,
+      # the "only C dependency is zstd-sys" promise, and that every file quoting
+      # those numbers quotes the current ones. `reference-check` regenerates the
+      # reference pages from the binary's `--help`, the router's `.route(` calls
+      # and the config parser's key list, and diffs — so a pull request that
+      # adds an endpoint and not its row goes red.
+      - run: make ci-drift
 
   docs:
     name: docs
@@ -259,13 +206,10 @@ jobs:
           cache-dependency-path: docs/requirements.txt
       # `mkdocs build --strict` plus mkdocs.yml's `validation:` block is the
       # whole link checker — a dead internal link or a missing anchor fails the
-      # build. No separate link-checking action, and none needed.
-      - run: make docs
-      # The other thing this site publishes: `docs/install.sh` is a symlink to
-      # `scripts/get-mira.sh`, so these are the bytes strangers pipe into bash.
-      # shellcheck is preinstalled on the runner image. See the target for the
-      # one class of bug it checks that no runner here can reproduce.
-      - run: make install-script
+      # build. No separate link-checking action, and none needed. Then
+      # shellcheck over `scripts/get-mira.sh`, because `docs/install.sh` is a
+      # symlink to it: these are the bytes strangers pipe into bash.
+      - run: make ci-docs
 
   image:
     name: image
@@ -282,38 +226,15 @@ jobs:
         with:
           key: image
 
-      # Not aquasecurity/trivy-action. That action was compromised in March
-      # 2026 — a pushed tag, a mutated release, and every workflow that had
-      # `@v0` in it ran attacker code with whatever token the job held. The
-      # lesson is not "pin the action", it is that an action is a program with
-      # your token; an install script is a program with nothing but the runner.
-      # So: the upstream script, fetched from a tag-immutable raw URL and
-      # checked against its digest before it is run, exactly as `meta` installs
-      # actionlint below. The script then verifies the release tarball against
-      # the checksums file aquasecurity signs, so the whole chain is pinned.
-      #
-      # TRIVY_VERSION is here and not in the Makefile on purpose: locally
-      # `make scan-image` uses whatever trivy you have, because a developer with
-      # a newer database is a developer finding more, and only the gate needs a
-      # version everyone agrees on.
-      - name: install trivy
-        env:
-          TRIVY_VERSION: 0.74.0
-          TRIVY_INSTALL_SHA256: e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
-        run: |
-          set -euo pipefail
-          curl -fsSLo install.sh \
-            "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh"
-          echo "${TRIVY_INSTALL_SHA256}  install.sh" | sha256sum -c -
-          sh install.sh -b /usr/local/bin "v${TRIVY_VERSION}"
-          rm install.sh
-          trivy --version
+      # The pin and its digest are in ci.mk, alongside the argument for why
+      # this is a checksummed install script and not a third-party action.
+      - run: make ci-tool-trivy
 
       # Builds the image from the binary `make build` produced — the same
       # BIN=prebuilt path release.yml takes — and scans it. Before this leg
       # existed a Dockerfile change landed unbuilt and unscanned, and the first
       # place a broken base image showed up was a tag.
-      - run: make scan-image
+      - run: make ci-image
 
   e2e:
     name: e2e
@@ -338,7 +259,7 @@ jobs:
       # front of it, the OpenTelemetry project's own generator on the wire, and
       # then the query API asked whether the data arrived. Every other test in
       # the tree uses a client we wrote.
-      - run: make e2e
+      - run: make ci-e2e
 
   release-dry-run:
     name: release-dry-run
@@ -357,20 +278,14 @@ jobs:
       - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-cyclonedx@0.5.9
-      # `make dist` is the tarball, the SBOM and SHA256SUMS — literally the
-      # targets release.yml calls on a tag. Running it here is the difference
-      # between a release path that is tested and one that is first run in
-      # anger, in public, with a tag already pushed that cannot be moved.
-      - run: make dist
-
-      # The other half of the release, and the half that cannot be retried: a
-      # crates.io version is consumed the moment it uploads, and `cargo yank`
-      # hides it rather than freeing it. `--dry-run` packages all three crates,
+      # Both halves of the release, run on every code PR: `make dist` is the
+      # tarball, the SBOM and SHA256SUMS — literally the targets release.yml
+      # calls on a tag — and `make publish-dry` packages all three crates,
       # resolves each against the one before it out of a temporary registry and
-      # compiles them, stopping at the upload — so a manifest that only builds
-      # because a path dependency papered over it fails here, on a PR, instead
-      # of halfway through a tag that cannot be moved.
-      - run: make publish-dry
+      # compiles them, stopping at the upload. The second matters most, because
+      # a crates.io version is consumed the moment it uploads and `cargo yank`
+      # hides it rather than freeing it.
+      - run: make ci-release-dry-run
 
   helm:
     name: helm
@@ -386,20 +301,11 @@ jobs:
           # lints on the runner and not on a contributor's machine is worse than
           # no gate. Move this and the chart's own floor in the same diff.
           version: v3.22.0
-      # `make chart` needs the unittest plugin and the helm-docs binary, and
-      # neither is on the runner. Both versions come out of the Makefile rather
-      # than being written a second time here: a tool pinned in two places is a
-      # tool pinned in neither, and the one that generates the file the drift
-      # gate diffs has to be the version a contributor gets from `make`.
-      - name: install the pinned chart tooling
-        run: |
-          helm plugin install https://github.com/helm-unittest/helm-unittest \
-            --version "$(make -s print-helm-unittest-version)"
-          go install "github.com/norwoodj/helm-docs/cmd/helm-docs@v$(make -s print-helm-docs-version)"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      # lint, template, unittest, values-schema and helm-docs drift, all behind
-      # one target the same way every other leg here works. See the Makefile.
-      - run: make chart
+      # The unittest plugin and the helm-docs binary, at the versions the
+      # Makefile pins — a tool pinned in two places is a tool pinned in neither.
+      - run: make ci-tool-chart
+      # lint, template, unittest, values-schema and helm-docs drift.
+      - run: make ci-helm
 
   meta:
     name: meta
@@ -415,49 +321,33 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - run: make ci-tool-actionlint
+      - run: make ci-tool-python
 
-      # U+00A7 is banned in authored content, and "authored content" includes
-      # what a reviewer reads in the PR list and what `git log` prints — neither
-      # of which is a tracked file, so the file scan alone would miss both.
-      - run: make section
+      # Every job in this file must be reachable from a required context below,
+      # every `run:` must be a `make ci-*` call, every `uses:` must be
+      # SHA-pinned, and no required workflow may carry a trigger-level path
+      # filter. Plus the U+00A7 scan over authored files. See scripts/check_ci.py
+      # and scripts/check-section-sign.sh.
+      - run: make ci-meta
+
+      # The other two thirds of "authored content": what `git log` prints and
+      # what a reviewer reads in the PR list. Neither is a tracked file, so the
+      # file scan alone misses both.
       - name: no section sign in the commit messages
         if: github.event_name == 'pull_request'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: sh scripts/check-section-sign.sh --commits "${BASE}..HEAD"
+        run: make ci-section-range RANGE="${BASE}..HEAD"
       - name: no section sign in the PR title or body
-        if: github.event_name == 'pull_request'
         env:
-          # Through the environment, never interpolated into the script body: a
-          # PR title is attacker-controlled text, and `${{ }}` pastes it in
-          # before the shell ever sees it.
+          # Through the environment, never interpolated into a command: a PR
+          # title is attacker-controlled text, and `${{ }}` pastes it in before
+          # the shell ever sees it.
           TITLE: ${{ github.event.pull_request.title }}
           BODY: ${{ github.event.pull_request.body }}
-        run: |
-          printf '%s' "${TITLE}" | sh scripts/check-section-sign.sh --text "pr title"
-          printf '%s' "${BODY}"  | sh scripts/check-section-sign.sh --text "pr body"
-
-      # Not through taiki-e/install-action: it ships no actionlint manifest, and
-      # its cargo-binstall fallback cannot find one either, because actionlint is
-      # a Go program and not a crate. A release tarball checked against its
-      # published digest is the same guarantee pinning an action by SHA gives, so
-      # the version and the digest are both pinned here.
-      - name: install actionlint
-        env:
-          ACTIONLINT_VERSION: 1.7.12
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-        run: |
-          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
-          curl -fsSLo actionlint.tgz "${url}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          echo "${ACTIONLINT_SHA256}  actionlint.tgz" | sha256sum -c -
-          tar -xzf actionlint.tgz actionlint
-          sudo install actionlint /usr/local/bin/actionlint
-          rm actionlint actionlint.tgz
-      - run: pip install -r scripts/requirements.txt
-      # Every job in this file must be reachable from the `required` context
-      # below, every `uses:` must be SHA-pinned, and no required workflow may
-      # carry a trigger-level path filter. See scripts/check_ci.py.
-      - run: make workflows
+        if: github.event_name == 'pull_request'
+        run: make ci-section-text
 
   # Two status contexts, and branch protection requires both. Every leg above
   # feeds into one of them, so adding a job never means remembering to update a
@@ -469,6 +359,11 @@ jobs:
   # Security legs arrive at a different rate from correctness legs (a scanner,
   # a SARIF sink, a secret scan), and `security-required` lets them land without
   # a settings change and without diluting what `required` means.
+  #
+  # These two are the only `run:` steps in this file that are not a make call,
+  # and scripts/check_ci.py allowlists them by name. They read
+  # `join(needs.*.result)` — workflow state that exists nowhere but here — so
+  # there is nothing for a local target to reproduce.
   required:
     name: required
     if: always()

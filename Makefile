@@ -1,10 +1,14 @@
 # This file is the single source of truth for every quality gate in Mira.
 #
-# CI does not reimplement a single one of them: .github/workflows/ci.yml calls
-# these targets and nothing else. That is the whole point — a gate that only
-# exists in YAML is a gate no contributor can run, and a gate that exists in
-# both places is two gates that drift. Adding a check means adding it here;
-# wiring it into CI is then one line, and `make check` picks it up for free.
+# CI does not reimplement a single one of them: .github/workflows/ci.yml is a
+# dispatcher, every `run:` in it is a `make ci-*` target, and check_ci.py fails
+# the build if one is not. That is the whole point — a gate that only exists in
+# YAML is a gate no contributor can run, and a gate that exists in both places
+# is two gates that drift. Adding a check means adding it here; wiring it into
+# CI is then one word in `ci.mk`, and `make check` picks it up for free.
+#
+# The gates are here; the legs are in ci.mk, included at the bottom. `make ci`
+# runs every one of them on this host.
 #
 # `cargo` is not on PATH in a non-login shell on the maintainer's machine.
 # Every recipe below goes through $(CARGO), so `make CARGO=$$HOME/.cargo/bin/cargo`
@@ -93,9 +97,10 @@ help: ## Show this help
 	@echo
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| sort \
-		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "  make check        runs every PR gate. Run it before you push."
+	@echo "  make check            every gate that needs no daemon or second toolchain."
+	@echo "  make ci               every CI leg, including the four 'check' leaves out."
 
 # ---------------------------------------------------------------------------
 # Formatting and lints
@@ -412,6 +417,11 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 		exit 1; }
 	actionlint
 	$(PYTHON) scripts/check_ci.py
+	@# actionlint shellchecks every `run:` block for free. `ci-changes.sh` used
+	@# to be one, so lifting it into a file would have quietly dropped that —
+	@# and it is still the workflow, just spelled somewhere greppable.
+	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
+	shellcheck scripts/ci-changes.sh
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs
@@ -450,10 +460,6 @@ install-script: ## The published one-liner installer still parses, lints and run
 	     printf '%s\n' "$$out" | sed 's/^/    /'; exit 1 ;; \
 	esac
 	@echo "installer: shellcheck clean, arrays expand safely, version lookup reached."
-
-.PHONY: print-msrv
-print-msrv: ## Print the declared MSRV (CI installs the toolchain from this)
-	@echo $(MSRV)
 
 .PHONY: msrv
 msrv: ## Compile with exactly the declared MSRV ($(MSRV))
@@ -538,18 +544,10 @@ CHART := charts/mira
 # changes meaning on someone else's machine.
 HELM_UNITTEST_VERSION ?= 1.0.3
 
-.PHONY: print-helm-unittest-version
-print-helm-unittest-version: ## Print the pinned helm-unittest version (CI installs it)
-	@echo $(HELM_UNITTEST_VERSION)
-
 # Pinned for the same reason, and it matters more here: helm-docs *generates*
 # the file `helm-docs-check` then diffs, so an unpinned generator turns a drift
 # gate into a coin flip that fails on whoever upgraded last.
 HELM_DOCS_VERSION ?= 1.14.2
-
-.PHONY: print-helm-docs-version
-print-helm-docs-version: ## Print the pinned helm-docs version (CI installs it)
-	@echo $(HELM_DOCS_VERSION)
 
 .PHONY: helm-lint
 helm-lint: ## helm lint the chart
@@ -905,3 +903,14 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 	       exit $$rc' EXIT; \
 	docker compose -f $(E2E_COMPOSE) up -d; \
 	$(PYTHON) -c "$$E2EASSERT"
+
+# ---------------------------------------------------------------------------
+# The pipeline
+# ---------------------------------------------------------------------------
+#
+# Last, so every variable above is in scope. Everything in there is a `ci-`
+# target: the legs ci.yml dispatches to, the path filter that decides which of
+# them a diff needs, and the pinned versions of the tools a runner installs
+# into itself. `make ci` runs the lot on this host. See its header for why the
+# line between the two files falls where it does.
+include ci.mk

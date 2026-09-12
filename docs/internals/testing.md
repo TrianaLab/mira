@@ -10,8 +10,8 @@ runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
 second toolchain, a Docker daemon, a Trivy database, minutes rather than
-seconds) — and those are listed in
-[CONTRIBUTING](https://github.com/TrianaLab/mira/blob/main/CONTRIBUTING.md).
+seconds) — and `make ci` runs those too, on this host. Both are described in
+[Contributing](../contributing.md).
 
 ## The levels
 
@@ -145,7 +145,7 @@ tests do. Each exists because something got through.
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
 | `docs` | A dead link, a dead anchor, a page outside the nav, or a route with a capital letter in it |
 | `install-script` | The published one-liner no longer parsing, linting or running |
-| `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:` |
+| `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
 | `section` | A U+00A7 section sign anywhere authored — including the PR title and body |
 | `features` | `webhook-tls`, which nothing else compiles, failing to lint |
 | `msrv` | A construct newer than the declared minimum Rust |
@@ -175,6 +175,13 @@ make coverage-report   # per-file, worst first — what to write next
 
 ## What CI adds
 
+Three things, and they are all in `ci.mk`: which legs a diff needs, the tool
+versions everyone has to agree on, and the grouping of gates into legs.
+`ci.yml` is a dispatcher over that file — every
+`run:` in it is a `make ci-*` target, and `check_ci.py` fails the build if one
+is not — so `make ci` runs the whole pipeline on one host and a red leg is
+reproducible with one command.
+
 `ci.yml` computes a `changes` matrix first and every job is conditional on it,
 so a docs-only PR does not build the workspace. Two aggregate jobs — `required`
 and `security-required` — sit downstream of everything and are the contexts the
@@ -182,9 +189,11 @@ branch ruleset requires; `check_ci.py` enforces that no job can escape their
 `needs` closure, which is how a silently-skipped gate is caught statically at
 PR time rather than noticed later.
 
-The four gates that run only in CI are `msrv`, `scan-image`, `e2e` and `dist`
-(as `release-dry-run`, which runs the real tarball, SBOM and checksum targets on
-every code PR). Run them by hand when you have touched what they cover.
+The four gates that `make check` leaves to `make ci` are `msrv`, `scan-image`,
+`e2e` and `dist` (as `release-dry-run`, which runs the real tarball, SBOM and
+checksum targets on every code PR). Two of them a Mac cannot run at all —
+`ci-e2e` needs a Linux binary in a Linux container, `ci-image` needs a Docker
+daemon — and they say so rather than passing quietly.
 
 ## Choosing a home for a new test
 

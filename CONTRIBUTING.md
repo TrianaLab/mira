@@ -2,12 +2,17 @@
 
 Mira is an OTLP-native telemetry storage engine in a single binary. Before a
 change that is structural — a new dependency, a new on-disk shape, a new
-mechanism — read [`docs/architecture.md`](docs/architecture.md) section 0 and section 1.
-section 0 lists the mechanisms that did not survive contact with the formats, and
-re-proposing one of them is the most common way to waste an afternoon.
-[`CLAUDE.md`](CLAUDE.md) is the short version of everything below, written for
-someone already inside the tree; this file is the same rules for someone
-arriving.
+mechanism — read [Architecture](https://miradb.dev/architecture/) section 0 and
+section 1. section 0 lists the mechanisms that did not survive contact with the
+formats, and re-proposing one of them is the most common way to waste an
+afternoon. `CLAUDE.md` at the repository root is the short version of everything
+below, written for someone already inside the tree; this file is the same rules
+for someone arriving.
+
+> Links here are absolute `miradb.dev` URLs rather than repository paths,
+> because this file is read in two places — GitHub's pull-request sidebar and
+> [the site](https://miradb.dev/contributing/), which serves it by symlink — and
+> a relative path is only correct in one of them.
 
 The five principles are constraints, not aspirations. A PR is judged against
 them: performance is the product (ingest throughput per core, resident
@@ -51,12 +56,40 @@ make build       # release binary
 make check       # every gate, in the order they fail fastest
 ```
 
-**Before you open a PR: `make check`.** That is the checklist. Four gates run
-only in CI, because each wants something a pre-push check should not assume —
-`make msrv` (a second toolchain), `make scan-image` (a Docker daemon and a
-Trivy database), `make e2e` and `make dist` (minutes, not seconds). Run those
-by hand when you have touched what they cover. Anything else that is green
-locally and red in CI is a bug in the Makefile worth reporting on its own.
+**Before you open a PR: `make check`.** That is the checklist: everything that
+needs no second toolchain, no Docker daemon and no several minutes.
+
+## Running the pipeline locally
+
+`.github/workflows/ci.yml` is a dispatcher and nothing else. Every `run:` step
+in it is a `make ci-*` call into `ci.mk` — `scripts/check_ci.py` fails
+the build if one ever is not — so a leg that goes red on a runner is a leg you
+can reproduce with one command, and there is no shell living in YAML for anyone
+to debug by pushing commits and waiting six minutes.
+
+```sh
+make ci          # every leg a pull request runs, on this host
+make ci-rust     # one leg, exactly as its job runs it
+make ci-changes  # which legs your diff against origin/main would run
+```
+
+`make ci` is `make check` plus the four it leaves out — `ci-msrv` (a second
+toolchain), `ci-image` (a Docker daemon and a Trivy database), `ci-e2e` and
+`ci-release-dry-run` (minutes, not seconds). Two of those a Mac cannot do at
+all: `ci-e2e` needs a Linux binary in a Linux container and says so rather than
+pretending, and `ci-image` needs a daemon. Those two are the honest gap, and
+knowing which they are beats an aggregate that quietly skips them.
+
+The split between the two files is not "CI things live over here". The Makefile
+holds the **gates** — what "correct" means, which has to mean the same thing on
+a laptop as on a runner. `ci.mk` holds what a **runner** adds: which legs a diff
+needs, the tool versions everyone has to agree on, and the grouping of gates
+into legs. So a new gate goes in the Makefile and joins a `ci-` leg; a new leg
+is a target in `ci.mk` and a job in `ci.yml` that calls it, wired into
+`required` or `security-required`.
+
+Anything green locally and red in CI is a bug in one of those two files, worth
+reporting on its own.
 
 ## Four traps
 
@@ -102,12 +135,12 @@ the real thing that a unit test can be.
 
 New behaviour arrives with a test in the same PR. A bug fix arrives with the
 test that would have caught it, at the level where it would have caught it —
-[`docs/internals/testing.md`](docs/internals/testing.md) is the map of those
-levels and ends with how to pick one.
+[Testing architecture](https://miradb.dev/internals/testing/) is the map of
+those levels and ends with how to pick one.
 
 For what a unit test cannot reach — a real socket, a real exporter, real volume
-— [`docs/internals/e2e.md`](docs/internals/e2e.md) is a transcript rather than a
-plan: a live binary fed by the built-in `loadgen`, then `telemetrygen`, then a
+— [End-to-end testing](https://miradb.dev/internals/e2e/) is a transcript rather
+than a plan: a live binary fed by the built-in `loadgen`, then `telemetrygen`, then a
 stock OpenTelemetry Collector in front of it in Docker. Run it for anything
 touching the receivers, the wire formats or the ingest pipeline.
 
@@ -151,8 +184,8 @@ have an answer, and finding that out after the work is the expensive order.
 
 ## Releases
 
-[`docs/internals/releases.md`](docs/internals/releases.md) is the procedure and
-the reasoning: one version number across three coordinates, what a tag triggers,
+[Release architecture](https://miradb.dev/internals/releases/) is the procedure
+and the reasoning: one version number across four coordinates, what a tag triggers,
 what is signed, and the two facts that cannot be undone once a coordinate is
 published. Read it before changing `.github/workflows/release.yml`.
 
@@ -167,5 +200,5 @@ sign-off to remember.
 
 ## Conduct
 
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1. It
+[Code of conduct](https://miradb.dev/conduct/) — Contributor Covenant 2.1. It
 applies here and to every surface with the project's name on it.

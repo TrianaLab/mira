@@ -163,6 +163,10 @@ nav:
   - Reference:
       - CLI: reference/cli.md
       - HTTP API: reference/http.md
+      # A symlink to charts/mira/README.md, which helm-docs generates and
+      # `helm-docs-check` diffs — so the values table on the site is the one the
+      # chart ships, not a second copy of it that goes stale.
+      - Helm chart: reference/chart.md
       - Rust API: https://miradb.dev/api/
   - Understand:
       # A symlink to the repository-root MANIFESTO.md rather than a copy: it is
@@ -176,8 +180,15 @@ nav:
   # reader with the first one should not have to guess that it lives under the
   # second. Architecture moves here from Understand for the same reason: it is
   # the record of why the tree looks like this, addressed to whoever edits it.
+  # Symlinks again, for the same reason the manifesto is one: these three are
+  # files GitHub gives a fixed home (CONTRIBUTING.md, SECURITY.md), and a reader
+  # who arrived at miradb.dev should not be bounced to a code host to read
+  # prose. Nothing on this site links out to a file in the repository.
   - Project internals:
       - Architecture: architecture.md
       - Testing architecture: internals/testing.md
       - End-to-end testing: internals/e2e.md
       - Release architecture: internals/releases.md
+      - Contributing: contributing.md
+      - Security policy: security.md
+      - Code of conduct: conduct.md
