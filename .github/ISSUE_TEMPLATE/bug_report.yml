@@ -33,7 +33,7 @@ body:
     attributes:
       label: Version
       description: Output of `mira --version`, or the commit you built.
-      placeholder: mira 0.0.1
+      placeholder: mira 0.0.2
     validations:
       required: true
 

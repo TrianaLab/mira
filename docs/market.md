@@ -186,7 +186,6 @@ This table shows what the axis looks like; it is not one Mira wins.
 | Vendor | List price | Basis | = |
 |---|---|---|---|
 | Quickwit on S3 [^q5] | $8.4 per ingested TB/month | 2023 model, object store | no |
-| ClickHouse Cloud [^c4] | $276/mo for 14,336 GiB | 2023 list, self-published | no |
 | Elastic Serverless [^es] | $0.07/GB in, $0.017/GB-mo | "as low as", tier floor | no |
 | Grafana Cloud [^gc] | $0.55/GB combined | entry rate card | no |
 | New Relic [^nr] | $0.40/GB ingested | plus $349/user/mo Pro | no |
@@ -485,7 +484,6 @@ argument.
 [^c1]: <https://clickhouse.com/blog/storing-log-data-in-clickhouse-fluent-bit-vector-open-telemetry>
 [^c2]: <https://clickhouse.com/blog/a-quadrillion-rows-across-the-three-cloud-scaling-loghouse>
 [^c3]: <https://clickhouse.com/blog/elasticsearch-log-analytics-clickhouse>
-[^c4]: <https://clickhouse.com/blog/clickhouse-cloud-vs-elastic-datadog-observability-costs>
 [^oo]: <https://openobserve.ai/blog/openobserve-vs-clickhouse-one-billion-logs-benchmark/>
 [^j1]: <https://grafana.com/blog/2020/07/30/how-to-maximize-span-ingestion-while-limiting-writes-per-second-to-a-scylla-backend-with-jaeger-tracing/>
 [^j2]: <https://www.jaegertracing.io/docs/1.76/features/>

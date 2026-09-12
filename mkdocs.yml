@@ -6,7 +6,12 @@ site_description: An OTLP-native telemetry storage engine and short-term memory 
 site_url: https://miradb.dev/
 repo_url: https://github.com/TrianaLab/mira
 repo_name: TrianaLab/mira
-edit_uri: edit/main/docs/
+# No `edit_uri:` and no `content.action.edit`. Six of the pages under `docs/`
+# are symlinks into the repository root — CONTRIBUTING, SECURITY, the manifesto,
+# the chart reference — and git records the link rather than the file, so an
+# edit pencil on one of them opens an eighteen-byte blob containing a relative
+# path. That is a broken promise on a quarter of the site to save a reader one
+# navigation on the rest.
 # No `copyright:`. Material renders it as a line under the footer nav on every
 # page, and the licence is already stated where someone looks for it: the badge
 # and the licence section in the README, LICENSE at the repository root, and the
@@ -55,7 +60,6 @@ theme:
         icon: material/brightness-4
         name: Switch to system preference
   features:
-    - content.action.edit
     - content.code.annotate
     - content.code.copy
     - content.tabs.link

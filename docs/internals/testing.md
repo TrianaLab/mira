@@ -5,7 +5,7 @@ whether a PR has enough of them. For *reproducing the published numbers* against
 a live binary, see [End-to-end testing](e2e.md) — that page is a transcript, this
 one is the map.
 
-Mira has 304 cargo tests, 22 UI tests and 35 chart tests, and every one of them
+Mira has 306 cargo tests, 22 UI tests and 35 chart tests, and every one of them
 runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
@@ -15,13 +15,13 @@ seconds) — and `make ci` runs those too, on this host. Both are described in
 
 ## The levels
 
-Seven of them, and the ordering is by how much of the real system each one
+Eight of them, and the ordering is by how much of the real system each one
 holds, not by how they are usually named. "Integration test" is the label with
 the least agreement in the industry, so it does not appear here.
 
 | # | Level | Count | Lives in | Runs from |
 |---|---|---|---|---|
-| 1 | Unit, in-source | 118 core + 149 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 118 core + 151 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 34 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 2 | `crates/mira/tests/cli.rs` | `make test` |

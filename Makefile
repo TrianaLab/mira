@@ -33,7 +33,7 @@ LOADGEN := target/release/examples/loadgen
 # was last edited. It may only ever go up. Raising it is a one-line diff a
 # reviewer can see; lowering it needs an argument in the PR body. A gate set to
 # an aspiration is a gate that gets switched off the first time it goes red.
-# docs/architecture.md and .github/workflows/ci.yml both defer to this value.
+# docs/internals/testing.md and .github/workflows/ci.yml both defer to this value.
 #
 # Read it off a CI log, never off a laptop: `#[cfg]` splits the tree by host, so
 # the Linux runner measures a slightly different denominator than a Mac does and
@@ -553,6 +553,12 @@ site: docs doc ui-demo ## The published site: the docs, rustdoc at /api, the UI 
 	@# over it would delete a page mkdocs believes it published — a broken link
 	@# --strict cannot see, because the breakage happens after it ran.
 	rm -rf site/api && cp -R target/doc site/api
+	@# `cargo doc` over a workspace writes no root index — `target/doc/` is one
+	@# directory per crate and nothing above them — so the URL the architecture
+	@# page and the site nav both point at, miradb.dev/api, was a 404 while every
+	@# page under it was fine. `mkdocs build --strict` cannot see it: an absolute
+	@# https:// URL is external as far as the link checker is concerned.
+	printf '<meta http-equiv="refresh" content="0;url=mira/index.html">\n' > site/api/index.html
 	rm -rf site/play && cp -R $(UI_DIR)/dist-demo site/play
 	@echo "site/ built, with $$(find site/api -name '*.html' | wc -l | tr -d ' ') rustdoc pages under /api"
 	@echo "and the recorded UI snapshot under /play."

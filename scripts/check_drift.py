@@ -487,6 +487,22 @@ def check_coverage_badge() -> None:
             "grey on every view of the README and no build would go red."
         )
 
+    # A writer nothing calls is the same outage as no writer. `scripts/check_ci.py`
+    # cannot catch this: its make-dispatch rule covers ci.yml only, so a docs.yml
+    # that never runs the target is valid to it.
+    docs_yml = (ROOT / ".github/workflows/docs.yml").read_text()
+    if "make ci-coverage-json" not in docs_yml or not re.search(
+        r"^ci-coverage-json:", (ROOT / "ci.mk").read_text(), re.M
+    ):
+        fail(
+            "nothing publishes site/coverage.json: the deploy in "
+            ".github/workflows/docs.yml must run 'make ci-coverage-json' and "
+            "ci.mk must define that target.\n"
+            "    It has to be the deploy, after `make site` — mkdocs empties "
+            "the output directory, and ci.yml's coverage leg is conditional on "
+            "a code change, so a docs-only push would produce no file at all."
+        )
+
 
 def main() -> int:
     declared_crates, declared_mib = declared_from_readme()

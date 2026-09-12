@@ -83,10 +83,14 @@ silently skips is caught at PR time rather than discovered in a green run that
 published nothing.
 
 ```
-meta ──┬─> build (×4 targets) ──> package ──┐
-       ├─> image  ───────────────────────────┼─> release ──> crates ──> verify-release
-       └─> chart  ───────────────────────────┘
+meta ──> build (×4 targets) ──┬─> package ──────────┐
+                              └─> image ──> chart ──┴─> release ──> crates ──> verify-release
 ```
+
+`chart` is downstream of `image`, not a sibling of it: the chart advertises an
+image coordinate, and publishing a chart that points at an image which failed to
+push is the one ordering mistake that produces a green run and a broken
+`helm install`.
 
 **`meta`** computes `version`, `publish` and `prerelease` once. Deriving them
 per job is how a release ends up tagged `v0.2.0` with a binary that prints
@@ -201,12 +205,13 @@ restates it, and the right-hand column is what stops it rotting.
 | `CHANGELOG.md` | **none** (prose) |
 | `SECURITY.md` | **none** (prose) |
 
-The three ungated sites are prose that names the current version, and they will
-rot on the first bump that forgets them. That is a known gap and the fix is
-cheap — `scripts/check_drift.py` already owns every regex needed, so a `--bump`
-flag that *writes* the sites it currently only reads is around forty lines. It
-has not been written because nothing has been released yet and everything
-currently agrees.
+The three ungated sites are prose that names the current version, and they rot
+on the first bump that forgets them. That is a known gap and the fix is cheap —
+`scripts/check_drift.py` already owns every regex needed, so a `--bump` flag
+that *writes* the sites it currently only reads is around forty lines. It has
+not been written yet, and 0.0.2 is the bump that showed why it should be: the
+0.0.1 cut left `SECURITY.md` saying there was no tagged release, on the day
+there was one.
 
 ## What the tag path does not re-run
 
@@ -229,8 +234,14 @@ that packages all three crates, resolves each against the one before it out of a
 temporary registry and compiles them, stopping at the upload — on every code PR.
 `workflow_dispatch` runs the whole DAG with `publish=false`. Both have passed.
 
-`publish=false` skips every network-publishing step, so as of the first tag
-these will be executing for the first time: `cosign sign`, `helm push`, the
-`Digest:` scrape off `helm push`'s stderr, and the Artifact Hub `oras push`.
-`verify-release` fails loudly if any of them is wrong, and recovery is a bump to
-the next patch.
+`publish=false` skips every network-publishing step, so `cosign sign`,
+`helm push`, the `Digest:` scrape off `helm push`'s stderr and the Artifact Hub
+`oras push` were all executing for the first time on v0.0.1. All four worked.
+
+What is still unexercised is the `crates` job: v0.0.1 was tagged before the job
+existed, so 0.0.2 is the first release whose `make publish` actually uploads.
+That step is unrehearsable by construction — `publish-dry` does everything
+except the one irreversible thing — and the anonymous-pull check added *after*
+v0.0.1 is likewise running for the first time on a coordinate it has not seen.
+`verify-release` fails loudly if either is wrong, and recovery is a bump to the
+next patch.

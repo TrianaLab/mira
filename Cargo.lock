@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "miradb"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "bytes",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "miradb-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "miradb-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "prost",
