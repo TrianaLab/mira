@@ -317,7 +317,28 @@ to 4.61, 5.3x; a substring that fills the limit from 26.6 to 7.62, 3.5x. On the
 eight-reader read mix `attr` p50 improved 5.1x and `errors` p50 4.6x, taking the
 whole mix from 40 to 50 queries/s. Two classes did not improve and belong in the
 same sentence as the ones that did: `tail` p50 went from 1.42–1.54 ms to
-1.72–1.74, and `series` p50 from 575–616 ms to 686–702, both slightly worse.
+1.72–1.74, and `series` p50 from 575–616 ms to 686–702.
+
+The `series` figure was first written up here as a regression, and it is not
+one. The metrics module is byte-identical across the change, and the one
+vectorised function it can reach is called from inside `q.terms.iter()`, which
+is empty for a query with no `where` — the harness's is. Two binaries differing
+only in the read path, on a fresh store each, put it at 449.7 ms against 445.1
+and 524.5 against 608.7: 43.6, 42.5, 47.6 and 47.5 µs per matched row, in both
+directions and inside the pass-to-pass spread of one binary against itself. What
+moved is the mix around it — the same eight readers issue `series` 25% more
+often once the other five classes are five times cheaper.
+
+Diagnosing it did find something real, one layer down and nothing to do with
+vectorising. Metric attributes were joined by scanning the whole table per data
+point, which is the quadratic the same release removed from the log path and
+missed here. Fixed by reusing that path's run search: `series_cost_per_point`
+now prices it at a flat ~1 µs/point instead of one rising with the point count,
+which at 50,000 points in a block is 1,582 ms against 53.9. It is neutral on the
+harness because the harness's metrics blocks hold ~1,600 points against ~2,000
+attribute rows, where the join is about 7% of the query — the other ~93% is
+twenty-two blocks × ten tables of `mmap` and CRC, which is the same finding as
+the paragraph above, reached from the metrics side.
 
 It stays under gaps with a cause and a path, but the cause named is a different
 one and a shorter one. The old entry set the path at twenty years of SIMD

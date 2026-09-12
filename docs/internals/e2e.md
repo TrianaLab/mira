@@ -301,6 +301,23 @@ through the whole read path. The other 20 ns is `Block::open` faulting the
 mapping in and CRC'ing every table body, which is why `limit 1` costs what the
 whole block costs.
 
+The metrics route has the same instrument, per point rather than per row:
+
+```sh
+MIRA_BENCH_POINTS=50000 cargo test --release -p miradb-core --lib series_cost_per_point -- --nocapture
+series: 50000 points in 53.905708ms  1.078 us/point  60 series
+```
+
+Both are scaled tests rather than `#[ignore]`d benchmarks, so the default size
+runs in `make test` as a correctness check and the same code is the measurement
+at a real one. That matters here: the metrics attribute join stayed quadratic
+through the release that removed the same shape from the log path, and it stayed
+quadratic because nothing priced it. At 50,000 points in a block it was 1,582 ms
+before the run search and 53.9 after. The load harness does not show it — its
+metrics blocks hold ~1,600 points, where the join is about 7% of the query —
+which is the general lesson: **a mix measures the mix. Price the term you
+changed separately, or a 29× fix reads as noise.**
+
 **Do not compare a mixed run's query numbers to a read-only run's.** In a mixed
 run the store grows underneath the readers. On a *fresh* store the paging class
 reports ~1.9 pages/walk rather than 10 — not a bug, just most walks running out

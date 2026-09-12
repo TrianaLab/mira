@@ -1900,9 +1900,39 @@ Reading these honestly:
   **3.5×** on a substring that fills its limit. Across the eight-reader read mix
   it is 5.1× on the `attr` class p50 and 4.6× on `errors`, taking the mix from 40
   to 50 queries/s. Two classes did not move: `trace` is a `trace.idx` lookup with
-  almost no rows to filter, and `series` is the metrics route, which came out
-  slightly *worse* — 575–616 ms p50 before, 686–702 after. That is inside the
-  spread of two passes and it is not a win, so it is printed rather than dropped.
+  almost no rows to filter, and `series` is the metrics route, which read 575–616
+  ms p50 before and 686–702 after.
+
+  **`series` is not on this path at all, and saying so took a controlled A/B.**
+  `series.rs` is byte-identical across the change, and the only vectorised
+  function reachable from it, `attr_parents`, is called from inside
+  `q.terms.iter()` — empty for the harness's query, which carries no `where`. So
+  the measured query executes none of the changed instructions, and two binaries
+  differing only in the read path confirm it: 449.7 ms against 445.1 on one pass
+  and 524.5 against 608.7 on the next, which normalise to 43.6, 42.5, 47.6 and
+  47.5 µs per matched row — differences in both directions, all smaller than one
+  binary's spread against itself. The mix explains the rest: eight closed-loop
+  readers issue `series` 25% more often once the other five classes are five
+  times cheaper, and `Scan::wave` spawns a thread per block per wave, so the
+  classes that did speed up multiplied their spawn and shootdown rate by about
+  the same factor. `series` fans out to nothing and absorbs it.
+
+  **Chasing it did find a real defect, and it is the same shape as the one
+  above.** `collect_attrs` scanned the whole attribute table per parent and runs
+  once per matched data point, so the metrics path kept exactly the quadratic
+  semi-join section 7.6 removed from the log path — missed because `series_open`
+  loads its tables directly instead of through `query::Block::open`, so it never
+  saw `Attrs`. It uses it now. `series_cost_per_point` prices the result at a
+  flat 0.9–1.1 µs/point where it used to rise with the point count (2.1, 6.9,
+  31.6 µs at 2 K, 10 K and 50 K), which is 4.28 ms → 2.47, 69.4 → 9.0 and
+  1,582 → 53.9. On the load harness it is neutral, and the arithmetic says why:
+  its metrics blocks hold ~1,600 points against ~2,000 attribute rows, so the
+  join is ~7% of the query and twenty-two blocks × ten tables of `mmap`-and-CRC
+  is the rest. Series prunes on the directory name alone — no bloom, no zone
+  probe — and its block loop is sequential where `search` claims helpers from
+  `SPARE`. Those two are the levers left on this route, and both are larger than
+  a patch.
+
   The mix's `tail` class matched nothing on this corpus, because the data is
   older than the window `tail` asks for, so its numbers measure the empty path
   and are not quoted here — the unfiltered `limit 100` row of the table is the

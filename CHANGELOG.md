@@ -58,7 +58,8 @@ writes is read by 0.0.2.
   **5.3×** on an unfiltered `limit 100`, **3.5×** on a substring that fills its
   limit, and on an eight-reader read mix 5.1× on the `attr` class p50 and 4.6× on
   `errors`, taking the whole mix from 40 to 50 queries/s. The metrics `series`
-  class came out slightly slower and is recorded as such in
+  class read slower in the mix and does not share this path at all — see
+  **Fixed** below and
   [architecture section 11](docs/architecture.md#11-performance-model).
 - **The WAL watermark is a set, not a high-water mark.** Shards seal out of
   order, so the highest sequence in a block says nothing about the ones below it.
@@ -77,6 +78,22 @@ writes is read by 0.0.2.
   evaluation at 0.047–5.586 ns/row against 24–25 ns/row for the same block
   through the whole read path, so the unpruned scan is bound by the CRC32 every
   `Block::open` runs over the whole body, not by the scan.
+- **The metrics attribute join was quadratic in a block's point count.**
+  `collect_attrs` scanned the whole attribute table per parent and runs once per
+  matched data point, so the metrics path kept precisely the shape the
+  vectorisation above removed from the log path — missed because `series_open`
+  loads its tables directly rather than through `query::Block::open`, and so
+  never met `Attrs`. It uses it now. The new `series_cost_per_point` prices a
+  point at a flat 0.9–1.1 µs where it used to rise with the point count: at
+  50,000 points in a block, 1,582 ms became 53.9.
+- **The `series` figure in the read mix is not a regression, and the note saying
+  it was has been replaced with the measurement.** `series.rs` is byte-identical
+  across this release and the only vectorised function it can reach is called
+  from inside `q.terms.iter()`, which is empty for a query with no `where`. Two
+  binaries differing only in the read path measure 449.7 ms against 445.1 and
+  524.5 against 608.7 — both directions, all inside one binary's spread against
+  itself. Mira does not keep regressions as loose notes, and it does not keep
+  phantom ones either.
 - The `ingest.shards` justification no longer claims `available_parallelism`
   cannot see a cgroup CPU quota. It can. The cases it genuinely cannot see —
   `cpu.shares`/`cpu.weight`, a pod with no quota on a large node, hyperthreads
