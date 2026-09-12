@@ -89,7 +89,7 @@ when the crate costs one of the four performance axes — that is principle 1,
 not a code-golf preference.
 
 **`mira` has no lib target.** Filtering tests in the binary crate is
-`cargo test -p mira --bin mira <filter>`, not `--lib`. `--lib` silently matches
+`cargo test -p miradb --bin mira <filter>`, not `--lib`. `--lib` silently matches
 nothing and looks like a pass.
 
 ## Tests

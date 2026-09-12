@@ -453,8 +453,8 @@ The reasoning behind each of these is in
 [the architecture document](architecture.md) — this page records the decision, not the
 argument.
 
-[^m1]: `cargo bench -p mira-core --bench encode_bench`; [Architecture section 11](architecture.md#11-performance-model).
-[^m2]: `cargo run --release -p mira-core --example tier` over all 948 tables of a 7.35 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
+[^m1]: `cargo bench -p miradb-core --bench encode_bench`; [Architecture section 11](architecture.md#11-performance-model).
+[^m2]: `cargo run --release -p miradb-core --example tier` over all 948 tables of a 7.35 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
 [^m3]: [Architecture section 11](architecture.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
 [^g1]: <https://greptime.com/blogs/2026-03-24-ingestion-protocol-benchmark>
 [^g2]: <https://greptime.com/blogs/2025-03-10-log-benchmark-greptimedb>

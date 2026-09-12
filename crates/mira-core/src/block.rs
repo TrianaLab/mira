@@ -916,7 +916,7 @@ const MAX_COMPACT_PER_SWEEP: usize = 8;
 
 /// Rewrite aged blocks ZSTD-compressed, in place.
 ///
-/// Measured on real blocks (`cargo run --release -p mira-core --example tier`):
+/// Measured on real blocks (`cargo run --release -p miradb-core --example tier`):
 /// 0.127 of the plain size for logs, 0.142 for traces, at ~900 MiB/s on one
 /// core. Reads of the compressed block came back *faster* than of the plain one
 /// — 8× fewer pages to fault and 8× fewer bytes to CRC more than pays for the

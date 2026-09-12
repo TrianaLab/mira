@@ -6,16 +6,22 @@ publish it, you want [Install](../install.md).
 
 ## One binary, one chart, one number
 
-Mira publishes three coordinates and they all carry the same version string:
+Mira publishes four coordinates and they all carry the same version string:
 
 | Coordinate | Where |
 |---|---|
 | Tarballs, SBOM, `SHA256SUMS` | GitHub Release assets on the `vX.Y.Z` tag |
 | Multi-arch image | `ghcr.io/trianalab/mira:X.Y.Z` (and `:latest`) |
 | Helm chart | `ghcr.io/trianalab/charts/mira:X.Y.Z` |
+| Three crates | `miradb`, `miradb-core`, `miradb-proto` on crates.io |
 
-One number across all three, so there is nothing to compute: bumping is an edit
+One number across all four, so there is nothing to compute: bumping is an edit
 to `Cargo.toml` and a `make drift` run.
+
+The crates are `miradb-*` because `mira` on crates.io is an unrelated crate
+from 2024. Only the registry knows those names: the dependency keys, the `use`
+paths, the `[lib] name`s and the installed binary are all still `mira`.
+`Cargo.toml`'s `[workspace.dependencies]` block is where that is set up.
 
 ## Cutting a release
 
@@ -78,7 +84,7 @@ published nothing.
 
 ```
 meta ──┬─> build (×4 targets) ──> package ──┐
-       ├─> image  ───────────────────────────┼─> release ──> verify-release
+       ├─> image  ───────────────────────────┼─> release ──> crates ──> verify-release
        └─> chart  ───────────────────────────┘
 ```
 
@@ -113,6 +119,15 @@ looks for.
 does exactly this, so there is no third-party release action holding a write
 token.
 
+**`crates`** runs `make publish` — `cargo publish --workspace`, which works the
+order out of the dependency graph and waits for the index to serve each member
+before building the next. It is last because it is the least reversible thing
+the workflow does: a ghcr tag can be overwritten and a GitHub Release deleted,
+but a crates.io version is consumed on upload and `cargo yank` only hides it.
+It needs a `CARGO_REGISTRY_TOKEN` secret, and fails with a message naming it if
+it is missing — everything else has already published by then, so the fix is to
+re-run the job, not to bump.
+
 **`verify-release`** throws away every artifact and output the run produced,
 checks out nothing, re-downloads what a stranger would download, and verifies it
 with the same commands [Install](../install.md) tells a stranger to run. Its
@@ -138,6 +153,11 @@ is not a broken release: the bytes are published and correct, and the fix is the
 package's own settings page rather than a version bump. It is the only check
 here whose remedy is a click.
 
+The crates have the mirror-image problem and it is checked the same way: the
+`crates` job knows the upload returned 200, which is not the same as a stranger
+being able to resolve it. `verify-release` reads `index.crates.io` — the sparse
+index Cargo itself resolves against, not the API — for all three names.
+
 ## What is signed, and what is not
 
 | Artifact | Checksummed | Cosign | SLSA provenance |
@@ -148,6 +168,7 @@ here whose remedy is a click.
 | Image (`mira:X.Y.Z`) | digest | yes, over the digest | yes, pushed to the registry |
 | Chart (`charts/mira:X.Y.Z`) | digest | yes, over the digest | — |
 | `:artifacthub.io` metadata | — | — | — |
+| crates (`miradb*`) | registry `.crate` checksum | — | — |
 
 **Everything signed is signed over its digest, never over a tag.** A tag is a
 mutable pointer; a signature over one says nothing about the bytes that came
@@ -171,7 +192,7 @@ restates it, and the right-hand column is what stops it rotting.
 | Site | Gate |
 |---|---|
 | `Cargo.toml` `[workspace.package]` | the source |
-| `Cargo.toml` `mira-core` / `mira-proto` path-dep pins | **none** |
+| `Cargo.toml` `miradb-core` / `miradb-proto` path-dep pins | **none** |
 | `charts/mira/Chart.yaml` — `version`, `appVersion`, the scanned image tag | `make drift` |
 | `charts/mira/README.md` | generated; `make helm-docs-check` |
 | `charts/mira/tests/statefulset_test.yaml` | the chart suite fails if it disagrees |
@@ -202,9 +223,11 @@ could ship advertising an image tag that is not the one being released.
 
 ## Rehearsal, and what has never run
 
-`ci.yml`'s `release-dry-run` leg runs `make dist` — the real tarball, SBOM and
-checksum targets — on every code PR, and `workflow_dispatch` runs the whole DAG
-with `publish=false`. Both have passed.
+`ci.yml`'s `release-dry-run` leg runs `make dist` and `make publish-dry` — the
+real tarball, SBOM and checksum targets, then a full `cargo publish --workspace`
+that packages all three crates, resolves each against the one before it out of a
+temporary registry and compiles them, stopping at the upload — on every code PR.
+`workflow_dispatch` runs the whole DAG with `publish=false`. Both have passed.
 
 `publish=false` skips every network-publishing step, so as of the first tag
 these will be executing for the first time: `cosign sign`, `helm push`, the

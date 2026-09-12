@@ -22,7 +22,7 @@
 //! not against whatever the loop happened to accumulate.
 //!
 //! ```sh
-//! cargo bench -p mira-core --bench encode_bench
+//! cargo bench -p miradb-core --bench encode_bench
 //! ```
 //!
 //! Two things this deliberately does **not** do.

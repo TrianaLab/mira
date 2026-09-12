@@ -1,10 +1,13 @@
 [package]
-name = "mira"
+name = "miradb"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Mira: an OTLP-native telemetry storage engine in a single binary"
 
 [[bin]]

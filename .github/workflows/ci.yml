@@ -363,6 +363,15 @@ jobs:
       # anger, in public, with a tag already pushed that cannot be moved.
       - run: make dist
 
+      # The other half of the release, and the half that cannot be retried: a
+      # crates.io version is consumed the moment it uploads, and `cargo yank`
+      # hides it rather than freeing it. `--dry-run` packages all three crates,
+      # resolves each against the one before it out of a temporary registry and
+      # compiles them, stopping at the upload — so a manifest that only builds
+      # because a path dependency papered over it fails here, on a PR, instead
+      # of halfway through a tag that cannot be moved.
+      - run: make publish-dry
+
   helm:
     name: helm
     needs: changes

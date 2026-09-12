@@ -1,11 +1,22 @@
 [package]
-name = "mira-core"
+name = "miradb-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Mira storage engine: OTLP -> Arrow encoding, immutable block writer, zero-copy mmap reader"
+
+# The package is `miradb-core` on crates.io and the library is `mira_core` everywhere a
+# line of Rust mentions it. `mira` on crates.io is an unrelated crate from 2024,
+# so the published family had to take a different name; the code did not have to
+# learn about that. One spelling in the tree, and it is the one the directory is
+# called.
+[lib]
+name = "mira_core"
 
 [dependencies]
 mira-proto.workspace = true

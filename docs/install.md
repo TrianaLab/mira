@@ -52,6 +52,19 @@ when the running version is the one that would be installed, so running it *is*
 the check. If you installed from a package manager or from source, keep using
 that instead — this replaces a file, and it does not know what put it there.
 
+## With cargo
+
+```sh
+cargo install --locked miradb                    # -> ~/.cargo/bin/mira
+```
+
+The crate is `miradb` and the binary it installs is `mira`: `mira` on crates.io
+is an unrelated crate that has been there since 2024. Two libraries are
+published beside it for anyone embedding the engine rather than running it —
+[`miradb-core`](https://docs.rs/miradb-core) is the encoder, block writer and
+mmap reader, [`miradb-proto`](https://docs.rs/miradb-proto) is the OTLP
+bindings.
+
 ## From source
 
 The whole prerequisite list is **Rust 1.85 or newer** and a `cc`, which
@@ -66,12 +79,7 @@ script. No node toolchain: the browser UI is built and committed under
 ```sh
 git clone https://github.com/TrianaLab/mira && cd mira
 cargo install --locked --path crates/mira        # -> ~/.cargo/bin/mira
-```
-
-Or build without installing:
-
-```sh
-cargo build --release                            # -> ./target/release/mira
+cargo build --release                            # or: ./target/release/mira
 ```
 
 ## From a release

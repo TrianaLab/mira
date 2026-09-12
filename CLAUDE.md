@@ -34,7 +34,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 ```sh
 cargo test --workspace                                   # unit + in-process e2e
-cargo test -p mira --bin mira <filter>                   # NOT --lib; mira has no lib target
+cargo test -p miradb --bin mira <filter>                 # NOT --lib; miradb has no lib target
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
@@ -42,6 +42,12 @@ CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
 
 Use a separate `CARGO_TARGET_DIR` for coverage — it takes the same target-dir
 lock as a normal build, so it will block anything running in parallel.
+
+The package names are `miradb`, `miradb-core` and `miradb-proto`, because
+`mira` on crates.io is an unrelated crate from 2024. Nothing else moved: the
+binary is `mira`, the dependency keys are `mira-core`/`mira-proto`, `[lib] name`
+keeps the `use mira_core::…` spelling, and no source file mentions the registry.
+Only `-p` on a cargo command wants the published name.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the UI's `npm test` and
 build — `git diff --exit-code dist`, so a `.svelte` change that is not rebuilt is
@@ -63,7 +69,7 @@ The README states the crate count and binary size, and section 11 scores binary 
 an axis. Before and after adding any dependency:
 
 ```sh
-cargo tree -p mira --edges normal --prefix none --target aarch64-apple-darwin \
+cargo tree -p miradb --edges normal --prefix none --target aarch64-apple-darwin \
   | awk '{print $1" "$2}' | sort -u | wc -l
 ls -l target/release/mira
 ```
