@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # together.
 WORKSPACE_MEMBERS = 3
 
-# docs/ARCHITECTURE.md section 11 scores binary size as one of the four axes
+# docs/architecture.md section 11 scores binary size as one of the four axes
 # and sets the target at "<= 20 MB stripped with UI + query + MCP". That is the
 # contract; the 5.62 MiB below is merely where we are against it.
 SIZE_CEILING_BYTES = 20 * 1000 * 1000
@@ -73,21 +73,21 @@ ALLOWED_SYS_CRATES = {"zstd-sys", "core-foundation-sys"}
 # delete the line below, and either way a reviewer sees the decision.
 CRATE_COUNT_SITES = [
     "README.md",
-    "docs/ARCHITECTURE.md",
-    "docs/MARKET.md",
+    "docs/architecture.md",
+    "docs/market.md",
     "docs/index.md",
     "crates/mira/Cargo.toml",
     "crates/mira/src/term.rs",
 ]
 BINARY_SIZE_SITES = [
     "README.md",
-    "docs/ARCHITECTURE.md",
-    "docs/MARKET.md",
+    "docs/architecture.md",
+    "docs/market.md",
     "docs/index.md",
     "crates/mira/src/term.rs",
 ]
 
-# The README numbers were measured on an Apple M3 Pro (docs/ARCHITECTURE.md
+# The README numbers were measured on an Apple M3 Pro (docs/architecture.md
 # section 11 says so). A GitHub Linux runner links a measurably different
 # binary, so the exact-size gate only runs where the comparison means something.
 # Everywhere else the ceiling still applies, and the measured size is printed so
@@ -195,7 +195,7 @@ def check_crate_count(declared: int) -> None:
         fail(
             f"the dependency tree {direction} to {measured} crates but the docs "
             f"still say {declared}.\n"
-            f"    The count is a product property (README, docs/ARCHITECTURE.md "
+            f"    The count is a product property (README, docs/architecture.md "
             f"section 11). Update every site, not just the README:\n"
             + "".join(f"      {s}\n" for s in CRATE_COUNT_SITES)
         )
@@ -238,7 +238,7 @@ def check_c_toolchain() -> None:
                 "it compiles C at build time.\n"
                 "    That makes it a second C dependency, and 'zstd-sys is the "
                 "only one' is a stated property of the product (CLAUDE.md, "
-                "docs/ARCHITECTURE.md section 11). It also breaks the musl and "
+                "docs/architecture.md section 11). It also breaks the musl and "
                 "cross-compilation story in .github/workflows/release.yml."
             )
 
@@ -258,7 +258,7 @@ def check_binary_size(declared_mib: float) -> None:
     if measured > SIZE_CEILING_BYTES:
         fail(
             f"the binary is {measured_mib:.2f} MiB, over the {SIZE_CEILING_BYTES / 1e6:.0f} MB "
-            "target in docs/ARCHITECTURE.md section 11."
+            "target in docs/architecture.md section 11."
         )
 
     if sys.platform != REFERENCE_PLATFORM:
@@ -401,7 +401,7 @@ def check_chart_version(crate_version: str) -> None:
 # A comment saying "section 7.3" is a link with no href: nothing resolves it,
 # nothing breaks when the section is renumbered, and the reader is left looking
 # for a heading that no longer exists. There are ~90 of them in the tree, which
-# is too many to re-check by hand every time ARCHITECTURE.md is edited — and
+# is too many to re-check by hand every time architecture.md is edited — and
 # editing it is precisely when they rot.
 SECTION_CITE = re.compile(r"\bsection ([0-9]+(?:\.[0-9]+)*)\b")
 SECTION_HEADING = re.compile(r"^#{2,4} (?:Annex )?([0-9A-Z][0-9.]*)\.? ", re.M)
@@ -422,11 +422,11 @@ def sections_of(rel: str) -> set[str]:
 
 
 def check_section_refs() -> None:
-    arch = sections_of("docs/ARCHITECTURE.md")
+    arch = sections_of("docs/architecture.md")
 
     dangling: dict[str, list[str]] = {}
     for path in sorted(ROOT.glob("crates/*/src/*.rs")) + sorted(ROOT.glob("docs/*.md")):
-        if path.name == "ARCHITECTURE.md":
+        if path.name == "architecture.md":
             continue
         for cite in set(SECTION_CITE.findall(path.read_text())):
             if cite.rstrip(".") in arch:
@@ -436,7 +436,7 @@ def check_section_refs() -> None:
     for cite, where in sorted(dangling.items()):
         fail(
             f'"section {cite}" is cited in {", ".join(sorted(set(where)))} and '
-            "docs/ARCHITECTURE.md has no such heading.\n"
+            "docs/architecture.md has no such heading.\n"
             "    Either the section moved and the citation did not, or the "
             "citation is a typo. A cross-reference into a document is a "
             "promise about that document."

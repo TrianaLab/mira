@@ -20,7 +20,7 @@ PYTHON  ?= python3
 UI_DIR  := crates/mira/ui
 BIN     := target/release/mira
 # The load harness and the demo generator. `cargo build --release` does *not*
-# build examples, which is why docs/TESTING.md used to name a path that did not
+# build examples, which is why docs/testing.md used to name a path that did not
 # exist after the build it told you to run. One spelling, here, and every doc
 # points at `make build`.
 LOADGEN := target/release/examples/loadgen
@@ -29,7 +29,7 @@ LOADGEN := target/release/examples/loadgen
 # was last edited. It may only ever go up. Raising it is a one-line diff a
 # reviewer can see; lowering it needs an argument in the PR body. A gate set to
 # an aspiration is a gate that gets switched off the first time it goes red.
-# docs/ARCHITECTURE.md and .github/workflows/ci.yml both defer to this value.
+# docs/architecture.md and .github/workflows/ci.yml both defer to this value.
 #
 # Read it off a CI log, never off a laptop: `#[cfg]` splits the tree by host, so
 # the Linux runner measures a slightly different denominator than a Mac does and
@@ -191,7 +191,7 @@ DEMO_LOG    := $(DEMO_DIR).log
 DEMO_WINDOW ?= 45m
 # Alerting is off unless a node is pointed at a rules file, so the demo has to
 # point at one or its alert pane is empty for a reason that looks like a bug.
-# This file is also the worked example docs/CONFIG.md links to, so the demo is
+# This file is also the worked example docs/config.md links to, so the demo is
 # what keeps it honest.
 DEMO_RULES  ?= docs/e2e/alerts.kyaml
 
@@ -361,7 +361,7 @@ reference-check: reference ## Fail if a committed reference page is stale
 	@# reader gets it without a build, and a pull request that adds a route or
 	@# a config key without regenerating goes red here rather than shipping a
 	@# reference page that quietly stopped being true.
-	git diff --exit-code -- docs/reference docs/CONFIG.md
+	git diff --exit-code -- docs/reference docs/config.md
 
 # ---------------------------------------------------------------------------
 # Supply chain — the dependency budget is a product property (see CLAUDE.md)
@@ -475,6 +475,35 @@ $(VENV)/bin/mkdocs: docs/requirements.txt
 
 .PHONY: docs
 docs: $(VENV)/bin/mkdocs ## Build the docs site; --strict, so a dead link fails
+	@# mkdocs derives the URL from the filename and from nothing else, so
+	@# `docs/CONFIG.md` published a shouting route in a site whose every other
+	@# path is quiet — and one a reader who retypes it in the wrong case cannot
+	@# reach. --strict has no opinion: the page builds, every link resolves,
+	@# only the URL is wrong. Hence a gate, and before the build rather than
+	@# after, because the build is the slow half.
+	@bad=$$(find docs -name '*.md' | grep -E '/[^/]*[A-Z][^/]*\.md$$' || true); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these pages publish a route with capital letters in it:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  mkdocs takes the URL from the filename. Rename to lower case and"; \
+		echo "  update the links — \`git grep -l <OLD>.md\` finds every one."; \
+		exit 1; \
+	fi
+	@# The other half of the same rename: the site's own URL, spelled out in
+	@# full in a chart README, a --help string and two Rust error messages,
+	@# where no link checker on this repo can see it. Those are absolute and
+	@# external as far as mkdocs is concerned, so the rename above turned each
+	@# of them into a 404 in a message whose whole job is to tell someone where
+	@# to look.
+	@# `--untracked` so a file that has not been `git add`ed yet is still
+	@# checked; it keeps the standard excludes, so target/ and site/ stay out.
+	@bad=$$(git grep -nE --untracked 'miradb\.dev/[A-Za-z0-9_-]*[A-Z]' || true); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these name a site route with capital letters in it:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  every published route is lower case, so this is a 404."; \
+		exit 1; \
+	fi
 	$(VENV)/bin/mkdocs build --strict
 
 .PHONY: docs-serve
@@ -708,7 +737,7 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 #   * COPYFILE_DISABLE, because macOS tar otherwise writes ._ AppleDouble
 #     sidecars into the archive and they surface as junk on a Linux extract.
 # The size line goes to the run summary as well as stdout: README and
-# docs/ARCHITECTURE.md section 11 both quote a binary size, and a release that
+# docs/architecture.md section 11 both quote a binary size, and a release that
 # quietly doubles it should be visible without opening a log.
 
 .PHONY: dist-sbom
@@ -829,7 +858,7 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 		echo "error: $(DIST_BIN) is not a Linux binary, so the container cannot start it."; \
 		echo "  this gate runs on Linux (ci.yml's e2e leg). Locally, use \`make demo\`."; \
 		exit 1; }
-	@# The scenario docs/TESTING.md section 6 documents, run as a gate. The
+	@# The scenario docs/testing.md section 6 documents, run as a gate. The
 	@# --build-arg makes compose reuse the layers dist-image just built instead
 	@# of compiling a second time inside the Dockerfile; everything else about
 	@# the stack is exactly what a reader of that section types.

@@ -11,7 +11,7 @@ So the code is the source and these pages are the output:
 
   docs/reference/cli.md    <- `mira --help`, verbatim, from the built binary
   docs/reference/http.md   <- `.route(...)` calls + the handler's doc comment
-  docs/CONFIG.md           <- the `KNOWN` key list + `Config`'s field docs,
+  docs/config.md           <- the `KNOWN` key list + `Config`'s field docs,
                               injected between markers so the prose survives
 
 `make reference` writes them; `make reference-check` writes them and then
@@ -640,7 +640,7 @@ def humanize(expr: str) -> str:
 def known_keys() -> int:
     """How many keys the parser accepts, which is what `KNOWN` declares.
 
-    The opening sentence of `docs/CONFIG.md` counts them, and a count in prose
+    The opening sentence of `docs/config.md` counts them, and a count in prose
     is the first thing to go stale when a key is added — this one cannot,
     because it is the same array length the parser refuses everything else
     against.
@@ -781,7 +781,7 @@ def cli_page() -> str:
             # saying the same sentence a second line down.
             "",
             "Every flag here is also a config-file key:",
-            "[Configuration](../CONFIG.md) is the table, with the type, the",
+            "[Configuration](../config.md) is the table, with the type, the",
             "default and what each one sets.",
             "",
         ]
@@ -821,8 +821,8 @@ def main() -> int:
     changed = False
     changed |= write("docs/reference/cli.md", cli_page())
     changed |= write("docs/reference/http.md", http_page())
-    changed |= inject("docs/CONFIG.md", "keys", config_table())
-    changed |= inject("docs/CONFIG.md", "count", str(known_keys()))
+    changed |= inject("docs/config.md", "keys", config_table())
+    changed |= inject("docs/config.md", "count", str(known_keys()))
     check_rustdoc_links()
 
     if failures:

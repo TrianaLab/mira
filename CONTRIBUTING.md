@@ -2,7 +2,7 @@
 
 Mira is an OTLP-native telemetry storage engine in a single binary. Before a
 change that is structural — a new dependency, a new on-disk shape, a new
-mechanism — read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) section 0 and section 1.
+mechanism — read [`docs/architecture.md`](docs/architecture.md) section 0 and section 1.
 section 0 lists the mechanisms that did not survive contact with the formats, and
 re-proposing one of them is the most common way to waste an afternoon.
 [`CLAUDE.md`](CLAUDE.md) is the short version of everything below, written for
@@ -76,7 +76,7 @@ make a red build green. If your change genuinely cannot be covered, say so in
 the PR and we will look at it together rather than at the number.
 
 **The dependency budget is a product property.** The README states a crate
-count and a stripped binary size, and `docs/ARCHITECTURE.md` section 11 scores binary
+count and a stripped binary size, and `docs/architecture.md` section 11 scores binary
 size as an axis. Adding a crate is allowed; adding one silently is not — `make
 drift` compares those numbers against the tree that actually builds and fails
 when they disagree, so a PR that moves the count also updates the README bullet
@@ -104,7 +104,7 @@ New behaviour arrives with a test in the same PR. A bug fix arrives with the
 test that would have caught it.
 
 For what a unit test cannot reach — a real socket, a real exporter, real volume
-— [`docs/TESTING.md`](docs/TESTING.md) is a transcript rather than a plan: a
+— [`docs/testing.md`](docs/testing.md) is a transcript rather than a plan: a
 live binary fed by the built-in `loadgen`, then `telemetrygen`, then a stock
 OpenTelemetry Collector in front of it in Docker. Run it for anything touching
 the receivers, the wire formats or the ingest pipeline.
@@ -118,7 +118,7 @@ the receivers, the wire formats or the ingest pipeline.
   passes ~1k`. It marks the shortcut as a decision rather than an oversight,
   and it tells the next person the condition under which to revisit it. A
   shortcut with no known ceiling is not simple, it is unfinished.
-- **A non-obvious choice gets its reasoning in `docs/ARCHITECTURE.md`**, in the
+- **A non-obvious choice gets its reasoning in `docs/architecture.md`**, in the
   same diff. That file is the record of why the tree looks like this, not a
   plan for what it might become.
 - **New `unsafe` needs a `// SAFETY:` comment** stating the invariant that

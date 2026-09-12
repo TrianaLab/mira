@@ -32,7 +32,7 @@ prost.workspace = true
 
 # No criterion. It is ~40 crates of dev-dependency for a harness that would
 # report the same three percentiles this one prints, and the dependency budget
-# is a product property (docs/ARCHITECTURE.md section 11) — dev-dependencies still
+# is a product property (docs/architecture.md section 11) — dev-dependencies still
 # have to be downloaded and built by anyone who runs the test suite. The
 # upgrade path is criterion the day someone needs its regression tracking.
 [[bench]]

@@ -174,7 +174,7 @@ ingress:
   tls: []
 
 # Mira's config file. It is KYAML (principle 5) and the chart renders these
-# values into it verbatim; the keys below map one-for-one onto docs/CONFIG.md's
+# values into it verbatim; the keys below map one-for-one onto docs/config.md's
 # closed set, which is closed on purpose — an unknown key stops the process at
 # boot rather than being ignored.
 #
@@ -234,7 +234,7 @@ config:
     # clear". The chart writes it into the same ConfigMap and points
     # `alerts.rules` at the file. It is refused at `replicaCount > 1`: nothing
     # elects an evaluator, so three replicas would send three of every page.
-    # docs/CONFIG.md has the schema.
+    # docs/config.md has the schema.
     rules: ""
 
 # -- Extra environment variables, verbatim `core/v1` EnvVar entries. The reason

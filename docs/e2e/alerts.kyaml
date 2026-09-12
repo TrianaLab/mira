@@ -3,7 +3,7 @@
 # Point a node at this with `alerts.rules` in mira.yaml, or `--alerts <path>`.
 # A node with no rules file evaluates nothing and pages nobody, which is why
 # `/api/v1/alerts` answering an empty list means "alerting is off here" rather
-# than "everything is fine" — see docs/CONFIG.md.
+# than "everything is fine" — see docs/config.md.
 #
 # KYAML, so this is a JSON document with comments and unquoted keys. Every
 # `query` below is a `/api/v1/query` document, verbatim: one filter grammar for

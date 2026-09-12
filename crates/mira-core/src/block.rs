@@ -98,7 +98,7 @@ const LEGACY_VERSION: u32 = 1;
 /// The ZSTD level every compressed table is written at.
 ///
 /// The same as arrow-ipc's default, and set explicitly anyway: the ratio in
-/// `docs/ARCHITECTURE.md` section 11 is a published number, and an upstream
+/// `docs/architecture.md` section 11 is a published number, and an upstream
 /// default that moved would move it without anything in this tree changing.
 ///
 /// 3 and not higher, which was measured and rejected. Over 8 real blocks per
@@ -224,7 +224,7 @@ pub fn write_table_zstd(path: &Path, batch: &RecordBatch) -> Result<()> {
 
 /// The same again as LZ4_FRAME, so the `tier` example can price the pure-Rust
 /// alternative against the C one on real blocks. Nothing in the engine writes
-/// LZ4; see the decisions table in `docs/ARCHITECTURE.md`.
+/// LZ4; see the decisions table in `docs/architecture.md`.
 pub fn write_table_lz4(path: &Path, batch: &RecordBatch) -> Result<()> {
     write_table_with(
         path,

@@ -10,7 +10,7 @@ description: Where Mira actually sits against Loki, Tempo, VictoriaLogs, Quickwi
 a third party, on *their* hardware and *their* workload. Nobody ran Mira's
 workload and Mira ran nobody else's. Mira's own figures are single-machine
 measurements on one Apple M3 Pro (12 cores, 18 GiB), one process, generator
-co-resident — reproduce them with [the load harness](TESTING.md#3-the-load-harness).
+co-resident — reproduce them with [the load harness](testing.md#3-the-load-harness).
 
 The `=` column says whether a claim can honestly sit in the same row as Mira's.
 It is `no` for 128 of the 133 claims surveyed, and the four-word reason says why.
@@ -296,8 +296,8 @@ rather than the previous one because both were measured on real blocks and both
 lost. Every sort key tried came out at or below the unsorted ratio, because
 arrival order is time order and time already carries the locality; the attribute
 values that do repeat are dictionary-encoded already, and encoding the rest
-makes logs *worse*. ARCHITECTURE.md's ["What compresses and what does
-not"](ARCHITECTURE.md#what-compresses-and-what-does-not) has the numbers. Mira
+makes logs *worse*. architecture.md's ["What compresses and what does
+not"](architecture.md#what-compresses-and-what-does-not) has the numbers. Mira
 loses this row to a schema an operator declares up front and Mira, being
 OTLP-native, does not get to ask for.
 
@@ -341,7 +341,7 @@ path. Not a gap: a different product.
 **Ack latency with the log off.** p50 657 ms, p99 2.6 s, block-seal-bound.
 Nobody else publishes an ack latency so there is no row to lose, but the number
 is bad on its own terms and is why the write-ahead log is [the
-default](CONFIG.md#ingestwal). It stays on the list because the mode still
+default](config.md#ingestwal). It stays on the list because the mode still
 exists and someone will run it; with the log on the ack costs a `write(2)` — p50
 7.6 ms, p99 46 ms at four connections — and this row is not the shipped one.
 
@@ -450,12 +450,12 @@ sprint; each one buys something in the tables above.
 | **Profiles as a fourth signal** | Deferred, not refused, and the gate is external: the signal is Alpha and the proto is still removing fields. No placeholder table in the schema. |
 
 The reasoning behind each of these is in
-[the architecture document](ARCHITECTURE.md) — this page records the decision, not the
+[the architecture document](architecture.md) — this page records the decision, not the
 argument.
 
-[^m1]: `cargo bench -p mira-core --bench encode_bench`; [Architecture section 11](ARCHITECTURE.md#11-performance-model).
-[^m2]: `cargo run --release -p mira-core --example tier` over all 948 tables of a 7.35 GiB corpus; [Architecture section 11](ARCHITECTURE.md#11-performance-model).
-[^m3]: [Architecture section 11](ARCHITECTURE.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
+[^m1]: `cargo bench -p mira-core --bench encode_bench`; [Architecture section 11](architecture.md#11-performance-model).
+[^m2]: `cargo run --release -p mira-core --example tier` over all 948 tables of a 7.35 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
+[^m3]: [Architecture section 11](architecture.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
 [^g1]: <https://greptime.com/blogs/2026-03-24-ingestion-protocol-benchmark>
 [^g2]: <https://greptime.com/blogs/2025-03-10-log-benchmark-greptimedb>
 [^oa1]: <https://github.com/open-telemetry/otel-arrow>

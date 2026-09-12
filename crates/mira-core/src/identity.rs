@@ -29,7 +29,7 @@ use prost::Message;
 ///
 /// This list is deliberately fixed rather than configurable: an identity rule
 /// that two operators set differently is an identity rule that does not identify
-/// anything. See principle 3 in docs/ARCHITECTURE.md section 1.
+/// anything. See principle 3 in docs/architecture.md section 1.
 const IDENTITY: &[(&[&str], &[&str])] = &[
     (
         &["service.name", "service.instance.id"],

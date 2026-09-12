@@ -81,7 +81,7 @@ visible, and a `next` cursor when it filled `limit`.
 `make demo` does all of the above with a four-service shop scenario and a working alert
 rule. The whole end-to-end story, including the OpenTelemetry project's own
 `telemetrygen` and a stock Collector in front of Mira in Docker, is
-[docs/TESTING.md](docs/TESTING.md).
+[docs/testing.md](docs/testing.md).
 
 ## The three surfaces
 
@@ -178,7 +178,7 @@ into it without anything being saved server-side.
 | `--config FILE` | KYAML; flags override it |
 
 Everything a flag sets, the config file sets too, with `${env:VAR,default}`
-interpolation — [docs/CONFIG.md](docs/CONFIG.md) is the whole surface.
+interpolation — [docs/config.md](docs/config.md) is the whole surface.
 
 ### MCP — `POST /mcp`
 
@@ -198,7 +198,7 @@ the failing dependency: **[docs/agents.md](docs/agents.md)**.
 
 Four pillars. Every number in them is measured on this machine and reproducible with the
 load harness in this repository; the reasoning behind each choice is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/architecture.md](docs/architecture.md).
 
 **1. Agentic memory, and native MCP.** `POST /mcp` speaks JSON-RPC and exposes eight
 tools — `query_records`, `get_trace`, `query_metric`, `list_metrics`, `correlate`,
@@ -317,7 +317,7 @@ machine does not get to be quiet: managed daemons and a container VM hold two to
 cores throughout. That is not a footnote — an earlier pass of this identical sweep,
 taken while a 294%-CPU virtual machine was running, read 1,165,623 at four connections,
 20% low, with nothing in the output to say so. The full sweep, the per-pass spreads and
-what to quote from your own run are in [docs/TESTING.md](docs/TESTING.md).
+what to quote from your own run are in [docs/testing.md](docs/testing.md).
 
 Query rows are one store — the 7.35 GiB the four-connection run left behind, 28.8M logs
 and 28.8M spans in 180 blocks — and they are steady-state, with all of it in page cache.
@@ -328,7 +328,7 @@ I/O; on this machine the data never leaves RAM once it has been read, and short 
 `purge` there is no way back to a genuinely cold cache.
 
 Three things moved these numbers, and the reasoning for each is in
-[architecture section 11](docs/ARCHITECTURE.md#11-performance-model): Bloom sidecars took the
+[architecture section 11](docs/architecture.md#11-performance-model): Bloom sidecars took the
 absent-value case from 10.4 s to single-digit milliseconds; zone maps took the ordering
 predicate from 81.6 ms to about 1 ms; and one `madvise(MADV_WILLNEED)` took the
 unprunable full scan from 10.1 s to under 2 s on the first call, because `mmap` was
@@ -423,7 +423,7 @@ a bill, 8.38x for a ratio, and neither as a head-to-head.
 ## Scope
 
 Three boundaries worth knowing before you deploy it. The full list, with the reasoning,
-is [architecture section 0.1](docs/ARCHITECTURE.md#01-what-is-not-true-yet).
+is [architecture section 0.1](docs/architecture.md#01-what-is-not-true-yet).
 
 - **Ingestion is not zero-copy** — that is not achievable through protobuf, since `prost`
   memcpies every string unconditionally. *Queries* are zero-copy; ingestion is
@@ -456,7 +456,7 @@ make            # the target list
 make check      # fmt, clippy, tests, rustdoc, UI, supply chain, drift, docs, coverage
 ```
 
-Read [architecture section 0](docs/ARCHITECTURE.md#0-corrections-to-the-original-brief) first if the change is
+Read [architecture section 0](docs/architecture.md#0-corrections-to-the-original-brief) first if the change is
 structural — it lists the mechanisms from the original brief that do not survive contact
 with the formats, and re-proposing one is the most common way to waste an afternoon.
 [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough; releases are in

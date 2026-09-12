@@ -167,10 +167,10 @@ That is a StatefulSet of one, a PVC, and one Service carrying both ports. No
 operator, no sidecar, no CRDs and nothing to elect: Mira holds no coordination
 state, so the chart has nothing to coordinate. Configuration is the same KYAML
 document as everywhere else, rendered into a ConfigMap — the `config.*` values
-are [Configuration](CONFIG.md)'s keys, camelCased per Helm convention
+are [Configuration](config.md)'s keys, camelCased per Helm convention
 (`ingest.max_request_bytes` is `config.ingest.maxRequestBytes`), and how much
 CPU, memory and disk to give it is [that page's sizing
-table](CONFIG.md#sizing), every row anchored to a measured point.
+table](config.md#sizing), every row anchored to a measured point.
 
 The chart is signed the same way the binaries are:
 
@@ -202,7 +202,7 @@ FUSE is a warning rather than a refusal, because the magic number cannot tell
 That rules out an RWX PVC on Kubernetes — which is why the chart's
 `persistence.accessMode` offers only the two ReadWriteOnce modes, and why its
 `persistence.storageClass` should name a block-backed class.
-[Configuration](CONFIG.md) has the topology that works instead.
+[Configuration](config.md) has the topology that works instead.
 
 ## Check it runs
 

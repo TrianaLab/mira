@@ -20,7 +20,7 @@ targets = [
     "aarch64-apple-darwin",
 ]
 # Every feature, because every feature is a build somebody can run: the only
-# optional one is `webhook-tls` (docs/CONFIG.md), and a supported build whose
+# optional one is `webhook-tls` (docs/config.md), and a supported build whose
 # dependencies were never audited is the worst of both — off by default, so
 # nobody notices, and buildable, so somebody ships it. `make audit` passes
 # `--all-features` too; this line is here so a bare `cargo deny check` cannot
@@ -81,7 +81,7 @@ exceptions = []
 
 [bans]
 # Two versions of the same crate is two copies in the binary, and binary size
-# is one of the four axes (docs/ARCHITECTURE.md section 11). It is also the early
+# is one of the four axes (docs/architecture.md section 11). It is also the early
 # warning for the failure the Arrow pin exists to prevent: two majors of
 # arrow-array means `RecordBatch` is two different types and the compiler
 # error is unreadable.
@@ -106,7 +106,7 @@ skip = [
     # `--features webhook-tls` only, and the one place that build is measurably
     # worse than the default: `ring` pins getrandom 0.2 while arrow's `ahash`
     # is on 0.3, so a TLS binary carries two copies of a syscall wrapper. The
-    # published artifacts are the default build (README, docs/CONFIG.md), so
+    # published artifacts are the default build (README, docs/config.md), so
     # nothing anybody downloads pays for this. It goes away when `ring` moves
     # to getrandom 0.3.
     { crate = "getrandom@0.2", reason = "ring, behind the optional webhook-tls feature; not in the published binaries" },

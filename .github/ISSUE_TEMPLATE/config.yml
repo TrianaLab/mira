@@ -10,13 +10,13 @@ contact_links:
     about: Private, maintainers only. Never open a public issue for one — see SECURITY.md.
 
   - name: Why the tree looks like this
-    url: https://github.com/TrianaLab/mira/blob/main/docs/ARCHITECTURE.md
+    url: https://github.com/TrianaLab/mira/blob/main/docs/architecture.md
     about: section 0 lists the mechanisms that did not survive contact with the formats, and what replaced them.
 
   - name: Configuration reference
-    url: https://github.com/TrianaLab/mira/blob/main/docs/CONFIG.md
+    url: https://github.com/TrianaLab/mira/blob/main/docs/config.md
     about: Every flag and every KYAML key, with the env interpolation syntax.
 
   - name: Testing against a live instance
-    url: https://github.com/TrianaLab/mira/blob/main/docs/TESTING.md
+    url: https://github.com/TrianaLab/mira/blob/main/docs/testing.md
     about: Reproduce with synthetic data, telemetrygen or a stock Collector before filing.

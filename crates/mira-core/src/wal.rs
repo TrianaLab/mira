@@ -1,7 +1,7 @@
 //! The write-ahead log, which exists to decouple the acknowledgement from the
 //! seal.
 //!
-//! # Why this exists, given `docs/ARCHITECTURE.md` section 4 says "No WAL"
+//! # Why this exists, given `docs/architecture.md` section 4 says "No WAL"
 //!
 //! section 4's argument is about *recovery*, and it is still correct: a block
 //! directory is renamed into place atomically, so there is no torn state and

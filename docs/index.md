@@ -61,7 +61,7 @@ transformation step for a field to fall out of.
 | [Install](install.md) | one script, a container, or `cargo install` |
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
 | [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
-| [Configuration](CONFIG.md) | eleven keys, KYAML, `${env:…}` interpolation |
-| [End-to-end testing](TESTING.md) | a live binary, a real collector, the load harness |
-| [Architecture](ARCHITECTURE.md) | the reasoning behind every non-obvious choice |
-| [Market position](MARKET.md) | who else is in this space, and where the line is |
+| [Configuration](config.md) | eleven keys, KYAML, `${env:…}` interpolation |
+| [End-to-end testing](testing.md) | a live binary, a real collector, the load harness |
+| [Architecture](architecture.md) | the reasoning behind every non-obvious choice |
+| [Market position](market.md) | who else is in this space, and where the line is |

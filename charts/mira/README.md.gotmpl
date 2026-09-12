@@ -63,7 +63,7 @@ EBS `gp3`, GCE PD, Azure Disk). `persistence.enabled=false` swaps in an
 
 The defaults below — `500m` CPU, `512Mi` requested, `2Gi` limit, a `20Gi` PVC —
 are the "a team's services" row of
-[the sizing table](https://miradb.dev/CONFIG/#sizing), which is measured rather
+[the sizing table](https://miradb.dev/config/#sizing), which is measured rather
 than guessed and gives CPU, memory and disk per day against the record rate.
 Two things it will tell you that are not obvious from here: memory tracks the
 number of concurrent exporters and not the ingest rate at all, and the on-disk
@@ -86,7 +86,7 @@ Mira's config file is KYAML (a strict subset of YAML 1.2, so a JSON superset).
 The chart renders `config.*` into it and mounts it at `/etc/mira/mira.yaml`; the
 pod's whole command line is `--config /etc/mira/mira.yaml`. The keys under
 `config` are the closed set from
-[Configuration](https://miradb.dev/CONFIG/) —
+[Configuration](https://miradb.dev/config/) —
 an unknown key stops Mira at boot rather than being ignored, and this chart's
 `values.schema.json` is closed for the same reason.
 

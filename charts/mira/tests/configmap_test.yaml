@@ -1,6 +1,6 @@
 # The ConfigMap is the whole of Mira's configuration, and its format is not
 # free-form: KYAML wants every scalar quoted, and Mira refuses a value that
-# arrived as a number or a boolean instead of coercing it (docs/CONFIG.md). A
+# arrived as a number or a boolean instead of coercing it (docs/config.md). A
 # template that renders `wal: false` rather than `"false"` therefore does not
 # misconfigure the node, it stops it from booting — so the assertion that
 # matters is on the exact bytes, not on the keys.
