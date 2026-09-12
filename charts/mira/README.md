@@ -1,6 +1,6 @@
 # mira
 
-![Version: 0.0.2](https://img.shields.io/badge/Version-0.0.2-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.0.2](https://img.shields.io/badge/AppVersion-0.0.2-informational?style=flat-square)  [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira)
+![Version: 0.0.3](https://img.shields.io/badge/Version-0.0.3-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.0.3](https://img.shields.io/badge/AppVersion-0.0.3-informational?style=flat-square)  [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira)
 
 OTLP-native telemetry storage engine in a single binary — OTLP in, immutable Arrow blocks out, queried straight from mmap. One StatefulSet, one data directory, no sidecar and nothing to coordinate.
 
@@ -30,7 +30,7 @@ Pin the version:
 
 ```bash
 helm install mira oci://ghcr.io/trianalab/charts/mira \
-  --version 0.0.2 \
+  --version 0.0.3 \
   --namespace observability --create-namespace
 ```
 
@@ -142,7 +142,7 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira:0.0.2
+  ghcr.io/trianalab/charts/mira:0.0.3
 ```
 
 ## Values
@@ -152,8 +152,9 @@ cosign verify \
 | affinity | object | `{}` | Affinity rules. Worth setting when `replicaCount > 1` and the volumes are node-local: two replicas on one node share that node's disk bandwidth and die together. |
 | config.alerts.rules | string | `""` | The alert rules document, inline, in KYAML. Empty means this node evaluates nothing and pages nobody, which is the default and is why an empty `/api/v1/alerts` means "alerting is off here" rather than "all clear". The chart writes it into the same ConfigMap and points `alerts.rules` at the file. It is refused at `replicaCount > 1`: nothing elects an evaluator, so three replicas would send three of every page. docs/config.md has the schema. |
 | config.ingest.maxRequestBytes | string | `"16MiB"` | The largest export Mira will decode, on either port. 16MiB is eight times axum's default and four times tonic's, and comfortably above what a stock collector produces at its own default batch size. Too low is worse than it sounds: 4318 answers 413, which OTLP classes as permanent, so the exporter drops the batch instead of retrying it. |
-| config.ingest.queue | int | `128` | How many exports may be waiting for one signal's flusher. A full queue parks the next export for up to five seconds rather than refusing it, so this buys burst absorption and not throughput. Each slot can hold a decoded export, so the worst case is this times `maxRequestBytes` times three signals resident — check it against `resources.limits.memory` before raising it. |
-| config.ingest.wal | bool | `true` | Write-ahead log. Off means an export is acknowledged only once it is in a sealed, fsynced block — p99 around 2.4s, and read-your-writes holds. On means acknowledged once written to the log — p99 under 5ms, survives the process dying, does not survive the machine dying for up to 250ms, and what you just sent is not queryable yet. Both are correct; no measurement here can pick for you, so this is the binary's own default rather than a second opinion from the chart. |
+| config.ingest.queue | int | `128` | How many exports may be waiting for one signal's flushers. A full queue parks the next export for up to five seconds rather than refusing it, so this buys burst absorption and not throughput. Each slot can hold a decoded export, so the worst case is this times `maxRequestBytes` times three signals resident — check it against `resources.limits.memory` before raising it. |
+| config.ingest.shards | int | `0` | How many flusher tasks each signal runs, or 0 for one per two cores as the process sees them. A `resources.limits.cpu` quota is read correctly on its own, so leave this at 0 if you set one. It is for the cases that are not a quota: a `cpu.shares`/`cpu.weight` relative weight, or no limit at all on a large node, both of which read as the whole machine — on a 96-core node that is the capped sixteen flushers per signal for a pod that will get two cores. Set it to the whole cores the pod actually gets. Shards split `queue` between them rather than multiplying it, so the memory arithmetic above does not move; 16 is the ceiling the engine enforces. |
+| config.ingest.wal | bool | `true` | Write-ahead log. Off means an export is acknowledged only once it is in a sealed, fsynced block — p99 around 2.6s, and read-your-writes holds. On means acknowledged once written to the log — p99 under 5ms, survives the process dying, does not survive the machine dying for up to 250ms, and what you just sent is not queryable yet. Both are correct; no measurement here can pick for you, so this is the binary's own default rather than a second opinion from the chart. |
 | config.node | string | `"${env:POD_NAME}"` | This replica's name. It is hashed into every block directory name, which is what lets replicas share a volume without coordinating, so it has to be unique per pod. `POD_NAME` comes from the downward API rather than `HOSTNAME`, which is set by the container runtime and not guaranteed by Kubernetes — and a missing `${env:...}` with no default is a startup error, by design, so guessing is not an option. |
 | config.storage.retention | string | `"7d"` | How long to keep data. Units are `ms`, `s`, `m`, `h` or `d`, and a bare number is seconds. Seven days is the default the engine ships with; it is the only knob standing between an export rate and a full volume. |
 | config.telemetry.interval | string | `"15s"` | How often it samples, when `self` is on. Same duration syntax as `storage.retention`. |

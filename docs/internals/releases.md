@@ -250,7 +250,7 @@ commit: `helm package --version/--app-version` overrides two of `Chart.yaml`'s
 three version fields, but not the `artifacthub.io/images` annotation, so a chart
 could ship advertising an image tag that is not the one being released.
 
-## Rehearsal, and what has never run
+## Rehearsal, and what only the tag can run
 
 `ci.yml`'s `release-dry-run` leg runs `make dist` and `make publish-dry` — the
 real tarball, SBOM and checksum targets, then a full `cargo publish --workspace`
@@ -262,10 +262,9 @@ temporary registry and compiles them, stopping at the upload — on every code P
 `helm push`, the `Digest:` scrape off `helm push`'s stderr and the Artifact Hub
 `oras push` were all executing for the first time on v0.0.1. All four worked.
 
-What is still unexercised is the `crates` job: v0.0.1 was tagged before the job
-existed, so 0.0.2 is the first release whose `make publish` actually uploads.
-That step is unrehearsable by construction — `publish-dry` does everything
-except the one irreversible thing — and the anonymous-pull check added *after*
-v0.0.1 is likewise running for the first time on a coordinate it has not seen.
-`verify-release` fails loudly if either is wrong, and recovery is a bump to the
-next patch.
+The `crates` job and the anonymous-pull check both ran for the first time on
+v0.0.2, which is also the first release whose `make publish` actually uploaded.
+Both worked. That upload is unrehearsable by construction — `publish-dry` does
+everything except the one irreversible thing — so every release after it is
+still trusting a step that only the tag can run. `verify-release` fails loudly
+when it is wrong, and recovery is a bump to the next patch.

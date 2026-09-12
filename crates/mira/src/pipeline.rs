@@ -19,7 +19,7 @@
 //! the block directory rename is durable, because OTLP's retryable status set
 //! covers exports in flight at a crash — acking earlier is the one window where
 //! data is lost with the client believing it was stored. That costs a whole
-//! `max_block_age` at the tail, which is section 11's 2.4 s p99. With a log the frame
+//! `max_block_age` at the tail, which is section 11's 2.6 s p99. With a log the frame
 //! *is* the durable record, the publish is a background reorganisation of data
 //! that is already safe, and the ack costs a `write(2)`. Everything else here —
 //! the queue, the carry, the failure contract — is identical either way.
@@ -34,7 +34,6 @@ use mira_core::block;
 use mira_core::signal::Open;
 use mira_core::wal::{self, Wal};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
 /// Engine configuration.
@@ -56,7 +55,25 @@ pub struct Config {
     pub retention: Duration,
     /// How many exports may wait for one signal's flusher. See
     /// `crate::config::Config::queue`, which is where the reasoning is.
+    ///
+    /// Split across [`shards`](Self::shards), so the number an operator sets is
+    /// still the number of decoded exports this signal can be holding.
     pub queue: usize,
+    /// How many flusher tasks one signal runs, each with its own channel, open
+    /// block and block sequence.
+    ///
+    /// One per core, not one per resource hash — section 4's "A note on
+    /// sharding" is explicit about which of those is the right unit, and the
+    /// reason is that resource cardinality in real fleets is bimodal, so a hash
+    /// gives a permanently hot shard and a small-file explosion in the tail.
+    /// Files per flush interval should be a function of core count, known at
+    /// startup, not of the customer's topology.
+    ///
+    /// One, not `available_parallelism`, by default: `main` resolves the real
+    /// number from `ingest.shards` and the core count, and everything that
+    /// builds a `Config` by hand — every unit test, every e2e node — wants the
+    /// deterministic one block per seal that a single shard gives.
+    pub shards: usize,
     /// The write-ahead log, shared by all three signals, or `None` to
     /// acknowledge on the block publish as Mira always has.
     ///
@@ -67,8 +84,10 @@ pub struct Config {
     /// recoverable. A flag that let those disagree would only be able to
     /// express wrong answers.
     ///
-    /// Off by default. Turning it on trades read-your-writes — see
-    /// `mira_core::wal`'s module docs — and that repair has not landed.
+    /// Off by default. Turning it on would trade read-your-writes away — see
+    /// `mira_core::wal`'s module docs — were it not for
+    /// `mira_core::query::search_open`, which scans the flusher's open builder
+    /// alongside the sealed blocks and buys it back.
     pub wal: Option<Arc<Wal>>,
 }
 
@@ -81,6 +100,7 @@ impl Default for Config {
             max_block_age: Duration::from_secs(2),
             retention: Duration::from_secs(7 * 24 * 3600),
             queue: 128,
+            shards: 1,
             wal: None,
         }
     }
@@ -92,8 +112,9 @@ pub(crate) struct Job<R> {
     req: R,
     ack: oneshot::Sender<Result<(), Rejected>>,
     /// The log sequence this export was framed at, if there is a log. The
-    /// flusher takes the maximum over a block and publishes one past it as
-    /// `wal_hi`.
+    /// flusher collects them per block and asks `Wal::watermark_for` what
+    /// `wal_hi` that set permits — not the maximum over the block, which would
+    /// step over an older frame a sibling shard is still holding.
     wal_seq: Option<u64>,
 }
 
@@ -102,18 +123,27 @@ pub struct Ingest<R> {
     // `pub(crate)` so a test can build one around a queue it controls; see
     // [`Job`]. Nothing outside this module constructs one in anger — `spawn`
     // is the only supported way to get a handle.
-    pub(crate) tx: mpsc::Sender<Job<R>>,
+    //
+    // One sender per flusher shard, and never empty. `Arc<[_]>` rather than
+    // `Vec` because every receiver holds a clone of this handle and the shard
+    // count is fixed at startup.
+    pub(crate) tx: Arc<[mpsc::Sender<Job<R>>]>,
+    /// Where the next export that cannot go to shard 0 starts looking. Shared
+    /// across clones, because the point of it is to spread waiters over shards
+    /// rather than over handles.
+    pub(crate) turn: Arc<AtomicU64>,
     pub(crate) rejects: &'static Rejects,
     pub(crate) wal: Option<Arc<Wal>>,
     pub(crate) signal: wal::Signal,
 }
 
 // Derived `Clone` would demand `R: Clone`, which no export request is. Only the
-// `Sender` is cloned, and that is unconditional.
+// `Sender`s are cloned, and that is unconditional.
 impl<R> Clone for Ingest<R> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            turn: self.turn.clone(),
             rejects: self.rejects,
             wal: self.wal.clone(),
             signal: self.signal,
@@ -216,13 +246,31 @@ pub struct Rejects {
     pub published: AtomicU64,
     pub rows: AtomicU64,
     pub bytes: AtomicU64,
-    /// Unix second the currently open block took its first row, or 0 if nothing
-    /// is open. An age that keeps growing past `max_block_age` is a flusher that
-    /// is not flushing.
+    /// Unix second the oldest currently open block of this signal took its
+    /// first row, or 0 if nothing is open. An age that keeps growing past
+    /// `max_block_age` is a flusher that is not flushing.
+    ///
+    /// Derived from [`shard_open_since`](Self::shard_open_since) and not
+    /// written directly by a
+    /// flusher: with more than one shard per signal, a shard that has just
+    /// sealed would otherwise clear a sibling's clock and the stuck flusher
+    /// this number exists to expose would read as healthy. The oldest of them,
+    /// because the question it answers is "is anything stuck".
     pub open_since: AtomicU64,
     /// Unix second of the first publish failure in the current run of them, or 0
-    /// if the last publish worked. See [`UNREADY_AFTER`].
+    /// if the last publish worked. See [`UNREADY_AFTER`]. Derived like
+    /// `open_since`, and for the same reason.
     pub stalled_since: AtomicU64,
+    /// What each flusher shard actually writes; the two above are the oldest of
+    /// each.
+    ///
+    /// Fixed arrays rather than ones sized at `spawn`: these live in a `static`
+    /// that outlives every flusher and is re-entered by the next test in the
+    /// process, so a `OnceLock` sized by whoever spawned first would be the
+    /// wrong length for whoever spawns second. [`MAX_SHARDS`] pairs is 256
+    /// bytes a signal.
+    shard_open_since: [AtomicU64; MAX_SHARDS],
+    shard_stalled_since: [AtomicU64; MAX_SHARDS],
     /// Rate-limit gates, one per line that can fire per export.
     warned: AtomicU64,
     refuse_warned: AtomicU64,
@@ -240,21 +288,73 @@ impl Rejects {
             bytes: AtomicU64::new(0),
             open_since: AtomicU64::new(0),
             stalled_since: AtomicU64::new(0),
+            shard_open_since: [const { AtomicU64::new(0) }; MAX_SHARDS],
+            shard_stalled_since: [const { AtomicU64::new(0) }; MAX_SHARDS],
             warned: AtomicU64::new(0),
             refuse_warned: AtomicU64::new(0),
         }
     }
 
-    /// Start the clock on a run of failures, or leave it where it is.
+    /// The oldest non-zero timestamp any shard is reporting, or 0 if none is.
+    ///
+    /// Recomputed on every write rather than on every read because the readers
+    /// are `/healthz`, `/metrics` and the TUI — three calls a second between
+    /// them against a hot loop — and [`MAX_SHARDS`] relaxed loads is cheaper
+    /// than the branch that would decide when to skip it.
+    fn oldest(slots: &[AtomicU64; MAX_SHARDS]) -> u64 {
+        slots
+            .iter()
+            .map(|t| t.load(Relaxed))
+            .filter(|&t| t != 0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Report when `shard`'s open block took its first row, or 0 for "nothing
+    /// open".
+    fn set_open_since(&self, shard: usize, at: u64) {
+        self.shard_open_since[shard].store(at, Relaxed);
+        self.open_since
+            .store(Self::oldest(&self.shard_open_since), Relaxed);
+    }
+
+    /// Start the clock on a run of failures in `shard`, or leave it where it is.
     ///
     /// Not a `store`: readiness is about how *long* this has been going on, so
     /// the timestamp that matters is the first failure of the run, not the
-    /// latest. One flusher owns each of these, so the compare-exchange cannot
+    /// latest. One flusher owns each shard slot, so the compare-exchange cannot
     /// lose a race — it is here to keep the first value.
-    fn mark_stalled(&self) {
-        let _ = self
-            .stalled_since
-            .compare_exchange(0, now_secs().max(1), Relaxed, Relaxed);
+    fn mark_stalled(&self, shard: usize) {
+        let _ = self.shard_stalled_since[shard].compare_exchange(
+            0,
+            now_secs().max(1),
+            Relaxed,
+            Relaxed,
+        );
+        self.stalled_since
+            .store(Self::oldest(&self.shard_stalled_since), Relaxed);
+    }
+
+    /// Zero every open-block clock, shard slots included.
+    ///
+    /// Only the in-process end-to-end harness calls this — see
+    /// `e2e::forget_open_blocks` for why it has to. Clearing the aggregate
+    /// alone would not do it: the next shard to open a block recomputes the
+    /// aggregate from the slots, and a dead flusher's slot would come back.
+    #[cfg(test)]
+    pub fn forget_open(&self) {
+        for t in &self.shard_open_since {
+            t.store(0, Relaxed);
+        }
+        self.open_since.store(0, Relaxed);
+    }
+
+    /// `shard` stored a block, so its run of failures is over. The signal is
+    /// only unstalled once every shard's is.
+    fn clear_stalled(&self, shard: usize) {
+        self.shard_stalled_since[shard].store(0, Relaxed);
+        self.stalled_since
+            .store(Self::oldest(&self.shard_stalled_since), Relaxed);
     }
 
     fn record_shed(&self) {
@@ -305,6 +405,30 @@ pub fn stalled() -> Option<(&'static str, u64)> {
         .find_map(|r| stall_of(r, now).map(|secs| (r.signal, secs)))
 }
 
+impl<R> Ingest<R> {
+    /// A slot in the first shard that has one, or `None` if every shard is full
+    /// or gone.
+    ///
+    /// First fit from shard 0 rather than round-robin, and that is the whole
+    /// sharding policy. Round-robin spreads a trickle of exports over every
+    /// shard, and since each shard owns its own open block, a node doing two
+    /// exports a second would publish `shards` nearly-empty blocks every
+    /// `max_block_age` instead of one — the small-file explosion section 4
+    /// rejects hash sharding for, arrived at from the other direction. First
+    /// fit keeps a node that is not saturating one flusher behaving exactly as
+    /// it did with one, and starts using the second shard at the moment the
+    /// first one's queue stops draining, which is the moment the consumer's
+    /// service time became the curve.
+    ///
+    /// Ordering across shards is not preserved and does not need to be: two
+    /// exports are two OTLP requests, the spec orders neither against the
+    /// other, and block timestamps come from the data. Ordering *within* a
+    /// shard still is, which is what the carry rule in [`flusher`] needs.
+    fn reserve(&self) -> Option<mpsc::Permit<'_, Job<R>>> {
+        self.tx.iter().find_map(|tx| tx.try_reserve().ok())
+    }
+}
+
 impl<R: prost::Message> Ingest<R> {
     /// Enqueue and wait for durability.
     ///
@@ -312,7 +436,7 @@ impl<R: prost::Message> Ingest<R> {
     /// Without a log this returns once the block containing the request has
     /// been fsynced and renamed into place, which is correct and costs a whole
     /// `max_block_age` at the tail. With one it returns once the request is a
-    /// frame in the log's page cache, which is section 11's 2.4 s p99 turned into
+    /// frame in the log's page cache, which is section 11's 2.6 s p99 turned into
     /// microseconds and is why the log exists.
     pub async fn submit(&self, req: R) -> Result<(), Rejected> {
         let (ack, wait) = oneshot::channel();
@@ -332,10 +456,17 @@ impl<R: prost::Message> Ingest<R> {
         // Before the log append, not after: an export shed here never happened,
         // whereas one framed and then shed would be replayed into a node whose
         // client has already retried it elsewhere.
-        let permit = match self.tx.try_reserve() {
-            Ok(p) => p,
-            Err(mpsc::error::TrySendError::Full(())) => {
-                match tokio::time::timeout(ADMIT_WAIT, self.tx.reserve()).await {
+        let permit = match self.reserve() {
+            Some(p) => p,
+            // Every shard is full. Park on one of them rather than on all of
+            // them: `reserve` is not cancel-safe enough to race K of them and
+            // drop the losers' permits, and at this point the choice of shard
+            // does not matter — they are all behind their flusher. The turn
+            // counter spreads the parked waiters so they wake as each drains
+            // rather than all behind the same one.
+            None => {
+                let i = self.turn.fetch_add(1, Relaxed) as usize % self.tx.len();
+                match tokio::time::timeout(ADMIT_WAIT, self.tx[i].reserve()).await {
                     Ok(Ok(p)) => p,
                     Ok(Err(_)) => return Err(Rejected::Closed),
                     Err(_) => {
@@ -344,7 +475,6 @@ impl<R: prost::Message> Ingest<R> {
                     }
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(())) => return Err(Rejected::Closed),
         };
         if let Some(wal) = &self.wal {
             // Re-encoded, not the bytes off the wire: tonic decodes before the
@@ -415,14 +545,45 @@ impl<R: prost::Message + Default> Ingest<R> {
     /// frame; [`Rejected::Closed`] is the flusher being gone, which means the
     /// rest of the replay would go nowhere.
     pub fn replay(&self, body: &[u8], seq: u64) -> Result<(), Rejected> {
-        let req = R::decode(body).map_err(|e| Rejected::Failed(e.to_string()))?;
-        self.tx
-            .blocking_send(Job {
-                req,
-                ack: oneshot::channel().0,
-                wal_seq: Some(seq),
-            })
-            .map_err(|_| Rejected::Closed)
+        // Back among the unpublished before it is decoded, let alone queued, for
+        // the same reason `submit` numbers and enqueues under one lock: a shard
+        // that sealed in between would compute a watermark that steps over this
+        // frame.
+        if let Some(w) = &self.wal {
+            w.reframed(self.signal, seq);
+        }
+        let req = match R::decode(body) {
+            Ok(r) => r,
+            Err(e) => {
+                // Retired on the spot, and that is a decision rather than a
+                // leak. This frame will not decode on this boot and will not
+                // decode on any other, so leaving it unpublished would hold the
+                // signal's watermark at its sequence for the life of the volume
+                // — and every frame published after it would be replayed again
+                // on every boot, duplicating stored data to keep re-reading one
+                // that never becomes readable. `main::replay` says out loud that
+                // those exports are gone; this is the line that makes it true.
+                if let Some(w) = &self.wal {
+                    w.published(self.signal, &[seq]);
+                }
+                return Err(Rejected::Failed(e.to_string()));
+            }
+        };
+        let job = Job {
+            req,
+            ack: oneshot::channel().0,
+            wal_seq: Some(seq),
+        };
+        // First fit like `submit`, falling back to blocking on shard 0. Replay
+        // is the one caller that must not shed, so the bounded channel is the
+        // pacing: see the note above about decoding a multi-gigabyte log.
+        match self.reserve() {
+            Some(p) => {
+                p.send(job);
+                Ok(())
+            }
+            None => self.tx[0].blocking_send(job).map_err(|_| Rejected::Closed),
+        }
     }
 }
 
@@ -431,54 +592,217 @@ impl<R: prost::Message + Default> Ingest<R> {
 /// encoder exists is harmless.
 pub const SIGNALS: [&str; 3] = ["logs", "traces", "metrics"];
 
-/// Start one signal's ingest pipeline. Returns the handle its receivers push
-/// into. Each signal gets its own channel, flusher task and block sequence, so a
-/// slow flush on one cannot stall another.
+/// The most flusher shards one signal will run.
 ///
-/// The `JoinHandle` is the shutdown contract: drop every [`Ingest`] clone and the
-/// flusher seals whatever is open, acks everyone waiting on it and returns. A
-/// caller that exits without awaiting it turns a graceful stop into a reset for
-/// those waiters.
-pub fn spawn<B: SignalBuilder>(cfg: Arc<Config>) -> (Ingest<B::Request>, OpenSlot, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel(cfg.queue);
+/// A ceiling, not a target: it sizes the per-shard health clocks in a `static`
+/// and it bounds how many blocks a signal can publish per flush interval. Above
+/// this the flushers are no longer the bottleneck — the decode in front of them
+/// is — and every extra shard is another open block's worth of resident memory
+/// against the footprint axis. Sixteen is also `mira_core::query`'s scan fanout,
+/// and a machine wide enough to want more of one wants more of both.
+pub const MAX_SHARDS: usize = 16;
+
+/// How many flusher shards to run, given the configured value and what the
+/// machine reports.
+///
+/// Zero means "ask the machine", which is the default and the only value
+/// `config.rs` documents as auto. The count is a function of core count and
+/// nothing else — not of the resource cardinality, not of the connection count
+/// — which is section 4's rule for what a shard may be keyed on.
+///
+/// Halved, because a shard is a *consumer*: the producers are the decode
+/// and the runtime's own work, and giving every core a flusher leaves nothing
+/// to feed them. Section 11 measured 1.56M records/s on 2.18 cores with one
+/// flusher per signal, so the transcode is around a third of the total and
+/// three consumers per two producers would be an idle two-thirds.
+pub fn shard_count(configured: usize, cores: usize) -> usize {
+    match configured {
+        0 => (cores / 2).clamp(1, MAX_SHARDS),
+        n => n.min(MAX_SHARDS),
+    }
+}
+
+/// The handle over one signal's flusher shards: what a single `JoinHandle`
+/// meant when there was one of them, kept true now that there are several.
+///
+/// Awaiting it resolves when every shard has stopped; `abort` — test-only, see
+/// below — stops them all where they stand. A [`JoinSet`](tokio::task::JoinSet) and not
+/// a task that awaits a `Vec` of handles, because that shape gets the second
+/// half wrong: aborting such a task drops only its own future, so the shards
+/// keep running, and a shard that outlives the node it belonged to watches its
+/// senders drop, reads that as a graceful close, and seals a block — under a
+/// sequence, and into a staging directory, that the successor node is already
+/// using.
+pub struct Flushers(tokio::task::JoinSet<()>);
+
+/// Dropping the handle detaches, as dropping a `JoinHandle` does — a `JoinSet`
+/// on its own would abort instead. Read-only test harnesses build a node and
+/// keep only the parts they query; turning that into "and stop ingesting" would
+/// be a trap, and every caller that means to stop has one of the two ways to
+/// say so above.
+impl Drop for Flushers {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
+impl Flushers {
+    /// Stop every shard where it stands. Nothing is sealed; what survives is
+    /// whatever the log already holds — which is the claim every test that
+    /// calls this is making.
+    ///
+    /// Test-only, and that is not an oversight: the binary sets
+    /// `panic = "abort"`, so in production a flusher that stops without being
+    /// asked takes the process with it and there is nobody left to abort.
+    #[cfg(test)]
+    pub fn abort(&mut self) {
+        self.0.abort_all();
+    }
+
+    /// Three shards that will never stop, for the drain path that has to give
+    /// up on them.
+    #[cfg(test)]
+    pub fn wedged() -> Self {
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(std::future::pending());
+        Self(set)
+    }
+}
+
+impl std::future::Future for Flushers {
+    type Output = Result<(), tokio::task::JoinError>;
+
+    /// Ready once the set has drained. Unlike a `JoinHandle` this is safe to
+    /// poll again afterwards — an emptied set answers `Ready` forever — which
+    /// is what lets `main` await a handle `first_stopped` may already have run
+    /// to completion.
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        loop {
+            match self.0.poll_join_next(cx) {
+                Poll::Ready(Some(Ok(()))) => {}
+                // Surfaced rather than swallowed: `cargo test` does not build
+                // with `panic = "abort"`, so a flusher that panics under test
+                // is a `JoinError` here and nothing else anywhere.
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Start one signal's ingest pipeline. Returns the handle its receivers push
+/// into. Each signal gets its own channels, flusher tasks and block sequences,
+/// so a slow flush on one cannot stall another.
+///
+/// [`Flushers`] is the shutdown contract: drop every [`Ingest`] clone and every
+/// shard seals whatever is open, acks everyone waiting on it and returns; the
+/// handle resolves once they all have. A caller that exits without awaiting it
+/// turns a graceful stop into a reset for those waiters.
+pub fn spawn<B: SignalBuilder>(cfg: &Arc<Config>) -> (Ingest<B::Request>, OpenSlot, Flushers) {
+    let shards = cfg.shards.clamp(1, MAX_SHARDS);
+    // Once for the signal, before any shard can publish. Inside the flusher it
+    // would be one sweep per shard, and `sweep_staging` filters by signal and
+    // node — not by sequence — so shard 3 booting a moment late would delete the
+    // staging directory shard 0 was already writing tables into.
+    //
+    // Not fatal if it fails: a leaked directory under `.tmp` costs disk and
+    // nothing else, and refusing to ingest over it would turn a janitorial
+    // problem into an outage.
+    match block::sweep_staging(&cfg.data_dir, B::SIGNAL, cfg.node) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(signal = B::SIGNAL, count = n, "swept stale staging dirs"),
+        Err(e) => tracing::warn!(signal = B::SIGNAL, error = %e, "cannot sweep staging dirs"),
+    }
+    // Resume the sequence past whatever is already on disk so block directory
+    // names stay unique across restarts. This is the entirety of crash recovery.
+    //
+    // `max`, not `last`: `scan` sorts by `(min_ts, seq)`, so the last element is
+    // the latest-timestamped block, which is not the highest sequence number
+    // whenever a restart follows a backlog replay. Reusing a sequence makes the
+    // next `rename` land on an existing directory and the node never publishes
+    // again.
+    //
+    // Scanned here and handed to every shard rather than scanned by each of
+    // them, and that is load-bearing: a shard that read the directory after a
+    // sibling had already published would resume one higher and its stride
+    // would land on the sibling's next sequence. One base, distinct offsets.
+    let resume = match block::scan(&cfg.data_dir, B::SIGNAL) {
+        Ok(blocks) => Some(blocks.iter().map(|b| b.seq).max().map_or(0, |s| s + 1)),
+        Err(e) => {
+            tracing::error!(signal = B::SIGNAL, error = %e, "cannot scan data directory");
+            None
+        }
+    };
     let rejects = rejects_for(B::SIGNAL);
+    // The configured depth is the signal's, not each shard's: it is a bound on
+    // how many decoded exports this node can be holding, and that does not get
+    // larger because there are more consumers.
+    let depth = cfg.queue.div_ceil(shards).max(1);
+    let mut txs = Vec::with_capacity(shards);
+    let mut slots = Vec::with_capacity(shards);
+    let mut tasks = tokio::task::JoinSet::new();
+    for shard in 0..shards {
+        let (tx, rx) = mpsc::channel(depth);
+        // Eight concurrent askers, because a ninth gets a snapshot at most a
+        // millisecond older and waiting in line for one is worth less than that.
+        let (ask, asks) = mpsc::channel(8);
+        let slot = Shard {
+            cur: Arc::default(),
+            ask,
+        };
+        txs.push(tx);
+        // No flusher if the data directory could not be read, which drops the
+        // receiver and leaves the sender closed: `submit` answers `Closed` and
+        // the handle resolves at once. The same thing the flusher's own early
+        // return did, decided once instead of `shards` times.
+        if let Some(resume) = resume {
+            tasks.spawn(flusher::<B>(
+                rx,
+                asks,
+                cfg.clone(),
+                slot.clone(),
+                shard,
+                shards,
+                resume,
+            ));
+        }
+        slots.push(slot);
+    }
     let ingest = Ingest {
-        tx,
+        tx: txs.into(),
+        turn: Arc::default(),
         rejects,
         wal: cfg.wal.clone(),
         signal: wal::Signal::named(B::SIGNAL).expect("every signal has a log discriminant"),
     };
-    // Eight concurrent askers, because a ninth gets a snapshot at most a
-    // millisecond older and waiting in line for one is worth less than that.
-    let (ask, asks) = mpsc::channel(8);
-    let slot = OpenSlot {
-        cur: Arc::default(),
-        ask,
-    };
+    // One handle over all of them, so `main` still holds three. Awaiting every
+    // shard rather than the first to finish is the same contract it was: under
+    // `panic = "abort"` a flusher that dies takes the process with it, and the
+    // one way a shard returns early — an unreadable data directory at startup —
+    // is a condition every shard of the signal meets at once.
     (
         ingest,
-        slot.clone(),
-        tokio::spawn(flusher::<B>(rx, asks, cfg, slot)),
+        OpenSlot {
+            shards: slots.into(),
+        },
+        Flushers(tasks),
     )
 }
 
-/// Where the read path asks the flusher for a readable copy of its open block
-/// (section 4), and where the last copy it produced is cached.
-///
-/// The interesting half is [`OpenSlot::fresh`], and what makes it *fresh* rather
-/// than merely recent is the order the queue already enforces. `submit`
-/// acknowledges an export only after the job is in the flusher's channel, so
-/// every acknowledged export is queued before a request issued after it — and if
-/// the flusher answers only once that channel is empty, its answer necessarily
-/// contains them all. That is read-your-writes, for the price of one FIFO Mira
-/// was already paying, with no shared counter and no clock.
+/// Where the read path asks one flusher shard for a readable copy of its open
+/// block (section 4), and where the last copy it produced is cached.
 ///
 /// The snapshot is taken on demand, never on a timer: an idle node with nobody
 /// querying it copies nothing. A `Mutex` around the cached `Arc` rather than an
 /// `ArcSwap` — the critical section is one pointer clone and a crate for that
 /// would be a crate for nothing.
 #[derive(Clone)]
-pub struct OpenSlot {
+struct Shard {
     cur: Arc<Mutex<Option<Arc<Open>>>>,
     /// Handing the flusher somewhere to put an answer. Not generic in the
     /// signal's request type, which is the whole reason the read path can hold
@@ -486,36 +810,60 @@ pub struct OpenSlot {
     ask: mpsc::Sender<oneshot::Sender<Option<Arc<Open>>>>,
 }
 
-/// A slot nobody serves: `fresh` finds no flusher, falls back to the cache, and
-/// the cache is empty forever. That is exactly the no-log configuration and
-/// exactly what a unit test that only wants an `Api` wants.
-impl Default for OpenSlot {
-    fn default() -> Self {
-        Self {
-            cur: Arc::default(),
-            ask: mpsc::channel(1).0,
-        }
-    }
+/// Every shard of one signal's open blocks, asked together.
+///
+/// The interesting half is [`OpenSlot::fresh`], and what makes it *fresh*
+/// rather than merely recent is the order the queues already enforce. `submit`
+/// acknowledges an export only after the job is in some shard's channel, so
+/// every acknowledged export is queued before a request issued after it — and
+/// if each shard answers only once its own channel is empty, the answers
+/// together necessarily contain them all. That is read-your-writes, for the
+/// price of FIFOs Mira was already paying, with no shared counter and no clock.
+///
+/// Sharding does not weaken it, because the argument never depended on there
+/// being one queue: an acknowledged export is in exactly one shard's channel
+/// until that shard appends it. It does mean the read path has to ask all of
+/// them, which is what `fresh` does.
+#[derive(Clone, Default)]
+pub struct OpenSlot {
+    /// Empty for a slot nobody serves: `fresh` returns nothing, forever. That
+    /// is exactly what a unit test that only wants an `Api` wants.
+    shards: Arc<[Shard]>,
 }
 
 impl OpenSlot {
-    /// Everything acknowledged before this call, as one readable block — or
-    /// `None` when all of it has already been published.
+    /// Everything acknowledged before this call, as one readable block per
+    /// shard that has anything open.
     ///
-    /// Falls back to the last snapshot when the flusher cannot be reached: the
-    /// request queue is full, or the task is gone. Both are overload or
-    /// shutdown, and a query that waits its turn behind an overloaded ingest
-    /// path is a worse answer than one that is a few milliseconds stale.
-    pub async fn fresh(&self) -> Option<Arc<Open>> {
-        let (tx, rx) = oneshot::channel();
-        match self.ask.try_send(tx) {
-            Ok(()) => rx.await.unwrap_or_else(|_| self.get()),
-            Err(_) => self.get(),
+    /// Falls back to a shard's last snapshot when its flusher cannot be
+    /// reached: the request queue is full, or the task is gone. Both are
+    /// overload or shutdown, and a query that waits its turn behind an
+    /// overloaded ingest path is a worse answer than one that is a few
+    /// milliseconds stale.
+    ///
+    /// Every ask goes out before any answer is awaited, so the shards work
+    /// concurrently; awaiting them in turn would put a whole flusher's backlog
+    /// between one shard's answer and the next one's question.
+    pub async fn fresh(&self) -> Vec<Arc<Open>> {
+        let mut out = Vec::with_capacity(self.shards.len());
+        let mut waiting = Vec::with_capacity(self.shards.len());
+        for s in self.shards.iter() {
+            let (tx, rx) = oneshot::channel();
+            match s.ask.try_send(tx) {
+                Ok(()) => waiting.push((s, rx)),
+                Err(_) => out.extend(s.get()),
+            }
         }
+        for (s, rx) in waiting {
+            out.extend(rx.await.unwrap_or_else(|_| s.get()));
+        }
+        out
     }
+}
 
+impl Shard {
     /// The last snapshot taken, without asking for a new one.
-    pub fn get(&self) -> Option<Arc<Open>> {
+    fn get(&self) -> Option<Arc<Open>> {
         self.lock().clone()
     }
 
@@ -617,33 +965,22 @@ async fn flusher<B: SignalBuilder>(
     mut rx: mpsc::Receiver<Job<B::Request>>,
     mut asks: mpsc::Receiver<oneshot::Sender<Option<Arc<Open>>>>,
     cfg: Arc<Config>,
-    open_slot: OpenSlot,
+    open_slot: Shard,
+    shard: usize,
+    shards: usize,
+    resume: u64,
 ) {
     let rejects = rejects_for(B::SIGNAL);
-    // Resume the sequence past whatever is already on disk so block directory
-    // names stay unique across restarts. This is the entirety of crash recovery.
-    //
-    // `max`, not `last`: `scan` sorts by `(min_ts, seq)`, so the last element is
-    // the latest-timestamped block, which is not the highest sequence number
-    // whenever a restart follows a backlog replay. Reusing a sequence makes the
-    // next `rename` land on an existing directory and the node never publishes
-    // again.
-    let mut seq = match block::scan(&cfg.data_dir, B::SIGNAL) {
-        Ok(blocks) => blocks.iter().map(|b| b.seq).max().map_or(0, |s| s + 1),
-        Err(e) => {
-            tracing::error!(signal = B::SIGNAL, error = %e, "cannot scan data directory");
-            return;
-        }
-    };
-    // The other half of crash recovery: drop the staging directory a killed
-    // publish left behind. Not fatal if it fails — a leaked directory under
-    // `.tmp` costs disk and nothing else, and refusing to ingest over it would
-    // turn a janitorial problem into an outage.
-    match block::sweep_staging(&cfg.data_dir, B::SIGNAL, cfg.node) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(signal = B::SIGNAL, count = n, "swept stale staging dirs"),
-        Err(e) => tracing::warn!(signal = B::SIGNAL, error = %e, "cannot sweep staging dirs"),
-    }
+    // Shard k takes `resume + k`, `resume + k + shards`, and so on, so the
+    // shards of a signal partition the sequence space with no allocator and no
+    // agreement — a sequence only has to be unique, and the residues mod
+    // `shards` are distinct. It stays unique across a restart that runs a
+    // different number of shards, because the next `resume` is above every
+    // stride. That is the whole cost of a per-shard block sequence: the block
+    // directory is the manifest and a sequence is a filename, so nothing else
+    // has to know.
+    let mut seq = resume.saturating_add(shard as u64);
+    let signal = wal::Signal::named(B::SIGNAL).expect("every signal has a log discriminant");
 
     let mut builder = B::default();
     let mut waiters: Vec<oneshot::Sender<Result<(), Rejected>>> = Vec::new();
@@ -653,13 +990,18 @@ async fn flusher<B: SignalBuilder>(
     let mut carry: Vec<Job<B::Request>> = Vec::new();
     let mut deadline = Instant::now() + cfg.max_block_age;
     let mut open = true;
-    // One past the highest log sequence this signal has finished with since the
-    // last publish, or 0 when there is no log. "Finished with" and not "stored":
-    // an empty export and a permanently refused one both leave nothing to
-    // recover, so replaying them forever would only keep the log from
-    // truncating. A carried job is deliberately absent — it has not landed
+    // The log sequences this shard has finished with since the last publish,
+    // ascending, or empty when there is no log. "Finished with" and not
+    // "stored": an empty export and a permanently refused one both leave
+    // nothing to recover, so replaying them forever would only keep the log
+    // from truncating. A carried job is deliberately absent — it has not landed
     // anywhere yet, and claiming it here is how the watermark would lie.
-    let mut wal_hi: u64 = 0;
+    //
+    // A list rather than the running maximum it used to be, because with more
+    // than one shard per signal the maximum is no longer the watermark: see
+    // `Wal::watermark_for`, which needs to know exactly which sequences this
+    // block is retiring in order to answer what the *others* still hold.
+    let mut wal_seqs: Vec<u64> = Vec::new();
     // Readers waiting to be told what is in the block, and the builder size the
     // last answer was taken at. Answered only with an empty `rx` — see
     // [`OpenSlot::fresh`] — so they survive as many loop turns as the backlog
@@ -745,7 +1087,7 @@ async fn flusher<B: SignalBuilder>(
                 deadline = Instant::now() + cfg.max_block_age;
             }
             if let Some(seq) = job.wal_seq {
-                wal_hi = wal_hi.max(seq + 1);
+                wal_seqs.push(seq);
             }
             match builder.append_request(&job.req) {
                 // An export carrying no records is legal — the Collector emits
@@ -763,7 +1105,7 @@ async fn flusher<B: SignalBuilder>(
                     // that is never sealed because there is nothing in it is
                     // the exact false alarm this number would be read as.
                     if waiters.is_empty() {
-                        rejects.open_since.store(now_secs(), Relaxed);
+                        rejects.set_open_since(shard, now_secs());
                     }
                     waiters.push(job.ack);
                 }
@@ -812,17 +1154,17 @@ async fn flusher<B: SignalBuilder>(
             // Push the idle timer out so a stale deadline does not spin the loop.
             if waiters.is_empty() {
                 deadline = Instant::now() + cfg.max_block_age;
-                rejects.open_since.store(0, Relaxed);
+                rejects.set_open_since(shard, 0);
             }
             continue;
         }
 
-        rejects.open_since.store(0, Relaxed);
+        rejects.set_open_since(shard, 0);
         let sealed = match builder.finish() {
             Ok(s) => s,
             Err(e) => {
                 let msg = e.to_string();
-                rejects.mark_stalled();
+                rejects.mark_stalled(shard);
                 for w in waiters.drain(..) {
                     // Whose export broke the encoder is not knowable from here,
                     // so nobody is blamed permanently: everyone is told to send
@@ -833,10 +1175,11 @@ async fn flusher<B: SignalBuilder>(
                 // there is nothing to repair here — see `SignalBuilder::finish`.
                 //
                 // The watermark goes with it. Nothing claimed these sequences,
-                // so they stay in the log and come back on the next boot — which
+                // so they stay unpublished, keep every sibling shard's
+                // watermark behind them, and come back on the next boot — which
                 // is the only reason the callers above could be told to retry
                 // without that being a lie about where their data went.
-                wal_hi = 0;
+                wal_seqs.clear();
                 // Those rows are gone; a snapshot still advertising them would
                 // be the read path promising data no restart can produce.
                 open_slot.put(None);
@@ -848,8 +1191,16 @@ async fn flusher<B: SignalBuilder>(
         let dir = cfg.data_dir.clone();
         let node = cfg.node;
         let this_seq = seq;
-        seq += 1;
-        let block_wal_hi = std::mem::take(&mut wal_hi);
+        seq += shards as u64;
+        let block_seqs = std::mem::take(&mut wal_seqs);
+        // Asked before the publish, because the answer is part of the directory
+        // name, and answered against what every shard of this signal is still
+        // holding rather than against this block alone. The sequences are not
+        // retired until the rename lands.
+        let block_wal_hi = match &cfg.wal {
+            Some(w) => w.watermark_for(signal, &block_seqs),
+            None => 0,
+        };
         let rows = sealed.num_rows;
         let result = tokio::task::spawn_blocking(move || {
             // The size is measured in the same blocking hop as the write, off
@@ -870,10 +1221,13 @@ async fn flusher<B: SignalBuilder>(
 
         let outcome = match result {
             Ok(Ok((bytes, path))) => {
+                if let Some(w) = &cfg.wal {
+                    w.published(signal, &block_seqs);
+                }
                 rejects.published.fetch_add(1, Relaxed);
                 rejects.rows.fetch_add(rows as u64, Relaxed);
                 rejects.bytes.fetch_add(bytes, Relaxed);
-                rejects.stalled_since.store(0, Relaxed);
+                rejects.clear_stalled(shard);
                 tracing::info!(signal = B::SIGNAL, rows, bytes, seq = this_seq, path = %path.display(), "block published");
                 Ok(())
             }
@@ -881,12 +1235,12 @@ async fn flusher<B: SignalBuilder>(
             // is the one fact that explains every NACK the senders are about to
             // report, and it is invisible from their side.
             Ok(Err(e)) => {
-                rejects.mark_stalled();
+                rejects.mark_stalled(shard);
                 tracing::error!(signal = B::SIGNAL, seq = this_seq, error = %e, "block not published");
                 Err(e.to_string())
             }
             Err(e) => {
-                rejects.mark_stalled();
+                rejects.mark_stalled(shard);
                 Err(format!("flush task panicked: {e}"))
             }
         };
@@ -917,7 +1271,7 @@ fn answer<B: SignalBuilder>(
     asked: &mut Vec<oneshot::Sender<Option<Arc<Open>>>>,
     snapped: &mut Option<usize>,
     pending: bool,
-    slot: &OpenSlot,
+    slot: &Shard,
     node: u32,
     seq: u64,
 ) {
@@ -1138,6 +1492,17 @@ mod tests {
         block::scan(dir, "logs").map_or(0, |b| b.len())
     }
 
+    /// Every published logs block's sequence, ascending.
+    fn seqs(dir: &std::path::Path) -> Vec<u64> {
+        let mut v: Vec<u64> = block::scan(dir, "logs")
+            .unwrap()
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
     /// One record carrying `n` attributes with distinct keys. The key dictionary
     /// is the thing with a ceiling, and distinct keys are the only way to reach
     /// it — a million records sharing one key never do.
@@ -1174,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_does_not_fit_lands_in_the_next_block() {
         let (c, dir) = cfg("carry");
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // 40k distinct keys each: the first fits an empty block, the second
         // cannot join it, and 80k would overflow the u16 dictionary.
         let (a, b) = tokio::join!(tx.submit(wide(40_000)), tx.submit(wide(40_000)));
@@ -1193,7 +1558,7 @@ mod tests {
     #[tokio::test]
     async fn an_impossible_request_fails_only_itself() {
         let (c, dir) = cfg("toowide");
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         let before = tx.rejects.failed.load(Relaxed);
         let destroyed = tx.rejects.refused.load(Relaxed);
         // `Failed`, not `Unavailable`: this one is permanent, and the receiver
@@ -1228,7 +1593,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_export_is_acknowledged_without_a_block() {
         let (c, dir) = cfg("empty");
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // No timeout needed: if this ever blocks, it blocks forever, and the
         // test harness reports the hang for what it is.
         tx.submit(ExportLogsServiceRequest::default())
@@ -1262,7 +1627,7 @@ mod tests {
             wal: Some(Arc::clone(&wal)),
             ..Default::default()
         });
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
 
         let started = std::time::Instant::now();
         tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
@@ -1279,9 +1644,9 @@ mod tests {
         drop(tx);
         h.await.unwrap();
 
-        // The block claims the frame, so the next boot does not replay it —
-        // one past the highest sequence in it, which for the single frame 0
-        // is 1.
+        // The block claims the frame, so the next boot does not replay it. The
+        // watermark is exclusive and nothing else is pending, so it is the
+        // log's `next_seq` — 1, for the single frame 0.
         let published = block::scan(&dir, "logs").unwrap();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].wal_hi, 1);
@@ -1322,7 +1687,7 @@ mod tests {
             wal: Some(Arc::clone(&wal)),
             ..Default::default()
         });
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         let replayed = {
             let tx = tx.clone();
             let dir = dir.clone();
@@ -1344,22 +1709,14 @@ mod tests {
 
         // The second boot: every frame is behind the watermark, so nothing is
         // handed back and the log can be truncated.
-        let mut handed_back = 0;
         let again = Wal::replay(
             &dir,
             node,
             block::wal_watermarks(&dir).unwrap(),
-            |_, _, _| {
-                handed_back += 1;
-                Ok(())
-            },
+            |_, _, _| unreachable!("a frame a block already claims must never be replayed again"),
         )
         .unwrap();
-        assert_eq!(
-            (again.replayed, again.skipped, handed_back),
-            (0, 2, 0),
-            "a frame a block already claims must never be replayed again"
-        );
+        assert_eq!((again.replayed, again.skipped), (0, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1370,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_that_cannot_be_published_is_a_retryable_answer() {
         let (c, dir) = cfg("unpublishable");
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // A file where the staging directory belongs: every publish fails at its
         // first `create_dir_all` and none of them can reach the block tree. That
         // is the shape of a full or detached volume without needing one, and it
@@ -1409,7 +1766,7 @@ mod tests {
             wal: Some(Arc::new(Wal::open(&dir, node).unwrap())),
             ..Default::default()
         });
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
 
         let mut req = wide(1);
         req.resource_logs[0].scope_logs[0].log_records[0].body = Some(AnyValue {
@@ -1503,7 +1860,8 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Job<ExportLogsServiceRequest>>(1);
         let rejects = &REJECTS[0];
         let ingest = Ingest {
-            tx,
+            tx: [tx].into(),
+            turn: Arc::default(),
             rejects,
             wal: None,
             signal: wal::Signal::Logs,
@@ -1547,7 +1905,8 @@ mod tests {
         // test in this binary is running beside it.
         let rejects: &'static Rejects = Box::leak(Box::new(Rejects::new("logs")));
         let ingest = Ingest {
-            tx,
+            tx: [tx].into(),
+            turn: Arc::default(),
             rejects,
             wal: None,
             signal: wal::Signal::Logs,
@@ -1591,7 +1950,7 @@ mod tests {
     async fn an_unreadable_data_directory_stops_the_flusher_at_startup() {
         let (c, dir) = cfg("unscannable");
         std::fs::write(dir.join("logs"), b"not a directory").unwrap();
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         h.await.unwrap();
         assert!(matches!(
             tx.submit(ExportLogsServiceRequest::default()).await,
@@ -1606,7 +1965,7 @@ mod tests {
     #[tokio::test]
     async fn retention_drops_expired_blocks_on_its_first_pass() {
         let (c, dir) = cfg("retention");
-        let (tx, _open, h) = spawn::<LogsBuilder>(Arc::clone(&c));
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         tx.submit(crate::e2e::logs_export("checkout", 1_000, 4))
             .await
             .unwrap_or_else(|_| panic!("export"));
@@ -1643,7 +2002,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_volume_drops_the_oldest_blocks_before_their_ttl() {
         let (c, dir) = cfg("space");
-        let (tx, _open, h) = spawn::<LogsBuilder>(Arc::clone(&c));
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // Awaited one at a time: `submit` returns only once the block holding it
         // is durable, so each of these is a block of its own.
         for ts in [3_000_000, 1_000_000, 2_000_000] {
@@ -1765,7 +2124,7 @@ mod tests {
             wal: Some(Arc::clone(&wal)),
             ..Default::default()
         });
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // The log's directory, removed under it: the roll cannot create its
         // successor, which is what a volume that went away looks like from
         // inside `append`.
@@ -1821,7 +2180,7 @@ mod tests {
             .join(format!("logs-{:08x}-000000000007", 0));
         std::fs::create_dir_all(&theirs).unwrap();
 
-        let (tx, _open, h) = spawn::<LogsBuilder>(c);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         tx.submit(ExportLogsServiceRequest::default())
             .await
             .unwrap_or_else(|_| panic!("the flusher booted"));
@@ -1890,7 +2249,7 @@ mod tests {
         // Without a log the caller is the one waiting on the seal, so it is the
         // one that has to be told.
         let (c, dir) = cfg("brittle-seal");
-        let (tx, _open, h) = spawn::<Brittle<true>>(Arc::clone(&c));
+        let (tx, _open, h) = spawn::<Brittle<true>>(&c);
         let answer = tx.submit(wide(1)).await;
         assert!(
             matches!(&answer, Err(Rejected::Unavailable(why)) if why.contains("dictionary")),
@@ -1915,7 +2274,7 @@ mod tests {
             wal: Some(Arc::clone(&wal)),
             ..Default::default()
         });
-        let (tx, open, h) = spawn::<Brittle<true>>(c);
+        let (tx, open, h) = spawn::<Brittle<true>>(&c);
         tx.submit(wide(1))
             .await
             .unwrap_or_else(|_| panic!("the log took it, whatever the block does later"));
@@ -1928,7 +2287,7 @@ mod tests {
             "a block that was never published claims no sequence"
         );
         assert!(
-            open.get().is_none(),
+            open.fresh().await.is_empty(),
             "and advertises no rows the read path could no longer produce"
         );
         // Which is what makes the acknowledgement honest: the frame is still
@@ -1974,9 +2333,9 @@ mod tests {
             // is the other way round, so the healthy comparison runs through
             // the same wrapper rather than a different type.
             let (tx, open, h) = if breaks {
-                spawn::<Brittle<false>>(c)
+                spawn::<Brittle<false>>(&c)
             } else {
-                spawn::<Brittle<true>>(c)
+                spawn::<Brittle<true>>(&c)
             };
             tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
                 .await
@@ -1985,7 +2344,7 @@ mod tests {
             // `fresh` waits for the flusher to drain its queue, so this is not
             // a race: the export is in the builder by the time it answers.
             assert_eq!(
-                open.fresh().await.is_some(),
+                !open.fresh().await.is_empty(),
                 want,
                 "breaks={breaks}: a snapshot that failed must clear the slot"
             );
@@ -2147,7 +2506,7 @@ mod tests {
     #[tokio::test]
     async fn an_absurd_retention_keeps_every_block_and_still_compacts_the_cold_ones() {
         let (c, dir) = cfg("forever");
-        let (tx, _open, h) = spawn::<LogsBuilder>(Arc::clone(&c));
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
         // Timestamped in 1970, so it is cold by any clock: the compaction half
         // of the sweep has something to do and the TTL half must not.
         tx.submit(crate::e2e::logs_export("checkout", 1_000, 4))
@@ -2206,17 +2565,238 @@ mod tests {
 
         // The clock is the *first* failure of the run, not the latest one, or a
         // node failing every two seconds would reset itself to healthy forever.
-        r.stalled_since.store(1, Relaxed);
-        r.mark_stalled();
+        r.shard_stalled_since[0].store(1, Relaxed);
+        r.mark_stalled(0);
         assert_eq!(r.stalled_since.load(Relaxed), 1);
         // ...and the first failure does start it, from zero.
         let fresh = Rejects::new("logs");
         assert_eq!(fresh.stalled_since.load(Relaxed), 0);
-        fresh.mark_stalled();
+        fresh.mark_stalled(0);
         assert_ne!(fresh.stalled_since.load(Relaxed), 0);
 
         // Nothing in this test binary has been unable to store for two minutes,
         // so the live answer is the healthy one.
         assert_eq!(stalled(), None);
+    }
+
+    /// A signal's health is the worst of its shards, not the last one to report.
+    ///
+    /// The bug this exists to prevent: with the flushers writing the aggregate
+    /// directly, a shard sealing normally would clear `open_since` while a
+    /// sibling sat on a block it could not flush, and `/healthz` would call a
+    /// stuck node healthy. Oldest-of-nonzero is the only reduction that answers
+    /// "is anything stuck" rather than "was the last thing that happened fine".
+    #[test]
+    fn a_signals_clocks_report_the_worst_shard_not_the_latest_one() {
+        let r = Rejects::new("logs");
+        r.set_open_since(0, 100);
+        r.set_open_since(1, 500);
+        assert_eq!(r.open_since.load(Relaxed), 100);
+
+        // Shard 0 seals. Shard 1 is still holding its block open, so the signal
+        // still has something open — and it is shard 1's clock now.
+        r.set_open_since(0, 0);
+        assert_eq!(r.open_since.load(Relaxed), 500);
+        r.set_open_since(1, 0);
+        assert_eq!(
+            r.open_since.load(Relaxed),
+            0,
+            "nothing open is zero, not min"
+        );
+
+        // Same rule for stalls, and the same failure mode: one shard recovering
+        // does not make the node ready while another cannot write.
+        r.shard_stalled_since[1].store(900, Relaxed);
+        r.mark_stalled(0);
+        let both = r.stalled_since.load(Relaxed);
+        assert!(both > 0 && both <= 900, "the older of the two, got {both}");
+        r.clear_stalled(0);
+        assert_eq!(r.stalled_since.load(Relaxed), 900);
+        r.clear_stalled(1);
+        assert_eq!(r.stalled_since.load(Relaxed), 0);
+    }
+
+    /// Shard count is a function of core count and nothing else — section 4's
+    /// rule for what a shard may be keyed on.
+    #[test]
+    fn shards_are_counted_from_cores_and_clamped_at_both_ends() {
+        // Auto. Halved because a flusher is a consumer and the decode is the
+        // producer; never zero, whatever the machine claims.
+        assert_eq!(shard_count(0, 1), 1);
+        assert_eq!(shard_count(0, 2), 1);
+        assert_eq!(shard_count(0, 12), 6);
+        // The ceiling is what keeps a 128-core host from publishing 64 files
+        // per seal window per signal.
+        assert_eq!(shard_count(0, 128), MAX_SHARDS);
+        // Configured wins, up to the same ceiling — this is the escape hatch
+        // for a machine that miscounts the cores this process actually gets,
+        // and an operator who types 1 gets the old behaviour.
+        assert_eq!(shard_count(1, 128), 1);
+        assert_eq!(shard_count(4, 2), 4);
+        assert_eq!(shard_count(999, 2), MAX_SHARDS);
+    }
+
+    /// A sharded config with the log on, which is the shipped default and the
+    /// only setting under which a test can submit without waiting for a seal.
+    ///
+    /// Without a log `submit` returns at the publish, so a long `max_block_age`
+    /// makes every serial submit wait out the age timer and publish a block of
+    /// its own — which is the behaviour under test, inverted.
+    fn sharded(name: &str, shards: usize) -> (Arc<Config>, PathBuf) {
+        let (c, dir) = cfg(name);
+        let node = block::node_id(name);
+        let mut c = Arc::try_unwrap(c).ok().expect("freshly built");
+        c.node = node;
+        c.shards = shards;
+        c.wal = Some(Arc::new(Wal::open(&dir, node).unwrap()));
+        // Long enough that nothing seals on the timer mid-test: the blocks here
+        // are sealed by a full dictionary or by the shutdown path.
+        c.max_block_age = Duration::from_secs(30);
+        (Arc::new(c), dir)
+    }
+
+    /// Every shard's blocks land, and no two of them collide on a sequence.
+    ///
+    /// A collision is not a cosmetic problem: the block directory name is the
+    /// manifest, so `rename` onto an existing directory means the node stops
+    /// publishing — and with one queue per shard, "shard 2 picks the next
+    /// number" is not a thing anything can observe. Stride and offset are all
+    /// that keep them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shards_partition_the_sequence_space() {
+        let (c, dir) = sharded("shardseq", 4);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
+        // 40k distinct keys each: two of these cannot share a `UInt16`
+        // dictionary, so whichever shard takes two publishes two, and the
+        // sequences still may not collide.
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            sent.push(tokio::spawn(async move { tx.submit(wide(40_000)).await }));
+        }
+        for s in sent {
+            s.await
+                .unwrap()
+                .unwrap_or_else(|_| panic!("nothing may be shed: the wait is 5s"));
+        }
+        drop(tx);
+        h.await.unwrap();
+
+        let seqs = seqs(&dir);
+        assert_eq!(seqs.len(), 8, "one block per export, none lost");
+        let mut uniq = seqs.clone();
+        uniq.dedup();
+        assert_eq!(uniq, seqs, "two shards reused a sequence: {seqs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that is not saturating one flusher keeps behaving like a node
+    /// with one flusher, and its sequences stride by the shard count.
+    ///
+    /// The reason dispatch is first-fit and not round-robin. Round-robin would
+    /// spread a trickle over every shard and publish `shards` nearly-empty
+    /// blocks per seal window, which is the small-file explosion section 4
+    /// rejects hash sharding for, arrived at from the other direction. Shard
+    /// 0's queue has room every time, so `try_reserve` never has to look past
+    /// it.
+    #[tokio::test]
+    async fn a_trickle_stays_on_one_shard_and_strides_its_sequences() {
+        let (c, dir) = sharded("shardtrickle", 4);
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
+        for _ in 0..4 {
+            tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
+                .await
+                .unwrap_or_else(|_| panic!("acknowledged"));
+        }
+        // Two 40k-key exports: the first joins the open block, the second
+        // cannot share its dictionary and so seals it. Two blocks from one
+        // shard, which is what makes the stride observable.
+        for _ in 0..2 {
+            tx.submit(wide(40_000))
+                .await
+                .unwrap_or_else(|_| panic!("acknowledged"));
+        }
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(
+            seqs(&dir),
+            vec![0, 4],
+            "one shard's blocks, striding by the shard count — four shards must \
+             not mean four files for a load one shard can take"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read-your-writes survives the fan-out: every acknowledged export is
+    /// visible in some shard's open block, before anything has been sealed.
+    ///
+    /// The property section 4 buys from FIFO ordering, re-asserted now that
+    /// there is more than one FIFO. It holds for the same reason it did — an
+    /// acknowledged export is in exactly one shard's channel until that shard
+    /// appends it — but only because `fresh` asks all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_shard_answers_the_read_path() {
+        let (mut c, dir) = sharded("shardfresh", 4);
+        // One slot per shard, so eight concurrent submits have to spill past
+        // shard 0 rather than hoping the scheduler spreads them.
+        Arc::get_mut(&mut c).unwrap().queue = 4;
+        let (tx, open, h) = spawn::<LogsBuilder>(&c);
+        let mut sent = Vec::new();
+        for i in 0..8 {
+            let tx = tx.clone();
+            sent.push(tokio::spawn(async move {
+                tx.submit(crate::e2e::logs_export("checkout", 2_000 + i * 10, 4))
+                    .await
+            }));
+        }
+        for s in sent {
+            s.await.unwrap().unwrap_or_else(|_| panic!("acknowledged"));
+        }
+        let rows: usize = open.fresh().await.iter().map(|o| o.sealed.num_rows).sum();
+        assert_eq!(
+            rows, 32,
+            "eight exports of four records, all of them findable"
+        );
+
+        drop(tx);
+        h.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second shard takes what the first one cannot.
+    ///
+    /// `reserve` at the unit level, with no flusher behind either channel: the
+    /// first is full, so the job has to land in the second rather than wait out
+    /// `ADMIT_WAIT` and shed.
+    #[tokio::test]
+    async fn a_full_shard_spills_into_the_next_one() {
+        let (tx0, _rx0) = mpsc::channel::<Job<ExportLogsServiceRequest>>(1);
+        let (tx1, mut rx1) = mpsc::channel::<Job<ExportLogsServiceRequest>>(1);
+        // Shard 0's one slot, taken and held.
+        let _held = tx0.clone().reserve_owned().await.unwrap();
+        let ingest = Ingest {
+            tx: [tx0, tx1].into(),
+            turn: Arc::default(),
+            rejects: Box::leak(Box::new(Rejects::new("logs"))),
+            wal: None,
+            signal: wal::Signal::Logs,
+        };
+        let sent = tokio::spawn({
+            let i = ingest.clone();
+            async move { i.submit(ExportLogsServiceRequest::default()).await }
+        });
+        let job = rx1
+            .recv()
+            .await
+            .expect("shard 1 gets what shard 0 cannot take");
+        let _ = job.ack.send(Ok(()));
+        sent.await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("admitted, not shed"));
+        assert_eq!(
+            ingest.rejects.shed.load(Relaxed),
+            0,
+            "spilling to a free shard is not shedding"
+        );
     }
 }

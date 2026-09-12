@@ -41,7 +41,7 @@ outside.
 | **Resource/Scope dedup at block headers** | The Arrow mechanism for a "block header" is `Schema.custom_metadata`, exactly one map per file. That expresses dedup only if a block holds exactly one Resource. A block from any multi-tenant collector holds hundreds. | OTAP section 6.3: `resource_id`/`scope_id` `UInt16` columns in the root table plus separate attribute tables keyed by `parent_id`. A resource with 40 attributes shared by 10,000 records costs 40 rows and 10,000 `u16`s. |
 | **Dictionary-encode high-cardinality maps** | Backwards. Dictionary encoding is a *low*-cardinality technique with a hard ceiling — `Dictionary<UInt16,_>` raises `DictionaryKeyOverflowError` past 65,536 distinct values. `http.url` and `trace_id` are the highest-cardinality data in the system. | Dictionary-encode only enumerable columns: attribute *keys*, `severity_text`. Attribute *values* are plain `Utf8`/`Binary`. |
 | **Zero-copy ingestion** | Impossible on the OTLP path. `prost` memcpies every string unconditionally; varints must be decoded. Even on OTAP, `StreamDecoder` only avoids a copy when the whole message body is one contiguous `Buffer`, and an HTTP/2 body split across DATA frames is `extend_from_slice`'d. | Say **zero-copy queries**, not zero-copy ingestion. The ingest goal is *allocation-lean*: one unavoidable memcpy of the request body, then no per-field heap allocation. |
-| **Lock-free ring buffer for ingestion** | Cargo-culted from LMAX, where an item is a 150 ns order struct. Here an item is an export request costing 10⁵–10⁶ ns to decode and encode, arriving 10²–10⁴ times per second. The queue is four orders of magnitude from being the bottleneck, and a lock-free queue cannot express backpressure. | A bounded `tokio::sync::mpsc` per shard. `send().await` propagates backpressure out as HTTP/2 flow control. Revisit if a queue ever appears in a profile. |
+| **Lock-free ring buffer for ingestion** | Cargo-culted from LMAX, where an item is a 150 ns order struct. Here an item is an export request costing 10⁵–10⁶ ns to decode and encode, arriving 10²–10⁴ times per second. The queue is four orders of magnitude from being the bottleneck, and a lock-free queue cannot express backpressure. | A bounded `tokio::sync::mpsc` per flusher shard. A full set of them parks the caller for up to `ADMIT_WAIT` (section 4), which propagates backpressure out as HTTP/2 flow control; only a timeout sheds. Revisit if a queue ever appears in a profile. |
 | **4317 and 4318 both served by tonic** | 4318 is not gRPC. Per the OTLP spec it is plain HTTP/1.1 POST of protobuf or JSON to `/v1/{traces,metrics,logs}`. | Two listeners: tonic on 4317, axum on 4318. axum is already in the tree via tonic's `router` feature, so it costs no dependency. |
 | **A reflective proto3-JSON decoder for OTLP/HTTP JSON** | OTLP JSON is *not* canonical proto3 JSON. Ids are hex where every other `bytes` field is base64 — and a 32-character hex string is itself valid base64, so a generic decoder does not fail, it silently yields 24 bytes of nonsense for every `trace_id`. 64-bit integers are strings. Field names may be either dialect within one document. | `crates/mira/src/json.rs`: a hand-written decoder over the YAML 1.2 loader already in the tree (`api::parse`; YAML 1.2 is a superset of JSON, so KYAML bodies work for free — section 1). No new dependency, and the two deviations are handled where they occur rather than configured around. |
 
@@ -170,15 +170,17 @@ it is measured.
   matters more, which is that neither can be set wrong from outside. There **is**
   a config file ([Configuration](config.md)), and it is not a contradiction: it describes
   *where the process runs* — addresses, data directory, retention policy, replica
-  name — and contains no value that affects how the engine performs. The boundary
-  is structural, not documentary. It is also closed — eleven keys, and an unknown
+  name. The one key that reaches the engine, `ingest.shards`, is there because the
+  runtime's count of the cores it has can be wrong (section 4), and the default
+  asks nobody: it is a correction, not a tuning surface. The boundary
+  is structural, not documentary. It is also closed — twelve keys, and an unknown
   one is a startup error naming it — because the alternative is what
   `cluster.peers` was (section 12.2): a key read by nothing that still looks like a
   setting in effect.
-- *Agent-based internals* — the three flusher tasks and the retention worker are
-  a message-passing mesh already, and the flushers are supervised: one that
-  returns before the stop signal takes the process with it, once the other two
-  have drained. A crashloop is the honest shape of "this node cannot store logs"
+- *Agent-based internals* — the flusher tasks, three signals × `ingest.shards` of
+  them, and the retention worker are a message-passing mesh already, and the
+  flushers are supervised: one that returns before the stop signal takes the
+  process with it, once the other signals have drained. A crashloop is the honest shape of "this node cannot store logs"
   — an orchestrator reports it, and a restart is the recovery for the case that
   causes it — whereas carrying on leaves one signal answering 503 forever behind
   a probe that stays green. The retention worker is *not* in that select:
@@ -199,13 +201,13 @@ The concrete mechanism is in section 3.2 — the filesystem is the manifest. Thi
 rules out DataFusion *from the default build*: it would give SQL for free at a
 cost of 47 direct dependencies and a ~1.5M SLoC transitive tree. The binary cost
 was estimated here at 68–92 MB and that was too pessimistic — built at Mira's
-release profile it is **50.0 MiB and 271 crates**, against 5.62 MiB and 117. An
+release profile it is **50.0 MiB and 271 crates**, against 5.63 MiB and 117. An
 order of magnitude is still an order of magnitude, so it goes behind a
 `--features sql` cargo feature rather than into the binary everyone downloads;
 what it does not do is displace the hand-rolled ~2,000 LOC fast path, because a
-14 ms point lookup that already prunes to one block of 86 has nothing to gain
+4.5 ms point lookup that already prunes to one block of 137 has nothing to gain
 from a planner. With traces, metrics, query, MCP and both UIs in it, the default
-build is **5.62 MiB stripped, 117 crates** — the scale the design is defending.
+build is **5.63 MiB stripped, 117 crates** — the scale the design is defending.
 
 **KYAML-first, everywhere.** Every text format Mira reads or writes — the config
 file, dashboard definitions, saved queries, MCP examples, anything added later —
@@ -505,10 +507,10 @@ that come back *faster* than uncompressed ones.
 ## 4. Ingest path
 
 ```
-gRPC 4317 (tonic) ─┐
-                   ├─> Ingest::submit ─> mpsc(128) ─> flusher ─> spawn_blocking ─> publish
-HTTP 4318 (axum) ──┘         │                                        │
-                             └────────── oneshot ack ─────────────────┘
+gRPC 4317 (tonic) ─┐                    ┌─ mpsc ─> flusher 0 ─┐
+                   ├─> Ingest::submit ──┼─ mpsc ─> flusher 1 ─┼─> spawn_blocking ─> publish
+HTTP 4318 (axum) ──┘         │          └─ mpsc ─> flusher k ─┘         │
+                             └─────────────── oneshot ack ──────────────┘
 ```
 
 **gzip on both listeners, because the spec says MUST and the exporter says
@@ -547,9 +549,22 @@ until the queue gives up on the other. Either way the operator's move is the
 same: raise this number or lower the sender's batch size, which is what both
 error messages say.
 
-`submit` uses `try_reserve`, not `send().await`: shedding *before* the decode
-work is the difference between a fast NACK and an unbounded latency tail. A full
-queue returns `UNAVAILABLE` with `RetryInfo(250ms)`.
+`submit` tries `try_reserve` on every shard before it waits anywhere, and only
+waits when all of them are full: `ADMIT_WAIT`, five seconds, on one shard picked
+by a turn counter so the parked waiters wake as each queue drains rather than all
+behind the same one. A timeout, and only a timeout, returns `UNAVAILABLE` with
+`RetryInfo(250ms)`.
+
+The first revision shed the instant the queue was full, on the reasoning that a
+fast NACK beats an unbounded latency tail. The tail half is right and
+`ADMIT_WAIT` is what bounds it; the "fast" half was wrong. Tonic and axum both
+decode the request before the handler is called, so by the time `submit` runs the
+expensive part of the export is already paid, and shedding throws it away for a
+client that will send the same bytes again a second later. Section 11 has the
+A/B: at 96 connections shedding cost 93% of exports, four cores busy, and a third
+of the throughput two connections get on one. Parking is bounded by the
+connection count — every waiter is a request already in memory — where a deeper
+queue is bounded by nothing.
 
 The export is acknowledged **only after the block directory rename is durable**.
 OTLP's retryable status set — plus "if the server disconnects without returning a
@@ -586,12 +601,13 @@ block size, and shrinking the block to fix the ack would trade the read path for
 the write path. So the frame goes to `wal/` first and the ack costs a `write(2)`,
 which is 7 µs at p50; the publish becomes a background reorganisation of data
 that is already on disk. Two consequences follow, and both are load-bearing.
-Ordering: `block::wal_watermarks` takes the max over blocks, so `wal_hi = max+1`
-only describes the log correctly if a signal's frames reach their blocks in
-sequence order — hence `Wal::append_then`, which does the enqueue inside the
-log's own mutex rather than after it, because two `submit`s preempted between
-the append and the send would otherwise let a block claim a frame it never
-stored. And convergence: a replayed frame keeps the sequence it already has, so
+What the log tracks: not a high-water mark but a *set* — every sequence handed
+out and not yet published, held in `Wal::pending` and consulted by
+`watermark_for` (section 9). `Wal::append_then` does the enqueue inside the log's
+own mutex rather than after it, so a frame is in that set before any shard can
+publish past it; two `submit`s preempted between the append and the send would
+otherwise let a block claim a frame it never stored. And convergence: a replayed
+frame keeps the sequence it already has, so
 the block that finally stores it covers the original rather than a copy numbered
 above every watermark — the alternative replays the same frames at every boot,
 on a log that never truncates. The manifest-free property survives intact: the
@@ -637,13 +653,73 @@ gone — is a query answered from the previous snapshot instead of a fresh one.
 That is overload or shutdown, and a query that waits its turn behind an
 overloaded ingest path is the worse answer.
 
-**A note on sharding.** The design is one shard per listener/core
-(`SO_REUSEPORT`), not sharding by resource hash. Resource cardinality in real
-fleets is bimodal — a handful of huge resources carrying 90% of volume, plus a
-long near-idle tail — so hash sharding gives a permanently hot shard *and* a
-small-file explosion in the tail. Files per flush interval should be a function
-of core count, known at startup, not of the customer's topology. The skeleton
-runs a single shard; the boundary is already in the right place.
+**Sharding, and what a shard may be keyed on.** The unit is the core, not the
+resource hash. Resource cardinality in real fleets is bimodal — a handful of
+huge resources carrying 90% of volume, plus a long near-idle tail — so hash
+sharding gives a permanently hot shard *and* a small-file explosion in the tail.
+Files per flush interval should be a function of core count, known at startup,
+not of the customer's topology.
+
+Each signal runs `ingest.shards` flushers, defaulting to *cores ÷ 2* and capped
+at 16. Halved because a flusher is a **consumer**: the producers are the protobuf
+decode and the runtime's own work, and giving every core a flusher leaves nothing
+to feed them. The knob exists for the case where that count is a fiction.
+`available_parallelism` does read a cgroup CPU *quota*, so the common container
+is fine; what it cannot read is `cpu.shares`/`cpu.weight`, which is a relative
+claim on contention and not a number at all, or a pod with no quota set on a
+96-core node, which would otherwise start the capped sixteen flushers a signal
+against the two cores it will actually get. `ingest.shards: 1` restores the single-flusher
+behaviour exactly.
+
+Four things had to move, and none of them is the one line "shard the flusher"
+suggests:
+
+- **Dispatch is first fit from shard 0, not round-robin.** `Ingest::reserve`
+  walks the shards in order and takes the first `try_reserve` that succeeds. A
+  node doing two exports a second therefore behaves exactly as it did with one
+  flusher — one block per seal window, not `shards` nearly-empty ones — and only
+  starts using the second shard at the moment the first one's queue stops
+  draining, which is the moment the consumer's service time became the curve.
+  Round-robin would have reintroduced the small-file explosion the paragraph
+  above rejects hash sharding for, from the other direction. Ordering *across*
+  shards is not preserved and does not need to be: two exports are two OTLP
+  requests and the spec orders neither against the other. Ordering *within* a
+  shard still is, which is what the carry rule in section 5 needs.
+- **The sequence space is partitioned by stride, not by an allocator.** Shard
+  *k* takes `resume + k`, `resume + k + shards`, and so on. A sequence only has
+  to be unique, the residues mod `shards` are distinct, and the next restart's
+  `resume` is above every stride — so a node that reboots with a different shard
+  count is still safe. The alternative, a sixth field in the directory name,
+  `parse_dir_name` refuses on purpose. `resume` is scanned once in `spawn` and
+  handed to every shard, which is load-bearing: a shard that read the directory
+  after a sibling had already published would resume one higher and its stride
+  would land on the sibling's next number.
+- **The WAL watermark stopped being `max(seq) + 1`.** Shards seal out of order,
+  so the highest sequence in a block says nothing about the ones below it. What a
+  block claims now is the oldest sequence of its signal that nobody has
+  published and that is not in this block — section 9 has the protocol and the
+  direction it is allowed to be wrong in.
+- **`ingest.queue` became a total, not a depth.** Each shard gets
+  `queue.div_ceil(shards)`, so raising the shard count does not multiply the
+  worst-case resident cost the way it would if every shard took the configured
+  number. The arithmetic in section 11 about `--queue 2048` is about the sum.
+- **Health counters became per shard.** `open_since` and `stalled_since` are the
+  *oldest non-zero* of the shards', because the question `/healthz` asks is "is
+  anything stuck" — with the flushers writing one aggregate directly, a shard
+  sealing normally would clear the clock of a sibling sitting on a block it could
+  not flush.
+
+Read-your-writes survives, and not by luck. The argument in the previous section
+never depended on there being one queue: an acknowledged export is in exactly one
+shard's channel until that shard appends it, and each shard answers a `fresh`
+request only on a turn where both its channels are empty. `OpenSlot::fresh` sends
+every ask before awaiting any answer — awaiting them in turn would put a whole
+flusher's backlog between one shard's answer and the next one's question — and
+returns one open block per shard. `search_open` already took a list.
+
+`sweep_staging` also moved out of the flusher and into `spawn`, once per signal:
+it filters by signal and node, not by sequence, so shard 3 booting a moment late
+would have deleted the staging directory shard 0 was already writing tables into.
 
 **Decoder affinity, when OTAP lands.** OTAP section 4.4 mandates decoder state per
 (gRPC stream, payload_type, schema_id), strictly ordered. That is
@@ -655,7 +731,7 @@ reason the "one global lock-free ring buffer" shape was wrong.
 
 ## 5. Flusher state machine
 
-One task, one open block, three transitions:
+One task per shard, one open block each, three transitions:
 
 ```
         ┌──────────────── recv_many(≤64) ────────────────┐
@@ -1067,9 +1143,14 @@ timeout.
 A predicate on an attribute is a **relational semi-join**, not a column filter:
 filter `log_attrs` on `(key, active-value-column)` → collect the `parent_id` set
 → semi-join into `logs.id`. arrow-rs ships no join kernel (`arrow-select` has
-`filter`, `take`, `interleave`, `concat`, and no join), so this is roughly 120
-lines of `FxHashSet`-based helper covering all six value columns and every
-attribute level. Correct only because ids were rebased at ingest (section 0).
+`filter`, `take`, `interleave`, `concat`, and no join), so this is a hand-written
+one. `attr_parents` walks the attribute table once per term and returns the
+parent ids that matched; `attr_rows` scatters those into a `Vec<bool>` over root
+rows, which the scan then reads by index. No hash set anywhere, which is only
+possible because ids were rebased at ingest (section 0) and are therefore dense
+from zero — resource and scope go through a second boolean array of the same
+shape rather than a join, because entity ids number in the tens. It covers all
+six value columns and every attribute level.
 
 **Every level means the span's children too.** Record, resource and scope are the
 obvious three; a span's `events` and `links` carry attributes of their own, and
@@ -1344,7 +1425,7 @@ than leaving a shell in raw mode on the alternate screen, and that is why
 `restore()` is async-signal-safe `libc::write` and not `io::stdout()`, whose lock
 the handler may have interrupted its own thread holding.
 
-The cost is `crates/mira/src/term.rs`: 862 lines, 481 of them before the test
+The cost is `crates/mira/src/term.rs`: 1,127 lines, 534 of them before the test
 module, and a `Row` type that tracks visible width separately from bytes, because
 inline ANSI makes `len()` a lie. Unix only, which is the same bet `mmap` and
 `SIGTERM` already make.
@@ -1461,6 +1542,44 @@ attribute keys against a `UInt16` dictionary is not going to fit the next one
 either, so it keeps `INTERNAL`/`500`. Telling a sender to keep trying something
 that cannot work is worse than telling it the truth, and it is the only case
 where the truth is permanent.
+
+**The WAL watermark, and which way it is allowed to be wrong.** A block's fifth
+directory field is `wal_hi`, and boot replays every frame at or above
+`block::wal_watermarks`, which takes the maximum over the blocks of that signal.
+The field is exclusive: a block holding frame 0 claims 1. Too high and the frames
+it skipped are gone with the node that held them; too low and they are ingested a
+second time, which costs duplicate rows that `block::sources` and the
+`(node, seq)` dedupe rule will not catch because they are genuinely different
+blocks. One of those is recoverable and the other is not, so every choice here
+leans low.
+
+`max(seq) + 1` was correct while a signal had one flusher, and stopped being
+correct the moment it had several. Shards seal independently and out of order, so
+a block whose highest sequence is 40 says nothing about 39 sitting in a sibling's
+open block; publishing 41 would strand it. What the log tracks instead is a set —
+`Wal::pending`, one `BTreeSet` per signal, holding every sequence handed out and
+not yet published. `watermark_for(signal, seqs)` answers with the oldest member
+of that set which is *not* in `seqs`, falling back to `next_seq` when this block
+is the last of them. It is called before the publish, not after, so a sibling
+sealing in the same instant still counts this block's frames against its own
+answer and neither can claim the other's; `published` retires a sequence only
+once the rename is durable, so a block that failed to land leaves its frames
+holding the line for whoever seals next.
+
+Two edges follow from the set being the authority. A frame read back by replay is
+put *back* into `pending` by `Wal::reframed` before it is decoded, because a
+shard that sealed in between would otherwise compute a watermark that stepped
+over it — replay is precisely when the frames at risk are the ones a crash nearly
+lost. And a frame that fails to decode is retired on the spot rather than left
+pending: it will not decode on this boot or any other, and leaving it in the set
+would pin the signal's watermark at its sequence for the life of the volume,
+replaying every frame published behind it on every boot forever. `main::replay`
+says out loud that those exports are gone, and the retirement is what makes that
+sentence true.
+
+The cost of leaning low is bounded by `max_block_age`: a shard holding an old
+frame pins its siblings' watermarks behind it, and it is at most two seconds from
+sealing.
 
 **Probes are not the UI, and the listening line is not a promise.** `/health` and
 `/readyz` are the same handler — Mira has no warm-up and no cluster to join, so
@@ -1587,11 +1706,19 @@ The four axes, each with a target and a measurement. Measured on an Apple M3 Pro
 Every figure in this section comes from **one corpus and one binary**, because a
 table assembled from runs weeks apart is a table whose rows cannot be divided by
 each other. The corpus is `loadgen --conns 4 --batch 8192 --for 40s` over
-loopback: 28,811,264 log records, 28,811,264 spans and 42,204 data points, 7.35
-GiB of Arrow across 948 tables in 87 log blocks, 77 trace blocks and 16 metric
-blocks. The ingest rows are separate 30 s runs against a fresh server, each the
-median of three; the query rows are that corpus, read back after a restart; the
-cold-tier table further down is the same 948 tables.
+loopback: 27,066,368 log records, 27,066,368 spans and 39,648 data points, 8.33
+GiB of Arrow across 1,652 tables in 137 log blocks, 155 trace blocks and 24
+metric blocks. The ingest rows are separate 30 s runs against a fresh server,
+each the median of three; the query rows are that corpus, read back after a
+restart, and every one of them is a paired A/B against the 0.0.1 binary run
+back to back in the same sitting; the cold-tier table further down is the same
+1,652 tables.
+
+Six flushers per signal rather than one (section 4) changed the *shape* of that
+corpus as well as the rate that produced it: 137 log blocks of ~204,800 rows
+where one flusher sealed 87 of ~330,000. Same bytes, six sealers, so a block is
+smaller and there are more of them — which matters below, because what a query
+pays per block turns out to dominate what it pays per row.
 
 Scoring them together is the point, and it is why the generator that produced
 this table is also the load harness: `loadgen --readers N --pid N --data-dir P`
@@ -1601,26 +1728,27 @@ an engine that is fast at whichever one its authors were watching.
 [End-to-end testing section 3](internals/e2e.md#3-the-load-harness) is how to drive
 it and what it teaches.
 
-Read the two query columns carefully. **Neither is a cold-disk number**: 7.35
-GiB fits in this machine's page cache, so after one pass everything is resident
-and short of `purge` there is no way back. "First" is the first call after a
-process restart — the pages are in RAM but not in this process's address space,
-so it measures establishing 180 blocks' worth of mappings and faulting them in.
-"Steady" is the same call repeated. The gap between them is virtual-memory work,
-not I/O.
+Read the two query columns carefully. **Neither is a cold-disk number**: 8.33
+GiB fits in this machine's 18 GiB of page cache, so after one pass everything is
+resident and short of `purge` there is no way back. "First" is the first call
+after a process restart — the pages are in RAM but not in this process's address
+space, so it measures establishing 316 blocks' worth of mappings and faulting
+them in. "Steady" is the same call repeated. The gap between them is
+virtual-memory work, not I/O.
 
 | Axis | Target | Measured | |
 |---|---|---|---|
-| Ingest throughput | ≥ 1 M records/s/core | **891k records/s/core** — 604,166 records/s on 0.68 cores; **1,458,967 records/s** aggregate at four connections and 1,565,941 at eight, on 1.78 and 2.18 cores, nothing shed at any shape | ~ |
-| Resident footprint | ≤ 2 × the open block's target size | **244 MiB** at one connection, **862 MiB** at four, **2,244 MiB** at 96 — see below | ~ |
-| Ack latency | — | p50 **7.6 ms**, p99 **46 ms** at four connections, log on; p50 **657 ms**, p99 **2,647 ms** with it off | see below |
-| Query: attribute value, absent | ≤ 10 ms | **18.1 ms** first, **1.5 ms** steady, 0 of 87 blocks | ✓ |
-| Query: attribute value, matching | ≤ 10 ms | **18.9 ms** first, **8.9 ms** steady, 1 of 87 blocks | ✓ |
-| Query: trace by id | ≤ 10 ms | **20.1 ms** first, **13.3 ms** steady, 1 of 77 blocks | ~ |
-| Query: metric names | — | **16.0 ms** first, **3.7 ms** steady, 16 of 16 blocks | — |
-| Query: substring, no time bound, prunes nothing | — | **1,594 ms** first, **175 ms** steady, 87 of 87 blocks, 24.0 M rows | see below |
+| Ingest throughput | ≥ 1 M records/s/core | **886k records/s/core** — 629,384 records/s on 0.71 cores; **1,350,502 records/s** aggregate at four connections and a plateau peak of **1,537,875** at thirty-two, on 1.75 and 2.23 cores, nothing shed at any shape | ~ |
+| Resident footprint | ≤ 2 × the open block's target size | **232 MiB** at one connection, **689 MiB** at four, **1,648 MiB** at 96 — see below | ~ |
+| Ack latency | — | p50 **8.5 ms**, p99 **55 ms** at four connections, log on; p50 **657 ms**, p99 **2,647 ms** with it off | see below |
+| Query: attribute value, absent | ≤ 10 ms | **8.3 ms** first, **2.6 ms** steady, 0 of 137 blocks | ✓ |
+| Query: attribute value, matching | ≤ 10 ms | **4.1 ms** first, **4.5 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
+| Query: unfiltered `limit 100` | ≤ 10 ms | **29.1 ms** first, **4.6 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
+| Query: trace by id | ≤ 10 ms | **8.3 ms** first, **4.7 ms** steady, 2 of 155 blocks, 73,728 rows | ✓ |
+| Query: metric names | — | **8.9 ms** first, **4.7 ms** steady, 24 of 24 blocks | — |
+| Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.20 B/B** hot, **0.14 B/B** compacted | ✓ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.62 MiB** / 117 crates | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.63 MiB** / 117 crates | ✓ |
 
 Reading these honestly:
 
@@ -1628,16 +1756,17 @@ Reading these honestly:
   Aggregate throughput is a property of the offered load: raise `--conns` and it
   moves without a line of the server changing. Per core is measured rather than
   inferred — the harness takes the server's CPU-seconds either side of the run,
-  so 0.68 and 1.78 are consumed CPU over wall clock and not a core count
+  so 0.71 and 1.75 are consumed CPU over wall clock and not a core count
   somebody chose. Two things fall out of it. The server is **not CPU-bound at
-  any shape measured here**: the fastest row, 1,565,941 records/s at eight
-  connections, costs 2.18 of twelve cores, and the per-core rate is *highest* at
-  one connection — 891k records/s/core, where there is nothing to contend over.
-  And throughput **plateaus** between four and eight connections rather than
-  peaking at a point — three passes span 2.5% at four and 38% at eight, so the
-  ordering between them is inside the noise — then declines: 16 connections is
-  1,409,148 and 96 is 795,505. Ten idle cores at the plateau means the ceiling
-  is somewhere other than the engine's arithmetic. This run does not say where, and it
+  any shape measured here**: the fastest row, 1,537,875 records/s at thirty-two
+  connections, costs 2.23 of twelve cores, and the per-core rate is *highest* at
+  one connection — 886k records/s/core, where there is nothing to contend over.
+  And throughput **plateaus** between sixteen and thirty-two connections rather
+  than peaking at a point — the two are within 2% of each other on medians whose
+  passes span 6% and 16% — and then falls away to 1,136,941 at 96. That is a new
+  shape: before `ingest.shards` (section 4) the curve peaked at four connections
+  and declined from there, and 96 returned 734,142. Ten idle cores at the plateau
+  means the ceiling is somewhere other than the engine's arithmetic. This run does not say where, and it
   cannot: the generator is co-resident and encoding 8192 protobuf records per
   batch is inside the same loop, so part of the per-batch cost is the harness's.
   Separating them wants the generator on a second machine, which is the one
@@ -1652,17 +1781,21 @@ Reading these honestly:
   records/s and **nothing shed**, on 1.61 cores instead of 3.85, with the ack
   p99 down from 12.4 s to 3.2 s. Those two figures are a paired A/B from one
   sitting and should be read only against each other — the published
-  96-connection row is the later three-pass sweep's 795,505, measured on a
-  quieter box against the same code. The bound is the connection count — every
+  96-connection row is the later three-pass sweep's 1,136,941, measured against
+  sharded code on a quieter box. The bound is the connection count — every
   waiter is a request already in memory — where a deeper queue is bounded by
   nothing. Measured against that alternative: `--queue 2048` also removes the
-  shedding, by buffering ~20 GiB of anonymous memory on an 18 GiB machine.
+  shedding, by buffering ~20 GiB of anonymous memory on an 18 GiB machine. That
+  arithmetic is unaffected by sharding and that is deliberate: `ingest.queue` is
+  a per-signal *total* divided across that signal's shards, not a depth each
+  shard gets, so the worst case is the same number of resident exports whether
+  one flusher holds them or six do.
 - **The two ack rows are two chosen contracts, not a fast path and a slow one.**
   With the log on — the default — the ack is a `write(2)` into the page cache,
   and `cargo bench -p miradb-core --bench wal_bench` prices that write on its own
   at p50 7 µs / p99 39 µs for a 4 KiB body and p50 0.24 ms / p99 4.6 ms for a
   1 MiB one. What a client sees is larger than the append, because it includes
-  the decode and the queue: p50 7.6 ms, p99 46 ms at four connections.
+  the decode and the queue: p50 8.5 ms, p99 55 ms at four connections.
   With the log *off* the run is block-seal-bound, which is what p50 657 ms and
   p99 2,647 ms say — the block filling, then a durable publish landing in front
   of a waiter. Neither costs read-your-writes anything: the open block is
@@ -1683,17 +1816,25 @@ Reading these honestly:
   32 MiB block target is a read-path decision the write path can afford.
 - **Resident footprint is the axis with no number, and saying so is the point of
   scoring them together.** The harness reports peak RSS, and it moves by a
-  factor of nine across the ingest sweep alone — 244 MiB at 1 connection,
-  363 MiB at 2, 862 MiB at 4, 2,040 MiB at 8, 2,244 MiB at 96 in
+  factor of seven across the ingest sweep alone — 232 MiB at 1 connection,
+  314 MiB at 2, 689 MiB at 4, 1,243 MiB at 8, 1,648 MiB at 96 in
   [End-to-end testing section 3](internals/e2e.md#3-the-load-harness) — which is the
   clearest evidence that
   RSS is not this row: it counts every mapped block page a query touched, and on
   the write side it covers three signals' builders plus every in-flight decode,
   not one open block. The harness's anonymous figure is closer and still not it:
-  610 MiB against 660 MiB of RSS on a write-only run, and three open blocks
-  whose target is 32 MiB each, so the residue is decode buffers and allocator
-  arenas rather than block state, and dividing it by three would be inventing an
-  attribution.
+  610 MiB against 660 MiB of RSS on a write-only run, against `3 × ingest.shards`
+  open blocks whose target is 32 MiB each, so the residue is decode buffers and
+  allocator arenas rather than block state, and dividing it by eighteen would be
+  inventing an attribution.
+
+  Sharding moved this row *down*, which was not the goal and is worth saying why.
+  At four connections peak RSS is 689 MiB where one flusher needed 1,366 MiB, and
+  the anonymous figure 745 MiB against 1,446 MiB. Six open blocks per signal is
+  strictly more block state than one, so the saving is not block state: it is the
+  queue. One flusher behind four connections keeps its slots full of decoded
+  exports at ~1.29 MiB each; six flushers drain theirs, and an export that is
+  never queued is never resident.
   What actually holds the bound is section 5's refusal of `concat_batches`, which is a
   property of the code and a test, not a measurement. A per-open-block
   anonymous figure needs an allocator hook the tree does not have, and adding
@@ -1703,17 +1844,43 @@ Reading these honestly:
   the block count from "all of them" to one or zero, which is worth between 60×
   and 1800× and is the reason these rows are in milliseconds at all. Everything
   below is about the cost of the blocks that *are* opened.
-- **The per-block cost is page faults, not the scan.** A query that opens one
-  91 MB block answers in ~9 ms, of which the CRC32 of the whole body (section 3.3) and
-  the dictionary scan are a few. Multiply that by 87 and the last row of the
-  table should be ~1 s; before this was fixed it was **10.1 s**, and it did not
-  improve on repetition, which ruled out disk — the data was already resident.
-  What it was: `mmap` faults 16 KB at a time and `open_table` touches every page
-  anyway, so a multi-gigabyte scan took hundreds of thousands of single-page
-  faults with no readahead. One `madvise(MADV_WILLNEED)` at map time — the
-  mapping is about to be read end to end, so there is nothing speculative about
-  the hint — took that row to **1.59 s on the first call and 175 ms steady**,
-  and every other query row down with it.
+- **The per-block cost is opening the block, not scanning it.** This was
+  previously written as "page faults, not the scan", which was the right shape
+  and the wrong term, and `scan_cost_per_row` now prices both sides of it
+  directly. Over two million rows, evaluating a predicate costs **0.047 ns/row**
+  for no term at all, 0.485 for a dictionary equality, 1.064 for a resource
+  attribute, 2.402 for a record attribute and **5.586** for the most expensive
+  shape there is, a UTF-8 `contains`. The *same block through the whole read
+  path* costs **24 to 25 ns/row**. So the scan is at most 22% of what a query
+  pays, and for most predicates under 2%; the other ~20 ns/row is
+  `Block::open` — the `mmap`'s minor faults, the dictionary scan, the two child
+  indexes, and the CRC32 of every table body (section 3.3), which by construction
+  touches every page. The clearest statement of it is that `limit 1` costs
+  24.374 ns/row against the whole block's 25.430: asking for one row and asking
+  for all of them are the same query, because the block had to be opened either
+  way.
+
+  The arithmetic closes on the last row of the table. A full scan CRCs the
+  4,371 MiB of log blocks, and 4.58 GB in 885 ms is 5.2 GB/s, which is what
+  `crc32fast` does on this machine. **The unpruned scan is integrity-check-bound,
+  not scan-bound** — and that is a tradeoff rather than a bug, because the CRC is
+  why a corrupt block is refused instead of served (section 3.3). What it is not
+  is a vectorisation problem, which is what this section used to imply.
+
+  The history is still worth keeping, because it is how the page-fault term was
+  found: the last row was once **10.1 s** and did not improve on repetition,
+  which ruled out disk. `mmap` faults 16 KB at a time and `open_table` touches
+  every page anyway, so a multi-gigabyte scan took hundreds of thousands of
+  single-page faults with no readahead, and one `madvise(MADV_WILLNEED)` at map
+  time removed them.
+
+  **The 175 ms once published for that row does not reproduce and has been
+  withdrawn.** Four different full-scan predicates were run against this corpus
+  on both the 0.0.1 binary and this one, and every one of the eight lands between
+  0.96 s and 1.6 s over 27.1 M rows. The measurement now agrees with this
+  section's own prediction — "multiply the per-block cost by the block count and
+  the last row should be ~1 s" — rather than with the figure printed next to it,
+  which is the direction an error of that size usually resolves in.
 - **Sorting the match set to keep a hundred of it was the second lever.** A
   block scan produces every matching row, and the merge then ordered all of them
   before truncating to `limit`. For the query every session opens with — "the
@@ -1723,31 +1890,50 @@ Reading these honestly:
   ([section 3](internals/e2e.md#3-the-load-harness)), on the smaller store that A/B
   was run against,
   that took the whole read mix from 35 to 50 queries/s and `tail` p99 from
-  230 ms to 139 ms. On the corpus this section measures — twice the rows, eight
-  readers — the same mix reads 41 queries/s with `tail` at p50 63.6 ms and p99
-  130.5 ms.
+  230 ms to 139 ms.
 
-  What is left is O(n) in the block's row count and cannot be removed without
-  giving up `rows_matched`, which is an honest count of the match set and not of
-  the page — an operator asks "how broad is my filter", and answering it for the
-  page they happen to be on is answering a different question. So the remaining
-  lever on tail latency is `target_block_bytes`: at 32 MiB a logs block holds
-  ~330 K rows and an unfiltered `limit 100` costs ~40 ms uncontended. Halving the
-  target halves that and doubles the block count, which pruning makes nearly
-  free. It is not changed here because the tradeoff runs the other way for
-  compression ratio and directory size, and the number to tune it against is a
-  workload nobody has yet.
-- **A block cache is worth much less than it looks.** It was the obvious next
-  lever and the measurement says otherwise: what it saves is the `open` and the
-  CRC, and those are the small part of a ~9 ms single-block query. It stays on
-  the section 10 list, but as a small win, not the missing 10×.
+  **The third lever was the attribute semi-join, and it is the largest of the
+  three.** Section 7.6 replaced a per-row `attr_matches` with a predicate
+  evaluated once per contiguous parent run, and on the corpus this section
+  measures that is worth **6.7×** on a matching attribute value (30.2 ms steady
+  to 4.5), **5.3×** on the unfiltered `limit 100` above (24.4 ms to 4.6), and
+  **3.5×** on a substring that fills its limit. Across the eight-reader read mix
+  it is 5.1× on the `attr` class p50 and 4.6× on `errors`, taking the mix from 40
+  to 50 queries/s. Two classes did not move: `trace` is a `trace.idx` lookup with
+  almost no rows to filter, and `series` is the metrics route, which came out
+  slightly *worse* — 575–616 ms p50 before, 686–702 after. That is inside the
+  spread of two passes and it is not a win, so it is printed rather than dropped.
+  The mix's `tail` class matched nothing on this corpus, because the data is
+  older than the window `tail` asks for, so its numbers measure the empty path
+  and are not quoted here — the unfiltered `limit 100` row of the table is the
+  honest version of the same question.
+
+  What is left is not O(n) in the block's row count: `scan_cost_per_row` prices
+  that term at 0.047 ns/row, so a 204,800-row block spends about 10 µs of the
+  4.6 ms it takes. What is left is O(bytes) in the block's *size*, paid at open,
+  which also means `target_block_bytes` is **not** the lever it was once written
+  up as. Halving it halves the bytes each block CRCs and doubles the number of
+  blocks, so a query that prunes to one block gets faster and a query that prunes
+  to none gets nothing. It is not changed here because it only ever helped the
+  first kind, the tradeoff runs the other way for compression ratio and directory
+  size, and the number to tune it against is a workload nobody has yet. Sharding
+  has already moved it in that direction by accident: six sealers per signal make
+  a log block 204,800 rows where one made 330,000.
+- **A block cache went from "worth much less than it looks" to the obvious next
+  lever, and the measurement is what turned it round.** It was ruled a small win
+  on the belief that the `open` and the CRC were the small part of a single-block
+  query. They are not: they are ~80% of it, and on the unpruned scan they are
+  effectively all of it. A cache that holds an opened block's validated mapping
+  is the only thing on the section 10 list that attacks the term that actually
+  dominates. What it cannot do is help a first touch, and it trades resident
+  memory for it — which is the axis this section already scores worst.
 - **Cost per GB is 1.20 B/B while a block is hot and 0.14 once it is
   compacted.** 164.0 bytes on disk per 136.9-byte wire record, and it is the
   steadiest figure in this section: across fifteen benchmark runs it moved
   between 1.195 and 1.199. Not the sidecars either way: all the `attr.idx` files
   of a store this size together are a few tens of kilobytes, a `zone.idx` is 776
   bytes on a traces block and 656 on a logs one, and the trace filters are
-  single-digit megabytes against 7.35 GiB. What inflates the hot number is the
+  single-digit megabytes against 8.33 GiB. What inflates the hot number is the
   `ATTRS` table, which carries six typed value columns and writes all six for
   every row — a string attribute pays 8 bytes for a null `int`, 8 for a null
   `double` and 4-byte offsets each for null `bytes`/`ser`, roughly 24 bytes of
@@ -1763,35 +1949,41 @@ Reading these honestly:
 
   That padding is also almost free to compress, which is what the cold tier
   (section 3.5) collects. Measured by `cargo run --release -p miradb-core --example
-  tier -- <data-dir>` over the whole corpus — every one of the 948 tables, not a
+  tier -- <data-dir>` over the whole corpus — every one of the 1,652 tables, not a
   sample, and not a `zstd` CLI estimate either: it is the actual
   `write_table_zstd` path the sweep calls.
 
   | | plain | zstd | ratio | lz4 | ratio |
   |---|---|---|---|---|---|
-  | `logs/log_attrs.arrow` | 1,656.9 MiB | 24.5 MiB | **67.6x** | 97.7 MiB | 17.0x |
-  | `logs/logs.arrow` | 2,211.0 MiB | 412.1 MiB | 5.4x | 632.6 MiB | 3.5x |
-  | **logs, 87 blocks** | **3,868.9 MiB** | **437.5 MiB** | **8.84x** | 731.2 MiB | 5.3x |
-  | `traces/span_attrs.arrow` | 1,670.0 MiB | 31.1 MiB | **53.6x** | 98.5 MiB | 17.0x |
-  | `traces/spans.arrow` | 1,987.1 MiB | 428.1 MiB | 4.6x | 532.5 MiB | 3.7x |
-  | **traces, 77 blocks** | **3,657.9 MiB** | **460.0 MiB** | **7.95x** | 631.8 MiB | 5.8x |
-  | **metrics, 16 blocks** | **4.5 MiB** | **0.8 MiB** | **5.67x** | 1.2 MiB | 3.8x |
-  | **all 948 tables** | **7,531.4 MiB** | **898.3 MiB** | **8.38x** | 1,364.1 MiB | 5.5x |
+  | `logs/log_attrs.arrow` | 1,871.8 MiB | 27.9 MiB | **67.1x** | 110.6 MiB | 16.9x |
+  | `logs/logs.arrow` | 2,497.5 MiB | 465.8 MiB | 5.4x | 714.3 MiB | 3.5x |
+  | **logs, 137 blocks** | **4,371.0 MiB** | **495.1 MiB** | **8.83x** | 826.2 MiB | 5.3x |
+  | `traces/span_attrs.arrow` | 1,886.0 MiB | 38.0 MiB | **49.7x** | 111.6 MiB | 16.9x |
+  | `traces/spans.arrow` | 2,244.1 MiB | 482.7 MiB | 4.7x | 601.8 MiB | 3.7x |
+  | **traces, 155 blocks** | **4,132.0 MiB** | **522.2 MiB** | **7.91x** | 714.9 MiB | 5.8x |
+  | **metrics, 24 blocks** | **5.0 MiB** | **1.0 MiB** | **4.87x** | 1.5 MiB | 3.4x |
+  | **all 1,652 tables** | **8,508.0 MiB** | **1,018.3 MiB** | **8.36x** | 1,542.5 MiB | 5.5x |
 
-  1.20 B/B ÷ 8.38 is **0.14 B/B**, comfortably under the 0.35 target. The two
+  1.20 B/B ÷ 8.36 is **0.14 B/B**, comfortably under the 0.35 target. The two
   attribute tables are where it comes from and the reason is the padding above:
-  a column of nulls is a run, and `log_attrs` compresses **67.6x** against
+  a column of nulls is a run, and `log_attrs` compresses **67.1x** against
   `logs.arrow`'s 5.4x. The metrics ratio is worse mostly because that corpus is
-  4.5 MiB — too small for per-buffer framing to disappear into the payload — and
+  5.0 MiB — too small for per-buffer framing to disappear into the payload — and
   the tiny `resources` and `scope_attrs` tables actually get *larger* under zstd
   (0.96x) for the same reason. Compaction rewrites them anyway: skipping a table
   because it is 23 KB is more code than it saves bytes.
 
-  Compression runs at **808 MiB/s** zstd and **976 MiB/s** lz4 on one core — the
-  median of three passes over the whole 7,531 MiB, 9.3 CPU-seconds and 7.7, read
-  and write included, so that is the rewrite path rather than the codec in
-  isolation. It is sensitive to what else the box is doing: a fourth pass taken
-  while a benchmark was still winding down read 554 and 566. A 32 MiB block is
+  Six sealers per signal did not move any of this, which is the answer to the
+  obvious worry about sharding: 137 log blocks compress to 8.83x where 87 larger
+  ones compressed to 8.84x. A block is smaller, but a run of nulls in an `ATTRS`
+  column is a run at either size.
+
+  Compression runs at **634 MiB/s** zstd and **777 MiB/s** lz4 on one core — over
+  the whole 8,508 MiB, 13.4 CPU-seconds and 11.0, read and write included, so
+  that is the rewrite path rather than the codec in isolation. It is sensitive to
+  what else the box is doing, and these two were taken on a box that had been
+  running benchmarks all day; an earlier quiet pass over a smaller corpus read
+  808 and 976. A 32 MiB block is
   therefore ~40 ms, on a path already inside `spawn_blocking` and off the ingest
   critical path entirely: it is the retention sweep, an hour after the data
   landed. The `MAX_COMPACT_PER_SWEEP` cap of 8 blocks a minute exists for the
@@ -1801,27 +1993,27 @@ Reading these honestly:
   the opposite of what the design assumed.** The worry was that inflating a
   compressed buffer into the heap would cost more latency than the pages it
   saves, and that the age threshold would therefore have to be conservative.
-  `tier` now times the read back as well as the write, over all 948 tables:
-
-  | | read plain | read zstd | read lz4 |
-  |---|---|---|---|
-  | pass 1 | 5.4 s | 7.4 s | 8.3 s |
-  | pass 2 | 6.6 s | **6.5 s** | 8.4 s |
-  | pass 3 | 5.5 s | 6.2 s | 8.0 s |
+  `tier` now times the read back as well as the write. Over all 1,652 tables of
+  this corpus: **9.3 s plain, 10.4 s zstd, 14.4 s lz4** — zstd is 1.11× the plain
+  read. Three passes over the previous, smaller corpus put the same pair at
+  5.4/7.4, 6.6/6.5 and 5.5/6.2 seconds, a spread of 1.00× to 1.38× that brackets
+  it.
 
   These are **page-cache-warm** — the file was written microseconds before it
   was read — and warm is the half of the comparison that favours plain, because
   a resident plain block has nothing to fault while a compressed one still has
-  to inflate. Even so the two are within the run-to-run noise of each other
-  (1.00× to 1.38×), which is the useful result: the inflate is real, and it is
-  paid back by having 8.4× fewer bytes to touch and CRC32 over 8.4× fewer of
-  them. Cold — which is the case that matters, since a block is an hour old
-  before it is compacted — the arithmetic runs further the same way, because the
-  `MADV_WILLNEED` hint above is then faulting 8.4× fewer pages; an earlier
-  measurement over a smaller corpus read 0.68 s plain against 0.54 s zstd on
-  logs and 0.58 s against 0.26 s on traces. That one is not reproducible from
-  here: `tier` cannot drop this machine's page cache, and 18 GiB of it against a
-  7.35 GiB corpus means nothing stays cold for long.
+  to inflate. Even so the two are within the run-to-run noise of each other,
+  which is the useful result: the inflate is real, and it is paid back by having
+  8.4× fewer bytes to touch and CRC32 over 8.4× fewer of them. That second half
+  matters more than it looked when this was written, because the CRC is now
+  measured as the dominant per-block term rather than a small one. Cold — which
+  is the case that matters, since a block is an hour old before it is compacted —
+  the arithmetic runs further the same way, because the `MADV_WILLNEED` hint
+  above is then faulting 8.4× fewer pages; an earlier measurement over a smaller
+  corpus read 0.68 s plain against 0.54 s zstd on logs and 0.58 s against 0.26 s
+  on traces. That one is not reproducible from here: `tier` cannot drop this
+  machine's page cache, and 18 GiB of it against an 8.33 GiB corpus means nothing
+  stays cold for long.
 
   So the cold tier costs the read path nothing measurable — only the zero-copy
   property, which is an allocation cost, not a latency one. The threshold is set
@@ -1831,7 +2023,7 @@ Reading these honestly:
 
   LZ4 is the one clear loser and that settles a standing question. It is the
   pure-Rust alternative, and dropping `zstd-sys` would be dropping the only C
-  dependency in the tree — but it compresses 5.52× against zstd's 8.38× *and*
+  dependency in the tree — but it compresses 5.52× against zstd's 8.36× *and*
   reads back slower in every pass. It costs on both axes, so the C dependency
   stays.
 
@@ -2167,7 +2359,9 @@ closes the incident its fire opened.
 A direct `https://` target costs eleven crates and brings `ring`, which is C and
 assembly. "The tree is N crates" and "`zstd-sys` is the only C dependency" are
 both stated product properties (section 11, README), so HTTPS is `--features
-webhook-tls`: 120 crates by default, 131 with it. The default build refuses an
+webhook-tls`: 120 crates by default, 131 with it. Those two are `cargo tree`
+counts and so include the three workspace members; the 117 section 11 and the
+README state is the same default tree with those three taken out. The default build refuses an
 `https://` URL when the rules file is *loaded* — at boot, with the process
 exiting on the message — rather than at the first page, because the first page
 is precisely when nobody is reading logs. An egress proxy on localhost is the

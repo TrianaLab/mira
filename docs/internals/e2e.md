@@ -145,7 +145,7 @@ flattering number.
 Run three shapes in this order — write-only to build a store, read-only against
 it, then mixed. `--conns 64` below is tuned for the run these captures came
 from, which had `ingest.wal` off; on the default configuration throughput
-plateaus between four and eight connections and 64 is well past it, for the
+plateaus between sixteen and thirty-two connections and 64 is past it, for the
 reason the sweep further down gives:
 
 ```sh
@@ -216,13 +216,13 @@ they disagree by more than the medians do:
 
 | `--conns` | records/s | MiB/s | cores | per core | ack p50 / p99 | peak RSS | the three passes |
 |---|---|---|---|---|---|---|---|
-| 1 | 604,166 | 78.9 | 0.68 | **890,999** | 5.2 ms / 22 ms | 244 MiB | 604k / 614k / 598k |
-| 2 | 992,305 | 129.7 | 1.13 | 865,147 | 5.9 ms / 29 ms | 363 MiB | 942k / 996k / 992k |
-| **4** | **1,458,967** | 190.6 | 1.78 | 816,895 | 7.6 ms / 46 ms | 862 MiB | 1,446k / 1,482k / 1,458k |
-| 8 | 1,565,941 | 204.6 | 2.18 | 717,084 | 8.6 ms / 447 ms | 2,040 MiB | 1,217k / 1,676k / 1,565k |
-| 16 | 1,409,148 | 184.1 | 1.95 | 720,570 | 13.9 ms / 1,105 ms | 2,168 MiB | 1,252k / 1,467k / 1,409k |
-| 32 | 1,152,811 | 150.6 | 1.81 | 640,607 | 36.9 ms / 1,344 ms | 2,261 MiB | 1,079k / 1,152k / 1,206k |
-| 96 | 795,505 | 103.9 | 1.73 | 460,609 | 268.8 ms / 2,501 ms | 2,244 MiB | 795k / 775k / 983k |
+| 1 | 629,384 | 82.2 | 0.71 | **886,147** | 5.2 ms / 19 ms | 232 MiB | 635k / 609k / 629k |
+| 2 | 990,420 | 129.4 | 1.18 | 840,880 | 6.0 ms / 27 ms | 314 MiB | 990k / 1,023k / 911k |
+| **4** | **1,350,502** | 176.5 | 1.75 | 770,631 | 8.5 ms / 55 ms | 689 MiB | 1,374k / 1,351k / 1,244k |
+| 8 | 1,474,946 | 192.7 | 2.10 | 710,944 | 13.7 ms / 173 ms | 1,243 MiB | 1,564k / 1,475k / 1,436k |
+| 16 | 1,508,709 | 197.1 | 2.28 | 662,725 | 30.8 ms / 610 ms | 1,575 MiB | 1,509k / 1,429k / 1,517k |
+| **32** | **1,537,875** | 200.9 | 2.23 | 690,358 | 66.5 ms / 963 ms | 1,495 MiB | 1,538k / 1,539k / 1,329k |
+| 96 | 1,136,941 | 148.5 | 2.23 | 515,288 | 247.3 ms / 2,661 ms | 1,648 MiB | 1,427k / 1,137k / 1,026k |
 
 **Nothing shed, on any row, in any of the twenty-one runs.** That column used to
 be the interesting one — an earlier revision shed the moment the queue was full
@@ -230,13 +230,44 @@ and gave back 93% 503s at 96 connections — and `ADMIT_WAIT` (`pipeline.rs`)
 removed it by parking a full queue for up to five seconds instead. A run of your
 own that *does* shed is measuring a machine that cannot keep up, not this curve.
 
-**Throughput plateaus between four and eight connections; it does not peak at a
-point.** Read the last column before believing otherwise: at four connections
-the three passes span 2.5%, at eight they span 38%. Eight has the higher median
-and four is the number to quote, because four is the shape that reproduces —
-and it buys the plateau at 862 MiB of RSS and a 46 ms ack p99 against 2,040 MiB
-and 447 ms. Past eight, every added connection costs throughput and multiplies
-the tail, and by 96 the ack p99 is 2.5 s for 55% of the four-connection rate.
+**Throughput climbs to a plateau between sixteen and thirty-two connections.**
+Read the last column before believing otherwise: 16 and 32 are within 2% of each
+other on medians whose passes span 6% and 16%, so the ordering between them is
+noise and the plateau is the honest reading. Four connections is still the number
+to quote for a paired comparison, because it is the shape that reproduces —
+10% across three passes, against 39% at 96 — and it buys 1.35M records/s at
+689 MiB of RSS and a 55 ms ack p99. What thirty-two buys on top is 14% more
+throughput for eighteen times the ack p99.
+
+**That shape is new, and it is what `ingest.shards` bought.** Until 0.0.3 a
+signal had one flusher, so every connection past the point where that consumer
+saturated bought contention rather than work, and the curve *fell* from four
+connections onward. The paired A/B — the same three-pass sweep, the same box, the
+pre-sharding binary and this one run back to back:
+
+| `--conns` | one flusher | six flushers | |
+|---|---|---|---|
+| 1 | 605,006 | 629,384 | 1.04x |
+| 2 | 923,636 | 990,420 | 1.07x |
+| 4 | 1,353,967 | 1,350,502 | 1.00x |
+| 8 | 1,240,618 | 1,474,946 | 1.19x |
+| 16 | 1,216,557 | 1,508,709 | 1.24x |
+| 32 | 1,093,645 | 1,537,875 | 1.41x |
+| 96 | 734,142 | 1,136,941 | **1.55x** |
+
+Six because this box has twelve cores and the default is half of them
+([Architecture section 4](../architecture.md#4-ingest-path)). The rows below four
+connections are unchanged and that is the design: dispatch is first fit from
+shard 0, so a node that is not saturating one flusher never starts a second and
+goes on producing one block per seal window rather than six nearly-empty ones.
+The gain begins exactly where the old curve began to fall.
+
+Peak RSS fell with it, which was not the goal. At four connections it is 689 MiB
+against 1,366 MiB, and the harness's anonymous figure 745 MiB against 1,446 MiB.
+Six open blocks per signal is *more* block state than one, so the saving is not
+block state: it is the queue. One flusher behind four connections keeps its 128
+slots full of decoded exports at 1.29 MiB each; six flushers drain theirs, and
+the exports that used to sit in the queue are not resident at all.
 
 Divide by cores, not by connections. `--pid` makes the harness take the
 server's CPU time either side of the run and print the delta, so the `cpu` line
@@ -250,20 +281,25 @@ cpu      1.13 cores busy   865147 records/s/core
 The aggregate rate is a property of the offered load — raise `--conns` and it
 moves without a line of the server changing. The per-core rate is a property of
 the engine, and it is the one to quote. It is also the column that behaves: it
-falls monotonically across the whole sweep, from 891k at one connection to 461k
+falls across the whole sweep, from 886k at one connection to 515k
 at 96, while the aggregate rises and then falls. Ten of twelve cores are idle at
 the plateau, so what the added connections buy is contention, not work.
 
 **Check what else is running before you believe a run.** An earlier pass of this
 same sweep, taken with a 294%-CPU virtual machine and a `go build` on the box,
-read 1,165,623 at four connections — 20% under the median above, on the same
+read 1,165,623 at four connections — 14% under the median above, on the same
 binary and the same command. Nothing in the output says so; the only tell is
 `uptime`. Take three passes and print the load average beside each.
 
-**Query latency is linear in block rows, not in `limit`.** `tail` asks for 100
-records and scans 1 block, yet costs 62 ms: `rows_matched` is an honest count,
-so the whole block's match set is computed before the head of it is taken. At a
-32 MiB target block that is ~330k rows.
+**Query latency is linear in block bytes, not in `limit`.** `tail` asks for 100
+records and scans 1 block, yet costs 62 ms. `rows_matched` is an honest count,
+so the whole block's match set is computed before the head of it is taken — at a
+32 MiB target block that is ~205k rows — but that part is nearly free:
+`MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core --lib scan_cost_per_row`
+puts a predicate at 0.05–5.6 ns/row against 24–25 ns/row for the same block
+through the whole read path. The other 20 ns is `Block::open` faulting the
+mapping in and CRC'ing every table body, which is why `limit 1` costs what the
+whole block costs.
 
 **Do not compare a mixed run's query numbers to a read-only run's.** In a mixed
 run the store grows underneath the readers. On a *fresh* store the paging class
@@ -307,6 +343,14 @@ split above is deliberate: traces and metrics over gRPC, logs over HTTP, so one
 pass exercises both receivers.
 
 ## 5. Reading it back
+
+**`localhost` can answer from the wrong Mira.** If either compose stack below is
+up, Docker has published `*:4318` on IPv6 and macOS resolves `localhost` to
+`::1` first — so every command here reaches the *container* rather than the
+binary section 2 started, and answers with a `stats` object that is valid,
+plausible and about someone else's store. The tell is `blocks_total`: a store
+you know is large answering as if it were nearly empty. Use `127.0.0.1`, or
+bring the container down.
 
 ```sh
 curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \

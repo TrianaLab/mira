@@ -442,7 +442,8 @@ mod tests {
             dir.clone(),
             Duration::from_secs(60),
             pipeline::Ingest {
-                tx,
+                tx: [tx].into(),
+                turn: std::sync::Arc::default(),
                 rejects: &pipeline::REJECTS[1],
                 wal: None,
                 signal: mira_core::wal::Signal::Metrics,

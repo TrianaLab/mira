@@ -98,6 +98,7 @@ is the one thing both templates go through.
   "ingest": {
     "max_request_bytes": {{ .Values.config.ingest.maxRequestBytes | quote }},
     "queue": {{ .Values.config.ingest.queue | toString | quote }},
+    "shards": {{ .Values.config.ingest.shards | toString | quote }},
     "wal": {{ .Values.config.ingest.wal | toString | quote }},
   },
   "telemetry": {

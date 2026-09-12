@@ -34,7 +34,7 @@ of blanks.
 ## Ingest, one node
 
 Mira's row is a **consumed-CPU** measurement and every other row is a
-**provisioned-CPU** one. That is the whole difficulty of this table: 1.78 cores
+**provisioned-CPU** one. That is the whole difficulty of this table: 1.75 cores
 is CPU-seconds the server actually burned over the wall clock of the run, and
 nobody else publishes that, so their vCPU column is a purchase order and Mira's
 is a meter reading. Both bases are given below rather than picking the flattering
@@ -42,10 +42,10 @@ one.
 
 | Engine | Published | Their hardware | = | Reason |
 |---|---|---|---|---|
-| **Mira** | **1,458,967 rec/s, 191 MiB/s** at 137 B | M3 Pro 12c / 18 GiB, 1.78 busy | — | 4 connections, nothing shed |
-| Mira, higher median | 1,565,941 rec/s, 2.18 busy | same box, eight connections | — | 38% spread across three passes |
-| Mira, per-core ceiling | 604,166 rec/s, 0.68 cores | same box, one connection | — | 891k rec/s per consumed core |
-| Mira, 96 connections | 795,505 rec/s, 1.73 busy | same box, 96 connections | — | nothing shed, ack p99 2.5 s |
+| **Mira** | **1,350,502 rec/s, 176.5 MiB/s** at 137 B | M3 Pro 12c / 18 GiB, 1.75 busy | — | 4 connections, nothing shed |
+| Mira, sweep peak | 1,537,875 rec/s, 2.23 busy | same box, 32 connections | — | 1.14x the paired row |
+| Mira, per-core ceiling | 629,384 rec/s, 0.71 cores | same box, one connection | — | 886k rec/s per consumed core |
+| Mira, 96 connections | 1,136,941 rec/s, 2.23 busy | same box, 96 connections | — | nothing shed, ack p99 2.7 s |
 | Mira, 1 core [^m1] | 1.10M rec/s, 214 MiB/s | M3 Pro, one core | — | bench, not server |
 | GreptimeDB 1.0 [^g1] | 621,367 rows/s OTLP | M4 Max 16c / 48 GB | no | disclaims absolute rate |
 | otel-arrow OTAP [^oa1] | 540,309 logs/s at 110 B | 4 SUT cores of 64 | no | transport only, no store |
@@ -60,13 +60,13 @@ one.
 | Jaeger + Scylla [^j1] | ~8,000 spans/s | ~20 backend cores | no | backend only, nodes unstated |
 | Elastic APM [^ea] | 127,000 events/s | Elastic Cloud 32 GB | no | undefined events, no storage |
 
-Per core, on the basis the peers publish: 191 MiB/s across the 12 cores the
-process was given is **15.9 MiB/s per provisioned core**, against Quickwit's
+Per core, on the basis the peers publish: 176.5 MiB/s across the 12 cores the
+process was given is **14.7 MiB/s per provisioned core**, against Quickwit's
 6.75 MB/s/vCPU on a c5.xlarge [^q1] and Parseable's ~8.3 MiB/s/vCPU [^p1] —
-2.5x and 1.9x. Ahead, but on a different record and a different workload, so
+2.2x and 1.8x. Ahead, but on a different record and a different workload, so
 read it as an ordering rather than a ratio.
 
-On consumed CPU it is 107.1 MiB/s per core, a 16x gap, and that number should
+On consumed CPU it is 100.9 MiB/s per core, a 15x gap, and that number should
 not be quoted against these rows. Nobody else reports utilisation, so the gap it
 measures is partly Mira's and partly the fact that a benchmark rig provisions
 headroom it does not use. The reason to record it at all is what it says about
@@ -75,7 +75,7 @@ twelve cores idle, so the ingest ceiling on this box is not the engine's
 arithmetic.
 
 GreptimeDB is the only other single-process figure on laptop silicon and it is
-the one to be held to: 621,367 rows/s on 16 cores and 48 GB against 1,458,967 on
+the one to be held to: 621,367 rows/s on 16 cores and 48 GB against 1,350,502 on
 12 and 18. Their record is not this record, so the ordering is real and the
 ratio is not.
 
@@ -83,7 +83,7 @@ ratio is not.
 
 | Engine | Published | At what rate | = | Reason |
 |---|---|---|---|---|
-| **Mira** | **244 MiB peak** | 604k rec/s, whole process | — | ps-sampled, includes both UIs |
+| **Mira** | **232 MiB peak** | 629k rec/s, whole process | — | ps-sampled, includes both UIs |
 | GreptimeDB 0.12 [^g2] | 408 MB | 20,000 rows/s, c5d.2xlarge | no | 18x lower offered rate |
 | ClickHouse [^v2] | 1.12 GiB | 10,000 spans/s, 4 vCPU | no | cgroup budget, capped rate |
 | VictoriaLogs [^v2] | 1.15 GiB | 10,000 spans/s, same box | no | cgroup budget, capped rate |
@@ -95,17 +95,20 @@ ratio is not.
 Every peer here is measured inside a memory cgroup, so each number is a budget
 partly consumed rather than an intrinsic floor; Mira's is an uncapped laptop
 process. The load-bearing column is the operating point, not the megabytes:
-Mira's 244 MiB is at 604,166 records/s, the peers' at 10,000–20,000.
+Mira's 232 MiB is at 629,384 records/s, the peers' at 10,000–20,000.
 
 One caveat that belongs next to the number rather than in a footnote, because it
-is the row's weakness: Mira's RSS is **not flat in connection count**, and 244
+is the row's weakness: Mira's RSS is **not flat in connection count**, and 232
 MiB is the one-connection row, not the throughput headline. The same process
-reaches 862 MiB at the four connections that produce 1,458,967 records/s, 2,040
-MiB at eight and 2,244 MiB at ninety-six. RSS counts mapped block pages and more
+reaches 689 MiB at the four connections that produce 1,350,502 records/s, 1,243
+MiB at eight and 1,648 MiB at ninety-six. RSS counts mapped block pages and more
 concurrency keeps more blocks open, so past four connections Mira sits above
-ClickHouse's 1.12 GiB rather than below it. Both ends of that range are in the
-README's table; quoting only the low end would be quoting the sweep's best case
-as its result.
+ClickHouse's 1.12 GiB rather than below it. Sharding the flusher pulled the
+four-connection figure down from 1,366 MiB to 689 for the same throughput —
+smaller blocks sealed by six tasks hold less anonymous memory than large ones
+sealed by one — but it did not change the shape, and the shape is the caveat.
+Both ends of that range are in the README's table; quoting only the low end
+would be quoting the sweep's best case as its result.
 
 ## Artifact — stripped binary
 
@@ -117,16 +120,16 @@ number **up**, so these are the unpacked figures.
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 |---|---|---|---|---|
-| **Mira** | **5.62 MiB** (arm64 macOS) | 1.0x | 117 crates | — |
+| **Mira** | **5.63 MiB** (arm64 macOS) | 1.0x | 117 crates | — |
 | VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.9x | 98 Go packages | yes |
 | VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.8x | — | yes |
-| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 16.9x | 425 modules | yes |
-| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 18.6x | — | yes |
-| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 18.9x | 331 modules | yes |
-| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 24.9x | 407 modules | yes |
-| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 26.0x | 1,171 lock entries | yes |
-| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 27.5x | 462 crates | yes |
-| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 27.7x | — | yes |
+| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 16.7x | 425 modules | yes |
+| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 18.4x | — | yes |
+| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 18.6x | 331 modules | yes |
+| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 24.6x | 407 modules | yes |
+| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 25.6x | 1,171 lock entries | yes |
+| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 27.1x | 462 crates | yes |
+| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 27.3x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
 The dependency column is directional only: a Go module ships many packages, and
@@ -145,7 +148,7 @@ this axis. Mira publishes both.
 | Engine | Ratio | Denominator | = |
 |---|---|---|---|
 | **Mira, wire** [^m2] | 7.0x (0.14 B/B) | OTLP protobuf on the wire | — |
-| **Mira, internal** [^m2] | 8.8x logs, 8.0x traces | uncompressed Arrow columns | — |
+| **Mira, internal** [^m2] | 8.8x logs, 7.9x traces | uncompressed Arrow columns | — |
 | ClickHouse `otel_logs` [^c1] | 14.1x | engine-internal column bytes | no |
 | LogHouse fleet [^c2] | ~16x | engine-internal column bytes | no |
 | VictoriaLogs [^v3] | 11.2x | engine-internal column bytes | no |
@@ -166,15 +169,15 @@ at all, so this table is context rather than comparison.
 
 | Engine | Published | Corpus / hardware | = | Reason |
 |---|---|---|---|---|
-| **Mira** [^m3] | 1.5 ms absent value | 87 blocks, 0 opened | — | pruning, not scanning |
-| **Mira** [^m3] | 1.2 ms ordering predicate | 77 blocks, 0 opened | — | zone map, 0 opened |
-| **Mira** [^m3] | 13.3 ms trace by id | 28.8M spans, 1 block of 77 | — | bloom sidecar hit |
-| **Mira** [^m3] | 175 ms unpruned scan | 24.0M rows, 87 of 87 | — | every block opened |
+| **Mira** [^m3] | 2.56 ms absent value | 137 blocks, 0 opened | — | pruning, not scanning |
+| **Mira** [^m3] | 4.49 ms matching value | 27.1M rows, 1 block of 137 | — | pruned to one block |
+| **Mira** [^m3] | 4.74 ms trace by id | 27.1M spans, 2 blocks of 155 | — | bloom sidecar hit |
+| **Mira** [^m3] | 885 ms unpruned scan | 27.07M rows, 137 of 137 | — | every block opened |
 | VictoriaLogs [^v1] | 266 ms absent line | 300 GB, 4 vCPU | no | bloom scan vs prune |
 | VictoriaLogs [^v1] | 2.2 s absent line | 500 GB, 4 vCPU | no | bloom scan vs prune |
 | Quickwit [^q2] | 0.6 s term over 212 GB | n2-standard-16, GCS | yes | no Mira counterpart exists |
-| ClickHouse [^c3] | 0.68 s hot, 1.54 s cold | 9 queries, 1B rows | no | 40x rows, 2.7x cores |
-| Elasticsearch [^c3] | 1.78 s hot, 9.55 s cold | 9 queries, 1B rows | no | 40x rows, 2.7x cores |
+| ClickHouse [^c3] | 0.68 s hot, 1.54 s cold | 9 queries, 1B rows | no | 37x rows, 2.7x cores |
+| Elasticsearch [^c3] | 1.78 s hot, 9.55 s cold | 9 queries, 1B rows | no | 37x rows, 2.7x cores |
 | Datadog Husky [^dd] | p50 2.01 ms per fragment | unstated fleet | no | leaf call, mostly cache |
 | Honeycomb Retriever [^hc] | p90 2.5 s | Lambda fan-out fleet | no | fleet-wide, all shapes |
 
@@ -194,7 +197,7 @@ This table shows what the axis looks like; it is not one Mira wins.
 
 ## Where Mira is ahead
 
-**1. Artifact size, and it is not close.** 5.62 MiB stripped: one binary, three
+**1. Artifact size, and it is not close.** 5.63 MiB stripped: one binary, three
 signals, query API, MCP surface and two UIs. The nearest peer is VictoriaLogs at
 16.26 MiB — 2.9x — and that binary covers logs only; matching Mira's signal
 coverage takes VictoriaLogs plus VictoriaTraces, two processes and 32.44 MiB.
@@ -204,24 +207,24 @@ hardware, no workload, no denominator to argue about. Every correction applied
 while verifying it — zip to binary, tarball to binary, image layer to executable
 — moved the gap wider.
 
-**2. Resident set at the operating point.** 244 MiB peak RSS for the whole
-process at 604,166 records/s. The peers that publish RSS do it at 10,000–20,000
+**2. Resident set at the operating point.** 232 MiB peak RSS for the whole
+process at 629,384 records/s. The peers that publish RSS do it at 10,000–20,000
 records or spans per second: Tempo 4.26 GiB then OOM, VictoriaLogs 1.15 GiB,
 ClickHouse 1.12 GiB, Quickwit's indexer 4.9 GB average. GreptimeDB's 408 MB is
 at 30x less load. The claim that survives scrutiny is the ratio of footprint to
-offered rate, not the absolute figure — at the 1,458,967 records/s four-connection
-row the same process is 862 MiB, and by eight connections it is 2,040 MiB, above
+offered rate, not the absolute figure — at the 1,350,502 records/s four-connection
+row the same process is 689 MiB, and by eight connections it is 1,243 MiB, above
 ClickHouse. The mechanism behind the ratio
 is in the code rather than in a tuning flag: the flusher's refusal to
 `concat_batches`.
 
-**3. Pruned-query latency.** 1.5 ms for an attribute value present in none of 87
-blocks, 0 blocks opened; 1.2 ms for an ordering predicate nothing satisfies
-across 77 blocks; 13.3 ms to fetch every span of one trace out of 28.8M, opening
-1 block of 77. The closest published negative-query number is VictoriaLogs at
-266 ms over 300 GB. State it as pruning effectiveness rather than scan speed —
-VictoriaLogs is bloom-scanning where Mira is skipping the file — and it is
-defensible at two orders of magnitude.
+**3. Pruned-query latency.** 2.56 ms for an attribute value present in none of
+137 blocks, 0 blocks opened; 4.49 ms for one present in exactly one of them, a
+single block opened out of 137; 4.74 ms to fetch every span of one trace out of
+27.1M, opening 2 blocks of 155. The closest published negative-query number is
+VictoriaLogs at 266 ms over 300 GB. State it as pruning effectiveness rather
+than scan speed — VictoriaLogs is bloom-scanning where Mira is skipping the
+file — and it is defensible at two orders of magnitude.
 
 **4. Supply-chain surface.** 117 crates on `cargo tree --edges normal` for one
 target triple, with `zstd-sys` as the only C dependency. Parseable, measured with
@@ -240,42 +243,92 @@ reading.
 
 ### Gaps with a cause and a path
 
-**Ingest throughput.** Nothing here is a win worth leading with. 1,458,967
-records/s beats GreptimeDB's 621,367 on smaller hardware, but their record is
-not this record and neither party ran the other's workload, so the ordering
-survives and the ratio does not. On the per-provisioned-core basis the peers
-publish, 15.9 MiB/s against Quickwit's 6.75 and Parseable's ~8.3 is under 2.5x
-on a different record — an ordering, not a result. And the shape of the sweep is
-a limitation in its own right: throughput plateaus between four and eight
-connections and is 55% of the four-connection rate by 96, so an operator whose
-collector fleet opens many connections gets less than this table's headline and
-has no knob to tune it back — Mira does not expose a concurrency limit.
+**Ingest throughput.** Nothing here is a win worth leading with. 1,350,502
+records/s at four connections beats GreptimeDB's 621,367 on smaller hardware,
+but their record is not this record and neither party ran the other's workload,
+so the ordering survives and the ratio does not. On the per-provisioned-core
+basis the peers publish, 14.7 MiB/s against Quickwit's 6.75 and Parseable's ~8.3
+is 2.2x and 1.8x on a different record — an ordering, not a result. That half of
+the row is where it was, and nothing but somebody running both engines on one
+box will move it.
 
-The cause is one line of `crates/mira/src/pipeline.rs`: there is one bounded
-channel and one flusher task *per signal*, so ninety-six connections sending
-logs are ninety-six producers against one consumer, and the curve is that
-consumer's service time. What that curve no longer includes is *shedding*: the
-same sweep used to return a 503 to 93% of exports at 96 connections, and making
-a full queue wait for a slot rather than reject took it to nothing shed and
-double the throughput. The remaining gap costs latency instead — ack p99 2.5 s
-at 96 connections against 46 ms at four. Closing it means sharding the flusher
-within a signal, each shard owning its own block sequence — which the block
-directory already tolerates, since it is the manifest and a sequence is just a
-filename. It is not a redesign; it is the row this page most expects to move.
+The other half moved. What this page used to record was a curve that peaked at
+four connections and fell to 55% of that by 96, an operator whose collector
+fleet opens many connections therefore getting less than the headline, and no
+knob to tune it back; the cause was one bounded channel and one flusher task
+*per signal*, so ninety-six connections sending logs were ninety-six producers
+against one consumer and the curve was that consumer's service time. The flusher
+is now sharded within a signal — N tasks per signal, each owning its own block
+sequence, which the block directory already tolerated since it is the manifest
+and a sequence is just a filename — with dispatch first fit from shard 0, so a
+light load still seals one block per window rather than N thin ones. **The curve
+now climbs to a plateau at 16 to 32 connections, and 96 connections holds 84.2%
+of the four-connection rate and 73.9% of peak where it used to hold 55%.** Six
+shards against one is 1.19x at eight connections, 1.24x at 16, 1.41x at 32 and
+1.55x at 96. The knob the previous version of this paragraph said did not exist
+is `ingest.shards`, `(cores / 2).clamp(1, 16)` by default, six on this box.
 
-**Query at scale.** The unpruned scan is 175 ms steady over 24.0M rows — 137M
-rows/s — and 1.6 s the first time, before the page cache is warm. ClickHouse
-answers nine heterogeneous queries in 0.68 s hot over 1 billion rows and 642 GiB
-uncompressed, roughly 40x the rows on 2.7x the cores. Per row scanned Mira is
-about an order of magnitude behind, and the cold figure is another 9x on top of
-that. Mira's query numbers are a pruning result, not a scan result, and when
-pruning does not fire it does not win.
+What is still open is latency and headroom rather than shape, and both are worse
+than the throughput curve makes them look. Ack p99 is 2,661 ms at 96 connections
+against 55 ms at four: a full queue waits for a slot instead of returning a 503,
+so nothing is shed on any row of the sweep and the backpressure is paid in wait
+time, which is the trade and not a free win. And the server is not CPU-bound at
+any shape it was offered — 2.23 of twelve cores at the 1,537,875 records/s peak,
+and the same 2.23 at the 96-connection row that is 26% slower. Whatever sets the
+ceiling is now neither the flusher nor arithmetic, and this sweep cannot see it,
+which is why the row stays in this section rather than moving up the page.
 
-The path exists and it is long: the scan evaluates predicates row-wise over
-Arrow arrays where ClickHouse runs a vectorised engine with SIMD kernels and
-twenty years of them. This is a programme, not a patch, and nothing on this page
-should be read as a promise that it lands soon. It is listed here rather than
-under the design because there is no principle stopping it — only work.
+**Query at scale.** This row opens with a correction. The figure it used to
+carry — 175 ms steady over 24.0M rows, 137M rows/s — does not reproduce: four
+different full-scan predicates were run over a fresh 27.07M-row corpus on both
+the previous binary and this one, and every one of them landed between 0.96 s
+and 1.6 s, which is what architecture.md section 11's own arithmetic predicted
+for that row all along. **The honest figure for an unpruned scan is 885 ms
+steady over 27,066,368 rows, 30.6M rows/s**, against 1,163 ms and 23.3M rows/s
+on the pre-release binary, and 1,441 ms on the first call after a restart
+against 2,431 ms. Better than it was, and much worse than this page claimed.
+
+ClickHouse answers nine heterogeneous queries in 0.68 s hot over 1 billion rows
+and 642 GiB uncompressed, roughly 37x the rows on 2.7x the cores. Per row
+scanned that is about 48x rather than the order of magnitude this page used to
+claim, and a cold Mira call adds another 1.6x on top. Mira's query numbers are a
+pruning result, not a scan result, and when pruning does not fire it does not
+win.
+
+What changed underneath is the diagnosis, and it is the most useful measurement
+in the release. The row-wise scan this entry used to blame is gone: predicates
+are evaluated over contiguous binary-searched parent runs with a `Vec<bool>`
+scatter over root rows and no hash set anywhere. Over two million rows that
+costs 0.047 ns/row for no term at all, 0.485 for a dictionary equality, 1.064
+for a resource attribute, 2.402 for a record attribute and 5.586 for the worst
+case, a UTF-8 `contains`. The same block through the whole read path costs 24 to
+25 ns/row. **The scan is at most 22% of a query's cost and under 2% for the
+cheap predicates; the other ~20 ns/row is `Block::open`** — `mmap` minor faults,
+the dictionary scan, the two child indexes, and above all the CRC32 of every
+table body on every open (`crates/mira-core/src/block.rs:1200`). The arithmetic
+closes: the full scan CRCs 4,380 MiB of log blocks in 885 ms, which is about
+5 GB/s, which is what `crc32fast` does on this machine. A `limit 1` costs 24.374
+ns/row against 25.430 for the whole block, the same fact from the other side.
+The unpruned scan is integrity-check-bound, not scan-bound.
+
+Where vectorising did pay is everything that filters. An attribute value that
+matches went from 30.2 ms to 4.49 ms, 6.7x; an unfiltered `limit 100` from 24.4
+to 4.61, 5.3x; a substring that fills the limit from 26.6 to 7.62, 3.5x. On the
+eight-reader read mix `attr` p50 improved 5.1x and `errors` p50 4.6x, taking the
+whole mix from 40 to 50 queries/s. Two classes did not improve and belong in the
+same sentence as the ones that did: `tail` p50 went from 1.42–1.54 ms to
+1.72–1.74, and `series` p50 from 575–616 ms to 686–702, both slightly worse.
+
+It stays under gaps with a cause and a path, but the cause named is a different
+one and a shorter one. The old entry set the path at twenty years of SIMD
+kernels, called it a programme rather than a patch and said nothing here should
+be read as a promise it lands soon. Not re-verifying 4,380 MiB of block bodies
+on every full scan is a much smaller piece of work than that — but it is a real
+trade rather than free speed, because the CRC is the reason a corrupt block is
+detected instead of served, so the fix is not to remove it. Verifying once per
+block per process instead of once per open, or verifying only the tables a query
+actually reads, both keep the guarantee and both are patches. Until one of them
+ships, an unpruned scan pays full price to check bytes it is about to discard.
 
 ### Gaps that are what the design costs
 
@@ -283,7 +336,7 @@ under the design because there is no principle stopping it — only work.
 per byte of OTLP protobuf is the number an operator can predict a bill from, and
 it is better grounded than what the competitors print. But on the denominator
 they actually print — uncompressed engine-internal columns to compressed — Mira
-is 8.8x on logs and 8.0x on traces against ClickHouse's 14.1x and VictoriaLogs'
+is 8.8x on logs and 7.9x on traces against ClickHouse's 14.1x and VictoriaLogs'
 11.2x. That is a loss, and it is the like-for-like comparison.
 
 The cause is that rows land in arrival order and are compressed in arrival
@@ -342,7 +395,7 @@ Nobody else publishes an ack latency so there is no row to lose, but the number
 is bad on its own terms and is why the write-ahead log is [the
 default](config.md#ingestwal). It stays on the list because the mode still
 exists and someone will run it; with the log on the ack costs a `write(2)` — p50
-7.6 ms, p99 46 ms at four connections — and this row is not the shipped one.
+8.5 ms, p99 55 ms at four connections — and this row is not the shipped one.
 
 ## Claims rejected
 
@@ -432,7 +485,7 @@ sprint; each one buys something in the tables above.
 | Refused | What the user is told |
 |---|---|
 | **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice.** |
-| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 68–92 MB binary, against 5.62 MiB. |
+| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 5.63 MiB. |
 | **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
 | **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
 | **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
@@ -453,7 +506,7 @@ The reasoning behind each of these is in
 argument.
 
 [^m1]: `cargo bench -p miradb-core --bench encode_bench`; [Architecture section 11](architecture.md#11-performance-model).
-[^m2]: `cargo run --release -p miradb-core --example tier` over all 948 tables of a 7.35 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
+[^m2]: `cargo run --release -p miradb-core --example tier` over all 1,652 tables of an 8.33 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
 [^m3]: [Architecture section 11](architecture.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
 [^g1]: <https://greptime.com/blogs/2026-03-24-ingestion-protocol-benchmark>
 [^g2]: <https://greptime.com/blogs/2025-03-10-log-benchmark-greptimedb>

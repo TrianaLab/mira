@@ -27,7 +27,7 @@ use config::Config;
 
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
      [--data-dir PATH] [--retention DURATION]
-     [--max-request-bytes SIZE] [--queue N] [--wal]
+     [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
      [--self-telemetry] [--telemetry-interval DURATION]
      [--alerts FILE] [--version]
 
@@ -82,6 +82,7 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
             "--retention" => cfg.retention = config::duration(&value()?)?,
             "--max-request-bytes" => cfg.max_request_bytes = config::bytes(&value()?)?,
             "--queue" => cfg.queue = config::positive(&value()?)?,
+            "--shards" => cfg.shards = config::whole(&value()?)?,
             "--telemetry-interval" => cfg.telemetry_interval = config::duration(&value()?)?,
             "--alerts" => cfg.alerts = Some(PathBuf::from(value()?)),
             // These two take no value, unlike every other flag here. They are
@@ -325,16 +326,19 @@ async fn serve_with(
         node,
         retention: cfg.retention,
         queue: cfg.queue,
+        shards: pipeline::shard_count(
+            cfg.shards,
+            std::thread::available_parallelism().map_or(1, |n| n.get()),
+        ),
         wal: wal.clone(),
         ..Default::default()
     });
-    // One flusher, channel and block sequence per signal, so a slow flush on one
-    // cannot stall another.
-    let (logs, o_logs, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
-    let (traces, o_traces, h_traces) =
-        pipeline::spawn::<mira_core::traces::TracesBuilder>(pcfg.clone());
+    // One channel and block sequence per signal per shard, so a slow flush on
+    // one cannot stall another.
+    let (logs, o_logs, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&pcfg);
+    let (traces, o_traces, h_traces) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&pcfg);
     let (metrics, o_metrics, h_metrics) =
-        pipeline::spawn::<mira_core::metrics::MetricsBuilder>(pcfg.clone());
+        pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&pcfg);
     let flushers = [h_logs, h_traces, h_metrics];
     // In `pipeline::SIGNALS` order, which is what `Api::open` indexes with.
     let open_blocks = [o_logs, o_traces, o_metrics];
@@ -515,7 +519,7 @@ async fn drain<G, H>(
     stop: tokio::sync::watch::Sender<()>,
     grpc: tokio::task::JoinHandle<G>,
     http: tokio::task::JoinHandle<H>,
-    flushers: [tokio::task::JoinHandle<()>; 3],
+    flushers: [pipeline::Flushers; 3],
     grace: std::time::Duration,
 ) {
     let _ = stop.send(());
@@ -523,12 +527,10 @@ async fn drain<G, H>(
         let _ = grpc.await;
         let _ = http.await;
         for h in flushers {
-            // Skipped rather than awaited once it is done: `first_stopped` may
-            // already have polled one of these to completion, and a `JoinHandle`
-            // polled twice panics. A finished flusher has nothing left to seal.
-            if !h.is_finished() {
-                let _ = h.await;
-            }
+            // Awaited unconditionally: `first_stopped` may already have run one
+            // of these to completion, and a drained set answers at once rather
+            // than panicking the way a twice-polled `JoinHandle` would.
+            let _ = h.await;
         }
     };
     if tokio::time::timeout(grace, landed).await.is_err() {
@@ -540,12 +542,16 @@ async fn drain<G, H>(
 /// flushers, before the listeners open.
 ///
 /// Ordering is the reason this is not a background task. A replayed frame keeps
-/// the sequence it already has, which is below every live one, and
-/// `block::wal_watermarks` is only a correct watermark if a signal's frames
-/// reach their blocks in that order — so the last recovered frame has to be
-/// queued before the first new export is framed. It is also the reason nobody
-/// is waiting: the client that sent this either got its answer before the crash
-/// or gave up long before this process started.
+/// the sequence it already has, and `Ingest::replay` puts that sequence back
+/// among the log's unpublished before it queues the frame, which is what stops
+/// a shard sealing beside it from computing a watermark over it — but that only
+/// covers frames already read off disk. A frame still sitting in a segment is
+/// in nobody's pending set, so a live export sealing first would claim a
+/// watermark past it and the next boot would not replay it. Draining the whole
+/// log before the first new export is framed is the blunt guarantee that this
+/// never happens. It is also the reason nobody is waiting: the client that sent
+/// this either got its answer before the crash or gave up long before this
+/// process started.
 ///
 /// One `spawn_blocking` for the whole log, not one per frame. The channel is
 /// bounded at `ingest.queue` and the sends are blocking, so the flushers set the pace and
@@ -620,7 +626,7 @@ async fn replay(
 }
 
 /// Resolve as soon as any one flusher has returned.
-async fn first_stopped(flushers: &mut [tokio::task::JoinHandle<()>; 3]) {
+async fn first_stopped(flushers: &mut [pipeline::Flushers; 3]) {
     let [logs, traces, metrics] = flushers;
     tokio::select! {
         _ = logs => {}
@@ -1305,7 +1311,7 @@ mod tests {
             stop,
             wedged(),
             wedged(),
-            [wedged(), wedged(), wedged()],
+            std::array::from_fn(|_| pipeline::Flushers::wedged()),
             std::time::Duration::from_millis(1),
         )
         .await;
@@ -1551,10 +1557,10 @@ mod tests {
             max_block_age: std::time::Duration::from_millis(50),
             ..Default::default()
         });
-        let (logs, _ol, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
-        let (traces, _ot, h_traces) =
-            pipeline::spawn::<mira_core::traces::TracesBuilder>(pcfg.clone());
-        let (metrics, _om, h_metrics) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(pcfg);
+        let (logs, _ol, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&pcfg);
+        let (traces, _ot, h_traces) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&pcfg);
+        let (metrics, _om, h_metrics) =
+            pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&pcfg);
 
         replay(&dir, node, logs.clone(), traces.clone(), metrics.clone())
             .await
@@ -1568,9 +1574,17 @@ mod tests {
             let published = mira_core::block::scan(&dir, signal).unwrap();
             assert_eq!(published.len(), 1, "{signal} did not store its frame");
         }
-        // Each block claims one past the frame it stored, so the only thing the
-        // next boot hands back is the undecodable one, sequence 3.
-        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [1, 2, 3]);
+        // A block claims the first sequence of its signal that nothing covers,
+        // not one past the frame it happens to hold — under shards the two are
+        // different numbers, and only the first is safe to skip on the next
+        // boot. Here nothing of any signal is left outstanding: frames 0, 1 and
+        // 2 are in blocks, and frame 3 was retired when it failed to decode. So
+        // all three claim the whole log, and the next boot replays nothing.
+        //
+        // Sequence 3 being dropped rather than pinned is the point of that
+        // retirement: a frame that will never decode must not hold a watermark,
+        // or every frame published behind it is replayed on every boot forever.
+        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [4, 4, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1616,10 +1630,10 @@ mod tests {
             max_block_age: std::time::Duration::from_millis(50),
             ..Default::default()
         });
-        let (logs, _ol, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
-        let (traces, _ot, h_traces) =
-            pipeline::spawn::<mira_core::traces::TracesBuilder>(pcfg.clone());
-        let (metrics, _om, h_metrics) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(pcfg);
+        let (logs, _ol, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&pcfg);
+        let (traces, _ot, h_traces) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&pcfg);
+        let (metrics, _om, h_metrics) =
+            pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&pcfg);
 
         let (guard, log) = e2e::capture();
         replay(&dir, node, logs.clone(), traces.clone(), metrics.clone())
@@ -1676,9 +1690,9 @@ mod tests {
             node,
             ..Default::default()
         });
-        let (logs, _ol, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(pcfg.clone());
-        let (traces, _ot, _ht) = pipeline::spawn::<mira_core::traces::TracesBuilder>(pcfg.clone());
-        let (metrics, _om, _hm) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(pcfg);
+        let (logs, _ol, mut h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&pcfg);
+        let (traces, _ot, _ht) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&pcfg);
+        let (metrics, _om, _hm) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&pcfg);
         // The one failure mode a replay cannot route around: the receiving end
         // of this signal's channel is gone, so no retry and no other signal
         // makes the frame land.
