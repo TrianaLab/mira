@@ -25,8 +25,8 @@ target
 /site/
 /.venv-docs/
 
-# A local data directory is what `make run` and docs/testing.md write into.
-# Blocks are large, immutable and machine-specific — never a commit.
+# A local data directory is what `make run` and docs/internals/e2e.md write
+# into. Blocks are large, immutable and machine-specific — never a commit.
 /mira-data/
 /data/
 

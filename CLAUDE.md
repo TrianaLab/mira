@@ -49,8 +49,13 @@ a red build — and a **coverage ratchet**. The ratchet is the coverage that
 existed when the line was last edited; raise it when you raise coverage, never
 lower it.
 
-End-to-end testing against a live instance, with synthetic data, is
-[docs/testing.md](docs/testing.md).
+The contributor-facing internals live under `docs/internals/`:
+[testing.md](docs/internals/testing.md) is the map of the eight test levels and
+which one a new test belongs at, [e2e.md](docs/internals/e2e.md) is end-to-end
+testing against a live instance with synthetic data, and
+[releases.md](docs/internals/releases.md) is how a release is cut and what is
+signed. Those three plus `architecture.md` are the site's "Project internals"
+tab.
 
 ## The dependency budget is a product property
 
@@ -103,11 +108,11 @@ overflowing — so a layout change is not verified until you have looked at it.
 
 ## Pushing
 
-The default `gh` account cannot see the repo, and other sessions depend on it
-being active. Switch, push, switch back, in one go:
+`gh` is set to `edu-diaz` permanently — it is the only account that can see
+this repo, and there is no switch-back dance any more. If a `gh` call 404s on a
+repository that exists, check `gh auth status` before assuming anything else.
 
-```sh
-gh auth switch --hostname github.com --user edu-diaz
-git push origin main
-gh auth switch --hostname github.com --user eduardo-diaz-em
-```
+`main` is protected by a ruleset with an empty `bypass_actors`, so every change
+lands through a PR — including a version bump. See
+[docs/internals/releases.md](docs/internals/releases.md) for what a tag then
+triggers.

@@ -1,4 +1,4 @@
-# Mira behind a stock collector, for the end-to-end recipe in docs/testing.md.
+# Mira behind a stock collector, for the end-to-end recipe in docs/internals/e2e.md.
 #
 # Both containers share a compose network so the collector can resolve `mira`.
 # Running Mira on the host and the collector in Docker does not work on Docker

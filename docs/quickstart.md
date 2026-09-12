@@ -55,7 +55,7 @@ cargo build --release --bin mira --example loadgen
 `--demo` is the four-service shop, backdated over the window `--for` names.
 Without it `loadgen` is the load harness — a flat deterministic firehose aimed
 at the ingest path, which is [what section 3 of the testing guide
-measures](testing.md#3-the-load-harness).
+measures](internals/e2e.md#3-the-load-harness).
 
 ## Read it back
 
@@ -151,8 +151,8 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
 - [Connect an agent](agents.md) — the MCP wiring, the eight tools, and one
   investigation worked end to end.
 - [Configuration](config.md) — the eleven keys, and how much machine to give it.
-- [End-to-end testing](testing.md) — a live binary, `telemetrygen`, and a stock
+- [End-to-end testing](internals/e2e.md) — a live binary, `telemetrygen`, and a stock
   Collector in front of it in Docker.
-- [The load harness](testing.md#3-the-load-harness) — `loadgen` without
+- [The load harness](internals/e2e.md#3-the-load-harness) — `loadgen` without
   `--demo`, scoring ingest throughput, query latency, resident set and bytes per
   record in one run.

@@ -4,7 +4,7 @@
 rather than trust them.
 
 Every command here has been run against a live instance. To just *look* at Mira
-working, `make demo` is one command — [See it work](demo.md).
+working, `make demo` is one command — [See it work](../demo.md).
 
 `cargo` is not on `PATH` in a non-login shell:
 
@@ -400,7 +400,7 @@ That one command is the whole test. Six containers on one network: Mira
 collector. The generators are in the compose file on purpose — without them
 `up -d` brings up two idle containers and proves nothing.
 
-The collector config is [`docs/e2e/otelcol.yaml`](e2e/otelcol.yaml): the `otlp`
+The collector config is [`docs/e2e/otelcol.yaml`](../e2e/otelcol.yaml): the `otlp`
 and `otlphttp` exporters out of the box, pointed at a hostname. There is no
 Mira-specific component.
 
@@ -459,8 +459,8 @@ empty upstream and loaded last, so nothing in the demo checkout is patched:
 
 | | |
 |---|---|
-| [`docs/e2e/demo/otelcol-config-extras.yml`](e2e/demo/otelcol-config-extras.yml) | adds `otlp_grpc/mira` and `otlp_http/mira` to the collector's three pipelines |
-| [`docs/e2e/demo/compose.mira.yaml`](e2e/demo/compose.mira.yaml) | adds Mira as a service on the demo's compose network |
+| [`docs/e2e/demo/otelcol-config-extras.yml`](../e2e/demo/otelcol-config-extras.yml) | adds `otlp_grpc/mira` and `otlp_http/mira` to the collector's three pipelines |
+| [`docs/e2e/demo/compose.mira.yaml`](../e2e/demo/compose.mira.yaml) | adds Mira as a service on the demo's compose network |
 
 ```sh
 git clone --depth 1 https://github.com/open-telemetry/opentelemetry-demo /tmp/otel-demo

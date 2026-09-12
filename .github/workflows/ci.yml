@@ -333,8 +333,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: e2e
-      # docs/testing.md has described this scenario since before CI could run
-      # it: a real binary in a container, a stock OpenTelemetry Collector in
+      # docs/internals/e2e.md has described this scenario since before CI could
+      # run it: a real binary in a container, a stock OpenTelemetry Collector in
       # front of it, the OpenTelemetry project's own generator on the wire, and
       # then the query API asked whether the data arrived. Every other test in
       # the tree uses a client we wrote.

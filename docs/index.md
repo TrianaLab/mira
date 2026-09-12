@@ -62,6 +62,6 @@ transformation step for a field to fall out of.
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
 | [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
 | [Configuration](config.md) | eleven keys, KYAML, `${env:…}` interpolation |
-| [End-to-end testing](testing.md) | a live binary, a real collector, the load harness |
+| [End-to-end testing](internals/e2e.md) | a live binary, a real collector, the load harness |
 | [Architecture](architecture.md) | the reasoning behind every non-obvious choice |
 | [Market position](market.md) | who else is in this space, and where the line is |

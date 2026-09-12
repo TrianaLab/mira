@@ -20,9 +20,9 @@ PYTHON  ?= python3
 UI_DIR  := crates/mira/ui
 BIN     := target/release/mira
 # The load harness and the demo generator. `cargo build --release` does *not*
-# build examples, which is why docs/testing.md used to name a path that did not
-# exist after the build it told you to run. One spelling, here, and every doc
-# points at `make build`.
+# build examples, which is why docs/internals/e2e.md used to name a path that
+# did not exist after the build it told you to run. One spelling, here, and
+# every doc points at `make build`.
 LOADGEN := target/release/examples/loadgen
 
 # The coverage ratchet. This number is the coverage that existed when this line
@@ -858,7 +858,7 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 		echo "error: $(DIST_BIN) is not a Linux binary, so the container cannot start it."; \
 		echo "  this gate runs on Linux (ci.yml's e2e leg). Locally, use \`make demo\`."; \
 		exit 1; }
-	@# The scenario docs/testing.md section 6 documents, run as a gate. The
+	@# The scenario docs/internals/e2e.md section 6 documents, run as a gate. The
 	@# --build-arg makes compose reuse the layers dist-image just built instead
 	@# of compiling a second time inside the Dockerfile; everything else about
 	@# the stack is exactly what a reader of that section types.

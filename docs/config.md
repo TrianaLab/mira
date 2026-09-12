@@ -243,7 +243,7 @@ and a third of the two-connection rate, because every shed export is decoded,
 refused, retried and decoded again. Parking instead took the same row to nothing
 shed at double the throughput, and it has refused nothing in twenty-one
 consecutive runs of the sweep since — see [End-to-end testing section
-3](testing.md#3-the-load-harness) for the numbers and the box they were measured
+3](internals/e2e.md#3-the-load-harness) for the numbers and the box they were measured
 on.
 
 So this knob buys queueing, not throughput. The flusher drains at the rate it
@@ -286,7 +286,7 @@ default interval that is a few dozen points a minute. It counts itself — the
 Three axes driven by three different things: CPU by the record rate, memory by
 the number of concurrent exporters, and disk by the record rate again — through
 whichever of two costs applies. Every row is anchored to a measured point in
-[End-to-end testing section 3](testing.md#3-the-load-harness), the median of
+[End-to-end testing section 3](internals/e2e.md#3-the-load-harness), the median of
 three full passes on a 12-core M3 Pro; between the anchors it is linear
 interpolation and nothing more.
 

@@ -101,13 +101,15 @@ up. That is the loop to stay in: it is fast, and it is the closest thing to
 the real thing that a unit test can be.
 
 New behaviour arrives with a test in the same PR. A bug fix arrives with the
-test that would have caught it.
+test that would have caught it, at the level where it would have caught it —
+[`docs/internals/testing.md`](docs/internals/testing.md) is the map of those
+levels and ends with how to pick one.
 
 For what a unit test cannot reach — a real socket, a real exporter, real volume
-— [`docs/testing.md`](docs/testing.md) is a transcript rather than a plan: a
-live binary fed by the built-in `loadgen`, then `telemetrygen`, then a stock
-OpenTelemetry Collector in front of it in Docker. Run it for anything touching
-the receivers, the wire formats or the ingest pipeline.
+— [`docs/internals/e2e.md`](docs/internals/e2e.md) is a transcript rather than a
+plan: a live binary fed by the built-in `loadgen`, then `telemetrygen`, then a
+stock OpenTelemetry Collector in front of it in Docker. Run it for anything
+touching the receivers, the wire formats or the ingest pipeline.
 
 ## Code
 
@@ -146,6 +148,18 @@ rest.
 
 Open an issue before a large change. Not for process: because section 0 may already
 have an answer, and finding that out after the work is the expensive order.
+
+## Releases
+
+[`docs/internals/releases.md`](docs/internals/releases.md) is the procedure and
+the reasoning: one version number across three coordinates, what a tag triggers,
+what is signed, and the two facts that cannot be undone once a coordinate is
+published. Read it before changing `.github/workflows/release.yml` — it also
+records the mechanisms that were considered and rejected, so you do not have to
+re-derive why there is no version bot.
+
+A version bump is an ordinary PR like any other. It is not something you do on
+`main`, and it is not something a tag does for you.
 
 ## Licence
 
