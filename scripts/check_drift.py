@@ -35,7 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The three workspace members show up in `cargo tree -p mira`, so the measured
+# The three workspace members show up in `cargo tree -p miradb`, so the measured
 # figure is three above the number the README states. CLAUDE.md says the same
 # thing; if a fourth member is ever added, this constant and that sentence move
 # together.
@@ -182,7 +182,7 @@ def check_crate_count(declared: int) -> None:
     # The pipeline CLAUDE.md documents, done in Python: one entry per
     # name+version pair in mira's normal (non-dev, non-build) dependency tree.
     tree = cargo(
-        "tree", "-p", "mira", "--edges", "normal", "--prefix", "none",
+        "tree", "-p", "miradb", "--edges", "normal", "--prefix", "none",
         "--target", REFERENCE_TARGET,
     )
     pairs = {
@@ -216,7 +216,7 @@ def check_c_toolchain() -> None:
     """Whoever build-depends on `cc` is whoever compiles C. There is one."""
     for tool in C_TOOLCHAIN_CRATES:
         out = subprocess.run(
-            ["cargo", "tree", "-p", "mira", "--edges", "normal,build",
+            ["cargo", "tree", "-p", "miradb", "--edges", "normal,build",
              "-i", tool, "--prefix", "depth", "--format", "{p}",
              "--target", REFERENCE_TARGET],
             cwd=ROOT, capture_output=True, text=True,

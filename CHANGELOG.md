@@ -9,6 +9,22 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **Published on crates.io**: `cargo install --locked miradb` installs the
+  `mira` binary, and [`miradb-core`](https://docs.rs/miradb-core) and
+  [`miradb-proto`](https://docs.rs/miradb-proto) are there for embedding the
+  engine. The release workflow publishes them after the GitHub Release exists
+  and `verify-release` resolves all three out of the sparse index.
+
+### Changed
+
+- The three packages are named `miradb`, `miradb-core` and `miradb-proto`
+  rather than `mira`, `mira-core` and `mira-proto` — `mira` on crates.io is an
+  unrelated crate from 2024. Nothing else moved: the binary is still `mira`,
+  the dependency keys and `use` paths are still `mira_core` / `mira_proto`, and
+  no source file changed. `cargo test -p mira` is now `-p miradb`.
+
 ## [0.0.1] - 2026-09-12
 
 First tagged release. Everything below is the initial cut rather than a

@@ -10,7 +10,7 @@
 //! `wal.rs`'s module docs, and an argument nobody can re-run is folklore.
 //!
 //! ```sh
-//! cargo bench -p mira-core --bench wal_bench
+//! cargo bench -p miradb-core --bench wal_bench
 //! ```
 //!
 //! Exits non-zero if the p99 of a plain append is at or above 5 ms, so this is
@@ -66,7 +66,7 @@ const SIZES: &[(usize, usize)] = &[(4 << 10, 20_000), (64 << 10, 8_000), (1 << 2
 const PACED_BYTES_PER_SEC: f64 = 512.0 * 1024.0 * 1024.0;
 
 /// Override the paced rate, in MiB/s, to find where a given machine's cliff
-/// is: `MIRA_WAL_BENCH_MIBS=568 cargo bench -p mira-core --bench wal_bench`.
+/// is: `MIRA_WAL_BENCH_MIBS=568 cargo bench -p miradb-core --bench wal_bench`.
 /// The default above is a fact about the machine section 11 was measured on, and the
 /// only way to keep it a fact is for the next person to be able to re-derive
 /// it without editing this file.

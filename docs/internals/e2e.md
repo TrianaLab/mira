@@ -30,7 +30,7 @@ sockets, no ports, no cleanup. Two targets in it are not unit tests:
 The differential test is seeded, and a failure prints the seed:
 
 ```sh
-MIRA_DIFF_SEED=12858170866899772564 cargo test -p mira-core --test differential
+MIRA_DIFF_SEED=12858170866899772564 cargo test -p miradb-core --test differential
 ```
 
 ## 2. A live instance and the built-in generator

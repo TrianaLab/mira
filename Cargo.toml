@@ -8,6 +8,14 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/trianalab/mira"
+homepage = "https://miradb.dev"
+keywords = ["observability", "opentelemetry", "otlp", "telemetry", "tracing"]
+categories = ["database-implementations", "development-tools::debugging"]
+# No `readme`. It only resolves inside the package directory, and the README is
+# at the workspace root — `cargo package` drops a path that escapes, silently,
+# so the field would publish as a dangling reference. Three copies of it under
+# `crates/` is three things to keep in step for a page that `repository` and
+# `homepage` already link to, and docs.rs renders the crate docs regardless.
 
 # Lints, declared once and inherited by every member via `lints.workspace =
 # true`. Anything set here is enforced by `make lint`, which runs clippy with
@@ -58,8 +66,16 @@ uninlined_format_args = "warn"
 # wildcard, which crates.io refuses and `cargo deny check bans` flags. Keep
 # these in step with `workspace.package.version` above — Cargo has no syntax
 # for inheriting it here.
-mira-core = { path = "crates/mira-core", version = "0.0.1" }
-mira-proto = { path = "crates/mira-proto", version = "0.0.1" }
+#
+# `package =` because the crates.io names are `miradb-*` and the names in this
+# tree are `mira-*`. `mira` on crates.io is an unrelated crate from 2024, so the
+# published family had to move. Keeping the dependency keys `mira-*` — and, in
+# the members, `[lib] name = "mira_core"` — means one extern spelling holds
+# everywhere: workspace crates, their own integration tests and benches, and a
+# stranger who runs `cargo add miradb-core`. No source file knows the registry
+# exists, and none had to change for this.
+mira-core = { package = "miradb-core", path = "crates/mira-core", version = "0.0.1" }
+mira-proto = { package = "miradb-proto", path = "crates/mira-proto", version = "0.0.1" }
 
 # Arrow. Pinned as one version across the workspace: arrow_array::RecordBatch
 # from two different major versions is two different types, and the error you

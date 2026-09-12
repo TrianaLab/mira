@@ -887,7 +887,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mira"
+name = "miradb"
 version = "0.0.1"
 dependencies = [
  "axum",
@@ -898,8 +898,8 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
- "mira-core",
- "mira-proto",
+ "miradb-core",
+ "miradb-proto",
  "prost",
  "tokio",
  "tonic",
@@ -911,7 +911,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mira-core"
+name = "miradb-core"
 version = "0.0.1"
 dependencies = [
  "arrow-array",
@@ -921,14 +921,14 @@ dependencies = [
  "crc32fast",
  "libc",
  "memmap2",
- "mira-proto",
+ "miradb-proto",
  "prost",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
-name = "mira-proto"
+name = "miradb-proto"
 version = "0.0.1"
 dependencies = [
  "bytes",
