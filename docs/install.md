@@ -27,9 +27,8 @@ match, not that either came from this repository.
 | `GH_TOKEN` | avoids the anonymous 60-requests-an-hour limit on the version lookup |
 
 Piping a script from the internet into a shell is a decision, not a default.
-[Read it first](https://github.com/TrianaLab/mira/blob/main/scripts/get-mira.sh)
-— it is the same file served at that URL, by symlink, so what you read is what
-runs.
+[Read it first](https://miradb.dev/install.sh) — that URL is not a copy of the
+script, it *is* the script, so what you read is byte-for-byte what runs.
 
 ## Updating
 
@@ -162,9 +161,8 @@ Neither touches the block directory, so a slow disk does not fail a probe.
 
 ## Kubernetes
 
-The chart lives in the repository at
-[`charts/mira`](https://github.com/TrianaLab/mira/tree/main/charts/mira) and is
-published to the same registry as the image, as an OCI artifact:
+The chart is [`charts/mira`](reference/chart.md) in the repository, published to
+the same registry as the image, as an OCI artifact:
 
 ```sh
 helm install mira oci://ghcr.io/trianalab/charts/mira \
@@ -190,9 +188,8 @@ cosign verify \
   ghcr.io/trianalab/charts/mira:0.0.1
 ```
 
-The chart's own
-[README](https://github.com/TrianaLab/mira/blob/main/charts/mira/README.md) has
-every value, why it defaults where it does, and the argument for a StatefulSet.
+The [chart reference](reference/chart.md) has every value, why it defaults where
+it does, and the argument for a StatefulSet.
 It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira),
 which renders that README, the signature above and the image's current CVE
 report against the same coordinate. Every value is covered by a closed

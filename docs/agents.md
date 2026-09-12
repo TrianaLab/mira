@@ -48,7 +48,7 @@ on every later request; Mira issues none. Every request carries everything it ne
 any replica can answer any call and a load balancer needs no affinity. Killing a replica
 mid-conversation loses nothing.
 
-**No authentication either** — see [SECURITY.md](https://github.com/TrianaLab/mira/blob/main/SECURITY.md).
+**No authentication either** — see the [security policy](security.md).
 Bind it to localhost for a local agent, and put a proxy or a network policy in front of
 anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 

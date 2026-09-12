@@ -11,7 +11,7 @@ runs from a `make` target that CI also calls. There is no CI-only test step. If
 are the four gates that need something a pre-push check should not assume (a
 second toolchain, a Docker daemon, a Trivy database, minutes rather than
 seconds) — and `make ci` runs those too, on this host. Both are described in
-[CONTRIBUTING](https://github.com/TrianaLab/mira/blob/main/CONTRIBUTING.md).
+[Contributing](../contributing.md).
 
 ## The levels
 
@@ -175,9 +175,9 @@ make coverage-report   # per-file, worst first — what to write next
 
 ## What CI adds
 
-Three things, and they are all in [`ci.mk`](https://github.com/TrianaLab/mira/blob/main/ci.mk):
-which legs a diff needs, the tool versions everyone has to agree on, and the
-grouping of gates into legs. `ci.yml` is a dispatcher over that file — every
+Three things, and they are all in `ci.mk`: which legs a diff needs, the tool
+versions everyone has to agree on, and the grouping of gates into legs.
+`ci.yml` is a dispatcher over that file — every
 `run:` in it is a `make ci-*` target, and `check_ci.py` fails the build if one
 is not — so `make ci` runs the whole pipeline on one host and a red leg is
 reproducible with one command.

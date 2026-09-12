@@ -377,12 +377,25 @@ curl -s -X POST localhost:4318/mcp -H 'content-type: application/json' \
 ```
 
 `mira mira` with `--data-dir` reads the block directory in-process and needs no
-server; with `--addr` it queries one over HTTP. It needs a real terminal — the
-headless recipe is in
-[`CLAUDE.md`](https://github.com/TrianaLab/mira/blob/main/CLAUDE.md) — and count
-the `q`s in the key string you feed
-it: each one leaves one mode, so `2t\rq` stops in the trace waterfall and hangs
-until it is killed, where `2t\rqqq` unwinds span, waterfall, list and exits.
+server; with `--addr` it queries one over HTTP.
+
+It needs a real terminal, and stdin EOF does not close it — so driving it from a
+script means a pty and an explicit quit. `script -q /dev/null` supplies the pty;
+the `sed` strips the escape sequences so the output is diffable:
+
+```sh
+printf ']q' | script -q /dev/null ./target/release/mira mira --data-dir /tmp/mira-dev 2>&1 \
+  | tr -d '\r' | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g'
+
+# force a size, for a layout you want to look at rather than grep
+sh -c 'stty rows 50 cols 200; printf "2t\rqqq" | script -q /dev/null ./target/release/mira mira --data-dir /tmp/mira-dev'
+```
+
+Count the `q`s: each one leaves one mode, so `2t\rq` stops in the trace
+waterfall and hangs until it is killed, where `2t\rqqq` unwinds span, waterfall,
+list and exits. The layout unit tests pass even when content is being *lost* —
+`Row` clips at `max` rather than overflowing — so a layout change is not
+verified until you have looked at it.
 
 ## 6. A stock Collector in front
 

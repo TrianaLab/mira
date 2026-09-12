@@ -2,12 +2,17 @@
 
 Mira is an OTLP-native telemetry storage engine in a single binary. Before a
 change that is structural — a new dependency, a new on-disk shape, a new
-mechanism — read [`docs/architecture.md`](docs/architecture.md) section 0 and section 1.
-section 0 lists the mechanisms that did not survive contact with the formats, and
-re-proposing one of them is the most common way to waste an afternoon.
-[`CLAUDE.md`](CLAUDE.md) is the short version of everything below, written for
-someone already inside the tree; this file is the same rules for someone
-arriving.
+mechanism — read [Architecture](https://miradb.dev/architecture/) section 0 and
+section 1. section 0 lists the mechanisms that did not survive contact with the
+formats, and re-proposing one of them is the most common way to waste an
+afternoon. `CLAUDE.md` at the repository root is the short version of everything
+below, written for someone already inside the tree; this file is the same rules
+for someone arriving.
+
+> Links here are absolute `miradb.dev` URLs rather than repository paths,
+> because this file is read in two places — GitHub's pull-request sidebar and
+> [the site](https://miradb.dev/contributing/), which serves it by symlink — and
+> a relative path is only correct in one of them.
 
 The five principles are constraints, not aspirations. A PR is judged against
 them: performance is the product (ingest throughput per core, resident
@@ -57,7 +62,7 @@ needs no second toolchain, no Docker daemon and no several minutes.
 ## Running the pipeline locally
 
 `.github/workflows/ci.yml` is a dispatcher and nothing else. Every `run:` step
-in it is a `make ci-*` call into [`ci.mk`](ci.mk) — `scripts/check_ci.py` fails
+in it is a `make ci-*` call into `ci.mk` — `scripts/check_ci.py` fails
 the build if one ever is not — so a leg that goes red on a runner is a leg you
 can reproduce with one command, and there is no shell living in YAML for anyone
 to debug by pushing commits and waiting six minutes.
@@ -130,12 +135,12 @@ the real thing that a unit test can be.
 
 New behaviour arrives with a test in the same PR. A bug fix arrives with the
 test that would have caught it, at the level where it would have caught it —
-[`docs/internals/testing.md`](docs/internals/testing.md) is the map of those
-levels and ends with how to pick one.
+[Testing architecture](https://miradb.dev/internals/testing/) is the map of
+those levels and ends with how to pick one.
 
 For what a unit test cannot reach — a real socket, a real exporter, real volume
-— [`docs/internals/e2e.md`](docs/internals/e2e.md) is a transcript rather than a
-plan: a live binary fed by the built-in `loadgen`, then `telemetrygen`, then a
+— [End-to-end testing](https://miradb.dev/internals/e2e/) is a transcript rather
+than a plan: a live binary fed by the built-in `loadgen`, then `telemetrygen`, then a
 stock OpenTelemetry Collector in front of it in Docker. Run it for anything
 touching the receivers, the wire formats or the ingest pipeline.
 
@@ -179,8 +184,8 @@ have an answer, and finding that out after the work is the expensive order.
 
 ## Releases
 
-[`docs/internals/releases.md`](docs/internals/releases.md) is the procedure and
-the reasoning: one version number across three coordinates, what a tag triggers,
+[Release architecture](https://miradb.dev/internals/releases/) is the procedure
+and the reasoning: one version number across four coordinates, what a tag triggers,
 what is signed, and the two facts that cannot be undone once a coordinate is
 published. Read it before changing `.github/workflows/release.yml`.
 
@@ -195,5 +200,5 @@ sign-off to remember.
 
 ## Conduct
 
-[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1. It
+[Code of conduct](https://miradb.dev/conduct/) — Contributor Covenant 2.1. It
 applies here and to every surface with the project's name on it.
