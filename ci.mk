@@ -98,6 +98,16 @@ ci-coverage: ## The `coverage` leg
 	rustup component add llvm-tools-preview
 	$(MAKE) coverage
 
+# Not part of `ci`, and the only target here that another workflow calls: the
+# `docs` deploy runs it after `make site` to put the measured figure under
+# miradb.dev/coverage.json, which is what the README's badge reads. It lives
+# beside `ci-coverage` because it needs the same component for the same reason,
+# and a second copy of that rationale is a second thing to forget.
+.PHONY: ci-coverage-json
+ci-coverage-json: ## The coverage figure the deployed site publishes
+	rustup component add llvm-tools-preview
+	$(MAKE) coverage-json
+
 .PHONY: ci-supply-chain
 ci-supply-chain: deps ## The `supply-chain` leg
 

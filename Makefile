@@ -161,6 +161,32 @@ coverage-report: ## Per-file coverage, worst first — what to write tests for n
 	$(call need,cargo-llvm-cov)
 	$(CARGO) llvm-cov --workspace --locked --summary-only
 
+# The README's coverage badge reads this file over HTTP at render time, so the
+# number on the badge is the number the run that published the site measured —
+# not a figure someone remembered to edit. It used to be the ratchet, which is a
+# floor and was therefore honest but pessimistic: `%E2%89%A599.20%` under a tree
+# actually at 99.26.
+#
+# It lands in `site/` because the site is the only thing this repository already
+# publishes at a stable URL, and `docs.yml` runs this target straight after
+# `make site` — mkdocs empties that directory before it writes, so the order is
+# load-bearing and the other way round produces a 404 nobody sees until the
+# badge goes grey.
+#
+# Floored to two decimals rather than rounded, for the reason COVERAGE_MIN is:
+# 99.999 is not 100. `commit` is not read by the badge; it is there so a figure
+# that looks wrong can be traced to the tree that produced it.
+COVERAGE_JSON := site/coverage.json
+
+.PHONY: coverage-json
+coverage-json: ## Measure coverage into site/coverage.json — what the README badge reads
+	$(call need,cargo-llvm-cov)
+	@mkdir -p $(dir $(COVERAGE_JSON))
+	$(CARGO) llvm-cov --workspace --locked --summary-only --json \
+	  | $(PYTHON) -c 'import json,math,sys; p=json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"]; json.dump({"line": math.floor(p*100)/100, "commit": sys.argv[2]}, open(sys.argv[1],"w"))' \
+	    $(COVERAGE_JSON) "$${GITHUB_SHA:-$$(git rev-parse HEAD)}"
+	@echo; cat $(COVERAGE_JSON); echo
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------

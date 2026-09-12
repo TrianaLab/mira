@@ -173,6 +173,15 @@ CARGO_TARGET_DIR=/tmp/mira-cov make coverage
 make coverage-report   # per-file, worst first — what to write next
 ```
 
+The ratchet is a floor, and the README's badge does not show it. `make
+coverage-json` writes the *measured* figure to
+[miradb.dev/coverage.json](https://miradb.dev/coverage.json) as part of the
+deploy that publishes this page, and the badge is shields reading that file at
+render time — so it is the coverage of the commit the site was built from,
+never a number someone remembered to edit. It moves by a hundredth between runs
+because `differential.rs` picks a fresh seed each time, which is the honest
+behaviour: that is what the measurement does.
+
 ## What CI adds
 
 Three things, and they are all in `ci.mk`: which legs a diff needs, the tool
