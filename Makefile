@@ -742,12 +742,17 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 
 .PHONY: dist-sbom
 dist-sbom: sbom ## Name the CycloneDX SBOM after the release and put it in dist/
-	@# Located rather than hardcoded: `make sbom` owns cargo-cyclonedx's naming
-	@# and should stay free to move the file without breaking a release five
-	@# minutes into the build. Renamed on the way in because `mira.cdx.json` is
-	@# not a name you can attach to three tags of a repository.
-	@src=$$(find . -name 'mira.cdx.json' -not -path './target/*' -print -quit); \
-	[ -n "$$src" ] || { echo "error: make sbom produced no mira.cdx.json"; exit 1; }; \
+	@# Located by directory rather than by name: `make sbom` owns
+	@# cargo-cyclonedx's naming and should stay free to move the file without
+	@# breaking a release five minutes into the build. It writes one per package
+	@# named after the package, so the rename to `miradb` turned a `-name
+	@# 'mira.cdx.json'` match into zero hits — which is how the release SBOM step
+	@# would have failed on a tag. The binary crate's directory is the stable
+	@# fact; what the package inside it is called is not. Renamed on the way in
+	@# because `miradb.cdx.json` is not a name you can attach to three tags of a
+	@# repository.
+	@src=$$(find crates/mira -maxdepth 1 -name '*.cdx.json' -print -quit); \
+	[ -n "$$src" ] || { echo "error: make sbom produced no crates/mira/*.cdx.json"; exit 1; }; \
 	mkdir -p "$(DIST)"; \
 	cp "$$src" "$(DIST)/mira-$(VERSION).cdx.json"; \
 	echo "wrote $(DIST)/mira-$(VERSION).cdx.json"
