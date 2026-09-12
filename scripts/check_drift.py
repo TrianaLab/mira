@@ -31,6 +31,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,7 +44,7 @@ WORKSPACE_MEMBERS = 3
 
 # docs/architecture.md section 11 scores binary size as one of the four axes
 # and sets the target at "<= 20 MB stripped with UI + query + MCP". That is the
-# contract; the 5.62 MiB below is merely where we are against it.
+# contract; the size the README declares is merely where we are against it.
 SIZE_CEILING_BYTES = 20 * 1000 * 1000
 
 # `zstd-sys` is the only C dependency in the tree and CLAUDE.md calls that a
@@ -103,9 +104,9 @@ REFERENCE_PLATFORM = "darwin"
 # the one that was measured.
 REFERENCE_TARGET = "aarch64-apple-darwin"
 
-# Two percent of 5.62 MiB is ~115 KiB. A new dependency costs hundreds of KiB, so
-# this catches the regression it exists to catch; a rustc point release moves
-# the number by a few KiB, which it deliberately does not.
+# Two percent is ~115 KiB at the size the binary is now. A new dependency costs
+# hundreds of KiB, so this catches the regression it exists to catch; a rustc
+# point release moves the number by a few KiB, which it deliberately does not.
 SIZE_TOLERANCE = 0.02
 
 MIB = 1024 * 1024
@@ -116,26 +117,67 @@ MIB = 1024 * 1024
 # installs.
 CHART_YAML = "charts/mira/Chart.yaml"
 
-# Prose that pins the chart version in a copy-pasteable command. Same half-fix
-# problem as the crate count: whoever bumps Chart.yaml has no reason to think
-# about a docs page, and a `--version` the registry does not have is an install
-# that fails for a reader who did exactly what the page said.
-CHART_VERSION_SITES = ["docs/install.md"]
-
-# The other version in the prose: the *binary's*, in the two commands a reader
-# copies rather than reads — `--version vX.Y.Z` and the `V=` that opens the
-# manual download block. Checked the opposite way round from the chart sites
-# above, which only assert the current version appears *somewhere* in the file
-# and so are satisfied by a file that also carries a stale one. Here any release
-# version that is not the current one is the failure, because there is no reason
-# for a second: `v0.1.0` sat in three copy-pasteable blocks while the workspace
-# was at 0.0.1, and each was a 404 on a stranger's first contact with Mira.
+# Every site that restates the workspace version, as (file, pattern) with the
+# version itself as group 1. One table, read by two things: `check_version_sites`
+# asserts every match equals `[workspace.package] version`, and `--bump` rewrites
+# every match to a new one. That is the point of the shared table — a writer and
+# a gate maintained separately drift, and the direction they drift in is the bad
+# one, because the writer is what people actually run.
 #
-# Anchored on `--version v` and `V=` rather than on bare `vX.Y.Z` so that naming
-# some *other* project's version in prose — a Rust release, a Helm version — is
-# not a build failure.
-RELEASE_VERSION_SITES = ["README.md", "docs/install.md"]
-RELEASE_VERSION_RE = re.compile(r"(?:--version\s+v|^V=)(\d+\.\d+\.\d+)")
+# Each pattern is anchored on the *syntax around* the version rather than on a
+# bare `X.Y.Z`, so that naming some other project's version in prose — a Rust
+# release, a Helm version — is not a build failure, and so that a paragraph that
+# deliberately recounts a past release survives a bump. `docs/internals/
+# releases.md` is full of those sentences and must never be rewritten here.
+#
+# Every match in a listed file must equal the current version: a file carrying a
+# second, stale one is the failure mode this exists for. `v0.1.0` sat in three
+# copy-pasteable blocks while the workspace was at 0.0.1, and each was a 404 on a
+# stranger's first contact with Mira.
+VERSION_SITES: list[tuple[str, re.Pattern[str]]] = [
+    # The source itself, and the two path-dep pins beside it. The pins are the
+    # classic miss: `cargo publish` requires a `version` next to every `path`,
+    # and no local build ever reads it, so a stale pin is invisible right up
+    # until the release job uploads a crate depending on a sibling version that
+    # does not exist.
+    ("Cargo.toml", re.compile(r'^version = "(\d+\.\d+\.\d+)"$', re.M)),
+    (
+        "Cargo.toml",
+        re.compile(r'^mira-(?:core|proto) = \{.*?version = "(\d+\.\d+\.\d+)"', re.M),
+    ),
+    # Three lines in one file, which is three chances to bump two of them. The
+    # image tag is the expensive one: Artifact Hub reads `artifacthub.io/images`
+    # to attach a security report, so a stale tag shows the previous release's
+    # CVEs against this release's listing.
+    (CHART_YAML, re.compile(r"^version: (\d+\.\d+\.\d+)$", re.M)),
+    (CHART_YAML, re.compile(r'^appVersion: "(\d+\.\d+\.\d+)"$', re.M)),
+    (
+        CHART_YAML,
+        re.compile(r"^\s*image: ghcr\.io/trianalab/mira:(\d+\.\d+\.\d+)$", re.M),
+    ),
+    (
+        "charts/mira/tests/statefulset_test.yaml",
+        re.compile(r"ghcr\.io/trianalab/mira:(\d+\.\d+\.\d+)"),
+    ),
+    # The commands a reader copies rather than reads. A stale version here is a
+    # 404 rather than a typo. `--version v?` covers both spellings: the
+    # installer takes a tag (`v0.0.2`), helm takes a chart version (`0.0.2`).
+    ("README.md", re.compile(r"--version v(\d+\.\d+\.\d+)", re.M)),
+    ("docs/install.md", re.compile(r"--version v?(\d+\.\d+\.\d+)", re.M)),
+    ("docs/install.md", re.compile(r"^V=(\d+\.\d+\.\d+)", re.M)),
+    (
+        "docs/install.md",
+        re.compile(r"ghcr\.io/trianalab/charts/mira:(\d+\.\d+\.\d+)"),
+    ),
+    # The two that used to be ungated prose, and rotted exactly as predicted:
+    # the 0.0.1 cut left SECURITY.md claiming there was no tagged release, on
+    # the day after there was one.
+    ("SECURITY.md", re.compile(r"^Mira is pre-1\.0 — `(\d+\.\d+\.\d+)`", re.M)),
+    (
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        re.compile(r"^\s*placeholder: mira (\d+\.\d+\.\d+)$", re.M),
+    ),
+]
 
 # The Artifact Hub ownership proof, pushed to the chart repository under a
 # reserved tag by release.yml. Artifact Hub does not report a wrong or missing
@@ -324,61 +366,41 @@ def workspace_version() -> str:
     return m.group(1)
 
 
-def check_chart_version(crate_version: str) -> None:
-    """Chart version, appVersion and the scanned image tag all equal the crate's.
+def check_version_sites(crate_version: str) -> None:
+    """Every site in VERSION_SITES restates `[workspace.package] version`.
 
-    Three separate lines in one file, which is three chances to bump two of
-    them. The image tag is the expensive one to get wrong: Artifact Hub reads
-    `artifacthub.io/images` to attach a security report, so a stale tag shows
-    the previous release's CVEs against this release's listing.
+    Two ways to fail, and the second is the one that happens. A pattern that
+    matches *nothing* means the line it was written for has moved or gone, so
+    the gate has silently stopped gating — that is a failure here rather than a
+    pass, because a check for something that is no longer there passes forever.
+    A pattern that matches a *different* version is the ordinary half-bump.
     """
-    text = (ROOT / CHART_YAML).read_text()
-    found = {
-        "version": re.search(r"^version:\s*(\S+)\s*$", text, re.M),
-        "appVersion": re.search(r'^appVersion:\s*"?([^"\s]+)"?\s*$', text, re.M),
-        "artifacthub.io/images tag": re.search(
-            r"^\s*image:\s*ghcr\.io/trianalab/mira:(\S+)\s*$", text, re.M
-        ),
-    }
     print(f"chart:       {crate_version} in Cargo.toml")
-    for field, m in found.items():
-        if not m:
+    for rel, pattern in VERSION_SITES:
+        text = (ROOT / rel).read_text()
+        found = [(m.start(), m.group(1)) for m in pattern.finditer(text)]
+        if not found:
             fail(
-                f"{CHART_YAML} has no `{field}` this script can read.\n"
-                f"    It is checked against the crate version ({crate_version}); "
-                "restore the line, or teach scripts/check_drift.py the new shape."
+                f"{rel} has no line matching `{pattern.pattern}`.\n"
+                "    That pattern is how the version in this file is both "
+                "checked and rewritten by `make bump`, so a shape change here "
+                "turns the gate off rather than tripping it. Restore the line, "
+                "or teach VERSION_SITES in scripts/check_drift.py the new shape."
             )
-        elif m.group(1) != crate_version:
-            fail(
-                f"{CHART_YAML} `{field}` is {m.group(1)} but the workspace is at "
-                f"{crate_version}.\n"
-                "    Chart version, appVersion and the image tag are the crate "
-                "version — there is one binary and one chart, so a second number "
-                "would only ever be a question with no answer. Bump all three, "
-                "then `make helm-docs` to regenerate the README's pins."
-            )
+            continue
+        for offset, version in found:
+            if version != crate_version:
+                lineno = text.count("\n", 0, offset) + 1
+                fail(
+                    f"{rel}:{lineno} says {version}, but the workspace is at "
+                    f"{crate_version}.\n"
+                    "    One binary, one chart, one number — a second is only "
+                    f"ever a question with no answer. `make bump VERSION="
+                    f"{crate_version}` rewrites every site at once."
+                )
 
-    pinned = re.compile(rf"\b{re.escape(crate_version)}\b")
-    for rel in CHART_VERSION_SITES:
-        if not pinned.search((ROOT / rel).read_text()):
-            fail(
-                f"{rel} does not mention the current chart version "
-                f"({crate_version}). It pins `helm install --version` at the old "
-                "one, which is an install that fails for whoever copies it."
-            )
 
-    for rel in RELEASE_VERSION_SITES:
-        for lineno, line in enumerate((ROOT / rel).read_text().splitlines(), 1):
-            for m in RELEASE_VERSION_RE.finditer(line):
-                if m.group(1) != crate_version:
-                    fail(
-                        f"{rel}:{lineno} names release v{m.group(1)}, but the "
-                        f"workspace is at {crate_version}.\n"
-                        "    That line is a command someone copies, so a stale "
-                        "version is a 404 rather than a typo. Bump it with the "
-                        "crate version."
-                    )
-
+def check_artifacthub_repo() -> None:
     repo_yml = ROOT / ARTIFACTHUB_REPO_YML
     if not repo_yml.exists():
         fail(
@@ -504,13 +526,143 @@ def check_coverage_badge() -> None:
         )
 
 
+SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+CHANGELOG = "CHANGELOG.md"
+
+
+def _rewrite_group1(pattern: re.Pattern[str], text: str, new: str) -> tuple[str, int]:
+    """Replace group 1 of every match with `new`, leaving the rest untouched.
+
+    `re.sub` cannot do this: a template replaces the whole match, so putting the
+    surrounding syntax back means re-spelling every pattern twice, once to find
+    and once to restore. Splicing by group span keeps one pattern per site, and
+    one pattern is what lets the gate and the writer share a table.
+    """
+    out: list[str] = []
+    last = 0
+    count = 0
+    for m in pattern.finditer(text):
+        out.append(text[last : m.start(1)])
+        out.append(new)
+        last = m.end(1)
+        count += 1
+    out.append(text[last:])
+    return "".join(out), count
+
+
+def bumped_changelog(old: str, new: str, today: str) -> str:
+    """`## [Unreleased]` promoted to `## [new]`, a fresh one opened, links moved.
+
+    Refuses on an empty `[Unreleased]`, which is not pedantry: release.yml
+    extracts that section verbatim as the GitHub Release notes and falls back to
+    `--generate-notes` when it comes out empty. Mira does not use Conventional
+    Commits, so the fallback is a list of imperative prose subjects — strictly
+    worse than the section nobody wrote. Better to refuse than to publish it.
+    """
+    text = (ROOT / CHANGELOG).read_text()
+
+    body = re.search(r"^## \[Unreleased\]\n(.*?)(?=^## \[)", text, re.S | re.M)
+    if not body:
+        sys.exit(
+            f"error: {CHANGELOG} has no `## [Unreleased]` section followed by a "
+            "released one. That is the section this promotes; see "
+            "docs/internals/releases.md."
+        )
+    if not body.group(1).strip():
+        sys.exit(
+            f"error: {CHANGELOG}'s `## [Unreleased]` section is empty. Write the "
+            f"{new} notes into it first — release.yml publishes that section "
+            "verbatim as the Release notes, and an empty one degrades to "
+            "generated notes, which for this tree means a list of imperative "
+            "commit subjects."
+        )
+
+    text = text.replace(
+        "## [Unreleased]\n", f"## [Unreleased]\n\n## [{new}] - {today}\n", 1
+    )
+    text, n = _rewrite_group1(
+        re.compile(r"^\[Unreleased\]: \S+/compare/v(\d+\.\d+\.\d+)\.\.\.HEAD$", re.M),
+        text,
+        new,
+    )
+    if n != 1:
+        sys.exit(
+            f"error: {CHANGELOG} has no `[Unreleased]: …/compare/vX.Y.Z...HEAD` "
+            "link definition to move. Restore it, or drop the link definitions "
+            "and this block together."
+        )
+    return re.sub(
+        r"^(\[Unreleased\]: (\S+)/compare/\S+$)",
+        rf"\1\n[{new}]: \g<2>/compare/v{old}...v{new}",
+        text,
+        count=1,
+        flags=re.M,
+    )
+
+
+def bump(new: str) -> int:
+    """Write `new` to every site in VERSION_SITES, and promote the changelog.
+
+    Every file is rewritten in memory and validated before *any* of them is
+    written, because a refusal half way through is the worst outcome available:
+    `make drift` then reports the sites it did reach as the wrong ones, and
+    whoever is mid-release has to work out by hand which half happened. The
+    first version of this wrote as it went and tripped over exactly that on its
+    own empty-changelog guard.
+
+    Deliberately does *not* touch Cargo.lock or charts/mira/README.md: both are
+    generated, and `make bump` regenerates them straight after. Nor does it
+    touch docs/internals/releases.md, which recounts past releases by number on
+    purpose — the whole reason the sites are a table of anchored patterns rather
+    than a find-and-replace.
+    """
+    if not SEMVER.match(new):
+        sys.exit(f"error: {new!r} is not an X.Y.Z version.")
+    old = workspace_version()
+    if old == new:
+        sys.exit(f"error: the workspace is already at {new}. Nothing to bump.")
+
+    pending: dict[str, tuple[str, int]] = {}
+    for rel, pattern in VERSION_SITES:
+        text = pending[rel][0] if rel in pending else (ROOT / rel).read_text()
+        text, n = _rewrite_group1(pattern, text, new)
+        if not n:
+            sys.exit(
+                f"error: {rel} has no line matching `{pattern.pattern}`, so this "
+                "bump would leave it behind. Nothing has been written. Fix the "
+                "file, or teach VERSION_SITES in scripts/check_drift.py the new "
+                "shape."
+            )
+        pending[rel] = (text, pending.get(rel, ("", 0))[1] + n)
+    changelog = bumped_changelog(old, new, date.today().isoformat())
+
+    print(f"bump: {old} -> {new}")
+    for rel, (text, n) in pending.items():
+        (ROOT / rel).write_text(text)
+        print(f"  {rel}: {n} site(s)")
+    (ROOT / CHANGELOG).write_text(changelog)
+    print(f"  {CHANGELOG}: [Unreleased] promoted, link definitions moved")
+    print(
+        "\nCargo.lock and charts/mira/README.md are generated — `make bump` "
+        "regenerates them.\nThen `make drift` to verify, and open a PR: "
+        "docs/internals/releases.md step 3."
+    )
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) > 1:
+        if sys.argv[1] != "--bump" or len(sys.argv) != 3:
+            sys.exit("usage: check_drift.py [--bump X.Y.Z]")
+        return bump(sys.argv[2])
+
     declared_crates, declared_mib = declared_from_readme()
     check_crate_count(declared_crates)
     check_c_toolchain()
     check_binary_size(declared_mib)
     check_sites(declared_crates, declared_mib)
-    check_chart_version(workspace_version())
+    check_version_sites(workspace_version())
+    check_artifacthub_repo()
     check_coverage_badge()
     check_section_refs()
 

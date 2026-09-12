@@ -430,6 +430,34 @@ sbom: build ## CycloneDX SBOM, one <crate>.cdx.json beside each Cargo.toml
 drift: build ## Crate count, binary size and doc numbers still match reality
 	$(PYTHON) scripts/check_drift.py
 
+.PHONY: bump
+bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
+	@# The gate and the writer are the same table in check_drift.py, so this
+	@# reaches exactly the sites `make drift` checks and no others — in
+	@# particular it leaves docs/internals/releases.md alone, which recounts
+	@# past releases by number on purpose.
+	@#
+	@# `TO`, not `VERSION`: this file already defines VERSION, defaulted off
+	@# Cargo.toml for the image build, so `make bump` with the argument
+	@# forgotten would have bumped the tree to the version it is already at
+	@# instead of printing this usage.
+	@#
+	@# The two regenerated files are regenerated here rather than left to the
+	@# person: Cargo.lock's workspace entries and the chart README's version
+	@# badges are both derived, and both fail a *different* gate than the one
+	@# that just went green, which is how a bump ends up taking three pushes.
+	@test -n "$(TO)" || { \
+		echo "usage: make bump TO=X.Y.Z" >&2; \
+		echo "  writes Cargo.toml, Chart.yaml, the chart test, README.md," >&2; \
+		echo "  SECURITY.md, docs/install.md, the issue template, CHANGELOG.md" >&2; \
+		echo "  then regenerates Cargo.lock and charts/mira/README.md" >&2; \
+		exit 1; }
+	$(PYTHON) scripts/check_drift.py --bump $(TO)
+	$(CARGO) update --workspace --quiet
+	$(MAKE) --no-print-directory helm-docs
+	@echo
+	@echo "Now: \`make drift\` to verify, then a PR — docs/internals/releases.md."
+
 .PHONY: workflows
 workflows: ## Lint the workflows, and check every CI job can block a merge
 	@# actionlint is the syntax and shellcheck pass; check_ci.py is the
