@@ -20,7 +20,7 @@ match, not that either came from this repository.
 
 | | |
 |---|---|
-| `--version v0.0.1` | a specific release instead of the latest |
+| `--version v0.0.2` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the attestation check (the checksum is still enforced) |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
@@ -35,7 +35,7 @@ script, it *is* the script, so what you read is byte-for-byte what runs.
 ```sh
 mira update              # to the latest release
 mira update --dry-run    # print the command it would run, and stop
-mira update --version v0.0.1
+mira update --version v0.0.2
 ```
 
 This runs the installer above rather than re-implementing it, so the checksum
@@ -88,7 +88,7 @@ linux and macOS on x86_64 and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one
 SLSA provenance attestation covering every file in it.
 
 ```sh
-V=0.0.1; T=x86_64-unknown-linux-gnu
+V=0.0.2; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
@@ -166,7 +166,7 @@ the same registry as the image, as an OCI artifact:
 
 ```sh
 helm install mira oci://ghcr.io/trianalab/charts/mira \
-  --version 0.0.1 --namespace observability --create-namespace
+  --version 0.0.2 --namespace observability --create-namespace
 ```
 
 That is a StatefulSet of one, a PVC, and one Service carrying both ports. No
@@ -185,7 +185,7 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira:0.0.1
+  ghcr.io/trianalab/charts/mira:0.0.2
 ```
 
 The [chart reference](reference/chart.md) has every value, why it defaults where

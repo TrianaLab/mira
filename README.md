@@ -61,7 +61,7 @@ docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:l
 helm install mira oci://ghcr.io/trianalab/charts/mira
 ```
 
-Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.1` pins the
+Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.2` pins the
 installer to a release; every one of them ships a CycloneDX SBOM, `SHA256SUMS`,
 a cosign signature and a SLSA provenance attestation.
 
