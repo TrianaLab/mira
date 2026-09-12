@@ -1975,7 +1975,7 @@ fn count_points(r: &ExportMetricsServiceRequest) -> u64 {
 /// `[[example]] test = true`, and the manifest is not this file's to change. So
 /// `make test` runs `loadgen --selftest` after the suite. It is the smallest
 /// thing that goes red if the generator stops producing what the README, the
-/// quickstart and docs/testing.md all claim it produces.
+/// quickstart and docs/internals/e2e.md all claim it produces.
 fn selftest() {
     const TRACES: u64 = 64;
     const T0: u64 = 1_757_000_000_000_000_000;

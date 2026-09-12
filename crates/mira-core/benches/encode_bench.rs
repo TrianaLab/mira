@@ -34,13 +34,14 @@
 //!
 //! It does not model contention. One thread, one builder, one core — which is
 //! the definition of the axis. A real node runs three flushers and N decoders,
-//! and the aggregate figure that produces is `loadgen`'s job (docs/testing.md
-//! section 3). Comparing the two is the point of having both, and the two now
-//! exist: this bench blends to about 1.02 M records/s/core over the server's
-//! half-logs-half-spans mix, against the 778k records/s/core the server itself
-//! reaches. The 24% between them is the whole network path, the Tokio runtime
-//! and the durability barrier — which is a much smaller tax than it is usually
-//! assumed to be, and it means the encoder is where ingest work still pays.
+//! and the aggregate figure that produces is `loadgen`'s job
+//! (docs/internals/e2e.md section 3). Comparing the two is the point of having
+//! both, and the two now exist: this bench blends to about 1.02 M
+//! records/s/core over the server's half-logs-half-spans mix, against the 778k
+//! records/s/core the server itself reaches. The 24% between them is the whole
+//! network path, the Tokio runtime and the durability barrier — which is a much
+//! smaller tax than it is usually assumed to be, and it means the encoder is
+//! where ingest work still pays.
 //!
 //! **Run it on an idle machine**, for the reason `wal_bench` gives at more
 //! length: these are microsecond timings and the tail belongs to whoever else is

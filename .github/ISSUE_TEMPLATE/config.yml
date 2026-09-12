@@ -18,5 +18,5 @@ contact_links:
     about: Every flag and every KYAML key, with the env interpolation syntax.
 
   - name: Testing against a live instance
-    url: https://github.com/TrianaLab/mira/blob/main/docs/testing.md
+    url: https://github.com/TrianaLab/mira/blob/main/docs/internals/e2e.md
     about: Reproduce with synthetic data, telemetrygen or a stock Collector before filing.

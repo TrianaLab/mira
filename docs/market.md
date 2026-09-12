@@ -10,7 +10,7 @@ description: Where Mira actually sits against Loki, Tempo, VictoriaLogs, Quickwi
 a third party, on *their* hardware and *their* workload. Nobody ran Mira's
 workload and Mira ran nobody else's. Mira's own figures are single-machine
 measurements on one Apple M3 Pro (12 cores, 18 GiB), one process, generator
-co-resident — reproduce them with [the load harness](testing.md#3-the-load-harness).
+co-resident — reproduce them with [the load harness](internals/e2e.md#3-the-load-harness).
 
 The `=` column says whether a claim can honestly sit in the same row as Mira's.
 It is `no` for 128 of the 133 claims surveyed, and the four-word reason says why.

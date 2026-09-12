@@ -425,7 +425,11 @@ def check_section_refs() -> None:
     arch = sections_of("docs/architecture.md")
 
     dangling: dict[str, list[str]] = {}
-    for path in sorted(ROOT.glob("crates/*/src/*.rs")) + sorted(ROOT.glob("docs/*.md")):
+    # `docs/**` rather than `docs/*`: the contributor pages moved into
+    # docs/internals/ and cite architecture sections as heavily as anything at
+    # the top level, and a gate that stops covering a file the moment it is
+    # filed somewhere tidier is a gate that rots by reorganisation.
+    for path in sorted(ROOT.glob("crates/*/src/*.rs")) + sorted(ROOT.glob("docs/**/*.md")):
         if path.name == "architecture.md":
             continue
         for cite in set(SECTION_CITE.findall(path.read_text())):
