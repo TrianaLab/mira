@@ -447,6 +447,42 @@ def check_section_refs() -> None:
         )
 
 
+# The README's coverage badge, and the ratchet it quotes. A shields.io badge is
+# a number in an image URL, which is the one kind of number nobody re-reads: it
+# renders the same whether or not it is still true. So it states the *floor*
+# rather than a snapshot — the floor is a committed guarantee, and this ties it
+# to the Makefile that enforces it. `%E2%89%A5` is a URL-escaped >= sign.
+COVERAGE_BADGE = re.compile(r"coverage-(?:%E2%89%A5)?([0-9]+\.[0-9]+)%25")
+COVERAGE_RATCHET = re.compile(r"^COVERAGE_MIN \?= ([0-9]+\.[0-9]+)", re.M)
+
+
+def check_coverage_badge() -> None:
+    makefile = COVERAGE_RATCHET.search((ROOT / "Makefile").read_text())
+    if not makefile:
+        fail(
+            "Makefile no longer declares 'COVERAGE_MIN ?= <N.NN>', which the "
+            "README's coverage badge quotes."
+        )
+        return
+
+    badge = COVERAGE_BADGE.search((ROOT / "README.md").read_text())
+    if not badge:
+        fail(
+            "README.md no longer carries a shields.io coverage badge.\n"
+            "    Restore it, or delete check_coverage_badge — a gate for a "
+            "thing that is gone is a gate that passes forever."
+        )
+        return
+
+    if badge.group(1) != makefile.group(1):
+        fail(
+            f"the README's coverage badge says {badge.group(1)}% and the "
+            f"Makefile's ratchet is {makefile.group(1)}%.\n"
+            "    The ratchet only goes up, so this is a raise that stopped at "
+            "the Makefile. A badge nobody updates is worse than no badge."
+        )
+
+
 def main() -> int:
     declared_crates, declared_mib = declared_from_readme()
     check_crate_count(declared_crates)
@@ -454,6 +490,7 @@ def main() -> int:
     check_binary_size(declared_mib)
     check_sites(declared_crates, declared_mib)
     check_chart_version(workspace_version())
+    check_coverage_badge()
     check_section_refs()
 
     for note in notes:
