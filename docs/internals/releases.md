@@ -115,7 +115,28 @@ token.
 
 **`verify-release`** throws away every artifact and output the run produced,
 checks out nothing, re-downloads what a stranger would download, and verifies it
-with the same commands [Install](../install.md) tells a stranger to run.
+with the same commands [Install](../install.md) tells a stranger to run. Its
+first step is the only one that does *not* authenticate, and it is there for the
+trap below.
+
+## A package's first push is private
+
+GitHub creates a `ghcr.io` package private, and the release that publishes a
+coordinate for the first time is the release that creates it. Nothing in the
+workflow can change that — visibility is a setting on the package, not a field
+in a manifest, and there is no API for it.
+
+So v0.0.1 published an image and a chart that nobody could pull. `docker run
+ghcr.io/trianalab/mira` and `helm install oci://ghcr.io/trianalab/charts/mira` —
+the two lines the README hands a reader — answered `DENIED`, Artifact Hub's
+first tracking pass failed with the same error, and the run was green, because
+every step that touched the registry had logged in first.
+
+`verify-release` now asks for an anonymous pull token before it authenticates,
+for both coordinates, and fails the release if either is refused. That failure
+is not a broken release: the bytes are published and correct, and the fix is the
+package's own settings page rather than a version bump. It is the only check
+here whose remedy is a click.
 
 ## What is signed, and what is not
 
