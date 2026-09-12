@@ -4,14 +4,15 @@ Notable changes to Mira, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioned by
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Mira has never been released. There are no tags, no published binaries and no
-`0.1.0`; the workspace version is `0.0.1` and the only thing that exists is the
-tip of `main`. Everything below is therefore under `Unreleased`, and that is
-the honest shape of this file rather than an oversight. Being pre-1.0, anything
-here may change: the block format, the query document, the config keys, the
-`/mcp` tool set.
+Being pre-1.0, anything here may change: the block format, the query document,
+the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
+
+## [0.0.1] - 2026-09-12
+
+First tagged release. Everything below is the initial cut rather than a
+delta — there is no previous version to have changed from.
 
 ### Added
 
@@ -135,4 +136,5 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/commits/main
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/TrianaLab/mira/releases/tag/v0.0.1
