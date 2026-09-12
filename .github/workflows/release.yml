@@ -84,13 +84,17 @@ jobs:
             publish=false
           fi
 
-          # Pre-release covers both readings: an explicit -rc/-beta suffix, and
-          # 0.x, where CHANGELOG.md already says the block format and the query
-          # document may change under you. `latest` still moves — a 0.x project
-          # whose `latest` tag points nowhere is worse than an honest badge.
+          # An explicit -rc/-beta suffix, and nothing else. 0.x used to be here
+          # too, on the reading that a pre-1.0 project should say so — but
+          # GitHub's `releases/latest` endpoint *excludes* prereleases, and that
+          # endpoint is what scripts/get-mira.sh resolves when no --version is
+          # given. Marking 0.0.1 a prerelease makes `curl install.sh | bash`
+          # print "No release found" on the day of the first release. The
+          # pre-1.0 warning belongs in CHANGELOG.md and SECURITY.md, which say
+          # it already, not in a flag that turns the install one-liner off.
           case "${version}" in
-            0.*|*-*) prerelease=true ;;
-            *)       prerelease=false ;;
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
           esac
 
           printf 'version=%s\npublish=%s\nprerelease=%s\n' \
