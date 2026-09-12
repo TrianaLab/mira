@@ -23,7 +23,7 @@ data=${TMPDIR:-/tmp}/mira-fixtures.$$
 port=17399
 
 for f in "$bin" "$gen"; do
-  [ -x "$f" ] || { echo "missing $f — run: cargo build --release -p mira --examples" >&2; exit 1; }
+  [ -x "$f" ] || { echo "missing $f — run: cargo build --release -p miradb --examples" >&2; exit 1; }
 done
 
 mkdir -p "$data"

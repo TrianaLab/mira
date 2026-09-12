@@ -87,7 +87,7 @@ extra predicate on every join.
 
 ### 0.1 What is not true yet
 
-The README carries three of these; this is all of them. Each is a boundary
+The README carries four of these; this is all of them. Each is a boundary
 somebody will otherwise discover by deploying into it, so each says what is
 missing, why, and what to do instead today.
 
@@ -1792,7 +1792,7 @@ Reading these honestly:
   one flusher holds them or six do.
 - **The two ack rows are two chosen contracts, not a fast path and a slow one.**
   With the log on — the default — the ack is a `write(2)` into the page cache,
-  and `cargo bench -p mira-core --bench wal_bench` prices that write on its own
+  and `cargo bench -p miradb-core --bench wal_bench` prices that write on its own
   at p50 7 µs / p99 39 µs for a 4 KiB body and p50 0.24 ms / p99 4.6 ms for a
   1 MiB one. What a client sees is larger than the append, because it includes
   the decode and the queue: p50 8.5 ms, p99 55 ms at four connections.
@@ -1802,7 +1802,7 @@ Reading these honestly:
   queryable (section 4), so the choice is purely about what survives power loss.
   The same bench prices the road not taken, `append + fsync` on the ack path, at
   p50 4.1 ms and 0.9 MiB/s for 4 KiB bodies.
-- **Per core, with no I/O in the path**, `cargo bench -p mira-core --bench
+- **Per core, with no I/O in the path**, `cargo bench -p miradb-core --bench
   encode_bench` decodes and appends 1.09M log records/s (203 MiB/s of wire
   bytes), 1.06M spans/s (206 MiB/s) and 2.86M data points/s (254 MiB/s) on one
   thread. Those are medians of ten runs on a desktop with the usual desktop
@@ -1948,7 +1948,7 @@ Reading these honestly:
   were reconciled rather than argued about.
 
   That padding is also almost free to compress, which is what the cold tier
-  (section 3.5) collects. Measured by `cargo run --release -p mira-core --example
+  (section 3.5) collects. Measured by `cargo run --release -p miradb-core --example
   tier -- <data-dir>` over the whole corpus — every one of the 1,652 tables, not a
   sample, and not a `zstd` CLI estimate either: it is the actual
   `write_table_zstd` path the sweep calls.

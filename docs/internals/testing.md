@@ -5,13 +5,13 @@ whether a PR has enough of them. For *reproducing the published numbers* against
 a live binary, see [End-to-end testing](e2e.md) — that page is a transcript, this
 one is the map.
 
-Mira has 316 cargo tests, 22 UI tests and 36 chart tests, and every one of them
+Mira has 318 cargo tests, 22 UI tests and 36 chart tests, and every one of them
 runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
 second toolchain, a Docker daemon, a Trivy database, minutes rather than
-seconds) — and those are listed in
-[CONTRIBUTING](https://github.com/TrianaLab/mira/blob/main/CONTRIBUTING.md).
+seconds) — and `make ci` runs those too, on this host. Both are described in
+[Contributing](../contributing.md).
 
 ## The levels
 
@@ -21,7 +21,7 @@ the least agreement in the industry, so it does not appear here.
 
 | # | Level | Count | Lives in | Runs from |
 |---|---|---|---|---|
-| 1 | Unit, in-source | 124 core + 155 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 124 core + 157 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 34 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 2 | `crates/mira/tests/cli.rs` | `make test` |
@@ -149,17 +149,16 @@ tests do. Each exists because something got through.
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
 | `deps` | An advisory, licence, ban or source `cargo-deny` refuses, or a dependency nothing imports |
 | `drift` | The README's crate count or binary size no longer matching the tree that builds |
-| `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:` |
+| `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
 | `install-script` | The published one-liner no longer parsing, linting or running |
 | `docs` | A dead link, a dead anchor, a page outside the nav, or a route with a capital letter in it |
 
 Listed in `make check`'s own order, which is the order they fail fastest. It
 runs `test`, `chart` and `coverage` alongside these — the levels above and the
-ratchet below — and leaves out the four the top of this page counts: `msrv`
-refuses a construct newer than the declared minimum Rust, `scan-image` a
-fixable HIGH or CRITICAL in the release image, `dist` a Linux binary that will
-not start on the glibc the README promises (through `glibc-floor`), and `e2e`
-is level 8.
+ratchet below — and leaves out the four `make ci` picks up: `msrv` refuses a
+construct newer than the declared minimum Rust, `scan-image` a fixable HIGH or
+CRITICAL in the release image, `dist` a Linux binary that will not start on the
+glibc the README promises (through `glibc-floor`), and `e2e` is level 8.
 
 `section` has a `--selftest`, because every way that gate can break makes it
 pass. `workflows` runs two things that do not subsume each other: actionlint
@@ -182,7 +181,23 @@ CARGO_TARGET_DIR=/tmp/mira-cov make coverage
 make coverage-report   # per-file, worst first — what to write next
 ```
 
+The ratchet is a floor, and the README's badge does not show it. `make
+coverage-json` writes the *measured* figure to
+[miradb.dev/coverage.json](https://miradb.dev/coverage.json) as part of the
+deploy that publishes this page, and the badge is shields reading that file at
+render time — so it is the coverage of the commit the site was built from,
+never a number someone remembered to edit. It moves by a hundredth between runs
+because `differential.rs` picks a fresh seed each time, which is the honest
+behaviour: that is what the measurement does.
+
 ## What CI adds
+
+Three things, and they are all in `ci.mk`: which legs a diff needs, the tool
+versions everyone has to agree on, and the grouping of gates into legs.
+`ci.yml` is a dispatcher over that file — every
+`run:` in it is a `make ci-*` target, and `check_ci.py` fails the build if one
+is not — so `make ci` runs the whole pipeline on one host and a red leg is
+reproducible with one command.
 
 `ci.yml` computes a `changes` matrix first and every job is conditional on it,
 so a docs-only PR does not build the workspace. Two aggregate jobs — `required`
@@ -191,9 +206,11 @@ branch ruleset requires; `check_ci.py` enforces that no job can escape their
 `needs` closure, which is how a silently-skipped gate is caught statically at
 PR time rather than noticed later.
 
-The four gates that run only in CI are `msrv`, `scan-image`, `e2e` and `dist`
-(as `release-dry-run`, which runs the real tarball, SBOM and checksum targets on
-every code PR). Run them by hand when you have touched what they cover.
+The four gates that `make check` leaves to `make ci` are `msrv`, `scan-image`,
+`e2e` and `dist` (as `release-dry-run`, which runs the real tarball, SBOM and
+checksum targets on every code PR). Two of them a Mac cannot run at all —
+`ci-e2e` needs a Linux binary in a Linux container, `ci-image` needs a Docker
+daemon — and they say so rather than passing quietly.
 
 ## Choosing a home for a new test
 

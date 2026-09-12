@@ -34,7 +34,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 ```sh
 cargo test --workspace                                   # unit + in-process e2e
-cargo test -p mira --bin mira <filter>                   # NOT --lib; mira has no lib target
+cargo test -p miradb --bin mira <filter>                 # NOT --lib; miradb has no lib target
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
@@ -43,11 +43,23 @@ CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
 Use a separate `CARGO_TARGET_DIR` for coverage — it takes the same target-dir
 lock as a normal build, so it will block anything running in parallel.
 
+The package names are `miradb`, `miradb-core` and `miradb-proto`, because
+`mira` on crates.io is an unrelated crate from 2024. Nothing else moved: the
+binary is `mira`, the dependency keys are `mira-core`/`mira-proto`, `[lib] name`
+keeps the `use mira_core::…` spelling, and no source file mentions the registry.
+Only `-p` on a cargo command wants the published name.
+
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests, the UI's `npm test` and
 build — `git diff --exit-code dist`, so a `.svelte` change that is not rebuilt is
 a red build — and a **coverage ratchet**. The ratchet is the coverage that
 existed when the line was last edited; raise it when you raise coverage, never
 lower it.
+
+`ci.yml` is a dispatcher: every `run:` in it is a `make ci-*` target in `ci.mk`,
+and `scripts/check_ci.py` fails the build if one is not — so never write shell
+into that file. `make ci` runs every leg here, `make ci-<leg>` runs one, and
+`make ci-changes` says which legs a diff needs. Gates go in the `Makefile`; only
+leg grouping, the path filter and pinned runner tool versions go in `ci.mk`.
 
 The contributor-facing internals live under `docs/internals/`:
 [testing.md](docs/internals/testing.md) is the map of the eight test levels and
@@ -63,7 +75,7 @@ The README states the crate count and binary size, and section 11 scores binary 
 an axis. Before and after adding any dependency:
 
 ```sh
-cargo tree -p mira --edges normal --prefix none --target aarch64-apple-darwin \
+cargo tree -p miradb --edges normal --prefix none --target aarch64-apple-darwin \
   | awk '{print $1" "$2}' | sort -u | wc -l
 ls -l target/release/mira
 ```

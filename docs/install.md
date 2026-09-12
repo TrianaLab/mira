@@ -20,23 +20,22 @@ match, not that either came from this repository.
 
 | | |
 |---|---|
-| `--version v0.0.1` | a specific release instead of the latest |
+| `--version v0.0.2` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the attestation check (the checksum is still enforced) |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
 | `GH_TOKEN` | avoids the anonymous 60-requests-an-hour limit on the version lookup |
 
 Piping a script from the internet into a shell is a decision, not a default.
-[Read it first](https://github.com/TrianaLab/mira/blob/main/scripts/get-mira.sh)
-— it is the same file served at that URL, by symlink, so what you read is what
-runs.
+[Read it first](https://miradb.dev/install.sh) — that URL is not a copy of the
+script, it *is* the script, so what you read is byte-for-byte what runs.
 
 ## Updating
 
 ```sh
 mira update              # to the latest release
 mira update --dry-run    # print the command it would run, and stop
-mira update --version v0.0.1
+mira update --version v0.0.2
 ```
 
 This runs the installer above rather than re-implementing it, so the checksum
@@ -52,6 +51,19 @@ when the running version is the one that would be installed, so running it *is*
 the check. If you installed from a package manager or from source, keep using
 that instead — this replaces a file, and it does not know what put it there.
 
+## With cargo
+
+```sh
+cargo install --locked miradb                    # -> ~/.cargo/bin/mira
+```
+
+The crate is `miradb` and the binary it installs is `mira`: `mira` on crates.io
+is an unrelated crate that has been there since 2024. Two libraries are
+published beside it for anyone embedding the engine rather than running it —
+[`miradb-core`](https://docs.rs/miradb-core) is the encoder, block writer and
+mmap reader, [`miradb-proto`](https://docs.rs/miradb-proto) is the OTLP
+bindings.
+
 ## From source
 
 The whole prerequisite list is **Rust 1.85 or newer** and a `cc`, which
@@ -66,12 +78,7 @@ script. No node toolchain: the browser UI is built and committed under
 ```sh
 git clone https://github.com/TrianaLab/mira && cd mira
 cargo install --locked --path crates/mira        # -> ~/.cargo/bin/mira
-```
-
-Or build without installing:
-
-```sh
-cargo build --release                            # -> ./target/release/mira
+cargo build --release                            # or: ./target/release/mira
 ```
 
 ## From a release
@@ -81,7 +88,7 @@ linux and macOS on x86_64 and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one
 SLSA provenance attestation covering every file in it.
 
 ```sh
-V=0.0.1; T=x86_64-unknown-linux-gnu
+V=0.0.2; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
@@ -119,7 +126,7 @@ attestation verify` checks is about one artifact.
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
 ```
 
-Or build it locally, which is what to do until there is a tag:
+Or build it locally, to run a commit that has not been released:
 
 ```sh
 docker build -t mira .
@@ -154,13 +161,12 @@ Neither touches the block directory, so a slow disk does not fail a probe.
 
 ## Kubernetes
 
-The chart lives in the repository at
-[`charts/mira`](https://github.com/TrianaLab/mira/tree/main/charts/mira) and is
-published to the same registry as the image, as an OCI artifact:
+The chart is [`charts/mira`](reference/chart.md) in the repository, published to
+the same registry as the image, as an OCI artifact:
 
 ```sh
 helm install mira oci://ghcr.io/trianalab/charts/mira \
-  --version 0.0.1 --namespace observability --create-namespace
+  --version 0.0.2 --namespace observability --create-namespace
 ```
 
 That is a StatefulSet of one, a PVC, and one Service carrying both ports. No
@@ -179,12 +185,11 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira:0.0.1
+  ghcr.io/trianalab/charts/mira:0.0.2
 ```
 
-The chart's own
-[README](https://github.com/TrianaLab/mira/blob/main/charts/mira/README.md) has
-every value, why it defaults where it does, and the argument for a StatefulSet.
+The [chart reference](reference/chart.md) has every value, why it defaults where
+it does, and the argument for a StatefulSet.
 It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira),
 which renders that README, the signature above and the image's current CVE
 report against the same coordinate. Every value is covered by a closed

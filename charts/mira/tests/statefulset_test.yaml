@@ -29,7 +29,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/trianalab/mira:0.0.1
+          value: ghcr.io/trianalab/mira:0.0.2
 
   - it: honours an image tag override
     set:

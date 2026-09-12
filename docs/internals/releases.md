@@ -6,16 +6,22 @@ publish it, you want [Install](../install.md).
 
 ## One binary, one chart, one number
 
-Mira publishes three coordinates and they all carry the same version string:
+Mira publishes four coordinates and they all carry the same version string:
 
 | Coordinate | Where |
 |---|---|
 | Tarballs, SBOM, `SHA256SUMS` | GitHub Release assets on the `vX.Y.Z` tag |
 | Multi-arch image | `ghcr.io/trianalab/mira:X.Y.Z` (and `:latest`) |
 | Helm chart | `ghcr.io/trianalab/charts/mira:X.Y.Z` |
+| Three crates | `miradb`, `miradb-core`, `miradb-proto` on crates.io |
 
-One number across all three, so there is nothing to compute: bumping is an edit
+One number across all four, so there is nothing to compute: bumping is an edit
 to `Cargo.toml` and a `make drift` run.
+
+The crates are `miradb-*` because `mira` on crates.io is an unrelated crate
+from 2024. Only the registry knows those names: the dependency keys, the `use`
+paths, the `[lib] name`s and the installed binary are all still `mira`.
+`Cargo.toml`'s `[workspace.dependencies]` block is where that is set up.
 
 ## Cutting a release
 
@@ -77,10 +83,14 @@ silently skips is caught at PR time rather than discovered in a green run that
 published nothing.
 
 ```
-meta ──┬─> build (×4 targets) ──> package ──┐
-       ├─> image  ───────────────────────────┼─> release ──> verify-release
-       └─> chart  ───────────────────────────┘
+meta ──> build (×4 targets) ──┬─> package ──────────┐
+                              └─> image ──> chart ──┴─> release ──> crates ──> verify-release
 ```
+
+`chart` is downstream of `image`, not a sibling of it: the chart advertises an
+image coordinate, and publishing a chart that points at an image which failed to
+push is the one ordering mistake that produces a green run and a broken
+`helm install`.
 
 **`meta`** computes `version`, `publish` and `prerelease` once. Deriving them
 per job is how a release ends up tagged `v0.2.0` with a binary that prints
@@ -113,9 +123,44 @@ looks for.
 does exactly this, so there is no third-party release action holding a write
 token.
 
+**`crates`** runs `make publish` — `cargo publish --workspace`, which works the
+order out of the dependency graph and waits for the index to serve each member
+before building the next. It is last because it is the least reversible thing
+the workflow does: a ghcr tag can be overwritten and a GitHub Release deleted,
+but a crates.io version is consumed on upload and `cargo yank` only hides it.
+It needs a `CARGO_REGISTRY_TOKEN` secret, and fails with a message naming it if
+it is missing — everything else has already published by then, so the fix is to
+re-run the job, not to bump.
+
 **`verify-release`** throws away every artifact and output the run produced,
 checks out nothing, re-downloads what a stranger would download, and verifies it
-with the same commands [Install](../install.md) tells a stranger to run.
+with the same commands [Install](../install.md) tells a stranger to run. Its
+first step is the only one that does *not* authenticate, and it is there for the
+trap below.
+
+## A package's first push is private
+
+GitHub creates a `ghcr.io` package private, and the release that publishes a
+coordinate for the first time is the release that creates it. Nothing in the
+workflow can change that — visibility is a setting on the package, not a field
+in a manifest, and there is no API for it.
+
+So v0.0.1 published an image and a chart that nobody could pull. `docker run
+ghcr.io/trianalab/mira` and `helm install oci://ghcr.io/trianalab/charts/mira` —
+the two lines the README hands a reader — answered `DENIED`, Artifact Hub's
+first tracking pass failed with the same error, and the run was green, because
+every step that touched the registry had logged in first.
+
+`verify-release` now asks for an anonymous pull token before it authenticates,
+for both coordinates, and fails the release if either is refused. That failure
+is not a broken release: the bytes are published and correct, and the fix is the
+package's own settings page rather than a version bump. It is the only check
+here whose remedy is a click.
+
+The crates have the mirror-image problem and it is checked the same way: the
+`crates` job knows the upload returned 200, which is not the same as a stranger
+being able to resolve it. `verify-release` reads `index.crates.io` — the sparse
+index Cargo itself resolves against, not the API — for all three names.
 
 ## What is signed, and what is not
 
@@ -127,6 +172,7 @@ with the same commands [Install](../install.md) tells a stranger to run.
 | Image (`mira:X.Y.Z`) | digest | yes, over the digest | yes, pushed to the registry |
 | Chart (`charts/mira:X.Y.Z`) | digest | yes, over the digest | — |
 | `:artifacthub.io` metadata | — | — | — |
+| crates (`miradb*`) | registry `.crate` checksum | — | — |
 
 **Everything signed is signed over its digest, never over a tag.** A tag is a
 mutable pointer; a signature over one says nothing about the bytes that came
@@ -150,7 +196,7 @@ restates it, and the right-hand column is what stops it rotting.
 | Site | Gate |
 |---|---|
 | `Cargo.toml` `[workspace.package]` | the source |
-| `Cargo.toml` `mira-core` / `mira-proto` path-dep pins | **none** |
+| `Cargo.toml` `miradb-core` / `miradb-proto` path-dep pins | **none** |
 | `charts/mira/Chart.yaml` — `version`, `appVersion`, the scanned image tag | `make drift` |
 | `charts/mira/README.md` | generated; `make helm-docs-check` |
 | `charts/mira/tests/statefulset_test.yaml` | the chart suite fails if it disagrees |
@@ -159,12 +205,13 @@ restates it, and the right-hand column is what stops it rotting.
 | `CHANGELOG.md` | **none** (prose) |
 | `SECURITY.md` | **none** (prose) |
 
-The three ungated sites are prose that names the current version, and they will
-rot on the first bump that forgets them. That is a known gap and the fix is
-cheap — `scripts/check_drift.py` already owns every regex needed, so a `--bump`
-flag that *writes* the sites it currently only reads is around forty lines. One
-release in, the three still agree because they were bumped by hand; the bump
-that forgets one is what buys the forty lines.
+The three ungated sites are prose that names the current version, and they rot
+on the first bump that forgets them. That is a known gap and the fix is cheap —
+`scripts/check_drift.py` already owns every regex needed, so a `--bump` flag
+that *writes* the sites it currently only reads is around forty lines. It has
+not been written yet, and 0.0.2 is the bump that showed why it should be: the
+0.0.1 cut left `SECURITY.md` saying there was no tagged release, on the day
+there was one.
 
 ## What the tag path does not re-run
 
@@ -181,13 +228,19 @@ could ship advertising an image tag that is not the one being released.
 
 ## Rehearsal, and what only the tag can run
 
-`ci.yml`'s `release-dry-run` leg runs `make dist` — the real tarball, SBOM and
-checksum targets — on every code PR, and `workflow_dispatch` runs the whole DAG
-with `publish=false`. Both pass.
+`ci.yml`'s `release-dry-run` leg runs `make dist` and `make publish-dry` — the
+real tarball, SBOM and checksum targets, then a full `cargo publish --workspace`
+that packages all three crates, resolves each against the one before it out of a
+temporary registry and compiles them, stopping at the upload — on every code PR.
+`workflow_dispatch` runs the whole DAG with `publish=false`. Both have passed.
 
-`publish=false` skips every network-publishing step, so four things had no
-rehearsal at all until v0.0.1 pushed them for real: `cosign sign`, `helm push`,
-the `Digest:` scrape off `helm push`'s stderr, and the Artifact Hub `oras push`.
-All four worked and `verify-release` went green on that tag, which is the only
-evidence any of them is right — it is still the job that fails loudly when one
-of them is not, and recovery is still a bump to the next patch.
+`publish=false` skips every network-publishing step, so `cosign sign`,
+`helm push`, the `Digest:` scrape off `helm push`'s stderr and the Artifact Hub
+`oras push` were all executing for the first time on v0.0.1. All four worked.
+
+The `crates` job and the anonymous-pull check both ran for the first time on
+v0.0.2, which is also the first release whose `make publish` actually uploaded.
+Both worked. That upload is unrehearsable by construction — `publish-dry` does
+everything except the one irreversible thing — so every release after it is
+still trusting a step that only the tag can run. `verify-release` fails loudly
+when it is wrong, and recovery is a bump to the next patch.

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Mira is pre-1.0 — `0.0.1`. Two things are supported: the latest release and
+Mira is pre-1.0 — `0.0.2`. Two things are supported: the latest release and
 the tip of `main`. Fixes land on `main` and ship in the next release; there are
 no backport branches to ask about, and this table will not gain a third row.
 
@@ -130,10 +130,10 @@ never the tag — a tag is a name and names can be repointed. The release workfl
 also refuses to publish over a coordinate that already exists, so a re-run of a
 released version fails instead of quietly replacing what you verified yesterday.
 
-There is no tagged release yet, so none of this has a subject to run against
-today. The commands are here because they are the contract the workflow's own
-`verify-release` job runs against every publication — if they stop working, that
-job goes red before you find out.
+Every command below has a subject from `v0.0.1` on. They are also the contract
+the workflow's own `verify-release` job runs against every publication — it
+re-downloads what a stranger downloads and checks it exactly this way, so if
+they stop working that job goes red before you find out.
 
 Container image, keyless (no key to distribute, no key to leak — the identity is
 the workflow that signed it):

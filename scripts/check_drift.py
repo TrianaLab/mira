@@ -35,7 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The three workspace members show up in `cargo tree -p mira`, so the measured
+# The three workspace members show up in `cargo tree -p miradb`, so the measured
 # figure is three above the number the README states. CLAUDE.md says the same
 # thing; if a fourth member is ever added, this constant and that sentence move
 # together.
@@ -182,7 +182,7 @@ def check_crate_count(declared: int) -> None:
     # The pipeline CLAUDE.md documents, done in Python: one entry per
     # name+version pair in mira's normal (non-dev, non-build) dependency tree.
     tree = cargo(
-        "tree", "-p", "mira", "--edges", "normal", "--prefix", "none",
+        "tree", "-p", "miradb", "--edges", "normal", "--prefix", "none",
         "--target", REFERENCE_TARGET,
     )
     pairs = {
@@ -216,7 +216,7 @@ def check_c_toolchain() -> None:
     """Whoever build-depends on `cc` is whoever compiles C. There is one."""
     for tool in C_TOOLCHAIN_CRATES:
         out = subprocess.run(
-            ["cargo", "tree", "-p", "mira", "--edges", "normal,build",
+            ["cargo", "tree", "-p", "miradb", "--edges", "normal,build",
              "-i", tool, "--prefix", "depth", "--format", "{p}",
              "--target", REFERENCE_TARGET],
             cwd=ROOT, capture_output=True, text=True,
@@ -447,6 +447,63 @@ def check_section_refs() -> None:
         )
 
 
+# The README's coverage badge. A number baked into an image URL is the one kind
+# of number nobody re-reads — it renders the same whether or not it is still
+# true — so this badge holds no number at all: it is shields' `dynamic/json`
+# reader pointed at a file `make coverage-json` writes into the published site,
+# from the measurement the deploy itself took.
+#
+# Which leaves exactly one way for it to rot, and it is silent: the badge points
+# at a URL and nothing publishes the file, so it renders grey "resource not
+# found" forever on a page whose whole job is to be a promise. Both halves are
+# checked here, together, because either alone passes while the pair is broken.
+COVERAGE_BADGE_URL = "https://miradb.dev/coverage.json"
+COVERAGE_BADGE = re.compile(
+    r"img\.shields\.io/badge/dynamic/json\?[^)\s]*"
+    r"url=https(?::|%3A)(?://|%2F%2F)miradb\.dev(?:/|%2F)coverage\.json"
+)
+COVERAGE_WRITER = re.compile(r"^COVERAGE_JSON := site/coverage\.json$", re.M)
+
+
+def check_coverage_badge() -> None:
+    if not COVERAGE_BADGE.search((ROOT / "README.md").read_text()):
+        fail(
+            "README.md no longer carries a live coverage badge pointing at "
+            f"{COVERAGE_BADGE_URL}.\n"
+            "    A hard-coded percentage is not a substitute: it is true on "
+            "the day it is written and unfalsifiable afterwards. Restore the "
+            "shields dynamic/json badge, or delete check_coverage_badge and "
+            "`make coverage-json` together — a gate for a thing that is gone "
+            "is a gate that passes forever."
+        )
+        return
+
+    if not COVERAGE_WRITER.search((ROOT / "Makefile").read_text()):
+        fail(
+            "the README's coverage badge reads "
+            f"{COVERAGE_BADGE_URL}, and the Makefile no longer declares "
+            "'COVERAGE_JSON := site/coverage.json' to write it.\n"
+            "    Nothing would publish the file, so the badge would render "
+            "grey on every view of the README and no build would go red."
+        )
+
+    # A writer nothing calls is the same outage as no writer. `scripts/check_ci.py`
+    # cannot catch this: its make-dispatch rule covers ci.yml only, so a docs.yml
+    # that never runs the target is valid to it.
+    docs_yml = (ROOT / ".github/workflows/docs.yml").read_text()
+    if "make ci-coverage-json" not in docs_yml or not re.search(
+        r"^ci-coverage-json:", (ROOT / "ci.mk").read_text(), re.M
+    ):
+        fail(
+            "nothing publishes site/coverage.json: the deploy in "
+            ".github/workflows/docs.yml must run 'make ci-coverage-json' and "
+            "ci.mk must define that target.\n"
+            "    It has to be the deploy, after `make site` — mkdocs empties "
+            "the output directory, and ci.yml's coverage leg is conditional on "
+            "a code change, so a docs-only push would produce no file at all."
+        )
+
+
 def main() -> int:
     declared_crates, declared_mib = declared_from_readme()
     check_crate_count(declared_crates)
@@ -454,6 +511,7 @@ def main() -> int:
     check_binary_size(declared_mib)
     check_sites(declared_crates, declared_mib)
     check_chart_version(workspace_version())
+    check_coverage_badge()
     check_section_refs()
 
     for note in notes:

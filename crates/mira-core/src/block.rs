@@ -921,14 +921,14 @@ const MAX_COMPACT_PER_SWEEP: usize = 8;
 
 /// Rewrite aged blocks ZSTD-compressed, in place.
 ///
-/// Measured by `cargo run --release -p mira-core --example tier` over section
-/// 11's corpus: 0.113 of the plain size for logs, 0.126 for traces, at 808
-/// MiB/s on one core. Reading a compacted block back costs nothing measurable —
-/// warm it lands within run-to-run noise of the plain one, and cold, which is
-/// the only state a block old enough to be compacted is in, 8.4× fewer pages to
-/// fault and 8.4× fewer bytes to CRC more than pays for the inflate. So the
-/// tier costs the read path only the zero-copy property, and that only for data
-/// nothing is scanning any more.
+/// Measured by `cargo run --release -p miradb-core --example tier` over section
+/// 11's corpus: 0.113 of the plain size for logs, 0.126 for traces, at 634
+/// MiB/s on one core. Warm, reading a compacted block back costs 1.11× the
+/// plain read — the inflate is real and it is small. Cold, which is the only
+/// state a block old enough to be compacted is in, 8.4× fewer pages to fault
+/// and 8.4× fewer bytes to CRC more than pays for it. So the tier costs the
+/// read path the zero-copy property and a tenth of a warm read, and only for
+/// data nothing is scanning any more.
 ///
 /// Crash safety is the trick `publish` already uses: write beside the target,
 /// then rename. A crash leaves a directory with some tables compressed and some

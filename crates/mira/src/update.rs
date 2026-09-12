@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 /// same file.
 const INSTALLER: &str = "https://miradb.dev/install.sh";
 
+/// Where to go when there is no shell to run the installer with.
+const RELEASES: &str = "https://github.com/TrianaLab/mira/releases";
+
 pub const USAGE: &str = "mira update [--version VERSION] [--dry-run]
 
 Downloads the latest release from GitHub and replaces this binary with it,
@@ -37,7 +40,11 @@ by running the same installer as
 
 Installs over this binary's own directory, not /usr/local/bin, unless
 MIRA_INSTALL_DIR says otherwise. Nothing happens if the running version is
-already the one that would be installed.";
+already the one that would be installed.
+
+Needs bash and either curl or wget, because it runs the installer rather
+than carrying an HTTPS client. The container image has none of them; upgrade
+that by pulling a newer tag.";
 
 /// What `--version` was given, if anything.
 ///
@@ -145,11 +152,32 @@ fn installer(line: &str) -> std::process::Command {
 fn spawn(cmd: &mut std::process::Command) -> Result<(), String> {
     let status = cmd
         .status()
-        .map_err(|e| format!("could not run the installer: {e}"))?;
+        .map_err(|e| start_failed(&cmd.get_program().to_string_lossy(), &e))?;
     if !status.success() {
         return Err(format!("installer exited with {status}"));
     }
     Ok(())
+}
+
+/// What to say about a child that never started.
+///
+/// `NotFound` is not an unusual system here, it is the shipped one: the image
+/// is distroless, so it has no bash, no curl and no writable install directory,
+/// and the raw "No such file or directory (os error 2)" names the symptom while
+/// hiding the answer — a container upgrades by pulling a newer tag, not by
+/// rewriting its own rootfs. Every other tool the installer needs already
+/// refuses by name (curl-or-wget in [`command`], sha256sum in the script), so
+/// this is the last case that did not.
+fn start_failed(program: &str, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return format!(
+            "`{program}` is not on PATH, so there is nothing here to run the \
+             installer with. In a container, upgrade by pulling a newer image \
+             tag. Otherwise install {program}, or take the tarball for this \
+             platform straight from {RELEASES}."
+        );
+    }
+    format!("could not run the installer: {e}")
 }
 
 #[cfg(test)]
@@ -249,6 +277,29 @@ mod tests {
         assert!(e.starts_with("installer exited with"), "{e}");
 
         let e = spawn(&mut std::process::Command::new("/no/such/installer")).unwrap_err();
+        assert!(e.starts_with("`/no/such/installer` is not on PATH"), "{e}");
+    }
+
+    /// The distroless image has no bash, and that has to read as an answer
+    /// rather than as an errno.
+    #[test]
+    fn no_shell_says_so_and_says_what_to_do_instead() {
+        let e = start_failed("bash", &std::io::ErrorKind::NotFound.into());
+        assert!(e.starts_with("`bash` is not on PATH"), "{e}");
+        assert!(e.contains("pulling a newer image tag"), "{e}");
+        assert!(e.contains(RELEASES), "{e}");
+
+        // Anything else is a real error and is reported as one, rather than
+        // being explained away as a missing shell.
+        let e = start_failed("bash", &std::io::ErrorKind::PermissionDenied.into());
         assert!(e.starts_with("could not run the installer:"), "{e}");
+    }
+
+    #[test]
+    fn the_usage_names_what_it_needs_on_the_host() {
+        assert!(
+            USAGE.contains("Needs bash and either curl or wget"),
+            "{USAGE}"
+        );
     }
 }

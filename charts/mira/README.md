@@ -1,6 +1,6 @@
 # mira
 
-![Version: 0.0.1](https://img.shields.io/badge/Version-0.0.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.0.1](https://img.shields.io/badge/AppVersion-0.0.1-informational?style=flat-square)  [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira)
+![Version: 0.0.2](https://img.shields.io/badge/Version-0.0.2-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.0.2](https://img.shields.io/badge/AppVersion-0.0.2-informational?style=flat-square)  [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira)
 
 OTLP-native telemetry storage engine in a single binary — OTLP in, immutable Arrow blocks out, queried straight from mmap. One StatefulSet, one data directory, no sidecar and nothing to coordinate.
 
@@ -30,7 +30,7 @@ Pin the version:
 
 ```bash
 helm install mira oci://ghcr.io/trianalab/charts/mira \
-  --version 0.0.1 \
+  --version 0.0.2 \
   --namespace observability --create-namespace
 ```
 
@@ -142,7 +142,7 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira:0.0.1
+  ghcr.io/trianalab/charts/mira:0.0.2
 ```
 
 ## Values

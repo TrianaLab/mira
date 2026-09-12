@@ -13,7 +13,7 @@
 //! and the number has to come from real telemetry rather than a corpus.
 //!
 //! ```sh
-//! cargo run --release -p mira-core --example tier -- ./data
+//! cargo run --release -p miradb-core --example tier -- ./data
 //! ```
 //!
 //! The denominator matters and there are two of them in circulation. This one

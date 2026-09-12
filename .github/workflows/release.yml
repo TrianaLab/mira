@@ -553,6 +553,41 @@ jobs:
             "${prerelease_arg[@]}" \
             dist/*
 
+  # Last, because it is the least reversible thing this workflow does. A ghcr
+  # tag can be overwritten by a later release and a GitHub Release can be
+  # deleted outright; a crates.io version is consumed the moment it uploads and
+  # `cargo yank` only hides it from new resolutions. So it goes after the
+  # Release exists, when everything else has already worked.
+  #
+  # No checkout cache and no rehearsal flag: ci.yml's release-dry-run leg runs
+  # `make publish-dry` on every code PR, which is this minus the upload.
+  crates:
+    name: crates
+    needs: [meta, release]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `ui/dist` is committed and `make publish` builds each package out of
+      # the tarball it just produced, so there is no npm step here — the
+      # `include_bytes!` the binary needs is already in the tree, and ci.yml
+      # fails a `.svelte` change that was not rebuilt.
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Create a crates.io" \
+                 "API token scoped to publish-new and publish-update and add it" \
+                 "as a repository secret. Everything else in this release has" \
+                 "already published; re-run this job once the secret exists."
+            exit 1
+          fi
+          make publish
+
   # Everything above verifies its own inputs. Nothing above verifies the
   # *output*, and the failure mode that gap allows is a run that is green having
   # published nothing usable: an asset list that silently lost a leg, a
@@ -565,7 +600,7 @@ jobs:
   # whose inputs are not this workflow's own state — which is the entire point.
   verify-release:
     name: verify-release
-    needs: [meta, image, chart, release]
+    needs: [meta, image, chart, release, crates]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -580,13 +615,57 @@ jobs:
         with:
           version: v3.22.0
 
-      # A ghcr package is private until somebody makes it public, and the first
-      # release creates it — so an anonymous pull here would fail on exactly the
-      # release this job exists to check. `packages: read` and a login make the
-      # step independent of a setting nobody in this file can see. It weakens
-      # the check slightly (it no longer proves the package is *public*), and
-      # that is the right trade: visibility is an availability question, and
-      # this job is asking a supply-chain one.
+      # Before anything logs in, because after that this cannot fail.
+      #
+      # A ghcr package is private until somebody makes it public and the first
+      # release is what creates it — which used to be the argument for logging
+      # in and calling visibility somebody else's problem. v0.0.1 is what that
+      # costs: both packages published private, so `docker run
+      # ghcr.io/trianalab/mira` and `helm install oci://...` — the two lines the
+      # README hands a stranger — were DENIED for everyone, Artifact Hub's first
+      # tracking pass failed with the same error, and this workflow went green.
+      # The release where it can be wrong is the release that has to check.
+      #
+      # curl rather than docker or helm on purpose: no config file to read a
+      # credential out of, so it cannot quietly start passing because some
+      # earlier step authenticated. A failure here does not mean the bytes are
+      # wrong — they are published and correct — it means a setting is, so the
+      # fix is the package's settings page and not a version bump.
+      - name: a stranger can pull the image and the chart
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          anon() {
+            local repo="$1" ref="$2" token
+            token=$(curl -fsS \
+              "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" \
+              | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+            [ -n "${token}" ] || return 1
+            curl -fsS -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/${repo}/manifests/${ref}"
+          }
+          rc=0
+          for target in "${IMAGE#ghcr.io/}:${VERSION}" \
+                        "${CHARTS#ghcr.io/}/mira:${VERSION}"; do
+            if anon "${target%:*}" "${target##*:}"; then
+              echo "anonymous pull of ghcr.io/${target} ok"
+            else
+              echo "::error::ghcr.io/${target} is not pullable anonymously. The" \
+                   "package is private — make it public on its package settings" \
+                   "page. The published bytes are correct and need no new version."
+              rc=1
+            fi
+          done
+          exit "${rc}"
+
+      # Everything below is a supply-chain question rather than an availability
+      # one, and deliberately authenticates: whether a signature verifies must
+      # not depend on a visibility setting. The step above is what holds the
+      # setting.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -667,6 +746,31 @@ jobs:
             "${CHARTS}/mira@${DIGEST}" > /dev/null
           echo "chart ${CHARTS}/mira@${DIGEST} verified"
 
+      - name: all three crates are on crates.io at this version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The sparse index, not the API: it is the file Cargo itself resolves
+          # against, so a version that answers here is a version `cargo add`
+          # can actually reach. The API can serve a crate whose index entry has
+          # not propagated, which is the difference between "we uploaded it"
+          # and "a stranger can depend on it".
+          #
+          # Sparse-index paths are bucketed by name length — 1/x, 2/xy, 3/x/xyz,
+          # then aa/bb/name. All three of ours are long enough for the last.
+          rc=0
+          for crate in miradb miradb-core miradb-proto; do
+            if curl -fsS "https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}" \
+                 | grep -q "\"vers\":\"${VERSION}\""; then
+              echo "crates.io ${crate} ${VERSION} ok"
+            else
+              echo "::error::${crate} ${VERSION} is not in the crates.io index"
+              rc=1
+            fi
+          done
+          exit "${rc}"
+
       - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: the Artifact Hub ownership metadata came back
@@ -692,9 +796,11 @@ jobs:
           {
             echo '### Verified after publication'
             echo
+            echo '- the image and the chart are pullable with no credentials'
             echo '- SHA256SUMS matches every asset attached to the release'
             echo '- SLSA provenance resolves for the linux x86_64 tarball'
             echo '- the image digest carries a cosign signature from this workflow'
             echo '- the chart pulls and its digest carries the same signature'
+            echo '- all three crates resolve out of the crates.io sparse index'
             echo '- the Artifact Hub ownership metadata round-trips'
           } >> "$GITHUB_STEP_SUMMARY"

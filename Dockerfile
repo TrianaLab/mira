@@ -55,7 +55,7 @@ COPY . .
 # has to be copied out inside the same RUN.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked -p mira \
+    cargo build --release --locked -p miradb \
     && cp target/release/mira /mira
 
 # Resolves to `compile` or `prebuilt`; everything below is identical either way.

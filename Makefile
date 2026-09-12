@@ -1,10 +1,14 @@
 # This file is the single source of truth for every quality gate in Mira.
 #
-# CI does not reimplement a single one of them: .github/workflows/ci.yml calls
-# these targets and nothing else. That is the whole point — a gate that only
-# exists in YAML is a gate no contributor can run, and a gate that exists in
-# both places is two gates that drift. Adding a check means adding it here;
-# wiring it into CI is then one line, and `make check` picks it up for free.
+# CI does not reimplement a single one of them: .github/workflows/ci.yml is a
+# dispatcher, every `run:` in it is a `make ci-*` target, and check_ci.py fails
+# the build if one is not. That is the whole point — a gate that only exists in
+# YAML is a gate no contributor can run, and a gate that exists in both places
+# is two gates that drift. Adding a check means adding it here; wiring it into
+# CI is then one word in `ci.mk`, and `make check` picks it up for free.
+#
+# The gates are here; the legs are in ci.mk, included at the bottom. `make ci`
+# runs every one of them on this host.
 #
 # `cargo` is not on PATH in a non-login shell on the maintainer's machine.
 # Every recipe below goes through $(CARGO), so `make CARGO=$$HOME/.cargo/bin/cargo`
@@ -29,7 +33,7 @@ LOADGEN := target/release/examples/loadgen
 # was last edited. It may only ever go up. Raising it is a one-line diff a
 # reviewer can see; lowering it needs an argument in the PR body. A gate set to
 # an aspiration is a gate that gets switched off the first time it goes red.
-# docs/architecture.md and .github/workflows/ci.yml both defer to this value.
+# docs/internals/testing.md and .github/workflows/ci.yml both defer to this value.
 #
 # Read it off a CI log, never off a laptop: `#[cfg]` splits the tree by host, so
 # the Linux runner measures a slightly different denominator than a Mac does and
@@ -93,9 +97,10 @@ help: ## Show this help
 	@echo
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| sort \
-		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "  make check        runs every PR gate. Run it before you push."
+	@echo "  make check            every gate that needs no daemon or second toolchain."
+	@echo "  make ci               every CI leg, including the four 'check' leaves out."
 
 # ---------------------------------------------------------------------------
 # Formatting and lints
@@ -130,7 +135,7 @@ features: ## Lint the optional features, which nothing else compiles
 	@# on. Clippy rather than a full test run: the feature swaps one HTTP
 	@# connector for another, and there is no TLS endpoint in the suite to
 	@# point it at.
-	$(CARGO) clippy -p mira --all-targets --locked --features webhook-tls -- -D warnings
+	$(CARGO) clippy -p miradb --all-targets --locked --features webhook-tls -- -D warnings
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -155,6 +160,32 @@ coverage: ## Line coverage against the ratchet ($(COVERAGE_MIN)%)
 coverage-report: ## Per-file coverage, worst first — what to write tests for next
 	$(call need,cargo-llvm-cov)
 	$(CARGO) llvm-cov --workspace --locked --summary-only
+
+# The README's coverage badge reads this file over HTTP at render time, so the
+# number on the badge is the number the run that published the site measured —
+# not a figure someone remembered to edit. It used to be the ratchet, which is a
+# floor and was therefore honest but pessimistic: `%E2%89%A599.20%` under a tree
+# actually at 99.26.
+#
+# It lands in `site/` because the site is the only thing this repository already
+# publishes at a stable URL, and `docs.yml` runs this target straight after
+# `make site` — mkdocs empties that directory before it writes, so the order is
+# load-bearing and the other way round produces a 404 nobody sees until the
+# badge goes grey.
+#
+# Floored to two decimals rather than rounded, for the reason COVERAGE_MIN is:
+# 99.999 is not 100. `commit` is not read by the badge; it is there so a figure
+# that looks wrong can be traced to the tree that produced it.
+COVERAGE_JSON := site/coverage.json
+
+.PHONY: coverage-json
+coverage-json: ## Measure coverage into site/coverage.json — what the README badge reads
+	$(call need,cargo-llvm-cov)
+	@mkdir -p $(dir $(COVERAGE_JSON))
+	$(CARGO) llvm-cov --workspace --locked --summary-only --json \
+	  | $(PYTHON) -c 'import json,math,sys; p=json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"]; json.dump({"line": math.floor(p*100)/100, "commit": sys.argv[2]}, open(sys.argv[1],"w"))' \
+	    $(COVERAGE_JSON) "$${GITHUB_SHA:-$$(git rev-parse HEAD)}"
+	@echo; cat $(COVERAGE_JSON); echo
 
 # ---------------------------------------------------------------------------
 # Build
@@ -412,6 +443,11 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 		exit 1; }
 	actionlint
 	$(PYTHON) scripts/check_ci.py
+	@# actionlint shellchecks every `run:` block for free. `ci-changes.sh` used
+	@# to be one, so lifting it into a file would have quietly dropped that —
+	@# and it is still the workflow, just spelled somewhere greppable.
+	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
+	shellcheck scripts/ci-changes.sh
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs
@@ -450,10 +486,6 @@ install-script: ## The published one-liner installer still parses, lints and run
 	     printf '%s\n' "$$out" | sed 's/^/    /'; exit 1 ;; \
 	esac
 	@echo "installer: shellcheck clean, arrays expand safely, version lookup reached."
-
-.PHONY: print-msrv
-print-msrv: ## Print the declared MSRV (CI installs the toolchain from this)
-	@echo $(MSRV)
 
 .PHONY: msrv
 msrv: ## Compile with exactly the declared MSRV ($(MSRV))
@@ -521,6 +553,12 @@ site: docs doc ui-demo ## The published site: the docs, rustdoc at /api, the UI 
 	@# over it would delete a page mkdocs believes it published — a broken link
 	@# --strict cannot see, because the breakage happens after it ran.
 	rm -rf site/api && cp -R target/doc site/api
+	@# `cargo doc` over a workspace writes no root index — `target/doc/` is one
+	@# directory per crate and nothing above them — so the URL the architecture
+	@# page and the site nav both point at, miradb.dev/api, was a 404 while every
+	@# page under it was fine. `mkdocs build --strict` cannot see it: an absolute
+	@# https:// URL is external as far as the link checker is concerned.
+	printf '<meta http-equiv="refresh" content="0;url=mira/index.html">\n' > site/api/index.html
 	rm -rf site/play && cp -R $(UI_DIR)/dist-demo site/play
 	@echo "site/ built, with $$(find site/api -name '*.html' | wc -l | tr -d ' ') rustdoc pages under /api"
 	@echo "and the recorded UI snapshot under /play."
@@ -538,18 +576,10 @@ CHART := charts/mira
 # changes meaning on someone else's machine.
 HELM_UNITTEST_VERSION ?= 1.0.3
 
-.PHONY: print-helm-unittest-version
-print-helm-unittest-version: ## Print the pinned helm-unittest version (CI installs it)
-	@echo $(HELM_UNITTEST_VERSION)
-
 # Pinned for the same reason, and it matters more here: helm-docs *generates*
 # the file `helm-docs-check` then diffs, so an unpinned generator turns a drift
 # gate into a coin flip that fails on whoever upgraded last.
 HELM_DOCS_VERSION ?= 1.14.2
-
-.PHONY: print-helm-docs-version
-print-helm-docs-version: ## Print the pinned helm-docs version (CI installs it)
-	@echo $(HELM_DOCS_VERSION)
 
 .PHONY: helm-lint
 helm-lint: ## helm lint the chart
@@ -742,12 +772,17 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 
 .PHONY: dist-sbom
 dist-sbom: sbom ## Name the CycloneDX SBOM after the release and put it in dist/
-	@# Located rather than hardcoded: `make sbom` owns cargo-cyclonedx's naming
-	@# and should stay free to move the file without breaking a release five
-	@# minutes into the build. Renamed on the way in because `mira.cdx.json` is
-	@# not a name you can attach to three tags of a repository.
-	@src=$$(find . -name 'mira.cdx.json' -not -path './target/*' -print -quit); \
-	[ -n "$$src" ] || { echo "error: make sbom produced no mira.cdx.json"; exit 1; }; \
+	@# Located by directory rather than by name: `make sbom` owns
+	@# cargo-cyclonedx's naming and should stay free to move the file without
+	@# breaking a release five minutes into the build. It writes one per package
+	@# named after the package, so the rename to `miradb` turned a `-name
+	@# 'mira.cdx.json'` match into zero hits — which is how the release SBOM step
+	@# would have failed on a tag. The binary crate's directory is the stable
+	@# fact; what the package inside it is called is not. Renamed on the way in
+	@# because `miradb.cdx.json` is not a name you can attach to three tags of a
+	@# repository.
+	@src=$$(find crates/mira -maxdepth 1 -name '*.cdx.json' -print -quit); \
+	[ -n "$$src" ] || { echo "error: make sbom produced no crates/mira/*.cdx.json"; exit 1; }; \
 	mkdir -p "$(DIST)"; \
 	cp "$$src" "$(DIST)/mira-$(VERSION).cdx.json"; \
 	echo "wrote $(DIST)/mira-$(VERSION).cdx.json"
@@ -765,6 +800,28 @@ dist-sums: ## SHA256SUMS over everything in dist/
 	chmod 644 "$$tmp"; \
 	mv "$$tmp" SHA256SUMS; \
 	cat SHA256SUMS
+
+.PHONY: publish-dry
+publish-dry: ## Rehearse the crates.io publish: package, resolve, build, stop
+	$(CARGO) publish --workspace --locked --dry-run
+
+.PHONY: publish
+publish: ## Publish all three crates to crates.io. Irreversible.
+	$(CARGO) publish --workspace --locked
+# `--workspace` rather than three invocations in dependency order: Cargo works
+# the order out from the graph and, between members, waits for the index to
+# serve each one before building the next. The hand-rolled version of that is a
+# retry loop against a cache nobody controls, and it is the step that fails at
+# the exact moment a partial publish cannot be undone.
+#
+# A crates.io version is consumed forever — `cargo yank` hides it from new
+# resolutions and frees nothing. So `publish-dry` runs on every code PR
+# (ci.yml's release-dry-run leg) and does everything this does except the
+# upload, which is the only rehearsal available for a one-shot operation.
+#
+# The names here are `miradb`, `miradb-core` and `miradb-proto`; the binary is
+# still `mira` and so is every `use` in the tree. Cargo.toml's
+# [workspace.dependencies] block says why.
 
 # ---------------------------------------------------------------------------
 # The image, and the two gates over it
@@ -878,3 +935,14 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 	       exit $$rc' EXIT; \
 	docker compose -f $(E2E_COMPOSE) up -d; \
 	$(PYTHON) -c "$$E2EASSERT"
+
+# ---------------------------------------------------------------------------
+# The pipeline
+# ---------------------------------------------------------------------------
+#
+# Last, so every variable above is in scope. Everything in there is a `ci-`
+# target: the legs ci.yml dispatches to, the path filter that decides which of
+# them a diff needs, and the pinned versions of the tools a runner installs
+# into itself. `make ci` runs the lot on this host. See its header for why the
+# line between the two files falls where it does.
+include ci.mk

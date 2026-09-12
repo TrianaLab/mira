@@ -9,12 +9,12 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
-## [0.0.2] - 2026-09-12
+## [0.0.3] - 2026-09-12
 
 Two performance gaps that [the comparison page](docs/market.md) listed as having
 a cause inside this repository and a path to closing it. Both paths were taken.
-No format change: a 0.0.1 block directory is read by this binary and a block it
-writes is read by 0.0.1.
+No format change: a 0.0.2 block directory is read by this binary and a block it
+writes is read by 0.0.2.
 
 ### Added
 
@@ -74,6 +74,56 @@ writes is read by 0.0.1.
   cannot see a cgroup CPU quota. It can. The cases it genuinely cannot see —
   `cpu.shares`/`cpu.weight`, a pod with no quota on a large node, hyperthreads
   counted as cores — are what the knob is for.
+
+## [0.0.2] - 2026-09-12
+
+0.0.1 shipped the binary, the image and the chart. It did not ship the crates,
+because the publish job did not exist yet — so this release exists mostly to
+make `cargo install --locked miradb` true.
+
+### Added
+
+- **Published on crates.io**: `cargo install --locked miradb` installs the
+  `mira` binary, and [`miradb-core`](https://docs.rs/miradb-core) and
+  [`miradb-proto`](https://docs.rs/miradb-proto) are there for embedding the
+  engine. The release workflow publishes them after the GitHub Release exists
+  and `verify-release` resolves all three out of the sparse index.
+- **`make ci` runs the whole pipeline on your machine.** Every leg is a
+  `make ci-*` target in `ci.mk`, `.github/workflows/ci.yml` is a dispatcher
+  over that file, and `scripts/check_ci.py` fails the build on any `run:` step
+  that is not one — so a red leg is reproducible with one command rather than
+  by pushing again. `make ci-changes` says which legs a diff needs.
+- **The chart reference, contributing guide, security policy and code of
+  conduct are pages on the site**, not files on a code host. Nothing in the
+  documentation's body content links out to GitHub any more.
+
+### Changed
+
+- The three packages are named `miradb`, `miradb-core` and `miradb-proto`
+  rather than `mira`, `mira-core` and `mira-proto` — `mira` on crates.io is an
+  unrelated crate from 2024. Nothing else moved: the binary is still `mira`,
+  the dependency keys and `use` paths are still `mira_core` / `mira_proto`, and
+  no source file changed. `cargo test -p mira` is now `-p miradb`.
+- **The README's coverage badge is the measured figure, not the ratchet.** It
+  reads [miradb.dev/coverage.json](https://miradb.dev/coverage.json), which the
+  deploy that publishes the site writes from its own `cargo llvm-cov` run, and
+  the file records the commit it measured. `COVERAGE_MIN` is unchanged and
+  still enforced on every code PR; it was always a floor rather than a
+  measurement, and the badge no longer pretends otherwise.
+- The README states the value rather than the design, and every badge on it is
+  now something a reader can check.
+
+### Fixed
+
+- **The first release of a `ghcr.io` package is private, and nothing in a
+  workflow can change that** — so 0.0.1 published an image and a chart that
+  answered `DENIED` to everyone, in a run that was green because every step had
+  logged in first. `verify-release` now asks for an anonymous pull token before
+  it authenticates, for both coordinates, and fails the release if either is
+  refused. Both 0.0.1 coordinates are public now.
+- `mira update` names the tool it could not find when there is no shell to run
+  the installer with, instead of failing with the installer's own error about
+  something else.
 
 ## [0.0.1] - 2026-09-12
 
@@ -196,12 +246,14 @@ list.
 - Ingestion is allocation-lean, not zero-copy: `prost` memcpies every string.
 - No block cache — every query re-opens and re-CRCs the blocks it touches.
 - No cross-replica query fan-out, and no peer list to configure.
-- No entity selector: every block stores each resource's entity key and no read
-  surface reads it yet.
+- No entity *predicate* in the query document. Every block stores each
+  resource's entity key and `/api/v1/entities` lists them, but no filter
+  selects on one.
 - No `F_FULLFSYNC` fallback for volumes that answer `EINVAL`/`ENOTSUP`.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/TrianaLab/mira/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/TrianaLab/mira/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/TrianaLab/mira/releases/tag/v0.0.1
