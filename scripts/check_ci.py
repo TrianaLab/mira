@@ -26,6 +26,9 @@ assumes it is:
   * no required workflow carries a trigger-level `paths:` filter, because a
     filtered-out required check never starts, never reports, and strict branch
     protection waits for it forever;
+  * every `run:` in `ci.yml` is a single `make ci-*` call into a target that
+    exists in `ci.mk`, so every leg is one command on a laptop and nobody has
+    to debug shell by pushing commits;
   * every third-party action is pinned to a full commit SHA with a version
     comment, and every workflow declares `permissions:` and `concurrency:`.
 
@@ -48,6 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover - environment problem, not logic
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
+CI_MK = ROOT / "ci.mk"
 
 # The status contexts configured as required in branch protection for `main`.
 # This list and that setting are the same fact stored twice; there is no API
@@ -66,6 +70,24 @@ REQUIRED_CONTEXTS = {"required", "security-required"}
 # if a publisher is not in the terminal job's closure, it can fail or be skipped
 # and the run still reports green.
 TERMINAL_JOBS = {"release.yml": "verify-release"}
+
+# Workflows that must be pure dispatchers over `ci.mk`: every `run:` in them is
+# one `make ci-*` call, so a red leg is a leg you can reproduce with one
+# command. The alternative is what every repository drifts into — shell that
+# exists only inside YAML, debugged by pushing commits and waiting six minutes,
+# and slowly diverging from whatever `make` does locally.
+#
+# The value maps a workflow to the jobs exempted from the rule, by job *name*.
+# `required` and `security-required` are exempt because their shell reads
+# `join(needs.*.result, ' ')` — workflow state that exists nowhere but here.
+# There is nothing for a local target to reproduce, so hiding it behind `make`
+# would buy an indirection and lose the only place a reader can see what the
+# gate actually does.
+MAKE_DISPATCHED = {"ci.yml": REQUIRED_CONTEXTS}
+
+# `make ci-foo VAR=value` — the target is the first word after `make`.
+MAKE_RUN = re.compile(r"^make\s+(?P<target>[A-Za-z0-9_.-]+)(\s|$)")
+MAKE_TARGET = re.compile(r"^(?P<target>[A-Za-z0-9_.-]+):(?!=)")
 
 # Jobs that are deliberately NOT reachable from a required context. Each needs a
 # reason, and the reason is read by a human, so write it for one. Empty is the
@@ -188,6 +210,69 @@ def check_terminal(name: str, jobs: dict) -> None:
         )
 
 
+def ci_mk_targets() -> set[str]:
+    """Target names declared in `ci.mk`.
+
+    A regex rather than `make -pn`: parsing the database means running make,
+    and make runs `$(shell ...)` in the Makefile's variable assignments to do
+    it. This check has to be able to say "that target does not exist" on a
+    machine where cargo is missing.
+    """
+    if not CI_MK.exists():
+        fail("ci.mk", "does not exist, but ci.yml is declared to dispatch to it.")
+        return set()
+    return {
+        m.group("target")
+        for line in CI_MK.read_text().splitlines()
+        if (m := MAKE_TARGET.match(line))
+    }
+
+
+def check_make_dispatch(name: str, jobs: dict) -> None:
+    """Every `run:` is a `make ci-*` call into a target that exists."""
+    exempt = MAKE_DISPATCHED.get(name)
+    if exempt is None:
+        return
+    targets = ci_mk_targets()
+    for job_id, job in sorted(jobs.items()):
+        if ((job or {}).get("name") or job_id) in exempt:
+            continue
+        for index, step in enumerate((job or {}).get("steps") or []):
+            run = (step or {}).get("run")
+            if run is None:
+                continue
+            label = (step or {}).get("name") or f"step {index}"
+            where = f"{name}:{job_id}:{label}"
+            body = run.strip()
+            single = len(body.splitlines()) == 1
+            m = MAKE_RUN.match(body) if single else None
+            if m is None:
+                fail(
+                    where,
+                    "is shell in a workflow file. Every step here must be one "
+                    "`make ci-*` call, so the leg can be run on a laptop and "
+                    "so `make ci` means the same thing as a green pull "
+                    "request. Move the body into a target in ci.mk.",
+                )
+                continue
+            target = m.group("target")
+            if not target.startswith("ci-"):
+                fail(
+                    where,
+                    f"calls `make {target}`, not a `ci-` target. The `ci-` "
+                    "prefix is what makes ci.mk readable against the job list: "
+                    "one target per leg, named after it. Wrap it — "
+                    f"`ci-<leg>: {target}` — and call that.",
+                )
+            elif target not in targets:
+                fail(
+                    where,
+                    f"calls `make {target}`, which ci.mk does not define. Either "
+                    "the target was renamed and this was not, or it lives in the "
+                    "Makefile and belongs here.",
+                )
+
+
 def check_workflow(path: Path) -> None:
     doc = yaml.safe_load(path.read_text()) or {}
     name = path.name
@@ -205,6 +290,7 @@ def check_workflow(path: Path) -> None:
 
     check_pins(path)
     check_terminal(name, jobs)
+    check_make_dispatch(name, jobs)
 
     if "pull_request" not in on:
         return  # not a gating workflow; the checks below are about merges
@@ -301,6 +387,8 @@ def main() -> int:
     print(f"required context(s) {', '.join(sorted(REQUIRED_CONTEXTS))} cover every PR job.")
     for wf, terminal in sorted(TERMINAL_JOBS.items()):
         print(f"{wf}: `{terminal}` covers every publishing job.")
+    for wf in sorted(MAKE_DISPATCHED):
+        print(f"{wf}: every step is a `make ci-*` target in ci.mk.")
     return 0
 
 

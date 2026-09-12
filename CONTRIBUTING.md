@@ -51,12 +51,40 @@ make build       # release binary
 make check       # every gate, in the order they fail fastest
 ```
 
-**Before you open a PR: `make check`.** That is the checklist. Four gates run
-only in CI, because each wants something a pre-push check should not assume —
-`make msrv` (a second toolchain), `make scan-image` (a Docker daemon and a
-Trivy database), `make e2e` and `make dist` (minutes, not seconds). Run those
-by hand when you have touched what they cover. Anything else that is green
-locally and red in CI is a bug in the Makefile worth reporting on its own.
+**Before you open a PR: `make check`.** That is the checklist: everything that
+needs no second toolchain, no Docker daemon and no several minutes.
+
+## Running the pipeline locally
+
+`.github/workflows/ci.yml` is a dispatcher and nothing else. Every `run:` step
+in it is a `make ci-*` call into [`ci.mk`](ci.mk) — `scripts/check_ci.py` fails
+the build if one ever is not — so a leg that goes red on a runner is a leg you
+can reproduce with one command, and there is no shell living in YAML for anyone
+to debug by pushing commits and waiting six minutes.
+
+```sh
+make ci          # every leg a pull request runs, on this host
+make ci-rust     # one leg, exactly as its job runs it
+make ci-changes  # which legs your diff against origin/main would run
+```
+
+`make ci` is `make check` plus the four it leaves out — `ci-msrv` (a second
+toolchain), `ci-image` (a Docker daemon and a Trivy database), `ci-e2e` and
+`ci-release-dry-run` (minutes, not seconds). Two of those a Mac cannot do at
+all: `ci-e2e` needs a Linux binary in a Linux container and says so rather than
+pretending, and `ci-image` needs a daemon. Those two are the honest gap, and
+knowing which they are beats an aggregate that quietly skips them.
+
+The split between the two files is not "CI things live over here". The Makefile
+holds the **gates** — what "correct" means, which has to mean the same thing on
+a laptop as on a runner. `ci.mk` holds what a **runner** adds: which legs a diff
+needs, the tool versions everyone has to agree on, and the grouping of gates
+into legs. So a new gate goes in the Makefile and joins a `ci-` leg; a new leg
+is a target in `ci.mk` and a job in `ci.yml` that calls it, wired into
+`required` or `security-required`.
+
+Anything green locally and red in CI is a bug in one of those two files, worth
+reporting on its own.
 
 ## Four traps
 

@@ -55,6 +55,12 @@ a red build — and a **coverage ratchet**. The ratchet is the coverage that
 existed when the line was last edited; raise it when you raise coverage, never
 lower it.
 
+`ci.yml` is a dispatcher: every `run:` in it is a `make ci-*` target in `ci.mk`,
+and `scripts/check_ci.py` fails the build if one is not — so never write shell
+into that file. `make ci` runs every leg here, `make ci-<leg>` runs one, and
+`make ci-changes` says which legs a diff needs. Gates go in the `Makefile`; only
+leg grouping, the path filter and pinned runner tool versions go in `ci.mk`.
+
 The contributor-facing internals live under `docs/internals/`:
 [testing.md](docs/internals/testing.md) is the map of the eight test levels and
 which one a new test belongs at, [e2e.md](docs/internals/e2e.md) is end-to-end
