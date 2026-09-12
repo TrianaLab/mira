@@ -87,7 +87,7 @@ extra predicate on every join.
 
 ### 0.1 What is not true yet
 
-The README carries three of these; this is all of them. Each is a boundary
+The README carries four of these; this is all of them. Each is a boundary
 somebody will otherwise discover by deploying into it, so each says what is
 missing, why, and what to do instead today.
 

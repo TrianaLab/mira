@@ -25,6 +25,16 @@ on:
       # change. Without this line the published mechanics stay at whatever the
       # last prose edit happened to build.
       - "crates/**"
+      # This job also measures the coverage figure the README badge reads, so
+      # anything that can move that figure — or move how it is computed — is a
+      # docs change too. Without these, dropping a dependency or editing the
+      # `coverage-json` recipe leaves the badge asserting yesterday's number
+      # until somebody happens to touch a prose file.
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "Makefile"
+      - "ci.mk"
   workflow_dispatch:
 
 # The site is a build artefact of the repository, so nothing here writes to the

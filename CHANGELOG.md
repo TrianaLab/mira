@@ -59,6 +59,8 @@ make `cargo install --locked miradb` true.
   the installer with, instead of failing with the installer's own error about
   something else.
 
+## [0.0.1] - 2026-09-12
+
 First tagged release. Everything below is the initial cut rather than a
 delta — there is no previous version to have changed from.
 
@@ -178,11 +180,13 @@ list.
 - Ingestion is allocation-lean, not zero-copy: `prost` memcpies every string.
 - No block cache — every query re-opens and re-CRCs the blocks it touches.
 - No cross-replica query fan-out, and no peer list to configure.
-- No entity selector: every block stores each resource's entity key and no read
-  surface reads it yet.
+- No entity *predicate* in the query document. Every block stores each
+  resource's entity key and `/api/v1/entities` lists them, but no filter
+  selects on one.
 - No `F_FULLFSYNC` fallback for volumes that answer `EINVAL`/`ENOTSUP`.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/TrianaLab/mira/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/TrianaLab/mira/releases/tag/v0.0.1

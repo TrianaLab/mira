@@ -126,7 +126,7 @@ attestation verify` checks is about one artifact.
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
 ```
 
-Or build it locally, which is what to do until there is a tag:
+Or build it locally, to run a commit that has not been released:
 
 ```sh
 docker build -t mira .
