@@ -23,6 +23,13 @@ writes is read by 0.0.2.
   a twelve-core machine. The block directory is the manifest and a sequence is
   just a filename, so nothing above the flusher had to learn that there is more
   than one of them.
+- **`make bump TO=X.Y.Z`** writes every version site the release needs, and
+  `make drift` reads the same `VERSION_SITES` table to check them. A gate kept
+  separately from a writer drifts towards the writer, because the writer is what
+  people run; three sites that were ungated prose — both `Cargo.toml` path-dep
+  pins, `SECURITY.md` and the issue template's placeholder — became gated by
+  becoming writable. A pattern that matches nothing is a failure, because a gate
+  for a line that has moved is a gate that is off.
 
 ### Changed
 
