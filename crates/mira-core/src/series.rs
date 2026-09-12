@@ -1693,4 +1693,93 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// What one data point costs to render, at the point count that makes the
+    /// attribute join visible.
+    ///
+    /// Scaled rather than `#[ignore]`d, exactly like
+    /// [`crate::query::scan_cost_per_row`]: the default 2,000 points run in the
+    /// normal suite as a correctness check on the merge, and the same code is
+    /// the measurement at a real point count.
+    ///
+    /// ```sh
+    /// MIRA_BENCH_POINTS=50000 cargo test --release -p miradb-core \
+    ///     --lib series_cost_per_point -- --nocapture
+    /// ```
+    ///
+    /// The shape is the one a real exporter produces and the one the old
+    /// [`collect_attrs`] was quadratic in: a few distinct attribute sets over
+    /// many timestamps, so the series map stays small while `dp_attrs` grows
+    /// with the point count. Scanning the whole table per point is `2n²`
+    /// comparisons; the run search is two per point.
+    #[test]
+    fn series_cost_per_point() {
+        let n: usize = std::env::var("MIRA_BENCH_POINTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000);
+        let dir = tmp("series-bench");
+        const PODS: usize = 20;
+        let points: Vec<NumberDataPoint> = (0..n)
+            .map(|i| NumberDataPoint {
+                time_unix_nano: 1_000 + i as u64,
+                value: Some(NumValue::AsInt(i as i64)),
+                attributes: vec![
+                    kv("k8s.pod.name", &format!("checkout-{}", i % PODS)),
+                    kv("cloud.availability_zone", &format!("z{}", i % 3)),
+                ],
+                ..Default::default()
+            })
+            .collect();
+        publish(
+            &dir,
+            0,
+            Some(Resource {
+                attributes: vec![kv("service.name", "checkout")],
+                ..Default::default()
+            }),
+            None,
+            vec![Metric {
+                name: "http.server.requests".into(),
+                data: Some(Data::Gauge(Gauge {
+                    data_points: points,
+                })),
+                ..Default::default()
+            }],
+        );
+        let q = SeriesQuery {
+            name: Some("http.server.requests".into()),
+            max_points: n,
+            ..wide()
+        };
+
+        // Once to fault the block in, so the number below is the join and not
+        // the first touch of every page.
+        let warm = query(&dir, &q);
+        assert_eq!(warm.stats.rows_matched, n);
+
+        let t = std::time::Instant::now();
+        let r = query(&dir, &q);
+        let el = t.elapsed();
+
+        // The correctness half, which is why this is not `#[ignore]`d: every
+        // point kept its own pod and inherited the resource's service, so the
+        // binary search found the right run and not its neighbour.
+        let series = r.json.matches(r#""name":"#).count();
+        assert_eq!(series, PODS * 3, "one series per distinct attribute set");
+        for pod in 0..PODS {
+            assert!(
+                r.json
+                    .contains(&format!(r#""k8s.pod.name":"checkout-{pod}""#)),
+                "pod {pod} lost its own attributes"
+            );
+        }
+        assert!(r.json.contains(r#""service.name":"checkout""#));
+
+        println!(
+            "series: {n} points in {el:?}  {:.3} us/point  {series} series",
+            el.as_secs_f64() * 1e6 / n as f64,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
