@@ -2727,6 +2727,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `Config` that never went through [`shard_count`] is still bounded, and
+    /// the bound is observable from outside: the sequence stride *is* the shard
+    /// count.
+    ///
+    /// [`shard_count`] is what `main` calls, so it is the gate an operator hits.
+    /// This tests the other one — [`spawn`]'s own `clamp` — because a `Config`
+    /// is also built by hand, by the TUI, by a test, and by whatever calls this
+    /// next. A count of zero would spawn no flushers and hang every export
+    /// forever; a count of 4 billion would try to spawn 4 billion tasks. Neither
+    /// belongs to `main`'s gate alone.
+    #[tokio::test]
+    async fn spawn_bounds_a_shard_count_that_never_went_through_shard_count() {
+        for (configured, stride) in [(0, 1), (usize::MAX, MAX_SHARDS)] {
+            let (c, dir) = sharded(&format!("shardclamp{configured}"), configured);
+            let (tx, _open, h) = spawn::<LogsBuilder>(&c);
+            // First fit keeps a trickle on shard 0, so consecutive blocks off
+            // that one shard are exactly `stride` apart.
+            for _ in 0..2 {
+                tx.submit(wide(40_000))
+                    .await
+                    .unwrap_or_else(|_| panic!("acknowledged"));
+            }
+            drop(tx);
+            h.await.unwrap();
+            assert_eq!(
+                seqs(&dir),
+                vec![0, stride as u64],
+                "{configured} shards must be clamped to {stride}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A crash after a shard sealed *out of sequence order* replays every frame
+    /// no published block holds — and in particular replays the older frame the
+    /// sealed block's own sequences step over.
+    ///
+    /// This is the whole reason the watermark is a set rather than
+    /// `max(seq) + 1`, driven end to end instead of at the `Wal` API: real
+    /// flushers, a real block directory name carrying `wal_hi`, the real
+    /// `wal_watermarks` reduction over it, and a real `Wal::replay`. Getting it
+    /// wrong is silent loss, and silent loss is exactly what a test that only
+    /// counts rows does not see.
+    ///
+    /// The schedule is forced, not hoped for. Holding shard 0's only queue slot
+    /// makes first-fit spill to shard 1 deterministically, so shard 1 takes the
+    /// *higher* sequences and is made to seal — by a second 40k-key dictionary
+    /// it cannot merge — while frame 0 is still sitting in shard 0. If the
+    /// sealed block claimed `max(seq) + 1` it would claim 2, the watermark would
+    /// be 2, and frame 0 would never be handed back by any later boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crash_after_an_out_of_order_seal_replays_every_frame_no_block_holds() {
+        let (mut c, dir) = sharded("shardcrash", 2);
+        // One slot per shard: `queue` is a per-signal total and splits.
+        Arc::get_mut(&mut c).unwrap().queue = 2;
+        let node = c.node;
+        let wal = Arc::clone(c.wal.as_ref().unwrap());
+        let (tx, _open, mut h) = spawn::<LogsBuilder>(&c);
+
+        // Frame 0 goes to shard 0 by first fit, and stays there: nothing below
+        // seals it.
+        tx.submit(crate::e2e::logs_export("checkout", 2_000, 4))
+            .await
+            .unwrap_or_else(|_| panic!("the log took it"));
+
+        // Shard 0's one slot, taken and held. The await is itself the barrier
+        // that frame 0 has left the channel — capacity only comes back when the
+        // flusher has taken it.
+        let held = tx.tx[0].clone().reserve_owned().await.unwrap();
+
+        // So frames 1 and 2 both land on shard 1, and 2 cannot share 1's key
+        // dictionary — which seals the block holding frame 1 and carries 2 into
+        // the next one.
+        for _ in 0..2 {
+            tx.submit(wide(40_000))
+                .await
+                .unwrap_or_else(|_| panic!("the log took it"));
+        }
+        assert!(
+            until(|| blocks(&dir) == 1).await,
+            "shard 1's first block never landed"
+        );
+
+        // The crash: every shard stops where it stands, so frames 0 and 2 are
+        // in the log and in nobody's block.
+        h.abort();
+        drop(held);
+
+        let published = block::scan(&dir, "logs").unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].wal_hi, 0,
+            "a block holding frame 1 may not claim past frame 0, which shard 0 \
+             still has — this is the assertion `max(seq) + 1` fails"
+        );
+        assert_eq!(
+            block::wal_watermarks(&dir).unwrap(),
+            [0, 0, 0],
+            "and the reduction over the directory says the same"
+        );
+
+        // Recovery: nothing is skipped, and the frame the sealed block does
+        // hold comes back too. Re-ingesting frame 1 is the direction the
+        // watermark is allowed to be wrong in — the other direction is the one
+        // that loses data.
+        let mut got = Vec::new();
+        let replayed = Wal::replay(
+            &dir,
+            node,
+            block::wal_watermarks(&dir).unwrap(),
+            |_, seq, body| {
+                got.push((seq, body.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "every frame, none skipped"
+        );
+        assert_eq!((replayed.replayed, replayed.skipped), (3, 0));
+
+        // And it converges. Feeding the recovered frames to a fresh node under
+        // their own sequences leaves every one of them claimed, so the boot
+        // after this one replays nothing at all.
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
+        for (seq, body) in got {
+            tx.replay(&body, seq)
+                .unwrap_or_else(|_| panic!("the flusher took frame {seq}"));
+        }
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(
+            wal.watermark_for(wal::Signal::Logs, &[]),
+            3,
+            "every frame is published, so nothing is pending"
+        );
+        let again = Wal::replay(
+            &dir,
+            node,
+            block::wal_watermarks(&dir).unwrap(),
+            |_, seq, _| unreachable!("frame {seq} is in a block already"),
+        )
+        .unwrap();
+        assert_eq!((again.replayed, again.skipped), (0, 3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Read-your-writes survives the fan-out: every acknowledged export is
     /// visible in some shard's open block, before anything has been sealed.
     ///

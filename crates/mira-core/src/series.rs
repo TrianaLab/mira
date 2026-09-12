@@ -43,7 +43,7 @@ use arrow_array::{Array, RecordBatch};
 use crate::block::{self, Src};
 use crate::error::Result;
 use crate::json::Json;
-use crate::query::{Results, Stats, Term, attr_key, attr_parents, dict_index, emit_attr};
+use crate::query::{Attrs, Results, Stats, Term, attr_key, attr_parents, dict_index, emit_attr};
 use crate::schema::MetricKind;
 use crate::signal::Open;
 
@@ -426,18 +426,13 @@ fn collect_block(
         return Ok(());
     };
     let n_metrics = metrics.num_rows();
-    let metric_attrs = load(bref, "metric_attrs")?;
-    let dp_attrs = load(bref, "dp_attrs")?;
-    // Data point ids are one dense space across all four point tables, so one
-    // list indexed by id serves every table below — the same property that lets
-    // `dp_attrs` carry no discriminant.
-    let exemplars = load(bref, "exemplars")?;
-    let by_point = exemplars.as_ref().map(index_by_parent).unwrap_or_default();
-    let resource_attrs = load(bref, "resource_attrs")?;
-    let scope_attrs = load(bref, "scope_attrs")?;
 
     // Name filter: resolve the string against the dictionary once, then compare
     // u16 codes. A block whose dictionary lacks the name has no rows to check.
+    //
+    // Above the six loads below, not below them: each is an `mmap` and a CRC of
+    // the whole table body, so a block that does not hold the requested metric
+    // should cost one of them and not six.
     let mut wanted = vec![true; n_metrics];
     // Set when the requested name was a derived one, so only that half of the
     // histogram is emitted rather than both.
@@ -471,6 +466,19 @@ fn collect_block(
         }
     }
 
+    // Wrapped rather than raw, because `own_attrs` below runs once per matched
+    // point and `Attrs` turns each of those from a scan of the whole table into
+    // two binary searches.
+    let metric_attrs = load(bref, "metric_attrs")?.map(Attrs::new);
+    let dp_attrs = load(bref, "dp_attrs")?.map(Attrs::new);
+    // Data point ids are one dense space across all four point tables, so one
+    // list indexed by id serves every table below — the same property that lets
+    // `dp_attrs` carry no discriminant.
+    let exemplars = load(bref, "exemplars")?;
+    let by_point = exemplars.as_ref().map(index_by_parent).unwrap_or_default();
+    let resource_attrs = load(bref, "resource_attrs")?.map(Attrs::new);
+    let scope_attrs = load(bref, "scope_attrs")?.map(Attrs::new);
+
     // For each term, which metric rows satisfy it *above* the point level. A
     // point still qualifies if its own attributes satisfy the term, so this is
     // one half of an OR evaluated per point below.
@@ -484,7 +492,7 @@ fn collect_block(
             let mut hit = vec![false; n_metrics];
             // Metric level: parent_id is the descriptor row number.
             if let Some(a) = &metric_attrs {
-                for pid in attr_parents(a, key, t.op, &t.value) {
+                for pid in attr_parents(&a.rows, key, t.op, &t.value) {
                     if let Some(s) = hit.get_mut(pid as usize) {
                         *s = true;
                     }
@@ -496,7 +504,7 @@ fn collect_block(
                 let (Some(a), Some(col)) = (table, metrics.column_by_name(fk)) else {
                     continue;
                 };
-                let ids = attr_parents(a, key, t.op, &t.value);
+                let ids = attr_parents(&a.rows, key, t.op, &t.value);
                 let Some(&top) = ids.iter().max() else {
                     continue;
                 };
@@ -526,7 +534,7 @@ fn collect_block(
             };
             let mut hit = Vec::new();
             if let Some(a) = &dp_attrs {
-                for pid in attr_parents(a, key, t.op, &t.value) {
+                for pid in attr_parents(&a.rows, key, t.op, &t.value) {
                     if hit.len() <= pid as usize {
                         hit.resize(pid as usize + 1, false);
                     }
@@ -669,9 +677,9 @@ fn with_suffix(desc: &str, suffix: &str) -> String {
 fn upper_attrs(
     metrics: &RecordBatch,
     row: usize,
-    metric_attrs: &Option<RecordBatch>,
-    resource_attrs: &Option<RecordBatch>,
-    scope_attrs: &Option<RecordBatch>,
+    metric_attrs: &Option<Attrs>,
+    resource_attrs: &Option<Attrs>,
+    scope_attrs: &Option<Attrs>,
 ) -> Vec<Attr> {
     let fk = |name: &str| {
         metrics
@@ -694,7 +702,7 @@ fn upper_attrs(
     v
 }
 
-fn own_attrs(dp_attrs: &Option<RecordBatch>, dp_id: u32) -> Vec<Attr> {
+fn own_attrs(dp_attrs: &Option<Attrs>, dp_id: u32) -> Vec<Attr> {
     let mut v = Vec::new();
     if let Some(a) = dp_attrs {
         collect_attrs(a, dp_id, &mut v);
@@ -703,15 +711,19 @@ fn own_attrs(dp_attrs: &Option<RecordBatch>, dp_id: u32) -> Vec<Attr> {
     v
 }
 
-fn collect_attrs(a: &RecordBatch, parent: u32, out: &mut Vec<Attr>) {
-    let parents = a.column(0).as_primitive::<UInt32Type>().values();
-    for r in 0..a.num_rows() {
-        if parents[r] != parent {
-            continue;
-        }
+/// The rows one parent owns, rendered.
+///
+/// This runs once per matched point, so the search matters: `dp_attrs` on a
+/// block holding 7,752 points is thousands of rows, and scanning all of them
+/// per point is the quadratic shape [`Attrs`] exists to remove. Empty for a
+/// table whose parent column is not a `u32`, matching the read path — no schema
+/// in this tree writes one, and a block someone else wrote should not panic.
+fn collect_attrs(a: &Attrs, parent: u32, out: &mut Vec<Attr>) {
+    let parents = Attrs::parents(&a.rows).unwrap_or_default();
+    for r in a.run(parents, parent).filter(|&r| parents[r] == parent) {
         let mut j = Json::new();
-        emit_attr(&mut j, a, r);
-        out.push((attr_key(a, r).to_owned(), j.into_string()));
+        emit_attr(&mut j, &a.rows, r);
+        out.push((attr_key(&a.rows, r).to_owned(), j.into_string()));
     }
 }
 

@@ -1033,6 +1033,12 @@ mod tests {
             ("--max-request-bytes nope", "not a size"),
             ("--queue nope", "not a whole number"),
             ("--queue 0", "at least 1"),
+            // `--shards 0` is *not* here: zero is the documented auto value.
+            // A negative is rejected rather than wrapped — `usize::from_str`
+            // has no sign to lose, so `-1` cannot arrive as 18 quintillion
+            // shards that `clamp` then silently turns into 16.
+            ("--shards nope", "not a whole number"),
+            ("--shards -1", "not a whole number"),
             ("--telemetry-interval nope", "not a duration"),
             ("--config /no/such/file.yaml", "/no/such/file.yaml"),
         ] {

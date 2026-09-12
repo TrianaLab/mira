@@ -860,18 +860,21 @@ struct Child {
 /// Checked at open rather than assumed, because a binary search over unsorted
 /// parents does not fail — it silently drops attributes, which is the one
 /// outcome nobody would notice.
-struct Attrs {
-    rows: RecordBatch,
+///
+/// [`crate::series`] reads the same shape off its own tables and so uses this
+/// rather than a second copy of the search.
+pub(crate) struct Attrs {
+    pub(crate) rows: RecordBatch,
     ordered: bool,
 }
 
 impl Attrs {
-    fn new(rows: RecordBatch) -> Attrs {
+    pub(crate) fn new(rows: RecordBatch) -> Attrs {
         let ordered = Attrs::parents(&rows).is_some_and(|p| p.windows(2).all(|w| w[0] <= w[1]));
         Attrs { rows, ordered }
     }
 
-    fn parents(rows: &RecordBatch) -> Option<&[u32]> {
+    pub(crate) fn parents(rows: &RecordBatch) -> Option<&[u32]> {
         rows.column(0)
             .as_primitive_opt::<UInt32Type>()
             .map(|c| &**c.values())
@@ -887,7 +890,7 @@ impl Attrs {
     /// table no builder in this tree produces. It is O(rows) per emitted row;
     /// if one ever turns up, the fix is to sort it once at open rather than to
     /// make this cleverer.
-    fn run(&self, parents: &[u32], parent: u32) -> std::ops::Range<usize> {
+    pub(crate) fn run(&self, parents: &[u32], parent: u32) -> std::ops::Range<usize> {
         if !self.ordered {
             return 0..parents.len();
         }
