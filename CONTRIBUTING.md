@@ -154,9 +154,7 @@ have an answer, and finding that out after the work is the expensive order.
 [`docs/internals/releases.md`](docs/internals/releases.md) is the procedure and
 the reasoning: one version number across three coordinates, what a tag triggers,
 what is signed, and the two facts that cannot be undone once a coordinate is
-published. Read it before changing `.github/workflows/release.yml` — it also
-records the mechanisms that were considered and rejected, so you do not have to
-re-derive why there is no version bot.
+published. Read it before changing `.github/workflows/release.yml`.
 
 A version bump is an ordinary PR like any other. It is not something you do on
 `main`, and it is not something a tag does for you.
