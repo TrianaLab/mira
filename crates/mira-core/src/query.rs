@@ -12,8 +12,8 @@
 //!
 //! Three properties the layout hands the scan, in the order they matter:
 //!
-//! * **Blocks prune by name.** `<min_ts>-<max_ts>-<node>-<seq>` is the whole
-//!   index. A time-bounded query opens no file it will not read, and with
+//! * **Blocks prune by name.** `<min_ts>-<max_ts>-<node>-<seq>-<wal_hi>` is the
+//!   whole index. A time-bounded query opens no file it will not read, and with
 //!   blocks visited newest-first a `limit` stops the scan early.
 //! * **`parent_id` is a row index.** Ids are rebased dense per block at ingest,
 //!   so attaching an attribute to its record is an array store, not a hash

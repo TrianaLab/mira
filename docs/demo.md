@@ -201,7 +201,7 @@ query, run on the same blocks the screen above reads.
 ```
 
 **65 MiB peak resident** for 51,237 records ingested and 17 queries served, in a
-5.62 MiB binary that also contains the web UI, the terminal UI and the MCP
+5.63 MiB binary that also contains the web UI, the terminal UI and the MCP
 server. That peak is a transient: `--demo` delivers the whole 45-minute window
 in one burst at over a million records a second, and the process settles back to
 about 13 MiB once the blocks are sealed. Eleven runs of this exact scenario

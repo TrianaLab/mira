@@ -162,9 +162,9 @@ restates it, and the right-hand column is what stops it rotting.
 The three ungated sites are prose that names the current version, and they will
 rot on the first bump that forgets them. That is a known gap and the fix is
 cheap — `scripts/check_drift.py` already owns every regex needed, so a `--bump`
-flag that *writes* the sites it currently only reads is around forty lines. It
-has not been written because nothing has been released yet and everything
-currently agrees.
+flag that *writes* the sites it currently only reads is around forty lines. One
+release in, the three still agree because they were bumped by hand; the bump
+that forgets one is what buys the forty lines.
 
 ## What the tag path does not re-run
 
@@ -179,14 +179,15 @@ commit: `helm package --version/--app-version` overrides two of `Chart.yaml`'s
 three version fields, but not the `artifacthub.io/images` annotation, so a chart
 could ship advertising an image tag that is not the one being released.
 
-## Rehearsal, and what has never run
+## Rehearsal, and what only the tag can run
 
 `ci.yml`'s `release-dry-run` leg runs `make dist` — the real tarball, SBOM and
 checksum targets — on every code PR, and `workflow_dispatch` runs the whole DAG
-with `publish=false`. Both have passed.
+with `publish=false`. Both pass.
 
-`publish=false` skips every network-publishing step, so as of the first tag
-these will be executing for the first time: `cosign sign`, `helm push`, the
-`Digest:` scrape off `helm push`'s stderr, and the Artifact Hub `oras push`.
-`verify-release` fails loudly if any of them is wrong, and recovery is a bump to
-the next patch.
+`publish=false` skips every network-publishing step, so four things had no
+rehearsal at all until v0.0.1 pushed them for real: `cosign sign`, `helm push`,
+the `Digest:` scrape off `helm push`'s stderr, and the Artifact Hub `oras push`.
+All four worked and `verify-release` went green on that tag, which is the only
+evidence any of them is right — it is still the job that fails loudly when one
+of them is not, and recovery is still a bump to the next patch.

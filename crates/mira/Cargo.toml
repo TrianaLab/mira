@@ -37,7 +37,7 @@ hyper-rustls = { version = "0.27", default-features = false, optional = true, fe
   "tls12",
 ] }
 # The terminal UI's whole backend: termios, TIOCGWINSZ, poll and localtime_r.
-# ratatui is the alternative and costs 61 crates, against a tree of 117.
+# ratatui is the alternative and costs 35 crates, against a tree of 117.
 libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

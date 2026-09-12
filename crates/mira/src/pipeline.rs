@@ -19,7 +19,7 @@
 //! the block directory rename is durable, because OTLP's retryable status set
 //! covers exports in flight at a crash — acking earlier is the one window where
 //! data is lost with the client believing it was stored. That costs a whole
-//! `max_block_age` at the tail, which is section 11's 2.4 s p99. With a log the frame
+//! `max_block_age` at the tail, which is section 11's 2.6 s p99. With a log the frame
 //! *is* the durable record, the publish is a background reorganisation of data
 //! that is already safe, and the ack costs a `write(2)`. Everything else here —
 //! the queue, the carry, the failure contract — is identical either way.
@@ -84,8 +84,10 @@ pub struct Config {
     /// recoverable. A flag that let those disagree would only be able to
     /// express wrong answers.
     ///
-    /// Off by default. Turning it on trades read-your-writes — see
-    /// `mira_core::wal`'s module docs — and that repair has not landed.
+    /// Off by default. Turning it on would trade read-your-writes away — see
+    /// `mira_core::wal`'s module docs — were it not for
+    /// `mira_core::query::search_open`, which scans the flusher's open builder
+    /// alongside the sealed blocks and buys it back.
     pub wal: Option<Arc<Wal>>,
 }
 
@@ -110,8 +112,9 @@ pub(crate) struct Job<R> {
     req: R,
     ack: oneshot::Sender<Result<(), Rejected>>,
     /// The log sequence this export was framed at, if there is a log. The
-    /// flusher takes the maximum over a block and publishes one past it as
-    /// `wal_hi`.
+    /// flusher collects them per block and asks `Wal::watermark_for` what
+    /// `wal_hi` that set permits — not the maximum over the block, which would
+    /// step over an older frame a sibling shard is still holding.
     wal_seq: Option<u64>,
 }
 
@@ -444,7 +447,7 @@ impl<R: prost::Message> Ingest<R> {
     /// Without a log this returns once the block containing the request has
     /// been fsynced and renamed into place, which is correct and costs a whole
     /// `max_block_age` at the tail. With one it returns once the request is a
-    /// frame in the log's page cache, which is section 11's 2.4 s p99 turned into
+    /// frame in the log's page cache, which is section 11's 2.6 s p99 turned into
     /// microseconds and is why the log exists.
     pub async fn submit(&self, req: R) -> Result<(), Rejected> {
         let (ack, wait) = oneshot::channel();
@@ -1652,9 +1655,9 @@ mod tests {
         drop(tx);
         h.await.unwrap();
 
-        // The block claims the frame, so the next boot does not replay it —
-        // one past the highest sequence in it, which for the single frame 0
-        // is 1.
+        // The block claims the frame, so the next boot does not replay it. The
+        // watermark is exclusive and nothing else is pending, so it is the
+        // log's `next_seq` — 1, for the single frame 0.
         let published = block::scan(&dir, "logs").unwrap();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].wal_hi, 1);
@@ -2644,8 +2647,9 @@ mod tests {
         // The ceiling is what keeps a 128-core host from publishing 64 files
         // per seal window per signal.
         assert_eq!(shard_count(0, 128), MAX_SHARDS);
-        // Configured wins, up to the same ceiling — this is the cgroup-quota
-        // escape hatch, and an operator who types 1 gets the old behaviour.
+        // Configured wins, up to the same ceiling — this is the escape hatch
+        // for a machine that miscounts the cores this process actually gets,
+        // and an operator who types 1 gets the old behaviour.
         assert_eq!(shard_count(1, 128), 1);
         assert_eq!(shard_count(4, 2), 4);
         assert_eq!(shard_count(999, 2), MAX_SHARDS);

@@ -9,6 +9,72 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-09-12
+
+Two performance gaps that [the comparison page](docs/market.md) listed as having
+a cause inside this repository and a path to closing it. Both paths were taken.
+No format change: a 0.0.1 block directory is read by this binary and a block it
+writes is read by 0.0.1.
+
+### Added
+
+- **`ingest.shards`** — the number of flusher tasks per signal, each owning its
+  own block sequence. Defaults to `0`, meaning `(cores / 2).clamp(1, 16)`; six on
+  a twelve-core machine. The block directory is the manifest and a sequence is
+  just a filename, so nothing above the flusher had to learn that there is more
+  than one of them.
+
+### Changed
+
+- **Ingest throughput no longer falls away under connection count.** One flusher
+  per signal meant every connection past the point where that consumer saturated
+  bought contention rather than work, and the curve peaked at four connections
+  and declined. It now climbs to a plateau at sixteen to thirty-two. Paired A/B
+  on the same box, three passes a row: 1.19× at eight connections, 1.24× at
+  sixteen, 1.41× at thirty-two and **1.55× at ninety-six**, where 734,142
+  records/s became 1,136,941. Four connections and below are unchanged by
+  design — dispatch is first fit from shard 0, so a node that never saturates one
+  flusher never starts a second and goes on producing one block per seal window
+  instead of six nearly-empty ones.
+- **Peak resident memory fell with it**, which was not the goal: 689 MiB at four
+  connections against 1,366 MiB. Six open blocks per signal is more block state
+  than one, so the saving is the queue — the exports that used to sit in it are
+  never resident at all.
+- **`ingest.queue` is now a per-signal total rather than a per-shard depth.**
+  Each shard gets `queue.div_ceil(shards)`, so raising the shard count does not
+  multiply the worst-case resident cost. An operator who set `--queue` explicitly
+  keeps the same memory bound they had.
+- **The attribute scan is vectorised.** Per-row `attr_matches` is replaced by a
+  predicate evaluated once per contiguous, binary-searched parent run, scattering
+  into a `Vec<bool>` over root rows — no hash set anywhere. Measured against
+  0.0.1 on one corpus, restart between: **6.7×** on a matching attribute value,
+  **5.3×** on an unfiltered `limit 100`, **3.5×** on a substring that fills its
+  limit, and on an eight-reader read mix 5.1× on the `attr` class p50 and 4.6× on
+  `errors`, taking the whole mix from 40 to 50 queries/s. The metrics `series`
+  class came out slightly slower and is recorded as such in
+  [architecture section 11](docs/architecture.md#11-performance-model).
+- **The WAL watermark is a set, not a high-water mark.** Shards seal out of
+  order, so the highest sequence in a block says nothing about the ones below it.
+  A block now claims the oldest sequence of its signal that nobody has published
+  and that the block does not itself hold. Getting this wrong in the unsafe
+  direction loses data silently, so section 9 states which way it is allowed to
+  be wrong and why.
+
+### Fixed
+
+- **The published 175 ms figure for an unpruned full scan does not reproduce and
+  has been withdrawn.** Re-measured across four predicates on both binaries, the
+  row is 885 ms steady over 27.1 M rows and 137 blocks — better than 0.0.1's
+  1,163 ms, and much worse than the number that had been printed. The
+  re-measurement also changed the diagnosis: `scan_cost_per_row` prices predicate
+  evaluation at 0.047–5.586 ns/row against 24–25 ns/row for the same block
+  through the whole read path, so the unpruned scan is bound by the CRC32 every
+  `Block::open` runs over the whole body, not by the scan.
+- The `ingest.shards` justification no longer claims `available_parallelism`
+  cannot see a cgroup CPU quota. It can. The cases it genuinely cannot see —
+  `cpu.shares`/`cpu.weight`, a pod with no quota on a large node, hyperthreads
+  counted as cores — are what the knob is for.
+
 ## [0.0.1] - 2026-09-12
 
 First tagged release. Everything below is the initial cut rather than a
@@ -136,5 +202,6 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/TrianaLab/mira/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/TrianaLab/mira/releases/tag/v0.0.1

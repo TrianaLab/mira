@@ -3,7 +3,7 @@
 //! A block is a *directory* holding one Arrow IPC file per table:
 //!
 //! ```text
-//! <root>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>/
+//! <root>/logs/p=<epoch_hour>/<min_ts:020>-<max_ts:020>-<node:08x>-<seq:012>-<wal_hi:020>/
 //!     logs.arrow  log_attrs.arrow  resources.arrow  resource_attrs.arrow  scope_attrs.arrow
 //! ```
 //!
@@ -460,12 +460,17 @@ fn fsync_dir(path: &Path) -> Result<()> {
 /// Acking an OTLP export requires that its records are recoverable, and until
 /// [`crate::wal`] existed this call was the only thing that made them so — so
 /// the caller had to wait for it. It no longer does, provided the export is in
-/// the log: `wal_hi` is what records that, and it must be one past the highest
-/// log sequence contributing to `sealed`. Pass `0` when there is no log.
+/// the log: `wal_hi` is what records that, and it must be whatever
+/// [`crate::wal::Wal::watermark_for`] answers for the sequences in `sealed` —
+/// an *exclusive* watermark over the signal as a whole, not one past this
+/// block's own highest sequence, because sibling shards are filling their own
+/// blocks from the same log and hold sequences below it that are not here. Pass
+/// `0` when there is no log.
 ///
-/// Getting `wal_hi` too high is the dangerous direction. It marks sequences as
-/// absorbed that are not in this block, and replay then skips them — silent
-/// loss, with the client holding a 200. Too low only costs a re-ingest.
+/// Getting `wal_hi` too high is the dangerous direction. [`wal_watermarks`]
+/// takes the maximum over every block of the signal, so a watermark that claims
+/// sequences no block holds makes replay skip them — silent loss, with the
+/// client holding a 200. Too low only costs a re-ingest.
 pub fn publish(
     root: &Path,
     signal: &str,
@@ -916,12 +921,14 @@ const MAX_COMPACT_PER_SWEEP: usize = 8;
 
 /// Rewrite aged blocks ZSTD-compressed, in place.
 ///
-/// Measured on real blocks (`cargo run --release -p mira-core --example tier`):
-/// 0.127 of the plain size for logs, 0.142 for traces, at ~900 MiB/s on one
-/// core. Reads of the compressed block came back *faster* than of the plain one
-/// — 8× fewer pages to fault and 8× fewer bytes to CRC more than pays for the
-/// decompression — so the tier costs the read path nothing except the zero-copy
-/// property, and that only for data old enough that nothing is scanning it.
+/// Measured by `cargo run --release -p mira-core --example tier` over section
+/// 11's corpus: 0.113 of the plain size for logs, 0.126 for traces, at 808
+/// MiB/s on one core. Reading a compacted block back costs nothing measurable —
+/// warm it lands within run-to-run noise of the plain one, and cold, which is
+/// the only state a block old enough to be compacted is in, 8.4× fewer pages to
+/// fault and 8.4× fewer bytes to CRC more than pays for the inflate. So the
+/// tier costs the read path only the zero-copy property, and that only for data
+/// nothing is scanning any more.
 ///
 /// Crash safety is the trick `publish` already uses: write beside the target,
 /// then rename. A crash leaves a directory with some tables compressed and some

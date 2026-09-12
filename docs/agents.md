@@ -146,9 +146,9 @@ Eight spans, `parent_span_id` linking them into the tree. The 503 originates at
 `payments`' own `POST /authorize` and propagates up through `POST /pay` to the frontend —
 so `payments` is where the error is *created*, not merely where it is reported. `get_trace`
 rather than `query_records` with a `trace_id` filter: blocks carry a trace-id index, and
-this is the call that uses it — 4.6 ms here, and 13.3 ms against 28.8M spans in
-[the query benchmark](market.md#query), opening 1 block of 77, because the cost is
-the one block the Bloom sidecar could not rule out.
+this is the call that uses it — 4.6 ms here, and 4.7 ms against 27.1M spans in
+[the query benchmark](market.md#query), opening 2 blocks of 155, because the cost is
+the blocks the Bloom sidecar could not rule out.
 
 **4. What does the service itself say?** Logs are indexed on the same attributes, so this
 is one call, not a jump to another system.

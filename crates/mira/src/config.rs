@@ -143,10 +143,15 @@ pub struct Config {
     ///
     /// One shard per core is the sanctioned unit (architecture.md section 4);
     /// this is only here so the number can be pinned when the machine lies
-    /// about its core count — a cgroup CPU quota is invisible to
-    /// `available_parallelism`, and a 96-core host running Mira at 2 CPUs would
-    /// otherwise start 48 flushers per signal and publish 48 files per seal
-    /// window. Set it to the quota, or to 1 to get the pre-0.0.2 behaviour.
+    /// about its core count. `available_parallelism` honours cgroup v1 and v2
+    /// CPU quotas, so a container with a quota set needs no help here — but
+    /// `cpu.shares`/`cpu.weight` is a relative weight rather than a quota and
+    /// reads as the whole machine, a shared host often sets no quota at all, a
+    /// non-Linux container runtime leaves nothing to read, and hyperthreads
+    /// count as cores. A 96-core host running Mira on two cores' worth of any
+    /// of those would otherwise start 48 flushers per signal and publish 48
+    /// files per seal window. Set it to the cores the process actually gets,
+    /// or to 1 to get the pre-0.0.2 behaviour.
     ///
     /// Shards split `queue`, they do not multiply it: the resident worst case
     /// is the same whatever this is. Capped at `pipeline::MAX_SHARDS`.
@@ -161,7 +166,7 @@ pub struct Config {
     /// log's: the export survives the process dying, `panic = "abort"`, SIGKILL
     /// and the OOM killer, but not power loss in the last [`WAL_SYNC_PERIOD`],
     /// at a p99 in the microseconds. Off is the block's — acknowledged means
-    /// fsynced and renamed, which survives power loss too, at a p99 of 2.4 s
+    /// fsynced and renamed, which survives power loss too, at a p99 of 2.6 s
     /// because that is how long a lightly-loaded block takes to fill.
     ///
     /// Read-your-writes holds either way: the open block is queryable (section 4),

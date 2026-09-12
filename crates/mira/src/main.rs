@@ -542,12 +542,16 @@ async fn drain<G, H>(
 /// flushers, before the listeners open.
 ///
 /// Ordering is the reason this is not a background task. A replayed frame keeps
-/// the sequence it already has, which is below every live one, and
-/// `block::wal_watermarks` is only a correct watermark if a signal's frames
-/// reach their blocks in that order — so the last recovered frame has to be
-/// queued before the first new export is framed. It is also the reason nobody
-/// is waiting: the client that sent this either got its answer before the crash
-/// or gave up long before this process started.
+/// the sequence it already has, and `Ingest::replay` puts that sequence back
+/// among the log's unpublished before it queues the frame, which is what stops
+/// a shard sealing beside it from computing a watermark over it — but that only
+/// covers frames already read off disk. A frame still sitting in a segment is
+/// in nobody's pending set, so a live export sealing first would claim a
+/// watermark past it and the next boot would not replay it. Draining the whole
+/// log before the first new export is framed is the blunt guarantee that this
+/// never happens. It is also the reason nobody is waiting: the client that sent
+/// this either got its answer before the crash or gave up long before this
+/// process started.
 ///
 /// One `spawn_blocking` for the whole log, not one per frame. The channel is
 /// bounded at `ingest.queue` and the sends are blocking, so the flushers set the pace and

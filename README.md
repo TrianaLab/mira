@@ -1,7 +1,7 @@
 <img src="docs/assets/mira-wordmark.svg" alt="Mira" height="64">
 
 **An OTLP-native telemetry storage engine and short-term memory layer for AI agents and
-infrastructure — one 5.62 MiB binary.** Arrow + `mmap` + ZSTD. Logs, traces and metrics
+infrastructure — one 5.63 MiB binary.** Arrow + `mmap` + ZSTD. Logs, traces and metrics
 in; a web UI, a terminal UI and an MCP server out. No cluster, no sidecar, no database
 beside it.
 
@@ -29,7 +29,7 @@ curl -fsSL https://miradb.dev/install.sh | bash
 
 The installer picks your target, checks the release's `SHA256SUMS`, and — if the GitHub
 CLI is on `PATH` — verifies the SLSA provenance attestation before it moves anything into
-place. `--version v0.0.1` pins, `--no-sudo` installs without root, `MIRA_INSTALL_DIR`
+place. `--version v0.0.2` pins, `--no-sudo` installs without root, `MIRA_INSTALL_DIR`
 picks the directory.
 
 ```sh
@@ -116,7 +116,7 @@ uncompressed so it stays mappable, then rewritten ZSTD-compressed to **0.12** of
 size an hour later (**0.14** bytes on disk per byte on the wire), and reading one costs
 nothing measurable: warm, a compacted block opens within noise of a plain one, and cold
 — which is what an hour-old block is — 8.4x fewer pages to fault beats the inflate.
-5.62 MiB stripped, 117 crates — `zstd-sys` is the one C dependency and it vendors its
+5.63 MiB stripped, 117 crates — `zstd-sys` is the one C dependency and it vendors its
 own source.
 
 **3. Correlation algebra, in milliseconds.** `/api/v1/correlate` takes the filter you are
@@ -128,9 +128,8 @@ the same join, computed on read: no metrics generator, no second write path, no
 Prometheus beside it. Alert rules embed a query document *verbatim* and threshold it as a
 count or a ratio of two counts, which covers percentiles exactly rather than
 approximately: `p95(d) > 250ms` **is** `|{d > 250ms}| / |d| > 5%`. No sketch to maintain,
-no second dialect to learn. The pruning is what makes it loop-able — 1.5 ms to prove a
-value is in **none** of 87 blocks, 1.2 ms for an ordering predicate nothing satisfies,
-both with zero blocks opened.
+no second dialect to learn. The pruning is what makes it loop-able — 2.56 ms to prove a
+value is in **none** of 137 blocks, with zero blocks opened.
 
 **4. Zero-ops, local and edge.** One self-contained binary with no coordination state:
 no Raft, no membership, no external metadata store, and the block directory is the
@@ -160,29 +159,31 @@ actually costs a machine.
 
 | | |
 |---|---|
-| ingest, 4 connections × 8192 records — the shape that reproduces | **1,458,967 records/s**, 191 MiB/s of wire bytes, on 1.78 server cores — 817k records/s/core |
-| ingest, 1 connection × 8192 records | 604,166 records/s on 0.68 cores — **891k records/s/core**, the per-core ceiling |
-| ingest, 96 connections × 8192 records | 795,505 records/s, **nothing shed**, ack p50 269 ms / p99 2.5 s |
-| ack a client sees, default `ingest.wal` | p50 7.6 ms, p99 46 ms at four connections |
+| ingest, 4 connections × 8192 records — the shape that reproduces | **1,350,502 records/s**, 176.5 MiB/s of wire bytes, on 1.75 server cores — 771k records/s/core |
+| ingest, 32 connections × 8192 records — the top of the plateau | **1,537,875 records/s**, 200.9 MiB/s, on 2.23 cores |
+| ingest, 1 connection × 8192 records | 629,384 records/s on 0.71 cores — **886k records/s/core**, the per-core ceiling |
+| ingest, 96 connections × 8192 records | 1,136,941 records/s, **nothing shed**, ack p50 247 ms / p99 2.7 s |
+| ack a client sees, default `ingest.wal` | p50 8.5 ms, p99 55 ms at four connections |
 | the log append inside that ack | p50 7 µs, p99 39 µs for a 4 KiB body |
-| attribute value that is in one block, of 87 | 8.9 ms — 24,576 matched |
-| attribute value that is in none | 1.5 ms — 0 blocks opened |
-| every span of one trace, 28.8M spans on disk | 13.3 ms — 1 block of 77 |
-| `duration_nano > 100s` when nothing is that slow | 1.2 ms — 0 blocks opened |
-| no time bound, a substring filter that prunes nothing | 175 ms — 87 of 87 blocks, 24.0M rows scanned, 0 matched |
+| attribute value that is in one block, of 137 | 4.49 ms — 204,800 rows scanned |
+| attribute value that is in none | 2.56 ms — 0 blocks opened |
+| every span of one trace, 27.1M spans on disk | 4.74 ms — 2 blocks of 155 |
+| no time bound, a substring filter that prunes nothing | 885 ms — 137 of 137 blocks, 27.1M rows scanned — 30.6M rows/s |
 | bytes on disk per byte on the wire | **1.20** hot, **0.14** once compacted |
-| peak resident set, ingesting at 1.46M records/s | 862 MiB — 244 MiB at one connection |
+| peak resident set, ingesting at 1.35M records/s | 689 MiB — 232 MiB at one connection |
 
-The interesting number is not the rate. It is that the plateau costs **1.78 of 12
+The interesting number is not the rate. It is that the plateau costs **2.23 of 12
 cores** — Mira is not CPU-bound at any shape measured here, and the per-core rate falls
-monotonically from 891k at one connection to 461k at 96. What the extra connections buy
-is contention, not work. Throughput plateaus between four and eight connections rather
-than peaking at a point; nothing is shed at any shape, because an export that finds the
-queue full waits up to five seconds for room instead of taking a 503.
+from 886k at one connection to 515k at 96. What the extra connections buy is contention,
+not work. Throughput plateaus between eight and thirty-two connections rather than
+peaking at a point, and 96 connections still holds 84% of the four-connection rate,
+because each signal runs one flusher per two cores (`ingest.shards`) rather than one in
+total; nothing is shed at any shape, because an export that finds the queue full waits up
+to five seconds for room instead of taking a 503.
 
 Each ingest row is the median of three 30 s runs against a fresh server. Query rows are
-one store — 7.35 GiB, 28.8M logs and 28.8M spans in 180 blocks — steady-state, with all
-of it in page cache; the first call after a restart is 2–12× slower while the mappings
+one store — 8.33 GiB, 27.1M logs and 27.1M spans in 316 blocks — steady-state, with all
+of it in page cache; the first call after a restart is up to 6× slower while the mappings
 are faulted in. The full sweep, the per-pass spreads, the eight-connection row and what
 to quote from your own run: **[docs/internals/e2e.md](docs/internals/e2e.md)**. What
 moved these numbers, and why:
@@ -194,11 +195,11 @@ Every competitor figure is the vendor's own published number, linked, quoted wit
 hardware they ran it on — nobody ran Mira's workload and Mira did not run theirs, which
 is why the comparison lives in a document with room for the caveats rather than in a
 league table here. The short version: on ingest, the only other single-process figure on
-laptop silicon is GreptimeDB's 621k rows/s on 16 cores against Mira's 1.46M on 12, and
+laptop silicon is GreptimeDB's 621k rows/s on 16 cores against Mira's 1.35M on 12, and
 "same order, and the smaller machine did not lose" is what that pair supports. On
 artifact size VictoriaLogs is the one to beat and it is a 3x, not the 25x the Go
 observability stacks carry. On compression, quote **0.14** bytes on disk per wire byte
-for a bill and **8.38x** against uncompressed columnar for a ratio, and neither as a
+for a bill and **8.36x** against uncompressed columnar for a ratio, and neither as a
 head-to-head. All four tables, with sources and with the places Mira is *behind*:
 **[docs/market.md](docs/market.md)**.
 
@@ -217,8 +218,9 @@ is [architecture section 0.1](docs/architecture.md#01-what-is-not-true-yet).
 - **No entity predicate and no block cache.** `/api/v1/entities` lists the entities a
   window holds, but no query document accepts an entity key as a filter, so "everything
   this pod emitted" is still `{"attr":"service.instance.id","eq":"…"}`. Every query
-  re-opens and re-CRCs the blocks it touches — measured at a few ms of a 14 ms query, not
-  the 10× that page-fault behaviour was.
+  re-opens and re-CRCs the blocks it touches, and that is now most of what a query costs:
+  evaluating a predicate is 0.047–5.6 ns/row, against 24 ns/row for the same block
+  through the whole read path.
 
 ## Layout
 

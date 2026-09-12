@@ -36,9 +36,13 @@
 //! There is deliberately no userspace buffering. A `BufWriter` would batch the
 //! syscalls, but bytes sitting in a `Vec` in this process do not survive the
 //! process dying, which is exactly the failure this log is claiming to cover.
-//! One `write(2)` per export at a few tens of microseconds is affordable: at
-//! section 11's measured 545 k records/s in batches of 8,192 that is roughly 65
-//! appends a second.
+//! One `write(2)` per export at a few tens of microseconds is affordable
+//! because an export is a batch and not a record: the append rate is section
+//! 11's "Ingest throughput" row divided by the batch size, and the load
+//! generator sends 8,192 records per export. At one connection that row is
+//! 629,384 records/s, so 77 appends/s; at the thirty-two-connection plateau,
+//! 1,537,875 records/s is 188. Three digits of appends per second is not a rate
+//! a syscall per append can be the ceiling of.
 //!
 //! # The frame is the OTLP request, in its canonical protobuf encoding
 //!
@@ -79,9 +83,14 @@
 //!
 //! Replay needs exactly one fact — which frames are already inside a published
 //! block — and the block directory carries it, so principle 4 survives intact.
-//! Block names gain a fifth field, `wal_hi`, the highest sequence whose records
-//! are in that block. Boot recovery therefore stays what section 4 says it is: a
-//! `readdir`, the same one the read path already does, with no extra I/O and no
+//! Block names gain a fifth field, `wal_hi`: an *exclusive* watermark, meaning
+//! every sequence of that signal below it is inside some published block. It is
+//! not this block's own maximum, because sibling shards are filling their own
+//! blocks from the same log — it is what [`Wal::watermark_for`] answers, the
+//! lowest still-unpublished sequence this block does not hold, or one past
+//! everything the log has handed out when this block holds them all. Boot
+//! recovery therefore stays what section 4 says it is: a `readdir`, the same
+//! one the read path already does, with no extra I/O and no
 //! metadata store to keep consistent. Each signal keeps its own watermark, and
 //! that costs nothing because an OTLP export belongs to exactly one signal —
 //! `/v1/logs`, `/v1/traces` and `/v1/metrics` are three endpoints.
@@ -338,17 +347,17 @@ impl Wal {
     /// This exists to make one specific race impossible, and it is not a
     /// general-purpose hook.
     ///
-    /// A block claims the sequences it contains by publishing one past the
-    /// highest of them, and [`crate::block::wal_watermarks`] takes the maximum
-    /// over the blocks on disk. That is only a correct watermark if a signal's
-    /// frames reach their blocks in sequence order: if frame 5 is still in
-    /// flight when the block holding frame 6 is published, the watermark says
-    /// 7 and frame 5 is skipped on the next replay — which is silent loss, the
-    /// one failure this log exists to prevent.
+    /// A block's watermark is [`watermark_for`](Self::watermark_for)'s answer
+    /// over the sequences that block holds, and that call binary-searches them,
+    /// so a shard's list of them has to be ascending. Two exporters calling
+    /// `append` concurrently get their sequences in lock order but can be
+    /// preempted between the return and the enqueue, which would land 6 in a
+    /// shard's list ahead of 5. A binary search over an unsorted list is wrong
+    /// in both directions and one of them is a false hit: the watermark steps
+    /// over a frame no block holds, and the next replay skips it. That is
+    /// silent loss, the one failure this log exists to prevent.
     ///
-    /// Two exporters calling `append` concurrently get their sequences in lock
-    /// order but can be preempted between the return and the enqueue, so the
-    /// enqueue has to happen under the same lock. It costs nothing: the queue
+    /// So the enqueue happens under the same lock. It costs nothing: the queue
     /// hand-off is a pointer move into a reserved slot, next to a `write(2)`
     /// that has already been paid for.
     ///
@@ -555,8 +564,10 @@ impl Wal {
 
     /// Replay every frame not yet covered by a published block, oldest first.
     ///
-    /// `watermarks` is one past the last published sequence per signal, taken
-    /// from the block directory listing. A frame is handed to `f` only if its
+    /// `watermarks` is the exclusive watermark per signal, taken from the block
+    /// directory listing: every sequence below it is inside a published block,
+    /// which is not the same as one past the last sequence published, because
+    /// shards publish out of order. A frame is handed to `f` only if its
     /// sequence is at or above its own signal's watermark, so a block that
     /// sealed while another signal's was still open does not cause a
     /// re-ingest.
