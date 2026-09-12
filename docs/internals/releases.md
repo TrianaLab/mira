@@ -25,19 +25,23 @@ paths, the `[lib] name`s and the installed binary are all still `mira`.
 
 ## Cutting a release
 
-1. **Bump the version.** `Cargo.toml`'s `[workspace.package] version` is the
-   source of truth; everything else restates it. The full list is under
-   [Where the version lives](#where-the-version-lives). Run `make drift` until
-   it is quiet — it names the file and line it disagrees with.
-2. **Write the changelog section.** Rename `## [Unreleased]` to `## [X.Y.Z]` in
-   `CHANGELOG.md` and open a fresh empty `## [Unreleased]` above it. This is
-   not optional decoration: the release job extracts that section verbatim as
-   the Release notes, and if the heading is missing it degrades to
-   `--generate-notes` with a `::warning::`. Mira does not use Conventional
-   Commits, so generated notes are a list of imperative prose subjects — worse
-   than what you already wrote.
-3. **Open a normal PR with both.** The point is to make CI run `drift`, `chart`
-   and `docs` against the bumped tree before a tag can be cut from it.
+1. **Write the changelog section first**, under `## [Unreleased]` in
+   `CHANGELOG.md`. This is not optional decoration: the release job extracts
+   that section verbatim as the Release notes, and an empty one degrades to
+   `--generate-notes`. Mira does not use Conventional Commits, so generated
+   notes are a list of imperative prose subjects — worse than what you would
+   have written. Step 2 refuses if you skip this.
+2. **Bump the version.**
+   ```sh
+   make bump TO=X.Y.Z && make drift
+   ```
+   `Cargo.toml`'s `[workspace.package] version` is the source of truth and
+   everything else restates it; `bump` writes all of them and promotes the
+   changelog section you just wrote, `drift` checks it. The full list, and what
+   guards each one, is under
+   [Where the version lives](#where-the-version-lives).
+3. **Open a normal PR.** The point is to make CI run `drift`, `chart` and
+   `docs` against the bumped tree before a tag can be cut from it.
 4. **Tag the merged commit.**
    ```sh
    git tag vX.Y.Z && git push origin vX.Y.Z
@@ -193,25 +197,45 @@ raised by any other workflow, or on any other ref, fails the release.
 `Cargo.toml`'s `[workspace.package] version` is the source; everything below
 restates it, and the right-hand column is what stops it rotting.
 
-| Site | Gate |
-|---|---|
-| `Cargo.toml` `[workspace.package]` | the source |
-| `Cargo.toml` `miradb-core` / `miradb-proto` path-dep pins | **none** |
-| `charts/mira/Chart.yaml` — `version`, `appVersion`, the scanned image tag | `make drift` |
-| `charts/mira/README.md` | generated; `make helm-docs-check` |
-| `charts/mira/tests/statefulset_test.yaml` | the chart suite fails if it disagrees |
-| `docs/install.md` — `--version v`, `V=`, `helm install --version`, the chart coordinate | `make drift` |
-| `README.md` — `--version v` | `make drift` |
-| `CHANGELOG.md` | **none** (prose) |
-| `SECURITY.md` | **none** (prose) |
+| Site | Written by | Gate |
+|---|---|---|
+| `Cargo.toml` `[workspace.package]` | `make bump` | the source |
+| `Cargo.toml` `miradb-core` / `miradb-proto` path-dep pins | `make bump` | `make drift` |
+| `charts/mira/Chart.yaml` — `version`, `appVersion`, the scanned image tag | `make bump` | `make drift` |
+| `charts/mira/tests/statefulset_test.yaml` | `make bump` | `make drift`, and the chart suite |
+| `docs/install.md` — `--version v`, `V=`, `helm install --version`, the chart coordinate | `make bump` | `make drift` |
+| `README.md` — `--version v` | `make bump` | `make drift` |
+| `SECURITY.md` — the supported-versions line | `make bump` | `make drift` |
+| `.github/ISSUE_TEMPLATE/bug_report.yml` — the `mira X.Y.Z` placeholder | `make bump` | `make drift` |
+| `CHANGELOG.md` — the heading and the link definitions | `make bump` | **none** (prose) |
+| `Cargo.lock` | `cargo update --workspace` | `--locked` fails the build |
+| `charts/mira/README.md` | `helm-docs` | `make helm-docs-check` |
 
-The three ungated sites are prose that names the current version, and they rot
-on the first bump that forgets them. That is a known gap and the fix is cheap —
-`scripts/check_drift.py` already owns every regex needed, so a `--bump` flag
-that *writes* the sites it currently only reads is around forty lines. It has
-not been written yet, and 0.0.2 is the bump that showed why it should be: the
-0.0.1 cut left `SECURITY.md` saying there was no tagged release, on the day
-there was one.
+`make bump TO=X.Y.Z` writes every row above and then regenerates the last two,
+so step 1 is one command and `make drift` is how you check it did. The middle
+column exists because the writer and the gate are deliberately the same thing:
+`VERSION_SITES` in `scripts/check_drift.py` is one table of anchored patterns,
+read forwards to check and backwards to write. A gate maintained separately
+from the writer drifts, and it drifts in the bad direction — the writer is what
+people actually run.
+
+Anchored patterns rather than a find-and-replace, because this page is full of
+sentences that name a past release on purpose, and a bump must not rewrite one
+of them. For the same reason a pattern matching *nothing* is a failure rather
+than a pass: a gate for a line that has moved is a gate that is off.
+
+`CHANGELOG.md` is the one site still ungated, and it is ungated because the
+prose is the point — nothing can check that a human wrote the right notes. What
+`make bump` does mechanically is promote `## [Unreleased]` to `## [X.Y.Z]`, open
+a fresh empty one and move the link definitions. It **refuses** if
+`## [Unreleased]` is empty, since `release.yml` publishes that section verbatim
+and an empty one silently degrades to `--generate-notes`.
+
+This existed as a forty-line stub of an idea through two releases before it was
+written, and both paid for it: the 0.0.1 cut left `SECURITY.md` saying there was
+no tagged release on the day there was one, and 0.0.2 hand-edited the same three
+ungated sites again — missing the issue-template placeholder, which nothing had
+ever checked.
 
 ## What the tag path does not re-run
 
