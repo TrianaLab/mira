@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# One-line installer for Mira. Ported from TrianaLab/pacto's get-pacto.sh, which
-# is the house shape for this; keeping the two recognisably the same is
-# deliberate, and the differences below are all forced by Mira being a Rust
-# binary rather than a Go one.
+# One-line installer for Mira.
 #
 #   curl -fsSL https://miradb.dev/install.sh | bash
 #
@@ -12,11 +9,11 @@
 # URL still works and is the fallback if Pages is down; it is not advertised,
 # because a URL with a branch name in it is a URL that pins nothing.
 #
-# What is different from pacto's:
+# The shape of it:
 #
 #   * Assets are named by Rust target triple (`mira-0.1.0-aarch64-apple-darwin`)
-#     rather than by `os_arch`, and each is a tarball with the binary one
-#     directory down, because that is what release.yml publishes.
+#     and each is a tarball with the binary one directory down, because that is
+#     what release.yml publishes.
 #   * There is no Windows build. Mira mmaps its blocks and the whole storage
 #     layer is written against POSIX; a Windows port is not a build flag.
 #   * There are no plugins to install alongside. Mira is one binary; that is the

@@ -11,9 +11,7 @@
 #
 # Removing the character once fixes nothing on its own — the next document
 # written in the same style puts it straight back — so it is a gate, the same way
-# the crate count and the binary size are. Ported from TrianaLab/pacto, which
-# runs the identical check; keeping the two scripts recognisably the same is
-# deliberate.
+# the crate count and the binary size are.
 #
 # Modes:
 #
@@ -32,9 +30,9 @@
 # here is silent: a mangled `printf` escape, a locale that folds the byte pair,
 # a `grep` that stops honouring -F, an exclude that grew to cover the tree. Each
 # one turns a green run into "found nothing" rather than into an error, and a
-# gate that cannot fail is indistinguishable from no gate at all. pacto pays for
-# this with a Go fixture test; here it is nine lines in the script itself,
-# because a separate test target would be a second thing to keep wired up.
+# gate that cannot fail is indistinguishable from no gate at all. The proof is
+# nine lines in the script itself rather than a fixture test beside it, because
+# a separate test target would be a second thing to keep wired up.
 #
 # EXCLUDES, narrow and documented: crates/mira/ui/dist/ is the Svelte bundle,
 # generated from crates/mira/ui/src and committed so that building Mira needs no

@@ -11,7 +11,7 @@ The release has the same shape and the same failure mode wearing different
 clothes. A tag push has no status context to require, so the thing that holds it
 together is the terminal `verify-release` job: every publisher must be in its
 `needs:` closure, or a publisher can fail — or worse, be skipped — with the run
-still reported green. Pacto learned that one by shipping two no-op releases.
+still reported green, which is how a release ships nothing and says it worked.
 
 So this script reads the workflow files and asserts the graph is what everyone
 assumes it is:
