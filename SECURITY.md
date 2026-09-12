@@ -2,17 +2,15 @@
 
 ## Supported versions
 
-Mira is pre-1.0 — `0.0.1`, with no published binaries. There is exactly one
-supported version and it is the tip of `main`. Fixes land there; there are no
-backport branches to ask about.
+Mira is pre-1.0 — `0.0.1`. Two things are supported: the latest release and
+the tip of `main`. Fixes land on `main` and ship in the next release; there are
+no backport branches to ask about, and this table will not gain a third row.
 
 | Version | Supported |
 | --- | --- |
 | `main` | yes |
+| latest release | yes |
 | everything else | no |
-
-When the first tagged release exists this table gains one row: the latest
-release. It will not gain a third.
 
 ## Reporting a vulnerability
 
