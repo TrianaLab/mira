@@ -260,32 +260,19 @@ pub struct Rejects {
     /// if the last publish worked. See [`UNREADY_AFTER`]. Derived like
     /// `open_since`, and for the same reason.
     pub stalled_since: AtomicU64,
-    /// One pair per flusher shard, which is what the flushers actually write.
+    /// What each flusher shard actually writes; the two above are the oldest of
+    /// each.
     ///
-    /// A fixed array rather than one sized at `spawn`: this lives in a `static`
+    /// Fixed arrays rather than ones sized at `spawn`: these live in a `static`
     /// that outlives every flusher and is re-entered by the next test in the
     /// process, so a `OnceLock` sized by whoever spawned first would be the
     /// wrong length for whoever spawns second. [`MAX_SHARDS`] pairs is 256
     /// bytes a signal.
-    clocks: [ShardClock; MAX_SHARDS],
+    shard_open_since: [AtomicU64; MAX_SHARDS],
+    shard_stalled_since: [AtomicU64; MAX_SHARDS],
     /// Rate-limit gates, one per line that can fire per export.
     warned: AtomicU64,
     refuse_warned: AtomicU64,
-}
-
-/// What one flusher shard reports about itself. See [`Rejects::open_since`].
-struct ShardClock {
-    open_since: AtomicU64,
-    stalled_since: AtomicU64,
-}
-
-impl ShardClock {
-    const fn new() -> Self {
-        Self {
-            open_since: AtomicU64::new(0),
-            stalled_since: AtomicU64::new(0),
-        }
-    }
 }
 
 impl Rejects {
@@ -300,7 +287,8 @@ impl Rejects {
             bytes: AtomicU64::new(0),
             open_since: AtomicU64::new(0),
             stalled_since: AtomicU64::new(0),
-            clocks: [const { ShardClock::new() }; MAX_SHARDS],
+            shard_open_since: [const { AtomicU64::new(0) }; MAX_SHARDS],
+            shard_stalled_since: [const { AtomicU64::new(0) }; MAX_SHARDS],
             warned: AtomicU64::new(0),
             refuse_warned: AtomicU64::new(0),
         }
@@ -312,10 +300,10 @@ impl Rejects {
     /// are `/healthz`, `/metrics` and the TUI — three calls a second between
     /// them against a hot loop — and [`MAX_SHARDS`] relaxed loads is cheaper
     /// than the branch that would decide when to skip it.
-    fn oldest(&self, pick: fn(&ShardClock) -> &AtomicU64) -> u64 {
-        self.clocks
+    fn oldest(slots: &[AtomicU64; MAX_SHARDS]) -> u64 {
+        slots
             .iter()
-            .map(|c| pick(c).load(Relaxed))
+            .map(|t| t.load(Relaxed))
             .filter(|&t| t != 0)
             .min()
             .unwrap_or(0)
@@ -324,9 +312,9 @@ impl Rejects {
     /// Report when `shard`'s open block took its first row, or 0 for "nothing
     /// open".
     fn set_open_since(&self, shard: usize, at: u64) {
-        self.clocks[shard].open_since.store(at, Relaxed);
+        self.shard_open_since[shard].store(at, Relaxed);
         self.open_since
-            .store(self.oldest(|c| &c.open_since), Relaxed);
+            .store(Self::oldest(&self.shard_open_since), Relaxed);
     }
 
     /// Start the clock on a run of failures in `shard`, or leave it where it is.
@@ -336,14 +324,14 @@ impl Rejects {
     /// latest. One flusher owns each shard slot, so the compare-exchange cannot
     /// lose a race — it is here to keep the first value.
     fn mark_stalled(&self, shard: usize) {
-        let _ = self.clocks[shard].stalled_since.compare_exchange(
+        let _ = self.shard_stalled_since[shard].compare_exchange(
             0,
             now_secs().max(1),
             Relaxed,
             Relaxed,
         );
         self.stalled_since
-            .store(self.oldest(|c| &c.stalled_since), Relaxed);
+            .store(Self::oldest(&self.shard_stalled_since), Relaxed);
     }
 
     /// Zero every open-block clock, shard slots included.
@@ -354,8 +342,8 @@ impl Rejects {
     /// aggregate from the slots, and a dead flusher's slot would come back.
     #[cfg(test)]
     pub fn forget_open(&self) {
-        for c in &self.clocks {
-            c.open_since.store(0, Relaxed);
+        for t in &self.shard_open_since {
+            t.store(0, Relaxed);
         }
         self.open_since.store(0, Relaxed);
     }
@@ -363,9 +351,9 @@ impl Rejects {
     /// `shard` stored a block, so its run of failures is over. The signal is
     /// only unstalled once every shard's is.
     fn clear_stalled(&self, shard: usize) {
-        self.clocks[shard].stalled_since.store(0, Relaxed);
+        self.shard_stalled_since[shard].store(0, Relaxed);
         self.stalled_since
-            .store(self.oldest(|c| &c.stalled_since), Relaxed);
+            .store(Self::oldest(&self.shard_stalled_since), Relaxed);
     }
 
     fn record_shed(&self) {
@@ -1720,22 +1708,14 @@ mod tests {
 
         // The second boot: every frame is behind the watermark, so nothing is
         // handed back and the log can be truncated.
-        let mut handed_back = 0;
         let again = Wal::replay(
             &dir,
             node,
             block::wal_watermarks(&dir).unwrap(),
-            |_, _, _| {
-                handed_back += 1;
-                Ok(())
-            },
+            |_, _, _| unreachable!("a frame a block already claims must never be replayed again"),
         )
         .unwrap();
-        assert_eq!(
-            (again.replayed, again.skipped, handed_back),
-            (0, 2, 0),
-            "a frame a block already claims must never be replayed again"
-        );
+        assert_eq!((again.replayed, again.skipped), (0, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2584,7 +2564,7 @@ mod tests {
 
         // The clock is the *first* failure of the run, not the latest one, or a
         // node failing every two seconds would reset itself to healthy forever.
-        r.clocks[0].stalled_since.store(1, Relaxed);
+        r.shard_stalled_since[0].store(1, Relaxed);
         r.mark_stalled(0);
         assert_eq!(r.stalled_since.load(Relaxed), 1);
         // ...and the first failure does start it, from zero.
@@ -2625,7 +2605,7 @@ mod tests {
 
         // Same rule for stalls, and the same failure mode: one shard recovering
         // does not make the node ready while another cannot write.
-        r.clocks[1].stalled_since.store(900, Relaxed);
+        r.shard_stalled_since[1].store(900, Relaxed);
         r.mark_stalled(0);
         let both = r.stalled_since.load(Relaxed);
         assert!(both > 0 && both <= 900, "the older of the two, got {both}");
