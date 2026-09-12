@@ -413,7 +413,7 @@ fn attr_probes(q: &Search) -> Vec<AttrProbe> {
 ///
 /// Only an *unquoted* number qualifies, and that is a rule about the scan
 /// rather than about the index. A quoted scalar means a text comparison on a
-/// `str`-typed attribute (see [`attr_matches`]) and a numeric one on an `int`
+/// `str`-typed attribute (see [`AttrPred`]) and a numeric one on an `int`
 /// column, so the same term is lexicographic against one row and arithmetic
 /// against the next — two orderings, and [`crate::zone`] describes one. Since
 /// an absent key is read as "prune", a probe that describes the wrong ordering
@@ -441,7 +441,7 @@ fn range_probes(q: &Search) -> Vec<crate::zone::Probe> {
 
 /// The text an attribute of this value would have been indexed under.
 ///
-/// This is the contract between [`attr_matches`] and the block index, and both
+/// This is the contract between [`AttrPred`] and the block index, and both
 /// sides are written against it: `Op::Eq` on a stored string is *defined* as
 /// equality with this text, and [`crate::attrs::index`] writes exactly these
 /// bytes for the str, int and bool types. Doubles are not in the index at all —
@@ -1249,7 +1249,7 @@ pub(crate) fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) ->
 /// for the string column — the predicate already evaluated against the
 /// dictionary.
 ///
-/// This used to be [`attr_matches`], which did all of it *per row*: two
+/// This used to be `attr_matches`, which did all of it *per row*: two
 /// `downcast_ref`s, a `String` allocation for [`canon`], and a `parse::<f64>()`
 /// on every ordered comparison. That measured 30.9 ns per root row against 6.1
 /// for the allocation-free integer arm, which made an attribute filter fifteen
@@ -2951,7 +2951,7 @@ mod tests {
     /// count.
     ///
     /// ```sh
-    /// MIRA_BENCH_ROWS=2000000 cargo test --release -p mira-core \
+    /// MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core \
     ///     --lib scan_cost_per_row -- --nocapture
     /// ```
     #[test]

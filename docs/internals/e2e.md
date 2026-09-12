@@ -239,7 +239,7 @@ to quote for a paired comparison, because it is the shape that reproduces —
 689 MiB of RSS and a 55 ms ack p99. What thirty-two buys on top is 14% more
 throughput for eighteen times the ack p99.
 
-**That shape is new, and it is what `ingest.shards` bought.** Until 0.0.2 a
+**That shape is new, and it is what `ingest.shards` bought.** Until 0.0.3 a
 signal had one flusher, so every connection past the point where that consumer
 saturated bought contention rather than work, and the curve *fell* from four
 connections onward. The paired A/B — the same three-pass sweep, the same box, the
@@ -295,7 +295,7 @@ binary and the same command. Nothing in the output says so; the only tell is
 records and scans 1 block, yet costs 62 ms. `rows_matched` is an honest count,
 so the whole block's match set is computed before the head of it is taken — at a
 32 MiB target block that is ~205k rows — but that part is nearly free:
-`MIRA_BENCH_ROWS=2000000 cargo test --release -p mira-core --lib scan_cost_per_row`
+`MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core --lib scan_cost_per_row`
 puts a predicate at 0.05–5.6 ns/row against 24–25 ns/row for the same block
 through the whole read path. The other 20 ns is `Block::open` faulting the
 mapping in and CRC'ing every table body, which is why `limit 1` costs what the

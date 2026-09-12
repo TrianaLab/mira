@@ -667,8 +667,8 @@ to feed them. The knob exists for the case where that count is a fiction.
 `available_parallelism` does read a cgroup CPU *quota*, so the common container
 is fine; what it cannot read is `cpu.shares`/`cpu.weight`, which is a relative
 claim on contention and not a number at all, or a pod with no quota set on a
-96-core node, which would otherwise start 48 flushers a signal against the two
-cores it will actually get. `ingest.shards: 1` restores the single-flusher
+96-core node, which would otherwise start the capped sixteen flushers a signal
+against the two cores it will actually get. `ingest.shards: 1` restores the single-flusher
 behaviour exactly.
 
 Four things had to move, and none of them is the one line "shard the flusher"

@@ -210,12 +210,15 @@ config:
     # before raising it.
     queue: 128
     # -- How many flusher tasks each signal runs, or 0 for one per two cores as
-    # the process sees them. A CPU limit is what this is for: a cgroup quota is
-    # invisible to the runtime, so a pod capped at 2 CPUs on a 96-core node
-    # would otherwise start 48 flushers per signal. Set it to the whole cores
-    # in `resources.limits.cpu`. Shards split `queue` between them rather than
-    # multiplying it, so the memory arithmetic above does not move; 16 is the
-    # ceiling the engine enforces.
+    # the process sees them. A `resources.limits.cpu` quota is read correctly on
+    # its own, so leave this at 0 if you set one. It is for the cases that are
+    # not a quota: a `cpu.shares`/`cpu.weight` relative weight, or no limit at
+    # all on a large node, both of which read as the whole machine — on a
+    # 96-core node that is the capped sixteen flushers per signal for a pod that
+    # will get two cores. Set it to the whole cores the pod actually gets.
+    # Shards split `queue` between them rather than multiplying it, so the
+    # memory arithmetic above does not move; 16 is the ceiling the engine
+    # enforces.
     shards: 0
     # -- Write-ahead log. Off means an export is acknowledged only once it is in
     # a sealed, fsynced block — p99 around 2.6s, and read-your-writes holds. On

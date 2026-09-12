@@ -636,8 +636,8 @@ pub fn shard_count(configured: usize, cores: usize) -> usize {
 /// The handle over one signal's flusher shards: what a single `JoinHandle`
 /// meant when there was one of them, kept true now that there are several.
 ///
-/// Awaiting it resolves when every shard has stopped; [`abort`](Self::abort)
-/// stops them all where they stand. A [`JoinSet`](tokio::task::JoinSet) and not
+/// Awaiting it resolves when every shard has stopped; `abort` — test-only, see
+/// below — stops them all where they stand. A [`JoinSet`](tokio::task::JoinSet) and not
 /// a task that awaits a `Vec` of handles, because that shape gets the second
 /// half wrong: aborting such a task drops only its own future, so the shards
 /// keep running, and a shard that outlives the node it belonged to watches its

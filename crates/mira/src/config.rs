@@ -149,9 +149,9 @@ pub struct Config {
     /// reads as the whole machine, a shared host often sets no quota at all, a
     /// non-Linux container runtime leaves nothing to read, and hyperthreads
     /// count as cores. A 96-core host running Mira on two cores' worth of any
-    /// of those would otherwise start 48 flushers per signal and publish 48
-    /// files per seal window. Set it to the cores the process actually gets,
-    /// or to 1 to get the pre-0.0.2 behaviour.
+    /// of those would otherwise start the capped sixteen flushers per signal
+    /// and publish sixteen files per seal window. Set it to the cores the
+    /// process actually gets, or to 1 to get the pre-0.0.3 behaviour.
     ///
     /// Shards split `queue`, they do not multiply it: the resident worst case
     /// is the same whatever this is. Capped at `pipeline::MAX_SHARDS`.
