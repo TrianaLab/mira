@@ -3,7 +3,7 @@
 [![CI](https://github.com/TrianaLab/mira/actions/workflows/ci.yml/badge.svg)](https://github.com/TrianaLab/mira/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/TrianaLab/mira?label=release&color=2D4857)](https://github.com/TrianaLab/mira/releases/latest)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/search?repo=mira)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A599.20%25-brightgreen)](docs/internals/testing.md)
+[![Coverage](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fmiradb.dev%2Fcoverage.json&query=%24.line&suffix=%25&label=coverage&color=brightgreen)](docs/internals/testing.md)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://github.com/TrianaLab/mira/blob/main/Cargo.toml)
 [![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 

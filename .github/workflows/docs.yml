@@ -82,6 +82,18 @@ jobs:
       # ship a site full of 404s — which is why the generator checks those
       # links against `target/doc` in `ci`.
       - run: make site
+      # The README's coverage badge is shields' dynamic/json reader pointed at
+      # miradb.dev/coverage.json, so the site is what publishes the figure and
+      # this is the run that has to measure it. `ci`'s coverage leg cannot: it
+      # is conditional on a code change, so a docs-only push to main would have
+      # no artifact to copy, and reaching across workflows for "the last run
+      # that happened to produce one" is a lookup with no correct answer.
+      #
+      # After `make site`, never before: mkdocs empties the output directory.
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
+        with:
+          tool: cargo-llvm-cov
+      - run: make ci-coverage-json
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site

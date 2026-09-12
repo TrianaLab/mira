@@ -447,39 +447,44 @@ def check_section_refs() -> None:
         )
 
 
-# The README's coverage badge, and the ratchet it quotes. A shields.io badge is
-# a number in an image URL, which is the one kind of number nobody re-reads: it
-# renders the same whether or not it is still true. So it states the *floor*
-# rather than a snapshot — the floor is a committed guarantee, and this ties it
-# to the Makefile that enforces it. `%E2%89%A5` is a URL-escaped >= sign.
-COVERAGE_BADGE = re.compile(r"coverage-(?:%E2%89%A5)?([0-9]+\.[0-9]+)%25")
-COVERAGE_RATCHET = re.compile(r"^COVERAGE_MIN \?= ([0-9]+\.[0-9]+)", re.M)
+# The README's coverage badge. A number baked into an image URL is the one kind
+# of number nobody re-reads — it renders the same whether or not it is still
+# true — so this badge holds no number at all: it is shields' `dynamic/json`
+# reader pointed at a file `make coverage-json` writes into the published site,
+# from the measurement the deploy itself took.
+#
+# Which leaves exactly one way for it to rot, and it is silent: the badge points
+# at a URL and nothing publishes the file, so it renders grey "resource not
+# found" forever on a page whose whole job is to be a promise. Both halves are
+# checked here, together, because either alone passes while the pair is broken.
+COVERAGE_BADGE_URL = "https://miradb.dev/coverage.json"
+COVERAGE_BADGE = re.compile(
+    r"img\.shields\.io/badge/dynamic/json\?[^)\s]*"
+    r"url=https(?::|%3A)(?://|%2F%2F)miradb\.dev(?:/|%2F)coverage\.json"
+)
+COVERAGE_WRITER = re.compile(r"^COVERAGE_JSON := site/coverage\.json$", re.M)
 
 
 def check_coverage_badge() -> None:
-    makefile = COVERAGE_RATCHET.search((ROOT / "Makefile").read_text())
-    if not makefile:
+    if not COVERAGE_BADGE.search((ROOT / "README.md").read_text()):
         fail(
-            "Makefile no longer declares 'COVERAGE_MIN ?= <N.NN>', which the "
-            "README's coverage badge quotes."
+            "README.md no longer carries a live coverage badge pointing at "
+            f"{COVERAGE_BADGE_URL}.\n"
+            "    A hard-coded percentage is not a substitute: it is true on "
+            "the day it is written and unfalsifiable afterwards. Restore the "
+            "shields dynamic/json badge, or delete check_coverage_badge and "
+            "`make coverage-json` together — a gate for a thing that is gone "
+            "is a gate that passes forever."
         )
         return
 
-    badge = COVERAGE_BADGE.search((ROOT / "README.md").read_text())
-    if not badge:
+    if not COVERAGE_WRITER.search((ROOT / "Makefile").read_text()):
         fail(
-            "README.md no longer carries a shields.io coverage badge.\n"
-            "    Restore it, or delete check_coverage_badge — a gate for a "
-            "thing that is gone is a gate that passes forever."
-        )
-        return
-
-    if badge.group(1) != makefile.group(1):
-        fail(
-            f"the README's coverage badge says {badge.group(1)}% and the "
-            f"Makefile's ratchet is {makefile.group(1)}%.\n"
-            "    The ratchet only goes up, so this is a raise that stopped at "
-            "the Makefile. A badge nobody updates is worse than no badge."
+            "the README's coverage badge reads "
+            f"{COVERAGE_BADGE_URL}, and the Makefile no longer declares "
+            "'COVERAGE_JSON := site/coverage.json' to write it.\n"
+            "    Nothing would publish the file, so the badge would render "
+            "grey on every view of the README and no build would go red."
         )
 
 
