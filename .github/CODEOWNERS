@@ -13,7 +13,7 @@
 # trusts without changing a line of Rust.
 /.github/               @edu-diaz
 
-# docs/ARCHITECTURE.md is the record of why the tree looks like this, and every
+# docs/architecture.md is the record of why the tree looks like this, and every
 # number in the README is a promise. Neither drifts unreviewed.
 /docs/                  @edu-diaz
 

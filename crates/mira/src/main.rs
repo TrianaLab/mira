@@ -35,7 +35,7 @@ mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
 mira update [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
-also come from the file via ${env:VAR} — see https://miradb.dev/CONFIG/.
+also come from the file via ${env:VAR} — see https://miradb.dev/config/.
 
 `mira mira` opens the terminal UI. With --data-dir it reads a block directory
 in-process and needs no server running; with --addr it queries one over HTTP.

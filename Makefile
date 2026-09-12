@@ -20,7 +20,7 @@ PYTHON  ?= python3
 UI_DIR  := crates/mira/ui
 BIN     := target/release/mira
 # The load harness and the demo generator. `cargo build --release` does *not*
-# build examples, which is why docs/TESTING.md used to name a path that did not
+# build examples, which is why docs/testing.md used to name a path that did not
 # exist after the build it told you to run. One spelling, here, and every doc
 # points at `make build`.
 LOADGEN := target/release/examples/loadgen
@@ -29,7 +29,7 @@ LOADGEN := target/release/examples/loadgen
 # was last edited. It may only ever go up. Raising it is a one-line diff a
 # reviewer can see; lowering it needs an argument in the PR body. A gate set to
 # an aspiration is a gate that gets switched off the first time it goes red.
-# docs/ARCHITECTURE.md and .github/workflows/ci.yml both defer to this value.
+# docs/architecture.md and .github/workflows/ci.yml both defer to this value.
 #
 # Read it off a CI log, never off a laptop: `#[cfg]` splits the tree by host, so
 # the Linux runner measures a slightly different denominator than a Mac does and
@@ -191,7 +191,7 @@ DEMO_LOG    := $(DEMO_DIR).log
 DEMO_WINDOW ?= 45m
 # Alerting is off unless a node is pointed at a rules file, so the demo has to
 # point at one or its alert pane is empty for a reason that looks like a bug.
-# This file is also the worked example docs/CONFIG.md links to, so the demo is
+# This file is also the worked example docs/config.md links to, so the demo is
 # what keeps it honest.
 DEMO_RULES  ?= docs/e2e/alerts.kyaml
 
@@ -311,6 +311,27 @@ ui-demo: ## Build the recorded-snapshot UI the docs site hosts at /play
 	@# src/lib/fixtures.json instead of from a server, so it belongs on the
 	@# site and nowhere near the binary. `make site` picks it up.
 	cd $(UI_DIR) && npm ci && VITE_REPLAY=1 npm run build -- --outDir dist-demo
+	@# And the asset URLs point at /play, which is the one thing about this
+	@# build that nothing else can check. `make site` copies the directory into
+	@# site/play *after* mkdocs has run, so `mkdocs --strict` — the whole link
+	@# checker — structurally cannot see it; and a bundle built with the wrong
+	@# `base` does not 404, it serves a 200 whose body is an empty
+	@# `<div id="app">` and two 404s in a console nobody has open. That shipped
+	@# once. It is asserted here rather than in `site` because this is the half
+	@# a pull request can afford to run: node, and no rustdoc.
+	@grep -oE '(src|href)="/[^"]+"' $(UI_DIR)/dist-demo/index.html \
+	  | sed -e 's/^[a-z]*="//' -e 's/"$$//' \
+	  | while read -r u; do \
+	      case "$$u" in \
+	        /play/*) [ -f "$(UI_DIR)/dist-demo$${u#/play}" ] && continue ;; \
+	      esac; \
+	      echo "error: the recorded snapshot's index.html asks for $$u."; \
+	      echo "  it is served from /play/, so every asset URL in it has to be"; \
+	      echo "  /play/<file> and name a file this build produced. See the"; \
+	      echo "  VITE_REPLAY branch of \`base\` in $(UI_DIR)/vite.config.js."; \
+	      exit 1; \
+	    done
+	@echo "recorded snapshot: assets resolve under /play."
 
 .PHONY: ui-fixtures
 ui-fixtures: ## Re-record src/lib/fixtures.json from a live Mira
@@ -340,7 +361,7 @@ reference-check: reference ## Fail if a committed reference page is stale
 	@# reader gets it without a build, and a pull request that adds a route or
 	@# a config key without regenerating goes red here rather than shipping a
 	@# reference page that quietly stopped being true.
-	git diff --exit-code -- docs/reference docs/CONFIG.md
+	git diff --exit-code -- docs/reference docs/config.md
 
 # ---------------------------------------------------------------------------
 # Supply chain — the dependency budget is a product property (see CLAUDE.md)
@@ -392,6 +413,44 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 	actionlint
 	$(PYTHON) scripts/check_ci.py
 
+.PHONY: install-script
+install-script: ## The published one-liner installer still parses, lints and runs
+	@# `docs/install.sh` is a symlink to this file, so what the docs site serves
+	@# at miradb.dev/install.sh is these bytes — which makes it the one script
+	@# here that strangers run, unreviewed, as their first contact with the
+	@# project. It had no gate at all until it broke in the field.
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "error: shellcheck is not installed."; \
+		echo "  macOS: brew install shellcheck"; \
+		echo "  else:  https://github.com/koalaman/shellcheck#installing"; \
+		exit 1; }
+	shellcheck scripts/get-mira.sh
+	@# The failure shellcheck does not have an opinion about, and no runner here
+	@# can reproduce: `"$${a[@]}"` on an *empty* array is an unbound variable
+	@# under `set -u` on bash before 4.4. macOS ships 3.2.57 as /bin/bash and
+	@# `curl ... | bash` runs it, so "a Mac with no GH_TOKEN" — the common case —
+	@# exited before printing anything, while every ubuntu runner (bash 5.x)
+	@# found the same line perfectly legal. Hence a grep rather than a test.
+	@# The safe form contains the unsafe one as its own second half, so the
+	@# safe form is deleted before looking for what is left.
+	@! sed 's/\$${[A-Z_]*\[@\]+"\$${[A-Z_]*\[@\]}"}//g' scripts/get-mira.sh \
+	    | grep -nE '"\$$\{[A-Z_]+\[@\]\}"' || { \
+		echo "error: expand possibly-empty arrays as \$${a[@]+\"\$${a[@]}\"}."; \
+		echo "  the plain quoted form aborts under \`set -u\` on bash < 4.4,"; \
+		echo "  which is what macOS ships as /bin/bash and what the one-liner runs."; \
+		exit 1; }
+	@# And it reaches its version lookup and fails there in its own words. Port 1
+	@# refuses immediately, so this needs neither the network nor a published
+	@# release — and it is the whole path that broke: argv assembly, `fetch`,
+	@# and the `set -o pipefail` interaction that used to swallow the message.
+	@out=$$(API_URL=http://127.0.0.1:1/releases bash scripts/get-mira.sh --no-sudo 2>&1 || true); \
+	case "$$out" in \
+	  *"No release found"*) ;; \
+	  *) echo "error: the installer did not reach its version lookup cleanly:"; \
+	     printf '%s\n' "$$out" | sed 's/^/    /'; exit 1 ;; \
+	esac
+	@echo "installer: shellcheck clean, arrays expand safely, version lookup reached."
+
 .PHONY: print-msrv
 print-msrv: ## Print the declared MSRV (CI installs the toolchain from this)
 	@echo $(MSRV)
@@ -416,6 +475,35 @@ $(VENV)/bin/mkdocs: docs/requirements.txt
 
 .PHONY: docs
 docs: $(VENV)/bin/mkdocs ## Build the docs site; --strict, so a dead link fails
+	@# mkdocs derives the URL from the filename and from nothing else, so
+	@# `docs/CONFIG.md` published a shouting route in a site whose every other
+	@# path is quiet — and one a reader who retypes it in the wrong case cannot
+	@# reach. --strict has no opinion: the page builds, every link resolves,
+	@# only the URL is wrong. Hence a gate, and before the build rather than
+	@# after, because the build is the slow half.
+	@bad=$$(find docs -name '*.md' | grep -E '/[^/]*[A-Z][^/]*\.md$$' || true); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these pages publish a route with capital letters in it:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  mkdocs takes the URL from the filename. Rename to lower case and"; \
+		echo "  update the links — \`git grep -l <OLD>.md\` finds every one."; \
+		exit 1; \
+	fi
+	@# The other half of the same rename: the site's own URL, spelled out in
+	@# full in a chart README, a --help string and two Rust error messages,
+	@# where no link checker on this repo can see it. Those are absolute and
+	@# external as far as mkdocs is concerned, so the rename above turned each
+	@# of them into a 404 in a message whose whole job is to tell someone where
+	@# to look.
+	@# `--untracked` so a file that has not been `git add`ed yet is still
+	@# checked; it keeps the standard excludes, so target/ and site/ stay out.
+	@bad=$$(git grep -nE --untracked 'miradb\.dev/[A-Za-z0-9_-]*[A-Z]' || true); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these name a site route with capital letters in it:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  every published route is lower case, so this is a 404."; \
+		exit 1; \
+	fi
 	$(VENV)/bin/mkdocs build --strict
 
 .PHONY: docs-serve
@@ -540,7 +628,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check deps drift workflows chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 
@@ -649,7 +737,7 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 #   * COPYFILE_DISABLE, because macOS tar otherwise writes ._ AppleDouble
 #     sidecars into the archive and they surface as junk on a Linux extract.
 # The size line goes to the run summary as well as stdout: README and
-# docs/ARCHITECTURE.md section 11 both quote a binary size, and a release that
+# docs/architecture.md section 11 both quote a binary size, and a release that
 # quietly doubles it should be visible without opening a log.
 
 .PHONY: dist-sbom
@@ -770,7 +858,7 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 		echo "error: $(DIST_BIN) is not a Linux binary, so the container cannot start it."; \
 		echo "  this gate runs on Linux (ci.yml's e2e leg). Locally, use \`make demo\`."; \
 		exit 1; }
-	@# The scenario docs/TESTING.md section 6 documents, run as a gate. The
+	@# The scenario docs/testing.md section 6 documents, run as a gate. The
 	@# --build-arg makes compose reuse the layers dist-image just built instead
 	@# of compiling a second time inside the Dockerfile; everything else about
 	@# the stack is exactly what a reader of that section types.

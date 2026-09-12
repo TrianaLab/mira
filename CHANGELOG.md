@@ -74,7 +74,7 @@ here may change: the block format, the query document, the config keys, the
   and returned as nested JSON by the query API and MCP, printed inline by both
   UIs.
 - **KYAML configuration** with `${env:VAR,default}` interpolation, every flag
-  also settable from the file — [`docs/CONFIG.md`](docs/CONFIG.md) is the whole
+  also settable from the file — [`docs/config.md`](docs/config.md) is the whole
   surface.
 - **SIGTERM drains**: stop accepting, let in-flight exports reach their ack,
   seal and publish the open blocks, exit.
@@ -123,7 +123,7 @@ here may change: the block format, the query document, the config keys, the
 
 Tracked here because they are the difference between what the README promises
 and what a reader might assume;
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) section 0.1 is the authoritative
+[`docs/architecture.md`](docs/architecture.md) section 0.1 is the authoritative
 list.
 
 - Ingestion is allocation-lean, not zero-copy: `prost` memcpies every string.

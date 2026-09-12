@@ -81,8 +81,15 @@ jobs:
             # `overrides/` is the mkdocs theme override directory — one file, the
             # landing hero — and a Jinja error in it fails `mkdocs build --strict`
             # like any page would.
-            docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|.*\.md\$)${W}")
-            ui=$(m "^crates/mira/ui/${W}")
+            # `scripts/get-mira.sh` is here rather than only in `code` because
+            # `docs/install.sh` is a symlink to it: the docs site *publishes*
+            # it, so it is a documentation artefact that happens to be a script,
+            # and this is the leg that checks it.
+            docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$)${W}")
+            # `Makefile$` for the same reason it is in `code` and `image`: both
+            # of this leg's steps are make targets, so an edit to `ui-check` or
+            # `ui-demo` is a change to what this job asserts.
+            ui=$(m "^(crates/mira/ui/|Makefile\$)${W}")
             # The image is the binary plus the base image, so anything that
             # changes the binary changes what Trivy is looking at. Dockerfile
             # and .dockerignore are here for the obvious reason; Cargo.lock is
@@ -174,6 +181,11 @@ jobs:
       # what ships. `make ui-check` rebuilds it and diffs: a .svelte fix that
       # was never rebuilt is a fix nobody gets.
       - run: make ui-check
+      # The second build of the same source — the recorded snapshot the site
+      # hosts at /play. Only `docs.yml` builds it otherwise, and that runs after
+      # the merge, so a snapshot that renders a blank page was a green pull
+      # request. The target asserts its own asset URLs; see the comment there.
+      - run: make ui-demo
 
   coverage:
     name: coverage
@@ -249,6 +261,11 @@ jobs:
       # whole link checker — a dead internal link or a missing anchor fails the
       # build. No separate link-checking action, and none needed.
       - run: make docs
+      # The other thing this site publishes: `docs/install.sh` is a symlink to
+      # `scripts/get-mira.sh`, so these are the bytes strangers pipe into bash.
+      # shellcheck is preinstalled on the runner image. See the target for the
+      # one class of bug it checks that no runner here can reproduce.
+      - run: make install-script
 
   image:
     name: image
@@ -316,7 +333,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: e2e
-      # docs/TESTING.md has described this scenario since before CI could run
+      # docs/testing.md has described this scenario since before CI could run
       # it: a real binary in a container, a stock OpenTelemetry Collector in
       # front of it, the OpenTelemetry project's own generator on the wire, and
       # then the query API asked whether the data arrived. Every other test in

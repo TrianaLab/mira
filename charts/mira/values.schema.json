@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mira chart values",
-  "description": "additionalProperties is false at every level the chart owns. Mira's own config parser refuses an unknown key at boot rather than ignoring it (docs/CONFIG.md), and a chart that is laxer than the binary turns `--set persistence.sizee=100Gi` into a 20Gi volume nobody notices until it fills. The k8s-shaped pass-throughs (securityContext, resources, affinity, tolerations, extraEnv) stay open, because the API server owns those schemas and this one must not be a second, staler copy of them.",
+  "description": "additionalProperties is false at every level the chart owns. Mira's own config parser refuses an unknown key at boot rather than ignoring it (docs/config.md), and a chart that is laxer than the binary turns `--set persistence.sizee=100Gi` into a 20Gi volume nobody notices until it fills. The k8s-shaped pass-throughs (securityContext, resources, affinity, tolerations, extraEnv) stay open, because the API server owns those schemas and this one must not be a second, staler copy of them.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -193,7 +193,7 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Rendered into Mira's KYAML config file. These keys are the closed set from docs/CONFIG.md and nothing else parses.",
+      "description": "Rendered into Mira's KYAML config file. These keys are the closed set from docs/config.md and nothing else parses.",
       "properties": {
         "node": {
           "type": "string",

@@ -72,7 +72,7 @@ query is answered from one replica's own blocks, with no fan-out.
 Mira's config file, in KYAML.
 
 KYAML is a strict subset of YAML 1.2: explicit `{}`, every string quoted,
-indentation for the reader only (docs/CONFIG.md). Mira reads every value as a
+indentation for the reader only (docs/config.md). Mira reads every value as a
 string and refuses anything that arrived as another type, so `wal` — a bool in
 values.yaml, because that is what it is to whoever sets it — is rendered as the
 quoted string the parser demands. `quote` on every scalar is the whole trick.
@@ -83,7 +83,7 @@ is the one thing both templates go through.
 */}}
 {{- define "mira.config" -}}
 {{- if and .Values.config.alerts.rules (gt (int .Values.replicaCount) 1) }}
-{{- fail "config.alerts.rules is set with replicaCount > 1. Mira holds no coordination state, so nothing elects an evaluator: every replica would evaluate the same rules against its own blocks and page separately. Run the evaluating replica as its own release with replicaCount: 1 (docs/CONFIG.md, \"alerts.rules\")." }}
+{{- fail "config.alerts.rules is set with replicaCount > 1. Mira holds no coordination state, so nothing elects an evaluator: every replica would evaluate the same rules against its own blocks and page separately. Run the evaluating replica as its own release with replicaCount: 1 (docs/config.md, \"alerts.rules\")." }}
 {{- end }}
 {
   "node": {{ .Values.config.node | quote }},

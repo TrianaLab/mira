@@ -991,7 +991,7 @@ mod tests {
       ]
     }"#;
 
-    /// The file `make demo` loads and `docs/CONFIG.md` points at.
+    /// The file `make demo` loads and `docs/config.md` points at.
     ///
     /// A documented example that does not parse is worse than no example, and
     /// this one is also the only place the schema is written out in full — so

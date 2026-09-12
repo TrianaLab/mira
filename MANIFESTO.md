@@ -173,7 +173,7 @@ That store did not exist. Mira is an attempt at it.
      in both places at once. -->
 
 *How it is built, and why each choice:
-[the architecture document](https://miradb.dev/ARCHITECTURE/). The
+[the architecture document](https://miradb.dev/architecture/). The
 numbers behind every claim here, with the machine they were taken on and what
 every other engine publishes beside them:
-[where Mira sits in the market](https://miradb.dev/MARKET/).*
+[where Mira sits in the market](https://miradb.dev/market/).*

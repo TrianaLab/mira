@@ -1,4 +1,4 @@
-# Mira behind a stock collector, for the end-to-end recipe in docs/TESTING.md.
+# Mira behind a stock collector, for the end-to-end recipe in docs/testing.md.
 #
 # Both containers share a compose network so the collector can resolve `mira`.
 # Running Mira on the host and the collector in Docker does not work on Docker
@@ -16,7 +16,7 @@ services:
     volumes:
       # A named volume, not a bind mount: Mira mmaps its blocks and a Docker
       # Desktop bind mount is FUSE, where an I/O hiccup arrives as SIGBUS
-      # rather than an error (docs/ARCHITECTURE.md section 9).
+      # rather than an error (docs/architecture.md section 9).
       - mira-data:/data
 
   otelcol:

@@ -1,6 +1,6 @@
 //! Prices the cold tier on real blocks.
 //!
-//! The compression ratios in the README and in `docs/MARKET.md` are measured,
+//! The compression ratios in the README and in `docs/market.md` are measured,
 //! and this is what measures them. Point it at a data directory and it rewrites
 //! every table in it three ways — uncompressed, ZSTD at the level
 //! `block::ZSTD_LEVEL` sets, and LZ4_FRAME — using the engine's own writer, not
@@ -21,7 +21,7 @@
 //! compressed Arrow column bytes, which is the denominator ClickHouse,
 //! VictoriaLogs and LogHouse publish against. The wire ratio — OTLP protobuf in
 //! against bytes on disk — is a different and much less flattering number, and
-//! `docs/MARKET.md` prints both.
+//! `docs/market.md` prints both.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

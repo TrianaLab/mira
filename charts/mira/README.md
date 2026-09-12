@@ -63,7 +63,7 @@ EBS `gp3`, GCE PD, Azure Disk). `persistence.enabled=false` swaps in an
 
 The defaults below — `500m` CPU, `512Mi` requested, `2Gi` limit, a `20Gi` PVC —
 are the "a team's services" row of
-[the sizing table](https://miradb.dev/CONFIG/#sizing), which is measured rather
+[the sizing table](https://miradb.dev/config/#sizing), which is measured rather
 than guessed and gives CPU, memory and disk per day against the record rate.
 Two things it will tell you that are not obvious from here: memory tracks the
 number of concurrent exporters and not the ingest rate at all, and the on-disk
@@ -86,7 +86,7 @@ Mira's config file is KYAML (a strict subset of YAML 1.2, so a JSON superset).
 The chart renders `config.*` into it and mounts it at `/etc/mira/mira.yaml`; the
 pod's whole command line is `--config /etc/mira/mira.yaml`. The keys under
 `config` are the closed set from
-[Configuration](https://miradb.dev/CONFIG/) —
+[Configuration](https://miradb.dev/config/) —
 an unknown key stops Mira at boot rather than being ignored, and this chart's
 `values.schema.json` is closed for the same reason.
 
@@ -150,7 +150,7 @@ cosign verify \
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules. Worth setting when `replicaCount > 1` and the volumes are node-local: two replicas on one node share that node's disk bandwidth and die together. |
-| config.alerts.rules | string | `""` | The alert rules document, inline, in KYAML. Empty means this node evaluates nothing and pages nobody, which is the default and is why an empty `/api/v1/alerts` means "alerting is off here" rather than "all clear". The chart writes it into the same ConfigMap and points `alerts.rules` at the file. It is refused at `replicaCount > 1`: nothing elects an evaluator, so three replicas would send three of every page. docs/CONFIG.md has the schema. |
+| config.alerts.rules | string | `""` | The alert rules document, inline, in KYAML. Empty means this node evaluates nothing and pages nobody, which is the default and is why an empty `/api/v1/alerts` means "alerting is off here" rather than "all clear". The chart writes it into the same ConfigMap and points `alerts.rules` at the file. It is refused at `replicaCount > 1`: nothing elects an evaluator, so three replicas would send three of every page. docs/config.md has the schema. |
 | config.ingest.maxRequestBytes | string | `"16MiB"` | The largest export Mira will decode, on either port. 16MiB is eight times axum's default and four times tonic's, and comfortably above what a stock collector produces at its own default batch size. Too low is worse than it sounds: 4318 answers 413, which OTLP classes as permanent, so the exporter drops the batch instead of retrying it. |
 | config.ingest.queue | int | `128` | How many exports may be waiting for one signal's flusher. A full queue parks the next export for up to five seconds rather than refusing it, so this buys burst absorption and not throughput. Each slot can hold a decoded export, so the worst case is this times `maxRequestBytes` times three signals resident — check it against `resources.limits.memory` before raising it. |
 | config.ingest.wal | bool | `true` | Write-ahead log. Off means an export is acknowledged only once it is in a sealed, fsynced block — p99 around 2.4s, and read-your-writes holds. On means acknowledged once written to the log — p99 under 5ms, survives the process dying, does not survive the machine dying for up to 250ms, and what you just sent is not queryable yet. Both are correct; no measurement here can pick for you, so this is the binary's own default rather than a second opinion from the chart. |

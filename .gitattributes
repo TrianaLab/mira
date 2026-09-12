@@ -32,7 +32,7 @@ crates/mira-proto/proto/** linguist-vendored=true
 Cargo.lock                     linguist-generated=true
 crates/mira/ui/package-lock.json linguist-generated=true
 
-# ARCHITECTURE.md is the reasoning of record and CONFIG.md is the whole config
+# architecture.md is the reasoning of record and config.md is the whole config
 # surface — prose, not code. Counting them as a language would misreport the
 # tree in both directions.
 docs/** linguist-documentation=true

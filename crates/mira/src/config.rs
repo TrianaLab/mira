@@ -341,7 +341,7 @@ fn check_keys(node: &Yaml, prefix: &str) -> Result<()> {
         });
         if !known {
             return Err(format!(
-                "unknown key {path:?}. Mira reads exactly {}; see https://miradb.dev/CONFIG/",
+                "unknown key {path:?}. Mira reads exactly {}; see https://miradb.dev/config/",
                 KNOWN.join(", ")
             ));
         }
@@ -369,7 +369,7 @@ fn check_keys(node: &Yaml, prefix: &str) -> Result<()> {
             // reads as neither `listen.grpc` nor `listen.http`.
             _ if !leaf => {
                 return Err(format!(
-                    "{path}: expected a map of settings, found a value; see https://miradb.dev/CONFIG/"
+                    "{path}: expected a map of settings, found a value; see https://miradb.dev/config/"
                 ));
             }
             _ => {}

@@ -6,8 +6,8 @@
 
 <!--
 Only if the choice was not obvious — a mechanism you rejected, a constraint
-from docs/ARCHITECTURE.md section 0, a trade between two of the four performance
-axes. If the reasoning is worth keeping, it belongs in ARCHITECTURE.md in this
+from docs/architecture.md section 0, a trade between two of the four performance
+axes. If the reasoning is worth keeping, it belongs in architecture.md in this
 diff and this box can just point at the section.
 -->
 
@@ -29,7 +29,7 @@ the command you ran:
 - [ ] Tests cover the new behaviour — or, for a fix, the test fails without it.
 - [ ] Coverage went up, or held. If the ratchet moved, it moved **up**.
 - [ ] No new dependency. If there is one: `make deps` and `make drift` are
-      green, and the README bullet and `docs/ARCHITECTURE.md` section 11 are updated
+      green, and the README bullet and `docs/architecture.md` section 11 are updated
       in this diff.
 - [ ] UI touched? `make ui` was run and `crates/mira/ui/dist` is committed here.
 - [ ] The README is still true, with every number re-measured if this change

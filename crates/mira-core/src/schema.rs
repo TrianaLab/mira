@@ -4,7 +4,7 @@
 //! entity-attribute-value side tables keyed by `parent_id`.
 //!
 //! Two deliberate deviations from the OTAP wire spec, both documented in
-//! docs/ARCHITECTURE.md:
+//! docs/architecture.md:
 //!
 //! * `parent_id` and the root `id` are UInt32 and **block-local**. On the wire
 //!   OTAP ids are only unique within one `BatchArrowRecords`; persisting them
@@ -79,7 +79,7 @@ pub static ATTRS: LazyLock<SchemaRef> = LazyLock::new(|| {
         // wider index costs 0.7% of compressed bytes. Dictionary-encoding the
         // *other* string columns on top of this one was measured too and makes
         // logs *worse* (5.23x to 4.72x), so they stay plain. See
-        // docs/ARCHITECTURE.md, "What compresses and what does not".
+        // docs/architecture.md, "What compresses and what does not".
         Field::new("str", dict_u32_utf8(), true),
         Field::new("int", DataType::Int64, true),
         Field::new("double", DataType::Float64, true),
@@ -99,7 +99,7 @@ pub static ATTRS: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// original brief and is dropped: Arrow IPC has no such encoding (the whole
 /// surface is LZ4/ZSTD whole-buffer compression plus Dictionary and RunEndEncoded
 /// layouts), and Gorilla's 12x rests on samples landing on exact interval
-/// boundaries, which OTLP wall-clock reads do not. See docs/ARCHITECTURE.md.
+/// boundaries, which OTLP wall-clock reads do not. See docs/architecture.md.
 pub static LOGS: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt32, false),

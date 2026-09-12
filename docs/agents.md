@@ -147,7 +147,7 @@ Eight spans, `parent_span_id` linking them into the tree. The 503 originates at
 so `payments` is where the error is *created*, not merely where it is reported. `get_trace`
 rather than `query_records` with a `trace_id` filter: blocks carry a trace-id index, and
 this is the call that uses it — 4.6 ms here, and 13.3 ms against 28.8M spans in
-[the query benchmark](MARKET.md#query), opening 1 block of 77, because the cost is
+[the query benchmark](market.md#query), opening 1 block of 77, because the cost is
 the one block the Bloom sidecar could not rule out.
 
 **4. What does the service itself say?** Logs are indexed on the same attributes, so this
@@ -189,7 +189,7 @@ call, error and latency counts computed from `parent_span_id` at read time.
 ## Waking the loop from an alert
 
 Mira's alerting is static KYAML rules evaluated in-process
-([Configuration](CONFIG.md)). A `json` target POSTs the rule's whole state, which is
+([Configuration](config.md)). A `json` target POSTs the rule's whole state, which is
 enough to start an investigation without a first query:
 
 ```json
@@ -220,7 +220,7 @@ so a second process can map the same directory read-only while the writer keeps 
 mira mira --data-dir ./data     # the same views, no server, no port, no serialisation
 ```
 
-That is [architecture section 8.4](ARCHITECTURE.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
+That is [architecture section 8.4](architecture.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
 and it is the reason the co-located
 case is a different primitive from a managed backend rather than a cheaper one. Sandbox,
 edge node or the pod next door: if the agent can see the directory, it can read the

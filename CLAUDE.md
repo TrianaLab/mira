@@ -2,7 +2,7 @@
 
 Mira is an OTLP-native telemetry storage engine in a single binary: OTLP in,
 immutable Arrow IPC blocks out, queried straight from `mmap`. Read
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 0 and section 1 before changing anything
+[docs/architecture.md](docs/architecture.md) section 0 and section 1 before changing anything
 structural — section 0 lists the mechanisms from the original brief that do not survive
 contact with the formats, and re-proposing one of them is the most common way to
 waste a session.
@@ -50,7 +50,7 @@ existed when the line was last edited; raise it when you raise coverage, never
 lower it.
 
 End-to-end testing against a live instance, with synthetic data, is
-[docs/TESTING.md](docs/TESTING.md).
+[docs/testing.md](docs/testing.md).
 
 ## The dependency budget is a product property
 
@@ -69,7 +69,7 @@ Mac and the drift gate fires on the runner rather than on a real change.
 `scripts/check_drift.py` pins the same triple.
 
 That count includes the three workspace members, so it is three above the number
-the README states. If it moves, update the README bullet, `docs/ARCHITECTURE.md`
+the README states. If it moves, update the README bullet, `docs/architecture.md`
 section 11's table, and the "against a tree of N" comments. `zstd-sys` is the only C
 dependency and that is a stated property — keep new crates on pure-Rust
 backends.
@@ -78,9 +78,9 @@ backends.
 
 - **The README** is a promise. Every bullet must be true of the committed code,
   and every number must have been measured on this machine. Anything that is not
-  yet true belongs in `docs/ARCHITECTURE.md` section 0.1, summarised under the
+  yet true belongs in `docs/architecture.md` section 0.1, summarised under the
   README's "Scope".
-- **docs/ARCHITECTURE.md** is the reasoning, not a plan. When you make a
+- **docs/architecture.md** is the reasoning, not a plan. When you make a
   non-obvious choice, the section explaining *why* is part of the diff.
 - Comments explain **why**, not what. A deliberate simplification with a known
   ceiling gets a `ponytail:` comment naming the ceiling and the upgrade path.

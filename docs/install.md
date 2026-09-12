@@ -20,7 +20,7 @@ match, not that either came from this repository.
 
 | | |
 |---|---|
-| `--version v0.1.0` | a specific release instead of the latest |
+| `--version v0.0.1` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the attestation check (the checksum is still enforced) |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
@@ -36,7 +36,7 @@ runs.
 ```sh
 mira update              # to the latest release
 mira update --dry-run    # print the command it would run, and stop
-mira update --version v0.1.0
+mira update --version v0.0.1
 ```
 
 This runs the installer above rather than re-implementing it, so the checksum
@@ -81,7 +81,7 @@ linux and macOS on x86_64 and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one
 SLSA provenance attestation covering every file in it.
 
 ```sh
-V=0.1.0; T=x86_64-unknown-linux-gnu
+V=0.0.1; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
@@ -167,10 +167,10 @@ That is a StatefulSet of one, a PVC, and one Service carrying both ports. No
 operator, no sidecar, no CRDs and nothing to elect: Mira holds no coordination
 state, so the chart has nothing to coordinate. Configuration is the same KYAML
 document as everywhere else, rendered into a ConfigMap — the `config.*` values
-are [Configuration](CONFIG.md)'s keys, camelCased per Helm convention
+are [Configuration](config.md)'s keys, camelCased per Helm convention
 (`ingest.max_request_bytes` is `config.ingest.maxRequestBytes`), and how much
 CPU, memory and disk to give it is [that page's sizing
-table](CONFIG.md#sizing), every row anchored to a measured point.
+table](config.md#sizing), every row anchored to a measured point.
 
 The chart is signed the same way the binaries are:
 
@@ -202,7 +202,7 @@ FUSE is a warning rather than a refusal, because the magic number cannot tell
 That rules out an RWX PVC on Kubernetes — which is why the chart's
 `persistence.accessMode` offers only the two ReadWriteOnce modes, and why its
 `persistence.storageClass` should name a block-backed class.
-[Configuration](CONFIG.md) has the topology that works instead.
+[Configuration](config.md) has the topology that works instead.
 
 ## Check it runs
 

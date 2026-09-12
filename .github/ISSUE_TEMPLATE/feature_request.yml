@@ -8,11 +8,11 @@ body:
         Two things worth knowing before you write this up, because they decide
         most proposals on their own:
 
-        - **`docs/ARCHITECTURE.md` section 0** lists the mechanisms that did not
+        - **`docs/architecture.md` section 0** lists the mechanisms that did not
           survive contact with the OTLP and Arrow formats, and what replaced
           them. If your idea is in there, the interesting issue is why the
           replacement is not enough — not the original idea.
-        - **`docs/ARCHITECTURE.md` section 0.1** is the list of things already
+        - **`docs/architecture.md` section 0.1** is the list of things already
           known to be missing, and the README's "Scope" is its short form. A
           `+1` on one of those is more useful as a comment on an existing issue
           than as a new one.
@@ -115,5 +115,5 @@ body:
       options:
         - label: I searched the existing issues.
           required: true
-        - label: I checked `docs/ARCHITECTURE.md` sections 0 and 0.1.
+        - label: I checked `docs/architecture.md` sections 0 and 0.1.
           required: true

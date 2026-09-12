@@ -270,4 +270,4 @@ seven tools and a worked investigation: [Connect an agent](agents.md).
 
 - [Install](install.md) — one script, or a container, or `cargo install`.
 - [Quickstart](quickstart.md) — the manual path, and the query API.
-- [Architecture](ARCHITECTURE.md) — why it is shaped like this.
+- [Architecture](architecture.md) — why it is shaped like this.

@@ -34,7 +34,7 @@ COPY dist/linux/${TARGETARCH}/mira /mira
 FROM rust:1-slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS compile
 
 # `cc` is for zstd-sys, which vendors its own C source and is the only C
-# dependency in the tree (docs/ARCHITECTURE.md section 0). No protoc: protox compiles
+# dependency in the tree (docs/architecture.md section 0). No protoc: protox compiles
 # the OTLP protos in mira-proto's build script. No node: crates/mira/ui/dist is
 # committed and `include_bytes!`d.
 RUN apt-get update \

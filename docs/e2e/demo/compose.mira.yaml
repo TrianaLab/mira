@@ -23,7 +23,7 @@ services:
     volumes:
       # Named, not a bind mount: Mira mmaps its blocks and a Docker Desktop bind
       # mount is FUSE, where an I/O hiccup arrives as SIGBUS rather than as an
-      # error (docs/ARCHITECTURE.md section 9).
+      # error (docs/architecture.md section 9).
       - mira-data:/data
 
   otel-collector:

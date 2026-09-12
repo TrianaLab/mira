@@ -20,7 +20,7 @@ them describes behaviour.
 | the ingest channel, flusher and retention worker | [`mira::pipeline`](https://miradb.dev/api/mira/pipeline/index.html) |
 | the write-ahead log | [`mira_core::wal`](https://miradb.dev/api/mira_core/wal/index.html) |
 | every HTTP route and its body | [HTTP API](reference/http.md) — generated from the router |
-| every flag and config key | [CLI](reference/cli.md), [Configuration](CONFIG.md) — generated from the binary and from `Config` |
+| every flag and config key | [CLI](reference/cli.md), [Configuration](config.md) — generated from the binary and from `Config` |
 
 **Status:** the workspace under `crates/` implements most of this and its tests
 pass. Sections marked "still not built" are the exceptions; 0.1 below is the
@@ -168,7 +168,7 @@ it is measured.
   the YAML to either, and nothing moves them at runtime. Adapting them to
   observed load is the ambition and is not built; what is built is the half that
   matters more, which is that neither can be set wrong from outside. There **is**
-  a config file ([Configuration](CONFIG.md)), and it is not a contradiction: it describes
+  a config file ([Configuration](config.md)), and it is not a contradiction: it describes
   *where the process runs* — addresses, data directory, retention policy, replica
   name — and contains no value that affects how the engine performs. The boundary
   is structural, not documentary. It is also closed — eleven keys, and an unknown
@@ -242,7 +242,7 @@ parser in `config.rs`'s tests, not assumed from the spec.
 ```
 mira/
 ├── Cargo.toml                  # workspace, one pinned Arrow version
-├── docs/ARCHITECTURE.md
+├── docs/architecture.md
 └── crates/
     ├── mira-proto/             # vendored .proto + codegen. No hand-written code.
     │   ├── build.rs            # protox (pure Rust) -> tonic-prost-build
@@ -1598,7 +1598,7 @@ this table is also the load harness: `loadgen --readers N --pid N --data-dir P`
 reports ingest, six classes of query latency, the server's resident set and the
 bytes it added per record from one run. An engine measured one axis at a time is
 an engine that is fast at whichever one its authors were watching.
-[End-to-end testing section 3](TESTING.md#3-the-load-harness) is how to drive
+[End-to-end testing section 3](testing.md#3-the-load-harness) is how to drive
 it and what it teaches.
 
 Read the two query columns carefully. **Neither is a cold-disk number**: 7.35
@@ -1685,7 +1685,7 @@ Reading these honestly:
   scoring them together.** The harness reports peak RSS, and it moves by a
   factor of nine across the ingest sweep alone — 244 MiB at 1 connection,
   363 MiB at 2, 862 MiB at 4, 2,040 MiB at 8, 2,244 MiB at 96 in
-  [End-to-end testing section 3](TESTING.md#3-the-load-harness) — which is the
+  [End-to-end testing section 3](testing.md#3-the-load-harness) — which is the
   clearest evidence that
   RSS is not this row: it counts every mapped block page a query touched, and on
   the write side it covers three signals' builders plus every in-flight decode,
@@ -1720,7 +1720,7 @@ Reading these honestly:
   last 100 records", no predicate, so *every* row of the block matches — that is
   an O(n log n) sort of ~330 K hits to keep 100. `select_nth_unstable` partitions
   in linear time and only the surviving head is ordered; on the load harness
-  ([section 3](TESTING.md#3-the-load-harness)), on the smaller store that A/B
+  ([section 3](testing.md#3-the-load-harness)), on the smaller store that A/B
   was run against,
   that took the whole read mix from 35 to 50 queries/s and `tail` p99 from
   230 ms to 139 ms. On the corpus this section measures — twice the rows, eight
@@ -2082,7 +2082,7 @@ concurrency.
 
 **Built**: `crates/mira/src/alert.rs`. Static rules in a KYAML file named by
 `alerts.rules`, evaluated on a timer, dispatched as JSON webhooks. Off unless
-the file is named. The operator-facing half is [CONFIG.md](CONFIG.md); this
+the file is named. The operator-facing half is [config.md](config.md); this
 section is why it has the shape it does.
 
 ### 13.1 A rule embeds a query document, verbatim
