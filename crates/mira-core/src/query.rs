@@ -45,7 +45,7 @@ use arrow_array::types::{
     Float64Type, Int32Type, Int64Type, TimestampNanosecondType, UInt8Type, UInt16Type, UInt32Type,
     UInt64Type,
 };
-use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StringArray};
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 use arrow_schema::DataType;
 use mira_proto::common::v1::AnyValue;
 use prost::Message;
@@ -816,9 +816,9 @@ pub(crate) struct Block {
     signal: Signal,
     pub(crate) root: RecordBatch,
     /// Record-level attributes; `parent_id` indexes `root` directly.
-    attrs: Option<RecordBatch>,
-    resource_attrs: Option<RecordBatch>,
-    scope_attrs: Option<RecordBatch>,
+    attrs: Option<Attrs>,
+    resource_attrs: Option<Attrs>,
+    scope_attrs: Option<Attrs>,
     /// Rows that hang off a root row rather than being one: a span's events and
     /// its links. Empty for logs.
     children: Vec<Child>,
@@ -834,7 +834,7 @@ struct Child {
     /// What the array is called in the emitted row.
     label: &'static str,
     rows: RecordBatch,
-    attrs: Option<RecordBatch>,
+    attrs: Option<Attrs>,
     /// Child rows grouped by the root row they hang off, indexed by it.
     by_parent: Vec<Vec<u32>>,
     /// The root row each child `id` belongs to, indexed by the id. Child ids
@@ -842,6 +842,58 @@ struct Child {
     /// other join here — but it is not the identity, because `id` numbers a
     /// child and the row number is where it happens to sit.
     parent_of_id: Vec<u32>,
+}
+
+/// An attribute table, plus the one fact about it that makes rendering a row
+/// cheap: whether `parent_id` ascends.
+///
+/// Every builder with the [`crate::schema::ATTRS`] shape appends one parent's
+/// attributes in one go, parents in ascending order, so a parent's rows are a
+/// contiguous run and two binary searches find it. [`emit_attrs`] used to scan
+/// the whole table per emitted row per level — on a 330 K-row logs block that
+/// is 66 million comparisons to render a hundred records, and it measured as
+/// *most* of an unfiltered `limit 100`, more than the scan and more than the
+/// paging docs/architecture.md section 11 attributes it to. Same shape
+/// [`Block::emit_children`] already fixed for the child tables; this is the
+/// other half of it.
+///
+/// Checked at open rather than assumed, because a binary search over unsorted
+/// parents does not fail — it silently drops attributes, which is the one
+/// outcome nobody would notice.
+struct Attrs {
+    rows: RecordBatch,
+    ordered: bool,
+}
+
+impl Attrs {
+    fn new(rows: RecordBatch) -> Attrs {
+        let ordered = Attrs::parents(&rows).is_some_and(|p| p.windows(2).all(|w| w[0] <= w[1]));
+        Attrs { rows, ordered }
+    }
+
+    fn parents(rows: &RecordBatch) -> Option<&[u32]> {
+        rows.column(0)
+            .as_primitive_opt::<UInt32Type>()
+            .map(|c| &**c.values())
+    }
+
+    /// The rows belonging to `parent`, as a range the caller still filters —
+    /// exact when the table is ordered, the whole table when it is not.
+    ///
+    /// Takes the column the caller already downcast rather than repeating it,
+    /// since this runs once per emitted row per level.
+    ///
+    /// ponytail: that fallback is the linear scan this replaced, kept for a
+    /// table no builder in this tree produces. It is O(rows) per emitted row;
+    /// if one ever turns up, the fix is to sort it once at open rather than to
+    /// make this cleverer.
+    fn run(&self, parents: &[u32], parent: u32) -> std::ops::Range<usize> {
+        if !self.ordered {
+            return 0..parents.len();
+        }
+        let lo = parents.partition_point(|&p| p < parent);
+        lo..lo + parents[lo..].partition_point(|&p| p == parent)
+    }
 }
 
 /// The child tables of each signal: emitted name, row table, attribute table.
@@ -881,15 +933,15 @@ impl Block {
                     by_parent: crate::series::index_by_parent(&rows),
                     parent_of_id: index_parent_of_id(&rows),
                     rows,
-                    attrs: load(attrs)?,
+                    attrs: load(attrs)?.map(Attrs::new),
                 });
             }
         }
         Ok(Some(Block {
             signal,
-            attrs: load(signal.attrs())?,
-            resource_attrs: load("resource_attrs")?,
-            scope_attrs: load("scope_attrs")?,
+            attrs: load(signal.attrs())?.map(Attrs::new),
+            resource_attrs: load("resource_attrs")?.map(Attrs::new),
+            scope_attrs: load("scope_attrs")?.map(Attrs::new),
             children,
             root,
         }))
@@ -913,13 +965,23 @@ impl Block {
         // covers, usually the most selective. When the block sits wholly inside
         // the window the comparison is skipped entirely — the directory name
         // already proved it, which is the point of putting the range there.
-        let mut sel: Vec<u32> = if q.from <= bref.min_ts && q.to >= bref.max_ts {
-            (0..n as u32).collect()
-        } else {
-            (0..n as u32)
-                .filter(|&i| (q.from..=q.to).contains(&time[i as usize]))
-                .collect()
-        };
+        // ponytail: the selection is now sized for the whole block even when
+        // the time filter throws most of it away, where the filtered collect
+        // this replaced grew to the match count — 4 bytes per row of one block,
+        // for as long as the block's hits take to build, against a fan-out of
+        // sixteen. Worth it for a 2.6x on the one predicate every query has; if
+        // the transient ever matters, `shrink_to_fit` after the time filter
+        // buys it back for one realloc.
+        let mut sel: Vec<u32> = (0..n as u32).collect();
+        if !(q.from <= bref.min_ts && q.to >= bref.max_ts) {
+            // The `&[i64]` loop docs/architecture.md section 10 names as what
+            // replaces intrinsics on the scan, and the one column every query
+            // has a predicate on. `None` for the validity because the time
+            // column is non-nullable in every signal's schema — and the scan it
+            // replaced read the raw slice too, so a nullable one would compare
+            // the same bytes it always did.
+            keep(&mut sel, None, time, |t| (q.from..=q.to).contains(&t));
+        }
 
         for term in &q.terms {
             if sel.is_empty() {
@@ -927,15 +989,14 @@ impl Block {
             }
             match &term.target {
                 Target::Field(name) => {
-                    let pred = self
+                    let ok = self
                         .root
                         .column_by_name(name)
-                        .and_then(|c| field_pred(c.as_ref(), term.op, &term.value));
-                    match pred {
-                        Some(p) => sel.retain(|&i| p(i)),
-                        // Unknown column, or a value that cannot be compared
-                        // against this column's type at all.
-                        None => sel.clear(),
+                        .is_some_and(|c| field_filter(&mut sel, c.as_ref(), term.op, &term.value));
+                    // Unknown column, or a value that cannot be compared
+                    // against this column's type at all.
+                    if !ok {
+                        sel.clear();
                     }
                 }
                 Target::Attr(key) => {
@@ -956,7 +1017,7 @@ impl Block {
         // Record level: parent_id *is* the root row number, so this is a store,
         // not a join. That is what rebasing ids at ingest bought.
         if let Some(a) = &self.attrs {
-            for pid in attr_parents(a, key, op, value) {
+            for pid in attr_parents(&a.rows, key, op, value) {
                 if let Some(slot) = out.get_mut(pid as usize) {
                     *slot = true;
                 }
@@ -974,7 +1035,7 @@ impl Block {
             let (Some(a), Some(col)) = (table, self.root.column_by_name(fk)) else {
                 continue;
             };
-            let ids = attr_parents(a, key, op, value);
+            let ids = attr_parents(&a.rows, key, op, value);
             let Some(&top) = ids.iter().max() else {
                 continue;
             };
@@ -1003,7 +1064,7 @@ impl Block {
         // was missing was the last hop.
         for c in &self.children {
             let Some(a) = &c.attrs else { continue };
-            for id in attr_parents(a, key, op, value) {
+            for id in attr_parents(&a.rows, key, op, value) {
                 // Two `get`s and no `let` chain, for the MSRV reason given in
                 // `search` above.
                 if let Some(slot) = c
@@ -1129,16 +1190,19 @@ pub(crate) fn emit_fields(j: &mut Json, b: &RecordBatch, row: u32) {
 }
 
 /// One `{...}` merging the attributes of several levels, most specific last.
-fn emit_attrs(j: &mut Json, levels: &[(&Option<RecordBatch>, Option<u32>)]) {
+fn emit_attrs(j: &mut Json, levels: &[(&Option<Attrs>, Option<u32>)]) {
     j.obj(|j| {
         let mut merged: Vec<(&str, &RecordBatch, usize)> = Vec::new();
         for &(table, parent) in levels {
             let (Some(a), Some(parent)) = (table, parent) else {
                 continue;
             };
-            let parents = a.column(0).as_primitive::<UInt32Type>().values();
-            for r in (0..a.num_rows()).filter(|&r| parents[r] == parent) {
-                merged.push((attr_key(a, r), a, r));
+            // Empty for a table whose parent column is not a `u32` — which no
+            // schema in this tree produces, and which then emits nothing rather
+            // than panicking on a block someone else wrote.
+            let parents = Attrs::parents(&a.rows).unwrap_or_default();
+            for r in a.run(parents, parent).filter(|&r| parents[r] == parent) {
+                merged.push((attr_key(&a.rows, r), &a.rows, r));
             }
         }
         // Sorted so output is deterministic, and stably so that within one key
@@ -1164,13 +1228,153 @@ pub(crate) fn attr_parents(a: &RecordBatch, key: &str, op: Op, value: &Value) ->
         return Vec::new();
     };
     let codes = keys.keys().values();
-    let parents = a.column(0).as_primitive::<UInt32Type>();
-    let types = a.column(2).as_primitive::<UInt8Type>();
+    let parents = &**a.column(0).as_primitive::<UInt32Type>().values();
+    let types = &**a.column(2).as_primitive::<UInt8Type>().values();
+    let pred = AttrPred::new(a, op, value);
 
-    (0..a.num_rows())
-        .filter(|&i| codes[i] == code && attr_matches(a, types.value(i), i, op, value))
-        .map(|i| parents.value(i))
+    // Three raw buffers zipped, so the key test — which rejects most rows in a
+    // table holding every key of every record — is a `u16` compare against a
+    // slice the bounds check is already gone from.
+    codes
+        .iter()
+        .zip(types)
+        .zip(parents)
+        .enumerate()
+        .filter_map(|(i, ((&c, &ty), &p))| (c == code && pred.test(ty, i)).then_some(p))
         .collect()
+}
+
+/// One attribute term with everything that does not depend on the row resolved
+/// once: the four value columns downcast, the query scalar canonicalized, and —
+/// for the string column — the predicate already evaluated against the
+/// dictionary.
+///
+/// This used to be [`attr_matches`], which did all of it *per row*: two
+/// `downcast_ref`s, a `String` allocation for [`canon`], and a `parse::<f64>()`
+/// on every ordered comparison. That measured 30.9 ns per root row against 6.1
+/// for the allocation-free integer arm, which made an attribute filter fifteen
+/// times dearer than a column one on the same block.
+struct AttrPred<'a> {
+    op: Op,
+    /// The `str` column's dictionary codes, and which dictionary entries
+    /// satisfy the predicate.
+    ///
+    /// The same trick as [`field_filter`]'s `Dictionary` arm: attribute values
+    /// are where telemetry repeats (see [`crate::schema::ATTRS`]), so a few
+    /// hundred string comparisons replace one per row and the row loop never
+    /// touches string data.
+    ///
+    /// ponytail: evaluated over the whole dictionary, which every key in the
+    /// table shares — so filtering on a rare key in a block whose values are
+    /// nearly all distinct pays one comparison per distinct value to reject a
+    /// handful of rows. The ceiling is a value column with no repetition in it,
+    /// which is the case its dictionary encoding is already the wrong layout
+    /// for; the upgrade path is a lazily filled memo over the same array.
+    strs: Option<(&'a [u32], Vec<bool>)>,
+    ints: Option<(&'a [i64], i64)>,
+    doubles: Option<(&'a [f64], f64)>,
+    bools: Option<(&'a BooleanArray, bool)>,
+}
+
+impl AttrPred<'_> {
+    fn new<'a>(a: &'a RecordBatch, op: Op, v: &Value) -> AttrPred<'a> {
+        let text = canon(v);
+        // A quoted query scalar asked for a text comparison and gets one; so
+        // does anything that is not a number. Decided once rather than per row.
+        let numeric = !matches!(v, Value::Str(_));
+        // `_opt` on all four: a table whose columns are not the ATTRS shape
+        // matches nothing here instead of panicking inside a scan thread.
+        let strs = a
+            .column(3)
+            .as_dictionary_opt::<UInt32Type>()
+            .and_then(|d| Some((d, d.values().as_string_opt::<i32>()?)))
+            .map(|(d, values)| {
+                let ok = (0..values.len())
+                    .map(|i| {
+                        let s = values.value(i);
+                        match op {
+                            Op::Contains => s.contains(text.as_str()),
+                            // Equality against a string column is *defined* as
+                            // equality with `canon`, because that is the text
+                            // the block index holds (see [`canon`]). Widening
+                            // it any further — say, matching the stored string
+                            // "200.0" against `eq: 200` because both parse to
+                            // the same number — would make the filter prune
+                            // away blocks that do contain a match, which is the
+                            // one failure mode a sidecar is not allowed to
+                            // have.
+                            Op::Eq | Op::Ne => op.test_ord(s.cmp(text.as_str())),
+                            // Ordering is not in the index — `attr_probes` only
+                            // takes `Op::Eq` — so there is nothing here to
+                            // disagree with, and a number written as a string
+                            // can be ordered as the number it is. It has to be:
+                            // half the SDKs that emit
+                            // `http.response.status_code` emit it as text, and
+                            // lexicographically "1000" sorts below "400", so
+                            // `gte: 400` would otherwise mean something
+                            // different on each of them.
+                            _ => match (s.parse::<f64>(), v.as_f64()) {
+                                (Ok(x), Some(y)) if numeric => {
+                                    x.partial_cmp(&y).is_some_and(|o| op.test_ord(o))
+                                }
+                                _ => op.test_ord(s.cmp(text.as_str())),
+                            },
+                        }
+                    })
+                    .collect();
+                (&**d.keys().values(), ok)
+            });
+        AttrPred {
+            op,
+            strs,
+            ints: a
+                .column(4)
+                .as_primitive_opt::<Int64Type>()
+                .zip(v.as_i64())
+                .map(|(c, y)| (&**c.values(), y)),
+            doubles: a
+                .column(5)
+                .as_primitive_opt::<Float64Type>()
+                .zip(v.as_f64())
+                .map(|(c, y)| (&**c.values(), y)),
+            bools: a.column(6).as_boolean_opt().zip(v.as_bool()),
+        }
+    }
+
+    /// Compare one attribute row against the query scalar, dispatching on the
+    /// stored `type` rather than on the query's — the column decides what it
+    /// is.
+    ///
+    /// Empty, Bytes, Slice and Map are returned in results but not filterable
+    /// in V0, and a column whose type does not match the schema reads the same
+    /// way: no match.
+    fn test(&self, ty: u8, row: usize) -> bool {
+        const STR: u8 = AttrType::Str as u8;
+        const INT: u8 = AttrType::Int as u8;
+        const DOUBLE: u8 = AttrType::Double as u8;
+        const BOOL: u8 = AttrType::Bool as u8;
+        match ty {
+            STR => self.strs.as_ref().is_some_and(|(codes, ok)| {
+                codes
+                    .get(row)
+                    .and_then(|&c| ok.get(c as usize))
+                    .copied()
+                    .unwrap_or(false)
+            }),
+            INT => self
+                .ints
+                .is_some_and(|(xs, y)| xs.get(row).is_some_and(|&x| self.op.test_ord(x.cmp(&y)))),
+            DOUBLE => self.doubles.is_some_and(|(xs, y)| {
+                xs.get(row)
+                    .and_then(|x| x.partial_cmp(&y))
+                    .is_some_and(|o| self.op.test_ord(o))
+            }),
+            BOOL => self
+                .bools
+                .is_some_and(|(xs, y)| row < xs.len() && self.op.test_ord(xs.value(row).cmp(&y))),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) fn attr_key(a: &RecordBatch, row: usize) -> &str {
@@ -1178,64 +1382,6 @@ pub(crate) fn attr_key(a: &RecordBatch, row: usize) -> &str {
     d.values()
         .as_string::<i32>()
         .value(d.keys().value(row) as usize)
-}
-
-/// Compare one attribute row against a query scalar, dispatching on the stored
-/// `type` rather than on the query's — the column decides what it is.
-fn attr_matches(a: &RecordBatch, ty: u8, row: usize, op: Op, v: &Value) -> bool {
-    const STR: u8 = AttrType::Str as u8;
-    const INT: u8 = AttrType::Int as u8;
-    const DOUBLE: u8 = AttrType::Double as u8;
-    const BOOL: u8 = AttrType::Bool as u8;
-    match ty {
-        STR => {
-            let strs = crate::attrs::str_column(a);
-            let s = strs.value(row);
-            match op {
-                // Equality against a string column is *defined* as equality
-                // with `canon`, because that is the text the block index holds
-                // (see [`canon`]). Widening it any further — say, matching the
-                // stored string "200.0" against `eq: 200` because both parse to
-                // the same number — would make the filter prune away blocks
-                // that do contain a match, which is the one failure mode a
-                // sidecar is not allowed to have.
-                Op::Eq | Op::Ne => op.test_ord(s.cmp(canon(v).as_str())),
-                Op::Contains => s.contains(canon(v).as_str()),
-                // Ordering is not in the index — `attr_probes` only takes
-                // `Op::Eq` — so there is nothing here to disagree with, and a
-                // number written as a string can be ordered as the number it
-                // is. It has to be: half the SDKs that emit
-                // `http.response.status_code` emit it as text, and
-                // lexicographically "1000" sorts below "400", so `gte: 400`
-                // would otherwise mean something different on each of them.
-                _ => match (s.parse::<f64>(), v.as_f64()) {
-                    (Ok(x), Some(y)) if !matches!(v, Value::Str(_)) => {
-                        x.partial_cmp(&y).is_some_and(|o| op.test_ord(o))
-                    }
-                    // A quoted query scalar asked for a text comparison and
-                    // gets one; so does anything that is not a number.
-                    _ => op.test_ord(s.cmp(canon(v).as_str())),
-                },
-            }
-        }
-        INT => {
-            let x = a.column(4).as_primitive::<Int64Type>().value(row);
-            v.as_i64().is_some_and(|y| op.test_ord(x.cmp(&y)))
-        }
-        DOUBLE => {
-            let x = a.column(5).as_primitive::<Float64Type>().value(row);
-            v.as_f64()
-                .and_then(|y| x.partial_cmp(&y))
-                .is_some_and(|o| op.test_ord(o))
-        }
-        BOOL => {
-            let x = a.column(6).as_boolean().value(row);
-            v.as_bool().is_some_and(|y| op.test_ord(x.cmp(&y)))
-        }
-        // Empty, Bytes, Slice and Map are returned in results but not
-        // filterable in V0.
-        _ => false,
-    }
 }
 
 /// Position of `needle` in a dictionary's value array.
@@ -1249,65 +1395,55 @@ pub(crate) fn dict_index(values: &StringArray, needle: &str) -> Option<u16> {
         .map(|i| i as u16)
 }
 
-/// Build a row predicate for a root-table column, with type dispatch done once
-/// instead of per row.
+/// Narrow `sel` to the rows of `col` satisfying `op value`.
 ///
-/// `None` means the query value cannot be compared against this column at all,
-/// which the caller turns into an empty result.
-fn field_pred<'a>(col: &'a dyn Array, op: Op, v: &Value) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
-    macro_rules! int_col {
+/// `false` means the query value cannot be compared against this column at all,
+/// which the caller turns into an empty result. Nothing is written to `sel`
+/// before that decision, so a refusal leaves it untouched.
+///
+/// One monomorphic loop per column type, where this used to build a
+/// `Box<dyn Fn(u32) -> bool>` and pay an indirect call per row.
+/// docs/architecture.md section 10 rejects hand-written intrinsics on the scan
+/// and names what replaces them: "a tight loop over `&[i64]` with no bounds
+/// checks and no branches, which LLVM turns into NEON unasked". That is what
+/// [`keep`] is; this function's only job is to hand it a values slice and a
+/// comparison that inlines into it.
+fn field_filter(sel: &mut Vec<u32>, col: &dyn Array, op: Op, v: &Value) -> bool {
+    macro_rules! ints {
         ($t:ty) => {{
-            let a = col.as_primitive::<$t>();
-            let target = v.as_i64()?;
-            Some(Box::new(move |i: u32| {
-                !a.is_null(i as usize) && op.test_ord((a.value(i as usize) as i64).cmp(&target))
-            }) as Box<dyn Fn(u32) -> bool + 'a>)
+            let Some(target) = v.as_i64() else {
+                return false;
+            };
+            let vals = col.as_primitive::<$t>().values();
+            keep(sel, col.nulls(), vals, |x| {
+                op.test_ord((x as i64).cmp(&target))
+            });
         }};
     }
 
     match col.data_type() {
-        DataType::Timestamp(_, _) => int_col!(TimestampNanosecondType),
-        DataType::Int64 => int_col!(Int64Type),
-        DataType::Int32 => int_col!(Int32Type),
-        DataType::UInt64 => int_col!(UInt64Type),
-        DataType::UInt32 => int_col!(UInt32Type),
-        DataType::UInt16 => int_col!(UInt16Type),
-        DataType::UInt8 => int_col!(UInt8Type),
+        DataType::Timestamp(_, _) => ints!(TimestampNanosecondType),
+        DataType::Int64 => ints!(Int64Type),
+        DataType::Int32 => ints!(Int32Type),
+        DataType::UInt64 => ints!(UInt64Type),
+        DataType::UInt32 => ints!(UInt32Type),
+        DataType::UInt16 => ints!(UInt16Type),
+        DataType::UInt8 => ints!(UInt8Type),
         DataType::Float64 => {
-            let a = col.as_primitive::<Float64Type>();
-            let target = v.as_f64()?;
-            Some(Box::new(move |i: u32| {
-                !a.is_null(i as usize)
-                    && a.value(i as usize)
-                        .partial_cmp(&target)
-                        .is_some_and(|o| op.test_ord(o))
-            }))
-        }
-        DataType::Boolean => {
-            let a = col.as_boolean();
-            let target = v.as_bool()?;
-            Some(Box::new(move |i: u32| {
-                !a.is_null(i as usize) && op.test_ord(a.value(i as usize).cmp(&target))
-            }))
-        }
-        DataType::Utf8 => {
-            let a = col.as_string::<i32>();
-            let target = v.as_str()?.to_owned();
-            Some(Box::new(move |i: u32| {
-                if a.is_null(i as usize) {
-                    return false;
-                }
-                let s = a.value(i as usize);
-                match op {
-                    Op::Contains => s.contains(&target),
-                    _ => op.test_ord(s.cmp(target.as_str())),
-                }
-            }))
+            let Some(target) = v.as_f64() else {
+                return false;
+            };
+            let vals = col.as_primitive::<Float64Type>().values();
+            keep(sel, col.nulls(), vals, |x: f64| {
+                x.partial_cmp(&target).is_some_and(|o| op.test_ord(o))
+            });
         }
         DataType::Dictionary(_, _) => {
             let d = col.as_dictionary::<UInt16Type>();
             let values = d.values().as_string::<i32>();
-            let needle = v.as_str()?;
+            let Some(needle) = v.as_str() else {
+                return false;
+            };
             // Evaluate the predicate against the dictionary, not the rows: a
             // few dozen string comparisons replace one per row, and the scan
             // below is a lookup table indexed by a u16.
@@ -1320,25 +1456,104 @@ fn field_pred<'a>(col: &'a dyn Array, op: Op, v: &Value) -> Option<Box<dyn Fn(u3
                     }
                 })
                 .collect();
-            let codes = d.keys();
-            Some(Box::new(move |i: u32| {
-                !codes.is_null(i as usize)
-                    && ok
-                        .get(codes.value(i as usize) as usize)
-                        .copied()
-                        .unwrap_or(false)
-            }))
+            keep(sel, col.nulls(), d.keys().values(), |c| {
+                ok.get(c as usize).copied().unwrap_or(false)
+            });
+        }
+        DataType::Boolean => {
+            let a = col.as_boolean();
+            let Some(target) = v.as_bool() else {
+                return false;
+            };
+            keep_by(sel, a.len(), col.nulls(), |i| {
+                op.test_ord(a.value(i).cmp(&target))
+            });
+        }
+        DataType::Utf8 => {
+            let a = col.as_string::<i32>();
+            let Some(target) = v.as_str() else {
+                return false;
+            };
+            keep_by(sel, a.len(), col.nulls(), |i| {
+                let s = a.value(i);
+                match op {
+                    Op::Contains => s.contains(target),
+                    _ => op.test_ord(s.cmp(target)),
+                }
+            });
         }
         DataType::FixedSizeBinary(_) => {
             // Trace and span ids: hex in the query, bytes on disk. Decoding the
             // needle once beats hex-encoding every row.
-            let a = col.as_any().downcast_ref::<FixedSizeBinaryArray>()?;
-            let target = unhex(v.as_str()?)?;
-            Some(Box::new(move |i: u32| {
-                !a.is_null(i as usize) && op.test_ord(a.value(i as usize).cmp(target.as_slice()))
-            }))
+            let a = col.as_fixed_size_binary();
+            let Some(target) = v.as_str().and_then(unhex) else {
+                return false;
+            };
+            keep_by(sel, a.len(), col.nulls(), |i| {
+                op.test_ord(a.value(i).cmp(target.as_slice()))
+            });
         }
-        _ => None,
+        _ => return false,
+    }
+    true
+}
+
+/// Narrow `sel` to the rows where `p(vals[row])` holds.
+///
+/// Three shapes, because the first one is the whole point. A column with no
+/// nulls, not yet narrowed by an earlier term — which is every first term on a
+/// block the time range covers whole — walks `vals` contiguously and writes the
+/// surviving row number unconditionally, advancing the cursor by the boolean.
+/// No indirect call, no bounds check on the load, and no branch in the body, so
+/// the comparison itself stays in vector registers.
+///
+/// `sel.len() == vals.len()` is what proves the selection is still the identity
+/// `0..n`: [`Block::select`] only ever removes from it, and it is built
+/// ascending, so a full-length selection has nothing missing from it.
+///
+/// ponytail: the two narrowed shapes stay a gather under `retain` and do not
+/// vectorise. Making them would mean the selection becoming a bitmap so every
+/// term reads and writes contiguously — a different engine, and worth it only
+/// once a query with several selective terms shows up in a profile. Terms are
+/// applied cheapest-first-by-accident today, and most queries carry one.
+fn keep<T: Copy>(
+    sel: &mut Vec<u32>,
+    nulls: Option<&arrow_buffer::NullBuffer>,
+    vals: &[T],
+    p: impl Fn(T) -> bool,
+) {
+    match nulls {
+        None if sel.len() == vals.len() => {
+            let mut k = 0;
+            for (i, &x) in vals.iter().enumerate() {
+                sel[k] = i as u32;
+                k += p(x) as usize;
+            }
+            sel.truncate(k);
+        }
+        None => sel.retain(|&i| vals.get(i as usize).is_some_and(|&x| p(x))),
+        // An `is_null` per row is what kept this loop scalar, which is why the
+        // case above exists at all. Every column a sealed block filters on is
+        // non-null in practice; this is the path that stays correct when one is
+        // not.
+        Some(n) => {
+            sel.retain(|&i| n.is_valid(i as usize) && vals.get(i as usize).is_some_and(|&x| p(x)));
+        }
+    }
+}
+
+/// [`keep`] for a column with no values slice to walk: a bitmap, a variable
+/// offset array or a fixed stride, none of which a vector register helps with.
+/// The win here is only the closure being monomorphic rather than boxed.
+fn keep_by(
+    sel: &mut Vec<u32>,
+    len: usize,
+    nulls: Option<&arrow_buffer::NullBuffer>,
+    p: impl Fn(usize) -> bool,
+) {
+    match nulls {
+        None => sel.retain(|&i| (i as usize) < len && p(i as usize)),
+        Some(n) => sel.retain(|&i| n.is_valid(i as usize) && p(i as usize)),
     }
 }
 
@@ -1493,15 +1708,19 @@ mod tests {
     use super::*;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::{
-        BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
-        TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        BinaryArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
+        ListArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use std::sync::Arc;
 
+    /// `u32::MAX` for "this column cannot be compared against this value",
+    /// which the scan turns into an empty result rather than into every row.
     fn hits(col: &dyn Array, op: Op, v: &Value) -> Vec<u32> {
-        match field_pred(col, op, v) {
-            Some(p) => (0..col.len() as u32).filter(|&i| p(i)).collect(),
-            None => vec![u32::MAX],
+        let mut sel: Vec<u32> = (0..col.len() as u32).collect();
+        if field_filter(&mut sel, col, op, v) {
+            sel
+        } else {
+            vec![u32::MAX]
         }
     }
 
@@ -2529,6 +2748,321 @@ mod tests {
         // A short page is the last page, so there is nothing to ask for again.
         assert_eq!(cursor, None);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`keep`] is three loops where there used to be one boxed closure, and
+    /// only one of them is reachable from a full selection — so the thing to
+    /// pin is that all three answer the same question.
+    ///
+    /// The contiguous branch-free loop is taken when the column has no nulls
+    /// *and* nothing has narrowed the selection yet; a second term on the same
+    /// block, or any null at all, gathers through `sel` instead. Every
+    /// column-type case above enters through the first of those, which is
+    /// exactly why the other two need their own test.
+    #[test]
+    fn narrowing_a_selection_agrees_with_scanning_one_whole() {
+        let plain = Int64Array::from(vec![1, 2, 3, 4, 5, 6]);
+        let holed = Int64Array::from(vec![Some(1), None, Some(3), Some(4), None, Some(6)]);
+        let gt2 = |sel: &mut Vec<u32>, col: &dyn Array| {
+            assert!(field_filter(sel, col, Op::Gt, &Value::Int(2)));
+        };
+
+        let mut sel: Vec<u32> = (0..6).collect();
+        gt2(&mut sel, &plain);
+        assert_eq!(sel, [2, 3, 4, 5], "whole block, no nulls");
+
+        let mut sel = vec![1, 3, 5];
+        gt2(&mut sel, &plain);
+        assert_eq!(sel, [3, 5], "already narrowed by an earlier term");
+
+        let mut sel: Vec<u32> = (0..6).collect();
+        gt2(&mut sel, &holed);
+        assert_eq!(sel, [2, 3, 5], "a null is not a match, whole block");
+
+        let mut sel = vec![1, 3, 4];
+        gt2(&mut sel, &holed);
+        assert_eq!(sel, [3], "a null is not a match, narrowed");
+
+        // Nothing selected stays nothing selected — the length test that picks
+        // the fast path must not read an empty selection as a full one.
+        let mut sel: Vec<u32> = Vec::new();
+        gt2(&mut sel, &plain);
+        assert!(sel.is_empty());
+
+        // A refusal writes nothing: `select` clears the selection itself, and
+        // a half-filtered one left behind would be an answer, not an empty
+        // result.
+        let mut sel: Vec<u32> = (0..6).collect();
+        assert!(!field_filter(
+            &mut sel,
+            &plain,
+            Op::Eq,
+            &Value::Str("beta".into())
+        ));
+        assert_eq!(sel.len(), 6);
+
+        // And the same both ways round: a number against a dictionary column
+        // has no encoding to look up, so it is a refusal rather than a miss.
+        // `severity_text: 2` must not quietly mean "no logs", which is what a
+        // plain `false` per row would have made it.
+        let mut d = StringDictionaryBuilder::<UInt16Type>::new();
+        d.append_value("warn");
+        d.append_value("info");
+        let dict = d.finish();
+        let mut sel: Vec<u32> = (0..2).collect();
+        assert!(!field_filter(&mut sel, &dict, Op::Eq, &Value::Int(2)));
+        assert_eq!(sel.len(), 2);
+    }
+
+    /// Rendering a row binary-searches its attributes, which is only right
+    /// because every builder appends parents in ascending order.
+    ///
+    /// A table that is not in that order has to keep working, and the reason is
+    /// the failure mode rather than the likelihood: a binary search over
+    /// unsorted parents does not fail, it returns some of the rows, and an
+    /// attribute quietly missing from a response is what nobody would notice.
+    #[test]
+    fn an_attribute_table_out_of_parent_order_falls_back_to_the_scan() {
+        let table = |parents: &'static [u32]| {
+            let mut b = crate::attrs::AttrsBuilder::new("t.key");
+            for &p in parents {
+                b.append(p, "k", None).unwrap();
+            }
+            let a = Attrs::new(b.finish().unwrap());
+            // The slice `run` is handed below is the caller's own, so pin it to
+            // the column the builder actually wrote before trusting it.
+            assert_eq!(Attrs::parents(&a.rows), Some(parents));
+            (a, parents)
+        };
+
+        let (ordered, p) = table(&[0, 0, 1, 3, 3]);
+        assert!(ordered.ordered);
+        assert_eq!(ordered.run(p, 0), 0..2);
+        assert_eq!(ordered.run(p, 1), 2..3);
+        // A parent with no attributes of its own, and one past the end: both
+        // are empty runs rather than a panic or somebody else's rows.
+        assert_eq!(ordered.run(p, 2), 3..3);
+        assert_eq!(ordered.run(p, 9), 5..5);
+
+        let (jumbled, p) = table(&[3, 0, 1, 0, 3]);
+        assert!(!jumbled.ordered);
+        // The whole table, which the caller still filters row by row — the
+        // scan this replaced, reached only by a block nothing here writes.
+        assert_eq!(jumbled.run(p, 0), 0..5);
+
+        // An empty table is ordered by vacuous truth and has no rows for
+        // anyone, which is the same answer either way.
+        let (empty, p) = table(&[]);
+        assert_eq!(empty.run(p, 0), 0..0);
+    }
+
+    /// One log block of `rows` records, through the real encoder, held in
+    /// memory as an [`Open`] snapshot so a scan of it touches no file.
+    fn bench_block(rows: usize) -> Open {
+        use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
+        use mira_proto::common::v1::{InstrumentationScope, KeyValue, any_value};
+        use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use mira_proto::resource::v1::Resource;
+
+        let sv = |k: &str, v: &str| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.into())),
+            }),
+        };
+        const SEV: [(i32, &str); 4] = [(5, "DEBUG"), (9, "INFO"), (13, "WARN"), (17, "ERROR")];
+        const ROUTES: [&str; 6] = [
+            "/checkout",
+            "/cart",
+            "/search",
+            "/api/v1/orders",
+            "/healthz",
+            "/metrics",
+        ];
+
+        let mut b = crate::logs::LogsBuilder::new();
+        let mut done = 0usize;
+        while done < rows {
+            let take = (rows - done).min(8192);
+            let log_records = (0..take)
+                .map(|k| {
+                    let i = done + k;
+                    LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000 + i as u64 * 1_000,
+                        severity_number: SEV[i % 4].0,
+                        severity_text: SEV[i % 4].1.into(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(format!(
+                                "GET /api/v1/orders/{i} -> 200 in {}ms for tenant t{}",
+                                i % 997,
+                                i % 64
+                            ))),
+                        }),
+                        attributes: vec![
+                            sv("http.route", ROUTES[i % ROUTES.len()]),
+                            KeyValue {
+                                key: "http.status_code".into(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::IntValue(
+                                        200 + (i % 5) as i64 * 100,
+                                    )),
+                                }),
+                            },
+                        ],
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            b.append_request(&ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![sv("service.name", "checkout"), sv("env", "prod")],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: "http".into(),
+                            attributes: vec![sv("tier", "gold")],
+                            ..Default::default()
+                        }),
+                        log_records,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            })
+            .unwrap();
+            done += take;
+        }
+        Open {
+            node: 1,
+            seq: 1,
+            sealed: b.finish().unwrap(),
+        }
+    }
+
+    /// What one row of one block costs to filter, per predicate kind, with no
+    /// paging and no CRC in the number.
+    ///
+    /// Scaled rather than `#[ignore]`d: the default 4096 rows run in the normal
+    /// suite, so every line here is a covered correctness check on the six
+    /// predicate shapes, and the same code is the measurement at a real row
+    /// count.
+    ///
+    /// ```sh
+    /// MIRA_BENCH_ROWS=2000000 cargo test --release -p mira-core \
+    ///     --lib scan_cost_per_row -- --nocapture
+    /// ```
+    #[test]
+    fn scan_cost_per_row() {
+        let rows: usize = std::env::var("MIRA_BENCH_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4_096);
+        let open = bench_block(rows);
+        let (lo, hi) = (open.sealed.min_ts, open.sealed.max_ts);
+        let src = Src::open(&open);
+        let b = Block::open(&src, Signal::Logs).unwrap().unwrap();
+        let n = b.root.num_rows();
+        assert_eq!(n, rows);
+
+        let all = |terms: Vec<Term>| Search {
+            signal: Signal::Logs,
+            from: 0,
+            to: i64::MAX,
+            terms,
+            limit: 100,
+            after: None,
+        };
+        let field = |name: &str, op, value| {
+            all(vec![Term {
+                target: Target::Field(name.into()),
+                op,
+                value,
+            }])
+        };
+        let attr = |key: &str, op, value| {
+            all(vec![Term {
+                target: Target::Attr(key.into()),
+                op,
+                value,
+            }])
+        };
+        let cases: Vec<(&str, Search)> = vec![
+            ("no term (whole block)", all(Vec::new())),
+            (
+                "time range (per-row)",
+                Search {
+                    from: lo + (hi - lo) / 4,
+                    to: hi,
+                    ..all(Vec::new())
+                },
+            ),
+            (
+                "int field  severity_number gte",
+                field("severity_number", Op::Gte, Value::Int(9)),
+            ),
+            (
+                "utf8 field body contains",
+                field("body", Op::Contains, Value::Str("tenant t7".into())),
+            ),
+            (
+                "dict field severity_text eq",
+                field("severity_text", Op::Eq, Value::Str("ERROR".into())),
+            ),
+            (
+                "attr record http.route eq",
+                attr("http.route", Op::Eq, Value::Str("/checkout".into())),
+            ),
+            (
+                "attr record http.status_code gte",
+                attr("http.status_code", Op::Gte, Value::Int(500)),
+            ),
+            (
+                "attr resource service.name eq",
+                attr("service.name", Op::Eq, Value::Str("checkout".into())),
+            ),
+        ];
+
+        let reps = if rows > 100_000 { 5 } else { 1 };
+        for (name, s) in &cases {
+            let hit = b.select(s, &src).len();
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(b.select(s, &src));
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (reps * n) as f64;
+            println!("{name:34} {ns:8.3} ns/row  {hit} of {n}");
+            assert!(hit > 0, "{name} matched nothing");
+        }
+
+        // And the same block through the whole read path, published and warm,
+        // so `select` can be read as a fraction of what a query actually costs.
+        // Everything outside it — the mmap's minor faults, the CRC32 of every
+        // table body, the dictionary scan, `Block::open`'s two child indexes,
+        // the cursor filter and the JSON of `limit` rows — is the "no term"
+        // line, and that is the claim in docs/architecture.md section 11 that
+        // the per-block cost is paging rather than scanning.
+        let dir = std::env::temp_dir().join(format!("mira-scan-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::block::publish(&dir, "logs", 1, 1, 0, &open.sealed).unwrap();
+        let one = (
+            "no term, limit 1",
+            Search {
+                limit: 1,
+                ..all(Vec::new())
+            },
+        );
+        for (name, s) in [&cases[0], &one, &cases[3], &cases[5]] {
+            let _ = search(&dir, s).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(search(&dir, s).unwrap());
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (reps * n) as f64;
+            println!("  full search: {name:21} {ns:8.3} ns/row");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

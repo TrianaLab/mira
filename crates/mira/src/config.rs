@@ -139,6 +139,18 @@ pub struct Config {
     /// to avoid a 503. Each slot can hold a decoded export, so the worst case is
     /// this times [`Config::max_request_bytes`] times three signals resident.
     pub queue: usize,
+    /// How many flushers a signal runs, or 0 for "one per two cores".
+    ///
+    /// One shard per core is the sanctioned unit (architecture.md section 4);
+    /// this is only here so the number can be pinned when the machine lies
+    /// about its core count — a cgroup CPU quota is invisible to
+    /// `available_parallelism`, and a 96-core host running Mira at 2 CPUs would
+    /// otherwise start 48 flushers per signal and publish 48 files per seal
+    /// window. Set it to the quota, or to 1 to get the pre-0.0.2 behaviour.
+    ///
+    /// Shards split `queue`, they do not multiply it: the resident worst case
+    /// is the same whatever this is. Capped at `pipeline::MAX_SHARDS`.
+    pub shards: usize,
     /// Acknowledge an export once it is a frame in the write-ahead log, rather
     /// than once the block holding it has been published.
     ///
@@ -218,6 +230,8 @@ impl Default for Config {
             // is a decision an operator makes with the sweep in front of them
             // rather than a number that quietly moved under everyone.
             queue: 128,
+            // Auto: `pipeline::shard_count` reads the core count at startup.
+            shards: 0,
             // On, now that the open block is queryable (section 4). The reason it
             // was off was that acking before the seal let a query miss data the
             // sender had been told was stored; the snapshot closes that, so
@@ -270,6 +284,9 @@ impl Config {
         if let Some(v) = get(&root, "ingest.queue", env)? {
             cfg.queue = positive(&v).map_err(|e| format!("ingest.queue: {e}"))?;
         }
+        if let Some(v) = get(&root, "ingest.shards", env)? {
+            cfg.shards = whole(&v).map_err(|e| format!("ingest.shards: {e}"))?;
+        }
         if let Some(v) = get(&root, "ingest.wal", env)? {
             cfg.wal = boolean(&v).map_err(|e| format!("ingest.wal: {e}"))?;
         }
@@ -289,7 +306,7 @@ impl Config {
 }
 
 /// Every path this file may contain, in the order [`Config::parse`] reads them.
-const KNOWN: [&str; 11] = [
+const KNOWN: [&str; 12] = [
     "node",
     "listen.grpc",
     "listen.http",
@@ -297,6 +314,7 @@ const KNOWN: [&str; 11] = [
     "storage.retention",
     "ingest.max_request_bytes",
     "ingest.queue",
+    "ingest.shards",
     "ingest.wal",
     "telemetry.self",
     "telemetry.interval",
@@ -538,11 +556,18 @@ pub fn boolean(s: &str) -> Result<bool> {
 /// silently meaning "rendezvous channel", which is what `mpsc::channel(0)` would
 /// panic on and what an operator typing it would never intend.
 pub fn positive(s: &str) -> Result<usize> {
-    match s.trim().parse::<usize>() {
-        Ok(0) => Err("must be at least 1".into()),
-        Ok(n) => Ok(n),
-        Err(_) => Err(format!("{s:?} is not a whole number")),
+    match whole(s)? {
+        0 => Err("must be at least 1".into()),
+        n => Ok(n),
     }
+}
+
+/// A count of things where zero is an answer rather than a mistake — see
+/// [`Config::shards`], where it means "ask the machine".
+pub fn whole(s: &str) -> Result<usize> {
+    s.trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{s:?} is not a whole number"))
 }
 
 /// `500ms`, `30s`, `5m`, `2h`, `7d`. A bare number is seconds.

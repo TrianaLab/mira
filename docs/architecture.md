@@ -505,10 +505,10 @@ that come back *faster* than uncompressed ones.
 ## 4. Ingest path
 
 ```
-gRPC 4317 (tonic) ─┐
-                   ├─> Ingest::submit ─> mpsc(128) ─> flusher ─> spawn_blocking ─> publish
-HTTP 4318 (axum) ──┘         │                                        │
-                             └────────── oneshot ack ─────────────────┘
+gRPC 4317 (tonic) ─┐                    ┌─ mpsc ─> flusher 0 ─┐
+                   ├─> Ingest::submit ──┼─ mpsc ─> flusher 1 ─┼─> spawn_blocking ─> publish
+HTTP 4318 (axum) ──┘         │          └─ mpsc ─> flusher k ─┘         │
+                             └─────────────── oneshot ack ──────────────┘
 ```
 
 **gzip on both listeners, because the spec says MUST and the exporter says
@@ -637,13 +637,62 @@ gone — is a query answered from the previous snapshot instead of a fresh one.
 That is overload or shutdown, and a query that waits its turn behind an
 overloaded ingest path is the worse answer.
 
-**A note on sharding.** The design is one shard per listener/core
-(`SO_REUSEPORT`), not sharding by resource hash. Resource cardinality in real
-fleets is bimodal — a handful of huge resources carrying 90% of volume, plus a
-long near-idle tail — so hash sharding gives a permanently hot shard *and* a
-small-file explosion in the tail. Files per flush interval should be a function
-of core count, known at startup, not of the customer's topology. The skeleton
-runs a single shard; the boundary is already in the right place.
+**Sharding, and what a shard may be keyed on.** The unit is the core, not the
+resource hash. Resource cardinality in real fleets is bimodal — a handful of
+huge resources carrying 90% of volume, plus a long near-idle tail — so hash
+sharding gives a permanently hot shard *and* a small-file explosion in the tail.
+Files per flush interval should be a function of core count, known at startup,
+not of the customer's topology.
+
+Each signal runs `ingest.shards` flushers, defaulting to *cores ÷ 2* and capped
+at 16. Halved because a flusher is a **consumer**: the producers are the protobuf
+decode and the runtime's own work, and giving every core a flusher leaves nothing
+to feed them. The knob exists for one reason — a cgroup CPU quota is invisible to
+`available_parallelism`, so a 96-core host running Mira at 2 CPUs would otherwise
+start 48 flushers a signal — and `ingest.shards: 1` restores the single-flusher
+behaviour exactly.
+
+Four things had to move, and none of them is the one line "shard the flusher"
+suggests:
+
+- **Dispatch is first fit from shard 0, not round-robin.** `Ingest::reserve`
+  walks the shards in order and takes the first `try_reserve` that succeeds. A
+  node doing two exports a second therefore behaves exactly as it did with one
+  flusher — one block per seal window, not `shards` nearly-empty ones — and only
+  starts using the second shard at the moment the first one's queue stops
+  draining, which is the moment the consumer's service time became the curve.
+  Round-robin would have reintroduced the small-file explosion the paragraph
+  above rejects hash sharding for, from the other direction. Ordering *across*
+  shards is not preserved and does not need to be: two exports are two OTLP
+  requests and the spec orders neither against the other. Ordering *within* a
+  shard still is, which is what the carry rule in section 5 needs.
+- **The sequence space is partitioned by stride, not by an allocator.** Shard
+  *k* takes `resume + k`, `resume + k + shards`, and so on. A sequence only has
+  to be unique, the residues mod `shards` are distinct, and the next restart's
+  `resume` is above every stride — so a node that reboots with a different shard
+  count is still safe. The alternative, a sixth field in the directory name,
+  `parse_dir_name` refuses on purpose. `resume` is scanned once in `spawn` and
+  handed to every shard, which is load-bearing: a shard that read the directory
+  after a sibling had already published would resume one higher and its stride
+  would land on the sibling's next number.
+- **The WAL watermark stopped being `max(seq) + 1`.** See section 9.
+- **Health counters became per shard.** `open_since` and `stalled_since` are the
+  *oldest non-zero* of the shards', because the question `/healthz` asks is "is
+  anything stuck" — with the flushers writing one aggregate directly, a shard
+  sealing normally would clear the clock of a sibling sitting on a block it could
+  not flush.
+
+Read-your-writes survives, and not by luck. The argument in the previous section
+never depended on there being one queue: an acknowledged export is in exactly one
+shard's channel until that shard appends it, and each shard answers a `fresh`
+request only on a turn where both its channels are empty. `OpenSlot::fresh` sends
+every ask before awaiting any answer — awaiting them in turn would put a whole
+flusher's backlog between one shard's answer and the next one's question — and
+returns one open block per shard. `search_open` already took a list.
+
+`sweep_staging` also moved out of the flusher and into `spawn`, once per signal:
+it filters by signal and node, not by sequence, so shard 3 booting a moment late
+would have deleted the staging directory shard 0 was already writing tables into.
 
 **Decoder affinity, when OTAP lands.** OTAP section 4.4 mandates decoder state per
 (gRPC stream, payload_type, schema_id), strictly ordered. That is

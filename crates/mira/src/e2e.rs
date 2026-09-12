@@ -221,9 +221,9 @@ fn wire_with(name: &str, wal: bool) -> (receiver::Receivers, api::Api, std::path
         }),
         ..Default::default()
     });
-    let (logs, o_logs, _) = pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone());
-    let (traces, o_traces, _) = pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone());
-    let (metrics, o_metrics, _) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg);
+    let (logs, o_logs, _) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&cfg);
+    let (traces, o_traces, _) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&cfg);
+    let (metrics, o_metrics, _) = pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&cfg);
     let recv = receiver::Receivers {
         logs,
         traces,
@@ -2157,7 +2157,7 @@ fn node_cfg(root: &std::path::Path, wal: bool) -> pipeline::Config {
 struct Node {
     app: Router,
     api: api::Api,
-    flushers: [tokio::task::JoinHandle<()>; 3],
+    flushers: [pipeline::Flushers; 3],
 }
 
 impl Node {
@@ -2182,9 +2182,15 @@ impl Node {
     /// survives is whatever the log already holds. That last clause is the claim
     /// every test that calls this is making.
     fn kill(self) {
-        for h in &self.flushers {
+        let Node { app, api, flushers } = self;
+        for mut h in flushers {
             h.abort();
         }
+        // After the abort, not before: dropping the router drops the last
+        // `Ingest`, and a shard that saw its senders close before it was
+        // cancelled would read that as a graceful stop and seal a block — which
+        // is the one thing a kill is defined not to do.
+        drop((app, api));
         forget_open_blocks();
     }
 }
@@ -2203,7 +2209,7 @@ impl Node {
 /// the right fix is per-node state, and it is a `main.rs` change, not a test's.
 fn forget_open_blocks() {
     for r in &pipeline::REJECTS {
-        r.open_since.store(0, std::sync::atomic::Ordering::Relaxed);
+        r.forget_open();
     }
 }
 
@@ -2219,11 +2225,10 @@ async fn restart_with(cfg: pipeline::Config) -> Node {
     let root = cfg.data_dir.clone();
     let id = cfg.node;
     let cfg = Arc::new(cfg);
-    let (logs, o_logs, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(cfg.clone());
-    let (traces, o_traces, h_traces) =
-        pipeline::spawn::<mira_core::traces::TracesBuilder>(cfg.clone());
+    let (logs, o_logs, h_logs) = pipeline::spawn::<mira_core::logs::LogsBuilder>(&cfg);
+    let (traces, o_traces, h_traces) = pipeline::spawn::<mira_core::traces::TracesBuilder>(&cfg);
     let (metrics, o_metrics, h_metrics) =
-        pipeline::spawn::<mira_core::metrics::MetricsBuilder>(cfg);
+        pipeline::spawn::<mira_core::metrics::MetricsBuilder>(&cfg);
     crate::replay(&root, id, logs.clone(), traces.clone(), metrics.clone())
         .await
         .expect("replay");
@@ -2657,6 +2662,10 @@ async fn a_torn_wal_tail_costs_only_the_frame_that_was_in_flight() {
         "half a frame was replayed; the checksum exists to stop exactly that"
     );
     n.stop().await;
+    // One, not two: the tear took the sequence with it. `Wal::open` resumes
+    // numbering at the first frame it could not read, so the frame in flight
+    // never existed as far as the next boot is concerned, and the watermark the
+    // block claims is the whole log — which here is one frame.
     assert_eq!(
         mira_core::block::wal_watermarks(&root).unwrap()[0],
         1,

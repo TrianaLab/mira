@@ -99,6 +99,7 @@
 //! not free — that snapshot is the one allocation the read path makes — and
 //! section 7.6 is why it is paid there rather than in the scan.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -208,6 +209,29 @@ struct Inner {
     /// unchanged file on every tick, which on macOS is a 4 ms barrier bought
     /// for nothing.
     dirty: bool,
+    /// Every sequence this log has handed out that no block has published yet,
+    /// per signal, indexed by [`Signal::index`].
+    ///
+    /// This is what makes more than one flusher per signal safe. A block claims
+    /// a watermark by name and [`crate::block::wal_watermarks`] takes the
+    /// maximum, which is only sound if frames reach blocks in sequence order —
+    /// see [`Wal::append_then`]. Shard a signal's flusher and they no longer
+    /// do: shard 1 can publish frame 6 while shard 0 still holds frame 5, and
+    /// the maximum would say 7. So the watermark stops being "one past what
+    /// this block holds" and becomes "the oldest frame nobody has published",
+    /// which is [`Wal::watermark_for`]. Frames leave the set only on a
+    /// *successful* publish, so a block that fails to land cannot be claimed
+    /// past either — a hole the single-flusher version had, because a failed
+    /// publish dropped its sequences and the next block's maximum stepped
+    /// straight over them.
+    ///
+    /// ponytail: a `BTreeSet` walked for its minimum, on the reasoning that it
+    /// holds one entry per *export* in flight — tens, not millions — and is
+    /// touched once per append under a lock the append already holds. If a
+    /// deployment ever runs deep enough queues for the removals to show up,
+    /// the shape that replaces it is a per-shard "oldest held" cell plus the
+    /// channel's own ordering.
+    pending: [BTreeSet<u64>; 3],
     /// Segments that have been rolled past but not yet forced, handed to the
     /// next [`Wal::sync`].
     ///
@@ -291,6 +315,7 @@ impl Wal {
                 written,
                 next_seq,
                 dirty: false,
+                pending: Default::default(),
                 retired: Vec::new(),
             }),
             dir,
@@ -340,7 +365,7 @@ impl Wal {
             });
         };
 
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.lock();
 
         if inner.written >= SEGMENT_BYTES {
             self.roll(&mut inner)?;
@@ -376,8 +401,63 @@ impl Wal {
         inner.written += (HEADER_LEN + body.len() + CRC_LEN) as u64;
         inner.next_seq += 1;
         inner.dirty = true;
+        inner.pending[signal.index()].insert(seq);
         then(seq);
         Ok(seq)
+    }
+
+    /// Put a sequence this log already handed out back among the unpublished —
+    /// the replay path, where the frame is read off disk rather than appended.
+    ///
+    /// Without it a recovered frame is invisible to [`watermark_for`](Self::watermark_for),
+    /// so a block sealed beside it could claim a watermark that steps over it
+    /// and the next boot would not replay it a second time. That is the one
+    /// failure this log exists to prevent, and replay is exactly when it would
+    /// bite: the frames in flight are the ones a crash already nearly lost.
+    pub fn reframed(&self, signal: Signal, seq: u64) {
+        self.lock().pending[signal.index()].insert(seq);
+    }
+
+    /// A panic cannot leave the log's state inconsistent — every critical
+    /// section is a write and a counter — so poisoning carries no information.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The watermark a block holding `seqs` may publish: the oldest sequence of
+    /// this signal that nobody has published, or, if this block is the last of
+    /// them, one past everything the log has handed out.
+    ///
+    /// `seqs` must be sorted. Called *before* the publish, because the answer
+    /// goes in the directory name; the sequences stay unpublished until
+    /// [`published`](Self::published) says otherwise, so a sibling shard sealing
+    /// at the same moment still counts this block's frames against its own
+    /// watermark and neither can claim the other's.
+    ///
+    /// It can be too low — a shard holding an old frame pins every sibling's
+    /// watermark behind it — and that is the direction it is allowed to be
+    /// wrong in: too low re-ingests a frame a block already has, too high loses
+    /// it. Nothing is pinned for long, because the shard holding the old frame
+    /// is at most `max_block_age` from sealing it.
+    pub fn watermark_for(&self, signal: Signal, seqs: &[u64]) -> u64 {
+        let inner = self.lock();
+        inner.pending[signal.index()]
+            .iter()
+            .find(|s| seqs.binary_search(s).is_err())
+            .copied()
+            .unwrap_or(inner.next_seq)
+    }
+
+    /// Retire the sequences a block has durably published.
+    ///
+    /// Only on success. A block that failed to land leaves its frames here, and
+    /// that is what keeps the next block's watermark from claiming them.
+    pub fn published(&self, signal: Signal, seqs: &[u64]) {
+        let mut inner = self.lock();
+        let pending = &mut inner.pending[signal.index()];
+        for s in seqs {
+            pending.remove(s);
+        }
     }
 
     /// Force everything appended so far onto the device.
@@ -387,7 +467,7 @@ impl Wal {
     /// `F_FULLFSYNC` and costs about 4 ms, which is the whole reason it is not
     /// on the ack path.
     pub fn sync(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.lock();
         if !inner.dirty && inner.retired.is_empty() {
             return Ok(());
         }
@@ -426,7 +506,7 @@ impl Wal {
     /// file with no name.
     pub fn truncate(&self, covered: u64) -> Result<usize> {
         let current = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.lock();
             inner.path.clone()
         };
         let segments = Self::segments(&self.dir, self.node)?;
@@ -456,7 +536,7 @@ impl Wal {
             // survive until the last descriptor closes, so leaving it there
             // means `truncate` reports space it has not actually freed.
             {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.lock();
                 inner.retired.retain(|(p, _)| p != path);
             }
             removed += 1;
@@ -1339,5 +1419,102 @@ mod tests {
             assert_eq!(Signal::from_u8(s as u8), Some(s));
         }
         assert_eq!(Signal::from_u8(3), None);
+    }
+
+    /// The invariant [`Wal::append_then`] is built around, now that a signal has
+    /// more than one flusher.
+    ///
+    /// With one flusher a block could take `max(seq) + 1` as its watermark,
+    /// because a signal's frames reached their blocks in sequence order. With
+    /// two, frame 5 can still be in shard 0's builder when shard 1 seals the
+    /// block holding frame 6 — and `max + 1` would say 7, so the next boot
+    /// would skip frame 5. That is silent loss, which is the one failure this
+    /// log exists to prevent.
+    #[test]
+    fn a_shard_may_not_claim_a_watermark_over_a_frame_a_sibling_still_holds() {
+        let root = tmpdir("watermark-for");
+        let wal = Wal::open(&root, 7).unwrap();
+        for b in [&b"l0"[..], b"l1", b"l2", b"l3"] {
+            wal.append(Signal::Logs, b).unwrap();
+        }
+        // Shard 0 took 0 and 2, shard 1 took 1 and 3 — the stride `pipeline`
+        // allocates with.
+        let (even, odd) = (vec![0, 2], vec![1, 3]);
+
+        // Shard 1 seals first. Frame 0 is still in shard 0's builder, so the
+        // highest honest watermark is 0: nothing is published.
+        assert_eq!(wal.watermark_for(Signal::Logs, &odd), 0);
+        wal.published(Signal::Logs, &odd);
+        // And now shard 0's block covers everything left, so it may claim the
+        // whole log — `next_seq`, not `max + 1`, which is the same number here
+        // and would not be if a fifth frame were in flight.
+        assert_eq!(wal.watermark_for(Signal::Logs, &even), 4);
+
+        // Signals do not see each other: a traces frame in flight cannot hold
+        // back a logs watermark, which is what the per-signal array is for. The
+        // logs watermark goes past it, and the traces one does not — a sequence
+        // is global, and only the array makes skipping another signal's frame
+        // safe.
+        wal.append(Signal::Traces, b"t4").unwrap();
+        assert_eq!(wal.watermark_for(Signal::Logs, &even), 5);
+        assert_eq!(wal.watermark_for(Signal::Traces, &[]), 4);
+    }
+
+    /// A block that failed to publish keeps its frames replayable.
+    ///
+    /// The bug this pins predates sharding: with `max(seq) + 1` the *next*
+    /// block's watermark stepped over the failed one's frames, so a crash after
+    /// a failed publish lost them. Retiring sequences only on success fixes
+    /// both at once.
+    #[test]
+    fn a_block_that_never_landed_holds_the_watermark_where_it_was() {
+        let root = tmpdir("watermark-fail");
+        let wal = Wal::open(&root, 8).unwrap();
+        for b in [&b"l0"[..], b"l1"] {
+            wal.append(Signal::Logs, b).unwrap();
+        }
+        // The first block seals holding frame 0 and claims 1 — exclusive, so
+        // that says "frame 0 is covered, frame 1 is not" — and then fails to
+        // land, so nothing is retired.
+        assert_eq!(wal.watermark_for(Signal::Logs, &[0]), 1);
+        // The second one may not pretend the first succeeded.
+        assert_eq!(
+            wal.watermark_for(Signal::Logs, &[1]),
+            0,
+            "frame 0 is still unpublished, so no block may claim past it"
+        );
+        wal.published(Signal::Logs, &[1]);
+        // And when the first block is retried, it covers the lot.
+        assert_eq!(wal.watermark_for(Signal::Logs, &[0]), 2);
+
+        // Replay is the reason it matters: the frames are both still there.
+        let (got, _) = collect(&root, 8, [0, 0, 0]);
+        assert_eq!(got.len(), 2);
+    }
+
+    /// Replay re-arms the pending set, or the frames a crash nearly lost are
+    /// the ones the first seal after boot steps over.
+    #[test]
+    fn a_replayed_frame_counts_against_the_watermark_again() {
+        let root = tmpdir("watermark-reframe");
+        let wal = Wal::open(&root, 9).unwrap();
+        for b in [&b"l0"[..], b"l1"] {
+            wal.append(Signal::Logs, b).unwrap();
+        }
+        drop(wal);
+
+        let wal = Wal::open(&root, 9).unwrap();
+        assert_eq!(
+            wal.watermark_for(Signal::Logs, &[]),
+            2,
+            "a fresh log knows nothing is outstanding until replay says so"
+        );
+        let (_, seqs, _) = collect_seqs(&root, 9, [0, 0, 0]);
+        for seq in &seqs {
+            wal.reframed(Signal::Logs, *seq);
+        }
+        assert_eq!(seqs, vec![0, 1]);
+        // Shard 1 gets frame 1 and seals it before shard 0 has flushed frame 0.
+        assert_eq!(wal.watermark_for(Signal::Logs, &[1]), 0);
     }
 }
