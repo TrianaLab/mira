@@ -679,6 +679,22 @@ fn rewrite_group1(pattern: &Regex, text: &str, new: &str) -> (String, usize) {
     (out, count)
 }
 
+/// What is written under `## [Unreleased]`, up to the next released section.
+///
+/// The pattern *consumes* the header that ends the section rather than looking
+/// ahead at it, and the difference is the whole reason this is a function with
+/// a test rather than one line inside [`bumped_changelog`]. `regex` has no
+/// look-around, `re` panics on a pattern it cannot compile, and the version
+/// that wrote `(?=^## \[)` therefore aborted every single invocation of
+/// `make bump` before it read a byte — an unreachable release path that no gate
+/// could see, because nothing called it. Consuming the header is free here:
+/// only group 1 is read, and the promotion below rewrites `text`, not the match.
+fn unreleased_body(text: &str) -> Option<&str> {
+    re(r"(?ms)^## \[Unreleased\]\n(.*?)^## \[")
+        .captures(text)
+        .map(|c| c.get(1).expect("group 1 is not optional").as_str())
+}
+
 /// `## [Unreleased]` promoted to `## [new]`, a fresh one opened, links moved.
 ///
 /// Refuses on an empty `[Unreleased]`, which is not pedantry: release.yml
@@ -689,7 +705,7 @@ fn rewrite_group1(pattern: &Regex, text: &str, new: &str) -> (String, usize) {
 fn bumped_changelog(old: &str, new: &str, today: &str) -> String {
     let text = read_or_exit(CHANGELOG);
 
-    let Some(body) = re(r"(?ms)^## \[Unreleased\]\n(.*?)(?=^## \[)").captures(&text) else {
+    let Some(body) = unreleased_body(&text) else {
         eprintln!(
             "error: {CHANGELOG} has no `## [Unreleased]` section followed by a \
              released one. That is the section this promotes; see \
@@ -697,7 +713,7 @@ fn bumped_changelog(old: &str, new: &str, today: &str) -> String {
         );
         std::process::exit(1);
     };
-    if body[1].trim().is_empty() {
+    if body.trim().is_empty() {
         eprintln!(
             "error: {CHANGELOG}'s `## [Unreleased]` section is empty. Write the {new} \
              notes into it first — release.yml publishes that section verbatim as the \
@@ -843,6 +859,52 @@ mod tests {
         // would leave the file behind" refusal, before anything is written.
         let (out, n) = rewrite_group1(&pattern, "nothing here\n", "9.9.9");
         assert_eq!((out.as_str(), n), ("nothing here\n", 0));
+    }
+
+    /// The release path's first read, which had never once been executed.
+    ///
+    /// Three separate ways to be wrong, and each fails a line here: the pattern
+    /// not compiling at all (look-around), the body running past the section it
+    /// belongs to (a greedy `.*`), and an unwritten section being promoted
+    /// anyway (the emptiness guard's input).
+    #[test]
+    fn the_unreleased_body_is_this_release_and_stops_at_the_last_one() {
+        // Two released sections, not one: with a single one below it a greedy
+        // `.*` and a lazy `.*?` stop at the same place, and the test passes
+        // while the reader swallows the entire history.
+        let text = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- a thing\n\n\
+                    ## [0.0.3] - 2026-09-12\n\n- an older thing\n\n\
+                    ## [0.0.2] - 2026-09-12\n\n- an older thing still\n";
+        assert_eq!(
+            unreleased_body(text),
+            Some("\n### Added\n\n- a thing\n\n"),
+            "the body is what is under Unreleased, not everything after it"
+        );
+
+        assert_eq!(
+            unreleased_body("# Changelog\n\n## [Unreleased]\n\n## [0.0.3] - x\n").map(str::trim),
+            Some(""),
+            "an unwritten section reads empty, which is what the refusal tests"
+        );
+
+        // A tree with no released section yet cannot be promoted, and says so
+        // rather than promoting the whole file.
+        assert_eq!(unreleased_body("## [Unreleased]\n\n- a thing\n"), None);
+    }
+
+    /// And the committed changelog is one `make bump` would accept today.
+    ///
+    /// The unit test above proves the reader; this proves the file it reads.
+    /// Both matter, because the failure mode being closed is a release that
+    /// stops at the first command of the runbook.
+    #[test]
+    fn the_committed_changelog_has_notes_to_promote() {
+        let text = read_or_exit(CHANGELOG);
+        let body = unreleased_body(&text).expect("an [Unreleased] section above a released one");
+        assert!(
+            !body.trim().is_empty(),
+            "{CHANGELOG}'s [Unreleased] section is empty, so `make bump` would refuse"
+        );
     }
 
     /// Every pattern in the shared table still matches the file it names.
