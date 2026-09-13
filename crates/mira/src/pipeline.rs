@@ -953,11 +953,12 @@ async fn wal_sweep(wal: Arc<Wal>, dir: PathBuf, truncating: bool) {
         if !truncating {
             return Ok(0);
         }
-        // The minimum across signals, not each signal's own: one segment holds
-        // frames for all three, so it can only go once the last of them has
-        // claimed everything in it.
-        let covered = block::wal_watermarks(&dir)?.into_iter().min().unwrap_or(0);
-        wal.truncate(covered)
+        // Each signal's own watermark, not the minimum across all three. There
+        // is a log per signal now, so a segment holds one signal's frames and
+        // goes as soon as that signal has claimed them — where the shared log
+        // had to wait for the last of the three and let the quietest signal pin
+        // the other two on disk.
+        wal.truncate(block::wal_watermarks(&dir)?)
     })
     .await;
     match done {
@@ -1666,7 +1667,7 @@ mod tests {
             "acknowledged in {acked:?}, which is the block age, not the log"
         );
         assert_eq!(blocks(&dir), 0, "the ack did not wait for a block");
-        assert_eq!(wal.next_seq(), 1, "the export is a frame");
+        assert_eq!(wal.next_seq(wal::Signal::Logs), 1, "the export is a frame");
 
         drop(tx);
         h.await.unwrap();
@@ -1839,9 +1840,15 @@ mod tests {
         // The 240th: no block claims that frame, so the covered watermark is 0
         // and the segment holding it stays.
         wal_sweep(Arc::clone(&wal), dir.clone(), true).await;
-        assert_eq!(wal.next_seq(), 1, "a sweep renumbers nothing");
         assert_eq!(
-            std::fs::read_dir(dir.join(".wal")).unwrap().count(),
+            wal.next_seq(wal::Signal::Logs),
+            1,
+            "a sweep renumbers nothing"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join(".wal").join("logs"))
+                .unwrap()
+                .count(),
             1,
             "the open segment is never dropped"
         );
@@ -1855,19 +1862,24 @@ mod tests {
         std::fs::write(bad.join("logs"), b"not a directory").unwrap();
         wal_sweep(Arc::clone(&wal), bad, true).await;
         wal.append(wal::Signal::Logs, b"another").unwrap();
-        assert_eq!(wal.next_seq(), 2);
+        assert_eq!(wal.next_seq(wal::Signal::Logs), 2);
 
         // The segment a crash between `roll` and the first append leaves: no
         // frames, so no watermark can ever cover it, and the empty-segment rule
         // is the only thing that will ever get rid of it.
-        let stale = dir.join(".wal").join(format!("{node:08x}-{:020}.wal", 9));
+        let stale = dir
+            .join(".wal")
+            .join("logs")
+            .join(format!("{node:08x}-{:020}.wal", 9));
         std::fs::File::create(&stale).unwrap();
         wal_sweep(Arc::clone(&wal), dir.clone(), false).await;
         assert!(stale.exists(), "a sync is not a truncation");
         wal_sweep(Arc::clone(&wal), dir.clone(), true).await;
         assert!(!stale.exists(), "the slow tick removed the dead segment");
         assert_eq!(
-            std::fs::read_dir(dir.join(".wal")).unwrap().count(),
+            std::fs::read_dir(dir.join(".wal").join("logs"))
+                .unwrap()
+                .count(),
             1,
             "and left the open one, which is still holding two unclaimed frames"
         );

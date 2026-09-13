@@ -2633,7 +2633,7 @@ async fn a_torn_wal_tail_costs_only_the_frame_that_was_in_flight() {
 
     // Chop four bytes: the second frame now has no checksum, which is where a
     // kill inside `append` leaves it.
-    let seg = std::fs::read_dir(root.join(".wal"))
+    let seg = std::fs::read_dir(root.join(".wal").join("logs"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|e| e == "wal"))
@@ -2690,7 +2690,7 @@ async fn a_torn_wal_tail_does_not_stop_the_node_from_booting() {
     otlp(&n.app, "/v1/logs", logs_export("checkout", 1_000, 5)).await;
     n.kill();
 
-    let seg = std::fs::read_dir(root.join(".wal"))
+    let seg = std::fs::read_dir(root.join(".wal").join("logs"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|e| e == "wal"))

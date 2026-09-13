@@ -1806,14 +1806,15 @@ mod tests {
         // A block claims the first sequence of its signal that nothing covers,
         // not one past the frame it happens to hold — under shards the two are
         // different numbers, and only the first is safe to skip on the next
-        // boot. Here nothing of any signal is left outstanding: frames 0, 1 and
-        // 2 are in blocks, and frame 3 was retired when it failed to decode. So
-        // all three claim the whole log, and the next boot replays nothing.
+        // boot. Here nothing of any signal is left outstanding. Each log
+        // numbers its own frames, so the good logs export and the undecodable
+        // one are logs seq 0 and 1 while traces and metrics each hold a single
+        // seq 0 — every log is claimed whole and the next boot replays nothing.
         //
-        // Sequence 3 being dropped rather than pinned is the point of that
+        // Logs seq 1 being dropped rather than pinned is the point of that
         // retirement: a frame that will never decode must not hold a watermark,
         // or every frame published behind it is replayed on every boot forever.
-        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [4, 4, 4]);
+        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [2, 1, 1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1844,6 +1845,7 @@ mod tests {
         // exactly what a process killed mid-write leaves behind.
         let seg = dir
             .join(".wal")
+            .join("logs")
             .join(format!("{node:08x}-{:020}.wal", 0u64));
         let len = std::fs::metadata(&seg).unwrap().len();
         std::fs::OpenOptions::new()

@@ -298,29 +298,36 @@ struct Inner {
 /// serialised section, now with a thread handoff per append on top. The fix is
 /// to make the section shorter or to stop having one of it — see the module
 /// docs, which name both and say why neither is in this tree yet.
-pub struct Wal {
+struct Log {
     inner: Mutex<Inner>,
     dir: PathBuf,
     node: u32,
 }
 
-impl Wal {
-    /// Open (or create) the log under `<root>/.wal/`, resuming the sequence
-    /// counter past anything already on disk.
+impl Log {
+    /// Open (or create) one signal's log in `dir`, resuming the sequence
+    /// counter past anything already on disk and past `floor`.
     ///
     /// Resuming from the *files* rather than from the block watermarks is
     /// deliberate: a sequence that went backwards would let a replay confuse a
     /// new frame for one a block already covers, and the watermark comparison
     /// is `>`, so the failure would be silent data loss rather than an error.
-    pub fn open(root: &Path, node: u32) -> Result<Self> {
-        let dir = root.join(".wal");
+    ///
+    /// `floor` is how that survives the split into three logs. Before it there
+    /// was one sequence space, so an upgrade finds blocks carrying watermarks
+    /// from it while a fresh per-signal log would start at zero — and `replay`
+    /// skips any frame below its signal's watermark, so every frame written
+    /// after the upgrade would be silently skipped at the next boot. Starting
+    /// each log above everything the old shared log handed out keeps the
+    /// comparison meaningful. See [`Wal::open`].
+    fn open(dir: PathBuf, node: u32, floor: u64) -> Result<Self> {
         fs::create_dir_all(&dir).ctx(&dir)?;
 
         let segments = Self::segments(&dir, node)?;
         // The highest sequence actually present, which is not the same as the
         // last segment's first sequence: a segment may be empty if the process
         // died between creating it and its first append.
-        let mut next_seq = 0;
+        let mut next_seq = floor;
         for (path, first) in &segments {
             let mut torn = false;
             for frame in FrameReader::open(path)? {
@@ -356,7 +363,7 @@ impl Wal {
             .ctx(&path)?;
         let written = file.metadata().ctx(&path)?.len();
 
-        Ok(Wal {
+        Ok(Log {
             inner: Mutex::new(Inner {
                 file,
                 path,
@@ -599,8 +606,8 @@ impl Wal {
             .next_seq
     }
 
-    /// Delete whole segments whose every frame is below `covered`, the
-    /// smallest of the per-signal [`Watermarks`] — same exclusive convention.
+    /// Delete whole segments whose every frame is below `covered`, this
+    /// signal's own entry in [`Watermarks`] — same exclusive convention.
     ///
     /// Returns how many segments were removed. Deletion is per segment rather
     /// than per frame because a log is only append-only if nothing ever
@@ -615,48 +622,13 @@ impl Wal {
             let inner = self.lock();
             inner.path.clone()
         };
-        let segments = Self::segments(&self.dir, self.node)?;
-        let mut removed = 0;
-
-        for (path, _) in &segments {
-            if *path == current {
-                continue;
-            }
-            // The last frame decides, not the first: a segment is only dead
-            // once everything in it is covered.
-            let mut highest = None;
-            for frame in FrameReader::open(path)? {
-                highest = Some(frame?.seq);
-            }
-            match highest {
-                // An empty segment is a crash artefact between create and
-                // first append; nothing references it and it will never be
-                // written to again, so it goes.
-                None => {}
-                Some(hi) if hi < covered => {}
-                Some(_) => continue,
-            }
-            fs::remove_file(path).ctx(path)?;
+        sweep(&self.dir, self.node, covered, Some(&current), |path| {
             // Drop the retired handle too. Unlinking a file this process still
             // has open is legal on Unix, but the inode — and its blocks —
             // survive until the last descriptor closes, so leaving it there
             // means `truncate` reports space it has not actually freed.
-            {
-                let mut inner = self.lock();
-                inner.retired.retain(|(p, _)| p != path);
-            }
-            removed += 1;
-        }
-
-        if removed > 0 {
-            // The unlinks are metadata on the WAL directory, and until that is
-            // flushed a crash brings the deleted segments back and replays
-            // frames a block already covers. The watermark makes that safe
-            // rather than wrong, but replaying gigabytes at every boot is its
-            // own outage.
-            crate::sync_all(&File::open(&self.dir).ctx(&self.dir)?).ctx(&self.dir)?;
-        }
-        Ok(removed)
+            self.lock().retired.retain(|(p, _)| p != path);
+        })
     }
 
     /// Replay every frame not yet covered by a published block, oldest first.
@@ -680,19 +652,17 @@ impl Wal {
     /// block that stored it would claim the new sequence and leave the old one
     /// uncovered — and the next boot would replay it again, forever. Carrying
     /// the original through to the block is what makes replay converge.
-    pub fn replay(
-        root: &Path,
+    fn replay_dir(
+        dir: &Path,
         node: u32,
         watermarks: Watermarks,
-        mut f: impl FnMut(Signal, u64, &[u8]) -> Result<()>,
-    ) -> Result<Replayed> {
-        let dir = root.join(".wal");
+        out: &mut Replayed,
+        f: &mut impl FnMut(Signal, u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
         if !dir.is_dir() {
-            return Ok(Replayed::default());
+            return Ok(());
         }
-        let mut out = Replayed::default();
-
-        for (path, _) in Self::segments(&dir, node)? {
+        for (path, _) in Self::segments(dir, node)? {
             for frame in FrameReader::open(&path)? {
                 let Ok(frame) = frame else {
                     out.torn_segments += 1;
@@ -707,7 +677,22 @@ impl Wal {
                 out.bytes += frame.body.len() as u64;
             }
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// One past the highest sequence any segment in `dir` holds, for the
+    /// `floor` [`Log::open`] resumes at. Torn tails are ignored rather than
+    /// reported: this is only ever used to push a starting point *up*.
+    fn high_water(dir: &Path, node: u32) -> Result<u64> {
+        let mut hi = 0;
+        for (path, first) in Self::segments(dir, node)? {
+            hi = hi.max(first + 1);
+            for frame in FrameReader::open(&path)? {
+                let Ok(frame) = frame else { break };
+                hi = hi.max(frame.seq + 1);
+            }
+        }
+        Ok(hi)
     }
 
     /// Segments for this node, oldest first.
@@ -773,6 +758,230 @@ impl Wal {
         }
         inner.written = 0;
         Ok(())
+    }
+}
+
+/// Delete every segment in `dir` whose frames all sit below `covered`, except
+/// `keep`, calling `removed` with each path just before it counts.
+///
+/// Free rather than a method because two callers want it against directories
+/// with different rules: a signal's own log, which has an open segment to spare
+/// and its own watermark, and the pre-split directory an upgrade left behind,
+/// which has neither. See [`Wal::truncate`].
+fn sweep(
+    dir: &Path,
+    node: u32,
+    covered: u64,
+    keep: Option<&Path>,
+    mut removed: impl FnMut(&Path),
+) -> Result<usize> {
+    let mut n = 0;
+    for (path, _) in &Log::segments(dir, node)? {
+        if Some(path.as_path()) == keep {
+            continue;
+        }
+        // The last frame decides, not the first: a segment is only dead once
+        // everything in it is covered.
+        let mut highest = None;
+        for frame in FrameReader::open(path)? {
+            highest = Some(frame?.seq);
+        }
+        match highest {
+            // An empty segment is a crash artefact between create and first
+            // append; nothing references it and it will never be written to
+            // again, so it goes.
+            None => {}
+            Some(hi) if hi < covered => {}
+            Some(_) => continue,
+        }
+        fs::remove_file(path).ctx(path)?;
+        removed(path);
+        n += 1;
+    }
+
+    if n > 0 {
+        // The unlinks are metadata on the WAL directory, and until that is
+        // flushed a crash brings the deleted segments back and replays frames a
+        // block already covers. The watermark makes that safe rather than
+        // wrong, but replaying gigabytes at every boot is its own outage.
+        crate::sync_all(&File::open(dir).ctx(dir)?).ctx(dir)?;
+    }
+    Ok(n)
+}
+
+/// An append-only log of OTLP export bodies: one per signal, under
+/// `<root>/.wal/<signal>/`.
+///
+/// Three logs and not one because the single log's mutex was the ingest
+/// ceiling. Profiled at thirty-two connections, 48% of all thread time sat in
+/// `__psynch_mutexwait` and the frames above it were this type's `lock`,
+/// `watermark_for` and `published` — the mutex was *held* for 7.054 s of an 8 s
+/// run, 88% occupancy, and 95% of each hold was the `write(2)` inside it. The
+/// other candidate, group commit, writes the same bytes down the same
+/// descriptor: at this frame size a `writev` of twelve frames costs what twelve
+/// writes cost, so it can only reclaim the ~5% of the hold that is not the
+/// write. That does not clear an 88%-occupied lock. Three descriptors do,
+/// because the serialised byte stream becomes three of them.
+///
+/// Nothing is coordinated between them — principle 4, and there is nothing to
+/// coordinate. A block belongs to exactly one signal, so the watermark it
+/// claims is a sequence in that signal's log and nowhere else. The frame format
+/// is unchanged, byte for byte; what moved is which directory a segment lives
+/// in, and [`Wal::open`] handles the upgrade.
+///
+/// ponytail: three, because there are three signals and a block already belongs
+/// to one. The ceiling is the widest signal — a logs-only fleet gets one log
+/// back and one mutex with it. The upgrade path is a log per *shard*, which
+/// scales with cores instead of with the enum, and costs a watermark per shard
+/// in the block name rather than per signal.
+pub struct Wal {
+    logs: [Log; 3],
+    /// `<root>/.wal` itself — the parent of the three, and where the single-log
+    /// version put its segments. Kept only so those can be replayed and swept.
+    dir: PathBuf,
+    node: u32,
+}
+
+impl Wal {
+    /// Open (or create) all three logs under `<root>/.wal/`.
+    ///
+    /// Segments left by the single-log version sit directly in `<root>/.wal/`
+    /// rather than in a signal's subdirectory, so none of the three claims
+    /// them. They are still replayed — [`Wal::replay`] reads that directory
+    /// too, and a frame header has always carried the signal byte that says
+    /// which flusher it belongs to — and every new log starts above the highest
+    /// sequence they hold, so the watermarks those frames' blocks go on to
+    /// claim stay comparable with the sequences handed out after the upgrade.
+    pub fn open(root: &Path, node: u32) -> Result<Self> {
+        let dir = root.join(".wal");
+        fs::create_dir_all(&dir).ctx(&dir)?;
+        let floor = Log::high_water(&dir, node)?;
+        Ok(Wal {
+            logs: [
+                Log::open(dir.join(Signal::Logs.as_str()), node, floor)?,
+                Log::open(dir.join(Signal::Traces.as_str()), node, floor)?,
+                Log::open(dir.join(Signal::Metrics.as_str()), node, floor)?,
+            ],
+            dir,
+            node,
+        })
+    }
+
+    fn log(&self, signal: Signal) -> &Log {
+        &self.logs[signal.index()]
+    }
+
+    /// Append one OTLP export body and return the sequence it was given. See
+    /// [`Wal::append_then`], which this is the callback-free form of.
+    pub fn append(&self, signal: Signal, body: &[u8]) -> Result<u64> {
+        self.log(signal).append(signal, body)
+    }
+
+    /// Append one body and run `then` with its sequence, still holding the
+    /// lock. `then` must not block, `.await`, or re-enter this log.
+    pub fn append_then(&self, signal: Signal, body: &[u8], then: impl FnOnce(u64)) -> Result<u64> {
+        self.log(signal).append_then(signal, body, then)
+    }
+
+    /// Put a replayed sequence back among this signal's unpublished.
+    pub fn reframed(&self, signal: Signal, seq: u64) {
+        self.log(signal).reframed(signal, seq);
+    }
+
+    /// The watermark a block sealing `seqs` may claim for its signal.
+    pub fn watermark_for(&self, signal: Signal, seqs: &[u64]) -> u64 {
+        self.log(signal).watermark_for(signal, seqs)
+    }
+
+    /// Retire `seqs` from this signal's unpublished set, after a block holding
+    /// them landed.
+    pub fn published(&self, signal: Signal, seqs: &[u64]) {
+        self.log(signal).published(signal, seqs);
+    }
+
+    /// Force every log that has been appended to since the last call.
+    ///
+    /// Not short-circuited on the first error: a log that fails to sync must
+    /// not stop the other two, or one bad descriptor silently stops the whole
+    /// node forcing anything. The first error is what gets returned.
+    pub fn sync(&self) -> Result<()> {
+        self.logs
+            .iter()
+            .map(Log::sync)
+            .find(Result::is_err)
+            .unwrap_or(Ok(()))
+    }
+
+    /// The next sequence one signal's log will hand out.
+    pub fn next_seq(&self, signal: Signal) -> u64 {
+        self.log(signal).next_seq()
+    }
+
+    /// Delete dead segments in every log, each against its own watermark, and
+    /// report how many went.
+    ///
+    /// Per signal, where the single log had to take the *minimum* of the three:
+    /// one shared sequence space meant a segment could hold frames from any
+    /// signal, so the least-published signal pinned every other signal's
+    /// segments on disk. Three logs have nothing to take a minimum over.
+    pub fn truncate(&self, watermarks: Watermarks) -> Result<usize> {
+        let mut removed = 0;
+        for signal in Signal::ALL {
+            removed += self.log(signal).truncate(watermarks[signal.index()])?;
+        }
+        // And the pre-split directory, under the rule that directory was
+        // written with: the *minimum*, because one of its segments can hold
+        // frames for all three signals and only the last of them to publish
+        // makes the file dead. Sweeping it matters rather than being tidiness —
+        // `replay` reads a frame's body before it can compare the sequence that
+        // skips it, so a shared segment nobody deletes is re-read in full at
+        // every boot for the life of the node.
+        removed += sweep(
+            &self.dir,
+            self.node,
+            watermarks.into_iter().min().unwrap_or(0),
+            None,
+            |_| {},
+        )?;
+        Ok(removed)
+    }
+
+    /// The directory one signal's segments live in.
+    #[cfg(test)]
+    fn dir_of(&self, signal: Signal) -> &Path {
+        &self.log(signal).dir
+    }
+
+    /// One signal's log state, for the tests that assert on segment paths and
+    /// sequence bookkeeping rather than on observable behaviour.
+    #[cfg(test)]
+    fn inner_of(&self, signal: Signal) -> std::sync::MutexGuard<'_, Inner> {
+        self.log(signal).lock()
+    }
+
+    /// Replay every frame no published block covers, oldest first within each
+    /// log. See [`Log::replay_dir`] for what a torn tail does.
+    ///
+    /// The order frames come back in is per log, not global. Nothing depends on
+    /// a global order: `f` dispatches on the frame's own signal and each signal
+    /// has one flusher set, so the only ordering that matters — within a signal
+    /// — is the one each log preserves.
+    pub fn replay(
+        root: &Path,
+        node: u32,
+        watermarks: Watermarks,
+        mut f: impl FnMut(Signal, u64, &[u8]) -> Result<()>,
+    ) -> Result<Replayed> {
+        let dir = root.join(".wal");
+        let mut out = Replayed::default();
+        // The pre-split directory first, because everything in it is older than
+        // anything the three logs hold.
+        Log::replay_dir(&dir, node, watermarks, &mut out, &mut f)?;
+        for signal in Signal::ALL {
+            let sub = dir.join(signal.as_str());
+            Log::replay_dir(&sub, node, watermarks, &mut out, &mut f)?;
+        }
+        Ok(out)
     }
 }
 
@@ -963,9 +1172,13 @@ mod tests {
     fn a_frame_round_trips_through_replay() {
         let root = tmpdir("roundtrip");
         let wal = Wal::open(&root, 0xab).unwrap();
+        // Zero three times, not 0/1/2: each signal has its own log and so its
+        // own sequence space. Nothing compares a sequence across signals —
+        // `Watermarks` has always been indexed per signal — so the spaces never
+        // meet.
         assert_eq!(wal.append(Signal::Logs, b"one").unwrap(), 0);
-        assert_eq!(wal.append(Signal::Traces, b"two").unwrap(), 1);
-        assert_eq!(wal.append(Signal::Metrics, b"three").unwrap(), 2);
+        assert_eq!(wal.append(Signal::Traces, b"two").unwrap(), 0);
+        assert_eq!(wal.append(Signal::Metrics, b"three").unwrap(), 0);
 
         let (got, stats) = collect(&root, 0xab, [0, 0, 0]);
         // The regression this pins: sequence 0 is a real frame and watermark 0
@@ -981,21 +1194,83 @@ mod tests {
     fn a_published_block_is_not_replayed_and_each_signal_counts_separately() {
         let root = tmpdir("watermark");
         let wal = Wal::open(&root, 1).unwrap();
-        wal.append(Signal::Logs, b"l0").unwrap(); // seq 0
-        wal.append(Signal::Traces, b"t1").unwrap(); // seq 1
-        wal.append(Signal::Logs, b"l2").unwrap(); // seq 2
-        wal.append(Signal::Traces, b"t3").unwrap(); // seq 3
+        wal.append(Signal::Logs, b"l0").unwrap(); // logs seq 0
+        wal.append(Signal::Traces, b"t1").unwrap(); // traces seq 0
+        wal.append(Signal::Logs, b"l2").unwrap(); // logs seq 1
+        wal.append(Signal::Traces, b"t3").unwrap(); // traces seq 1
 
-        // Logs sealed through seq 2 inclusive, traces only through seq 1. Only
-        // the traces frame above its own watermark comes back — a logs seal
-        // must not suppress an unsealed trace.
+        // Logs sealed through its seq 1 inclusive, traces only through its seq
+        // 0. Only the traces frame above its own watermark comes back — a logs
+        // seal must not suppress an unsealed trace.
         let mut wm = [0u64; 3];
-        wm[Signal::Logs.index()] = 3;
-        wm[Signal::Traces.index()] = 2;
+        wm[Signal::Logs.index()] = 2;
+        wm[Signal::Traces.index()] = 1;
         let (got, stats) = collect(&root, 1, wm);
         assert_eq!(stats.replayed, 1);
         assert_eq!(stats.skipped, 3);
         assert_eq!(got, vec![(Signal::Traces, b"t3".to_vec())]);
+    }
+
+    /// The upgrade from the single shared log to one per signal.
+    ///
+    /// Three things have to hold at once, and two of them fail silently — as
+    /// lost data at the next boot, not as an error — so they are pinned
+    /// together: the old segments still replay though no signal's directory
+    /// claims them, every new log starts above the sequences they handed out so
+    /// the watermarks stay comparable across the change, and once every signal
+    /// has published past them they are swept rather than re-read for ever.
+    #[test]
+    fn the_shared_logs_segments_replay_sequence_past_them_and_are_swept() {
+        let root = tmpdir("upgrade");
+        let dir = root.join(".wal");
+        {
+            // The pre-split layout, which is exactly one `Log` in `.wal` itself
+            // with one sequence space across the signals.
+            let old = Log::open(dir.clone(), 0x9c, 0).unwrap();
+            assert_eq!(old.append(Signal::Logs, b"l0").unwrap(), 0);
+            assert_eq!(old.append(Signal::Traces, b"t1").unwrap(), 1);
+            old.sync().unwrap();
+        }
+
+        let wal = Wal::open(&root, 0x9c).unwrap();
+        for signal in Signal::ALL {
+            assert_eq!(
+                wal.next_seq(signal),
+                2,
+                "{signal:?} restarted inside the shared sequence space"
+            );
+        }
+        assert_eq!(wal.append(Signal::Logs, b"l-new").unwrap(), 2);
+
+        // Nothing published yet, so all three come back — the old two dispatched
+        // on the signal byte their headers have always carried.
+        let (got, stats) = collect(&root, 0x9c, [0, 0, 0]);
+        assert_eq!(stats.replayed, 3);
+        assert_eq!(
+            got,
+            vec![
+                (Signal::Logs, b"l0".to_vec()),
+                (Signal::Traces, b"t1".to_vec()),
+                (Signal::Logs, b"l-new".to_vec()),
+            ],
+            "the shared log's frames first, then each signal's own"
+        );
+
+        // Logs has published past its new frame but traces has not, so the
+        // shared segment is still live: it holds a traces frame at seq 1.
+        assert_eq!(wal.truncate([3, 1, 2]).unwrap(), 0);
+        // Now traces covers it too, and the file that no signal owns goes.
+        assert_eq!(wal.truncate([3, 2, 2]).unwrap(), 1);
+        assert!(
+            Log::segments(&dir, 0x9c).unwrap().is_empty(),
+            "the shared segment is re-read in full at every boot until it goes"
+        );
+        let (got, _) = collect(&root, 0x9c, [0, 0, 0]);
+        assert_eq!(
+            got,
+            vec![(Signal::Logs, b"l-new".to_vec())],
+            "and sweeping it left the per-signal logs alone"
+        );
     }
 
     #[test]
@@ -1006,7 +1281,7 @@ mod tests {
         wal.append(Signal::Logs, b"also-complete").unwrap();
         wal.sync().unwrap();
         let path = {
-            let inner = wal.inner.lock().unwrap();
+            let inner = wal.inner_of(Signal::Logs);
             inner.path.clone()
         };
         drop(wal);
@@ -1037,7 +1312,7 @@ mod tests {
         wal.append(Signal::Logs, b"the-quick-brown-fox").unwrap();
         wal.sync().unwrap();
         let path = {
-            let inner = wal.inner.lock().unwrap();
+            let inner = wal.inner_of(Signal::Logs);
             inner.path.clone()
         };
         drop(wal);
@@ -1061,7 +1336,7 @@ mod tests {
         wal.append(Signal::Logs, b"small").unwrap();
         wal.sync().unwrap();
         let path = {
-            let inner = wal.inner.lock().unwrap();
+            let inner = wal.inner_of(Signal::Logs);
             inner.path.clone()
         };
         drop(wal);
@@ -1105,7 +1380,7 @@ mod tests {
         // there, and the watermark comparison would then skip new data as if
         // it were already published.
         let wal = Wal::open(&root, 6).unwrap();
-        assert_eq!(wal.next_seq(), 2);
+        assert_eq!(wal.next_seq(Signal::Logs), 2);
         assert_eq!(wal.append(Signal::Logs, b"c").unwrap(), 2);
 
         let (got, _) = collect(&root, 6, [0, 0, 0]);
@@ -1161,15 +1436,15 @@ mod tests {
         wal.append(Signal::Logs, b"old").unwrap();
         {
             // Force a roll without writing 64 MiB.
-            let mut inner = wal.inner.lock().unwrap();
+            let mut inner = wal.inner_of(Signal::Logs);
             inner.written = SEGMENT_BYTES;
         }
         wal.append(Signal::Logs, b"new").unwrap();
-        assert_eq!(Wal::segments(&wal.dir, 7).unwrap().len(), 2);
+        assert_eq!(Log::segments(wal.dir_of(Signal::Logs), 7).unwrap().len(), 2);
 
         // Watermark covers seq 0, the first segment's only frame.
-        assert_eq!(wal.truncate(1).unwrap(), 1);
-        let segments = Wal::segments(&wal.dir, 7).unwrap();
+        assert_eq!(wal.truncate([1, 0, 0]).unwrap(), 1);
+        let segments = Log::segments(wal.dir_of(Signal::Logs), 7).unwrap();
         assert_eq!(segments.len(), 1, "the open segment is never unlinked");
 
         let (got, _) = collect(&root, 7, [0, 0, 0]);
@@ -1183,15 +1458,15 @@ mod tests {
         wal.append(Signal::Logs, b"covered").unwrap(); // seq 0
         wal.append(Signal::Logs, b"not-yet").unwrap(); // seq 1
         {
-            let mut inner = wal.inner.lock().unwrap();
+            let mut inner = wal.inner_of(Signal::Logs);
             inner.written = SEGMENT_BYTES;
         }
         wal.append(Signal::Logs, b"newest").unwrap(); // seq 2, new segment
 
         // The last frame decides. Dropping the first segment at a watermark of
         // 1 would lose seq 1, which no block covers yet.
-        assert_eq!(wal.truncate(1).unwrap(), 0);
-        assert_eq!(wal.truncate(2).unwrap(), 1);
+        assert_eq!(wal.truncate([1, 0, 0]).unwrap(), 0);
+        assert_eq!(wal.truncate([2, 0, 0]).unwrap(), 1);
     }
 
     #[test]
@@ -1205,7 +1480,12 @@ mod tests {
         let wal = Wal::open(&root, 0x11).unwrap();
         wal.append(Signal::Logs, b"body").unwrap();
         wal.sync().unwrap();
-        let good = fs::read(root.join(".wal").join("00000011-00000000000000000000.wal")).unwrap();
+        let good = fs::read(
+            root.join(".wal")
+                .join("logs")
+                .join("00000011-00000000000000000000.wal"),
+        )
+        .unwrap();
         assert_eq!(good.len(), HEADER_LEN + 4 + CRC_LEN);
 
         let broken = |f: &dyn Fn(&mut Vec<u8>)| -> Error {
@@ -1287,7 +1567,7 @@ mod tests {
         wal.append(Signal::Logs, b"in-flight").unwrap();
         wal.sync().unwrap();
         let path = {
-            let inner = wal.inner.lock().unwrap();
+            let inner = wal.inner_of(Signal::Logs);
             inner.path.clone()
         };
         drop(wal);
@@ -1323,12 +1603,13 @@ mod tests {
         drop(wal);
         let head = root
             .join(".wal")
+            .join("logs")
             .join(format!("{:08x}-{:020}.wal", 0x4b, 1));
         fs::write(&head, torn_frame_bytes(1)).unwrap();
 
         let wal = Wal::open(&root, 0x4b).unwrap();
         assert_eq!(
-            wal.next_seq(),
+            wal.next_seq(Signal::Logs),
             2,
             "the torn segment's own name is not reused"
         );
@@ -1360,15 +1641,15 @@ mod tests {
         {
             // Rolled by hand: the alternative is 64 MiB of appends, and what is
             // under test is the hand-off, not the size trigger.
-            let mut inner = wal.inner.lock().unwrap();
-            wal.roll(&mut inner).unwrap();
+            let mut inner = wal.inner_of(Signal::Logs);
+            wal.log(Signal::Logs).roll(&mut inner).unwrap();
             assert_eq!(inner.retired.len(), 1, "queued for the timer, not forced");
             assert!(!inner.dirty, "and the new segment has nothing in it");
         }
 
         wal.sync().unwrap();
         {
-            let inner = wal.inner.lock().unwrap();
+            let inner = wal.inner_of(Signal::Logs);
             assert!(
                 inner.retired.is_empty(),
                 "taken, so a later tick does not pay for the same barrier again"
@@ -1398,13 +1679,17 @@ mod tests {
         wal.append(Signal::Logs, b"live").unwrap();
         let stale = root
             .join(".wal")
+            .join("logs")
             .join(format!("{:08x}-{:020}.wal", 0x6b, 7));
         File::create(&stale).unwrap();
-        assert_eq!(Wal::segments(&wal.dir, 0x6b).unwrap().len(), 2);
+        assert_eq!(
+            Log::segments(wal.dir_of(Signal::Logs), 0x6b).unwrap().len(),
+            2
+        );
 
         // Watermark 0: nothing at all is published, so the only reason this
         // file can go is that it holds no frames.
-        assert_eq!(wal.truncate(0).unwrap(), 1);
+        assert_eq!(wal.truncate([0, 0, 0]).unwrap(), 1);
         assert!(!stale.exists());
         let (got, _) = collect(&root, 0x6b, [0, 0, 0]);
         assert_eq!(
@@ -1427,7 +1712,9 @@ mod tests {
         let root = tmpdir("listing");
         let wal = Wal::open(&root, 0x7c).unwrap();
         wal.append(Signal::Logs, b"real").unwrap();
-        let dir = root.join(".wal");
+        // The logs log's own directory: the junk below has to sit beside a real
+        // segment to prove the filter picks it out of a populated listing.
+        let dir = root.join(".wal").join("logs");
         for junk in [
             "0000007c-00000000000000000009.log", // right shape, wrong suffix
             "0000007c-not-a-number.wal",         // suffix, but no sequence
@@ -1438,14 +1725,14 @@ mod tests {
             File::create(dir.join(junk)).unwrap();
         }
 
-        let listed = Wal::segments(&dir, 0x7c).unwrap();
+        let listed = Log::segments(&dir, 0x7c).unwrap();
         assert_eq!(listed.len(), 1, "only the real segment, got {listed:?}");
         assert_eq!(listed[0].1, 0);
 
         // A directory that is not there yet is the first boot on a fresh
         // volume, and has to read as empty rather than as an error.
         assert!(
-            Wal::segments(&root.join("never-created"), 0x7c)
+            Log::segments(&root.join("never-created"), 0x7c)
                 .unwrap()
                 .is_empty()
         );
@@ -1453,7 +1740,7 @@ mod tests {
         let notdir = root.join("a-file-not-a-dir");
         fs::write(&notdir, b"x").unwrap();
         assert!(matches!(
-            Wal::segments(&notdir, 0x7c),
+            Log::segments(&notdir, 0x7c),
             Err(Error::Io { .. })
         ));
     }
@@ -1558,14 +1845,14 @@ mod tests {
         // and would not be if a fifth frame were in flight.
         assert_eq!(wal.watermark_for(Signal::Logs, &even), 4);
 
-        // Signals do not see each other: a traces frame in flight cannot hold
-        // back a logs watermark, which is what the per-signal array is for. The
-        // logs watermark goes past it, and the traces one does not — a sequence
-        // is global, and only the array makes skipping another signal's frame
-        // safe.
+        // Signals do not see each other, and now by construction rather than by
+        // bookkeeping: a traces frame goes to the traces log, so it is not in
+        // the logs sequence space at all and cannot move a logs watermark by
+        // one. It is its own log's seq 0 and unpublished, so the traces
+        // watermark stays at nothing-published.
         wal.append(Signal::Traces, b"t4").unwrap();
-        assert_eq!(wal.watermark_for(Signal::Logs, &even), 5);
-        assert_eq!(wal.watermark_for(Signal::Traces, &[]), 4);
+        assert_eq!(wal.watermark_for(Signal::Logs, &even), 4);
+        assert_eq!(wal.watermark_for(Signal::Traces, &[]), 0);
     }
 
     /// A block that failed to publish keeps its frames replayable.
