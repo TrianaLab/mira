@@ -2011,6 +2011,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same sweep with `--offload` set: the block leaves the disk and is
+    /// in the store, in that order.
+    ///
+    /// `mira_core::offload` owns the copy and tests it; what this covers is the
+    /// wiring — that the retention worker passes the target down rather than
+    /// taking the plain `expire` branch. Mutation check: swap the `match` in
+    /// `retention` for an unconditional `block::expire` and the store is empty
+    /// here while the local count still reaches zero.
+    #[tokio::test]
+    async fn retention_with_offload_puts_the_block_in_the_store_before_unlinking_it() {
+        let (c, dir) = cfg("retention-offload");
+        let store = dir.join("cold");
+        let (tx, _open, h) = spawn::<LogsBuilder>(&c);
+        tx.submit(crate::e2e::logs_export("checkout", 1_000, 4))
+            .await
+            .unwrap_or_else(|_| panic!("export"));
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(blocks(&dir), 1);
+
+        let target = mira_core::offload::Target::parse(&format!("file://{}", store.display()))
+            .expect("file:// target");
+        spawn_retention(Arc::new(Config {
+            data_dir: dir.clone(),
+            retention: Duration::ZERO,
+            offload: Some(target.clone()),
+            ..Default::default()
+        }));
+        for _ in 0..200 {
+            if blocks(&dir) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(blocks(&dir), 0, "the local copy still goes");
+        assert_eq!(
+            target.list("logs").unwrap().len(),
+            1,
+            "and the store has it, listed by name with no index written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A volume that fills faster than the TTL expires is the outage the whole
     /// stack exists to explain, and before this it was permanent: every
     /// `publish` ENOSPC, every export NACKed, and the only thing that deletes

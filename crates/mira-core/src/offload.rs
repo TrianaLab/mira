@@ -59,10 +59,6 @@ impl Target {
         }
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Every block the store holds for `signal`, oldest first.
     ///
     /// This is [`block::scan`] against the store's root and nothing else: the
@@ -146,10 +142,7 @@ fn copy_block(
     // of the bytes about to be written again.
     if let Err(e) = fs::remove_dir_all(&tmp) {
         if e.kind() != io::ErrorKind::NotFound {
-            return Err(Error::Io {
-                path: tmp,
-                source: e,
-            });
+            return Err(e).ctx(tmp);
         }
     }
     fs::create_dir(&tmp).ctx(&tmp)?;
@@ -164,36 +157,33 @@ fn copy_block(
             // is `ENOTEMPTY`, which is the same outcome as the `exists` check
             // at the top of `push` and is not a failure of this sweep.
             Err(_) if dest.exists() => return Ok(false),
-            Err(e) => {
-                return Err(Error::Io {
-                    path: dest.into(),
-                    source: e,
-                });
-            }
+            Err(e) => return Err(e).ctx(dest),
         }
         fsync_dir(dest_dir)?;
         Ok(true)
     });
 
-    if copied.is_err() {
-        let _ = fs::remove_dir_all(&tmp);
-    }
+    // Unconditional: on success the rename took it, on `Ok(false)` the bytes
+    // are already there under someone else's copy, and on error it is a
+    // prefix. Leaving it costs a whole block of store until the next
+    // `sweep_staging`, and this is one `rmdir` on a directory that is usually
+    // already gone.
+    let _ = fs::remove_dir_all(&tmp);
     copied
 }
 
 fn copy_files(src: &Path, dst: &Path) -> Result<()> {
     for entry in fs::read_dir(src).ctx(src)? {
-        let from = entry.ctx(src)?.path();
+        let entry = entry.ctx(src)?;
+        let from = entry.path();
         // A block directory is flat: `<table>.arrow` files, the sidecars and
         // the `cold` marker. Anything else in there is not part of the block
         // and copying it would put bytes in the store that no reader opens.
-        if !from.is_file() {
-            continue;
+        // `DirEntry::file_name` rather than `Path::file_name` because the first
+        // cannot fail and the second returns an `Option` nothing can produce.
+        if from.is_file() {
+            copy_file(&from, &dst.join(entry.file_name()))?;
         }
-        let Some(name) = from.file_name() else {
-            continue;
-        };
-        copy_file(&from, &dst.join(name))?;
     }
     Ok(())
 }
@@ -263,6 +253,14 @@ mod tests {
         let dir = block(&local, "logs", 7_200_000_000_000, 1, b"hello");
         let t = Target::parse(&format!("file://{}", store.display())).unwrap();
 
+        // A block directory is flat, so anything with children in it belongs to
+        // something else — a half-written compaction, an editor's backup dir.
+        // It is walked past rather than recursed into, because the copy's cost
+        // is the block's size and nothing here bounds what a stray directory
+        // holds. Mutation check: recurse and this shows up in the store.
+        fs::create_dir(dir.join("not-a-table")).unwrap();
+        fs::write(dir.join("not-a-table").join("junk"), b"x").unwrap();
+
         let b = block::scan(&local, "logs").unwrap().remove(0);
         assert!(t.push("logs", &b).unwrap());
         // Idempotent: the second sweep sees it and does not copy it again.
@@ -275,6 +273,10 @@ mod tests {
         assert_eq!(listed[0].seq, b.seq);
         assert_eq!(listed[0].node, b.node);
         assert!(!store.join(".tmp").join("logs-x").exists());
+        assert!(
+            !listed[0].dir.join("not-a-table").exists(),
+            "a directory inside the block was copied into the store"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
         assert!(t.pull("logs", &listed[0], &local, 7).unwrap());
@@ -323,9 +325,63 @@ mod tests {
         );
     }
 
-    /// The invariant section 3.3 states: anything that reconstructs a file at
-    /// a path this process may already have verified must stamp a current
-    /// `mtime` rather than preserve a stored one.
+    /// Three failure shapes a round trip cannot produce, and `copy_block` has
+    /// to tell apart: a block whose directory cannot be named, a staging path
+    /// that is not a directory, and another replica landing the same immutable
+    /// bytes first. The third is the one worth the test — read as a failure it
+    /// would keep a block that is already safely in the store.
+    #[test]
+    fn a_copy_that_cannot_land_says_which_way_it_failed() {
+        let tmp = tempdir("fail");
+        let (local, store) = (tmp.join("data"), tmp.join("cold"));
+        block(&local, "logs", 7_200_000_000_000, 1, b"hello");
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&local, "logs").unwrap().remove(0);
+        let name = b.dir.file_name().unwrap().to_str().unwrap().to_string();
+        let staged = store
+            .join(".tmp")
+            .join(format!("logs-{name}-{}", std::process::id()));
+
+        // A `BlockRef` with no partition above it has no address in the store.
+        // `scan` cannot produce one; it is skipped rather than copied to a
+        // name that would not list.
+        let orphan = block::BlockRef {
+            dir: PathBuf::from("loose"),
+            ..b
+        };
+        assert!(!t.push("logs", &orphan).unwrap());
+        assert!(!t.pull("logs", &orphan, &local, 7).unwrap());
+
+        // Staging occupied by a *file*. Clearing a leftover directory is
+        // unambiguous and silent; this is not a leftover, so it is an error
+        // rather than something to delete.
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"not a directory").unwrap();
+        assert!(t.push("logs", &b).is_err());
+        assert!(t.list("logs").unwrap().is_empty());
+        fs::remove_file(&staged).unwrap();
+
+        // The race the staging name's pid exists for: the other replica
+        // renamed first, so `rename` gets `ENOTEMPTY` after this copy's
+        // `exists` check already passed. Called through `copy_block` because
+        // `push` returns at that check and never reaches the race.
+        let (partition, name) = split(&b.dir).unwrap();
+        let dest_dir = store.join("logs").join(partition);
+        let dest = dest_dir.join(name);
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("logs.arrow"), b"theirs").unwrap();
+        let staging = format!("logs-{name}");
+        assert!(!copy_block(&b.dir, &store, &dest_dir, &dest, &staging).unwrap());
+        // Theirs, untouched — and the copy this call made is not left behind
+        // in `.tmp` holding a second copy of the block.
+        assert_eq!(fs::read(dest.join("logs.arrow")).unwrap(), b"theirs");
+        assert!(!staged.exists());
+    }
+
+    /// The invariant [section
+    /// 6.1](https://miradb.dev/architecture/#61-offload-a-copy-before-the-unlink)
+    /// states: a restore rewrites what is at a path, so the path's `mtime` has
+    /// to say the bytes are new.
     ///
     /// Mutation check: implement `copy_file` with `fs::copy` on macOS, or add
     /// any explicit `utimensat` that replays the source timestamp, and the

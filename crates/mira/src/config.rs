@@ -663,6 +663,7 @@ mod tests {
   "storage": {
     "dir": "/var/lib/${node}/${env:MIRA_TEST_MISSING,fallback}",
     "retention": "36h",
+    "offload": "file:///cold/${node}",
   },
   "alerts": { "rules": "/etc/${node}/rules.yaml" },
 }"#,
@@ -674,6 +675,11 @@ mod tests {
         assert_eq!(cfg.grpc.port(), 5317);
         assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/node-7/fallback"));
         assert_eq!(cfg.retention, Duration::from_secs(36 * 3600));
+        // A URI is a string to this layer and the scheme is `main`'s to
+        // refuse, but it interpolates like every other value — one image, one
+        // bucket prefix per replica.
+        assert_eq!(cfg.offload.as_deref(), Some("file:///cold/node-7"));
+        assert_eq!(Config::default().offload, None, "off by default");
         // Every path in the file interpolates, including the one that is read
         // last: a rules file under `/etc/${node}` is how one image serves a
         // fleet, and a literal `${node}` there is a boot that finds no rules.
@@ -895,6 +901,22 @@ mod tests {
         assert_eq!(Config::default().queue, 128);
         let e = Config::parse(r#"{ "ingest": { "queue": "0" } }"#).unwrap_err();
         assert!(e.contains("ingest.queue"), "{e}");
+
+        // `ingest.shards` is the same count with one more spelling: zero is
+        // "ask the machine", so it goes through `whole` and not `positive`.
+        // Both parsers reject `4k` identically, which is why the key each one
+        // is wired to has to be asserted rather than assumed.
+        let cfg = Config::parse(r#"{ "ingest": { "shards": "4" } }"#).unwrap();
+        assert_eq!(cfg.shards, 4);
+        assert_eq!(
+            Config::parse(r#"{ "ingest": { "shards": "0" } }"#)
+                .unwrap()
+                .shards,
+            0
+        );
+        assert_eq!(Config::default().shards, 0, "one flusher per core");
+        let e = Config::parse(r#"{ "ingest": { "shards": "4k" } }"#).unwrap_err();
+        assert!(e.contains("ingest.shards"), "{e}");
     }
 
     /// Off by default: a node that stores its own telemetry is writing to the

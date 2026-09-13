@@ -203,4 +203,32 @@ mod tests {
         assert!(line.contains(">10ms=2"), "{line}");
         assert!(line.contains(">100ms=1"), "{line}");
     }
+
+    /// The dump is the whole point of the module, and the failure it can have
+    /// is silent: a probe added above and not listed below simply never
+    /// appears, and the run it was added for is measured without it. So the
+    /// test names every probe the diagnosis in `docs/architecture.md` section
+    /// 11 is read off, and a nine-line dump is what that section quotes.
+    #[test]
+    fn the_dump_names_every_probe_the_diagnosis_reads() {
+        let _scope = wal_scope();
+        let out = dump();
+        for name in [
+            "submit.total",
+            "submit.admit",
+            "submit.wait_ack",
+            "wal.encode",
+            "wal.lock_wait",
+            "wal.held",
+            "wal.write",
+            "runtime.lag",
+            "wal.inflight_max",
+        ] {
+            assert!(out.contains(name), "{name} is missing from:{out}");
+        }
+        assert_eq!(out.trim_start().lines().count(), 9, "{out}");
+        // `wal_scope` is live, so the high-water mark has seen at least one.
+        assert!(WAL_INFLIGHT_MAX.load(Relaxed) >= 1);
+        assert!(WAL_INFLIGHT.load(Relaxed) >= 1);
+    }
 }

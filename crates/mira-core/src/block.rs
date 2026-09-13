@@ -2262,6 +2262,50 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A hook that fails keeps its block, and the sweep carries on.
+    ///
+    /// This is the ordering `--offload` is built on, stated as a test: the
+    /// unlink is downstream of the copy, so a store that is unreachable costs
+    /// disk rather than data. Mutation check: run the hook after
+    /// `remove_dir_all`, or ignore its error, and the first assertion returns
+    /// 2 instead of 1.
+    #[test]
+    fn a_failing_before_delete_hook_keeps_its_block() {
+        let root = dir("hook");
+        let node = node_id("a");
+        let first = publish(&root, "logs", node, 0, 0, &sealed(1_000, 2_000))
+            .unwrap()
+            .dir;
+        let second = publish(&root, "logs", node, 1, 0, &sealed(3_000, 4_000))
+            .unwrap()
+            .dir;
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let dropped = expire_with(&root, "logs", i64::MAX, &|b| {
+            seen.borrow_mut().push(b.seq);
+            match b.seq {
+                0 => Err(Error::OffloadScheme {
+                    uri: "file://nowhere".into(),
+                }),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(dropped, 1);
+        assert_eq!(*seen.borrow(), vec![0, 1], "every block was offered");
+        assert!(first.is_dir(), "the block whose copy failed is still here");
+        assert!(!second.exists(), "the one beside it went");
+        // And the next sweep retries it, which is the other half of "two
+        // copies, never zero": a failure is a delay, not a leak.
+        assert_eq!(
+            expire_with(&root, "logs", i64::MAX, &|_| Ok(())).unwrap(),
+            1
+        );
+        assert!(scan(&root, "logs").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Free space, for the ingest side to back off on. Only the shape can be
     /// asserted here — the number belongs to whatever volume the test runs on.
     #[test]
