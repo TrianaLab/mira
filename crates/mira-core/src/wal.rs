@@ -578,13 +578,17 @@ impl Wal {
             }
             Ok(())
         };
-        force().inspect_err(|_| {
-            // Put the flag back: these bytes are still unforced, and a tick
-            // that failed must not be the reason the next one skips them.
-            if dirty {
-                self.lock().dirty = true;
-            }
-        })
+        let forced = force();
+        // Put the flag back: these bytes are still unforced, and a tick that
+        // failed must not be the reason the next one skips them. Written flat
+        // rather than as `inspect_err` so that the part no test can reach is
+        // the one assignment and not a four-line closure: `sync_data` degrades
+        // to `fsync` rather than failing, so nothing short of a filesystem
+        // going away under the process gets here.
+        if dirty && forced.is_err() {
+            self.lock().dirty = true;
+        }
+        forced
     }
 
     /// The sequence that will be handed to the next append.
