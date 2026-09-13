@@ -29,7 +29,11 @@ export default defineConfig({
     modulePreload: { polyfill: false },
     rollupOptions: {
       output: {
-        inlineDynamicImports: true,
+        // rollup 5's spelling of `inlineDynamicImports: true`, which it now
+        // warns on. Same guarantee, and the guarantee is load-bearing: the
+        // built files are listed by name in a const table in `src/ui.rs`, so a
+        // second chunk is not a slower page, it is a 404.
+        codeSplitting: false,
         entryFileNames: 'app.js',
         assetFileNames: 'app.[ext]',
       },
