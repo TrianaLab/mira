@@ -979,6 +979,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A query reads the attribute tables when it needs them and not before —
+    /// and every table it does read is still checksummed in full.
+    ///
+    /// The two halves are one test on purpose, because each is the other's
+    /// guard. Corrupt one block's `log_attrs.arrow` and leave everything else
+    /// alone:
+    ///
+    ///   - a query with no attribute predicate that the damaged block does not
+    ///     contribute a row to *succeeds*, having scanned that block's root
+    ///     table and never touched its attributes;
+    ///   - a query with an attribute predicate over it fails `BadChecksum`;
+    ///   - a query that emits one of its rows fails `BadChecksum`.
+    ///
+    /// Reverting `query::Block::open` to loading the attribute tables eagerly
+    /// fails the first assertion — the corrupt file is read by a query that
+    /// never looks at it. Dropping the CRC check, or rendering a block without
+    /// having loaded its detail through the verified path, fails the other
+    /// two: a bad block would be served.
+    #[test]
+    fn a_corrupt_attribute_table_is_caught_by_every_query_that_reads_it_and_no_other() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-attr-crc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Different row counts, so a body substring picks one block out. Block
+        // 0 is older and smaller, and it is the one that gets damaged.
+        let mut dirs = Vec::new();
+        for (seq, (service, n, base)) in [("checkout", 3usize, 1_000u64), ("payments", 10, 5_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request(service, n, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            let p = block::publish(&root, "logs", block::node_id("a"), seq as u64, 0, &sealed);
+            dirs.push(p.unwrap().dir);
+        }
+        let damaged = dirs[0].join("log_attrs.arrow");
+
+        // One byte, inside the region the footer's `mira.crc32.len` covers. The
+        // CRC is checked before a single byte of the body is parsed, so this is
+        // an error and not a malformed-Arrow panic — and the assertion below is
+        // what says the mutation landed where it was aimed.
+        let mut bytes = std::fs::read(&damaged).unwrap();
+        bytes[64] ^= 0xff;
+        std::fs::write(&damaged, &bytes).unwrap();
+        assert!(
+            matches!(block::open_table(&damaged), Err(Error::BadChecksum { .. })),
+            "the corruption must be detectable at all, or the rest proves nothing"
+        );
+
+        let q = |terms: Vec<Term>, limit: usize| Search {
+            signal: Signal::Logs,
+            from: 0,
+            to: i64::MAX,
+            terms,
+            limit,
+            after: None,
+        };
+        let body = |v: &str| Term {
+            target: Target::Field("body".into()),
+            op: Op::Contains,
+            value: QV::Str(v.into()),
+        };
+
+        // `contains` has no zone summary, so nothing prunes: both blocks are
+        // opened and every row of both is compared. Only the ten-row block
+        // holds "line 7", so the damaged block contributes nothing and is never
+        // rendered.
+        let r = query::search(&root, &q(vec![body("line 7")], 100)).unwrap();
+        assert_eq!(r.stats.blocks_total, 2);
+        assert_eq!(r.stats.blocks_scanned, 2, "neither block may prune");
+        assert_eq!(r.stats.rows_scanned, 13, "3 + 10 root rows, all compared");
+        assert_eq!(r.stats.rows_matched, 1);
+
+        // ...and the same query over a token no row holds still reads both root
+        // tables and still does not care that one block's attributes are junk.
+        let r = query::search(&root, &q(vec![body("zqxjw")], 100)).unwrap();
+        assert_eq!(r.stats.blocks_scanned, 2);
+        assert_eq!(r.stats.rows_matched, 0);
+
+        // An attribute predicate is evaluated against the attribute tables, so
+        // now it is read — and refused. "http.method" is on every row of both
+        // blocks, so the bloom sidecar cannot prune the damaged one.
+        let attr = Term {
+            target: Target::Attr("http.method".into()),
+            op: Op::Eq,
+            value: QV::Str("GET".into()),
+        };
+        let e = query::search(&root, &q(vec![attr], 100))
+            .err()
+            .expect("an attribute predicate over a damaged block must not succeed");
+        assert!(
+            matches!(&e, Error::BadChecksum { path, .. } if path == &damaged),
+            "an attribute predicate must verify what it reads, got {e}"
+        );
+
+        // And so is rendering: a row of the damaged block emits its attributes,
+        // so a query that reaches it fails rather than returning a row with
+        // attributes read out of unverified bytes.
+        let e = query::search(&root, &q(vec![], 100))
+            .err()
+            .expect("rendering a row of a damaged block must not succeed");
+        assert!(
+            matches!(&e, Error::BadChecksum { path, .. } if path == &damaged),
+            "a rendered row must verify what it reads, got {e}"
+        );
+
+        // The undamaged block on its own is still perfectly readable: the
+        // failure above is this file's, not the query's.
+        let r = query::search(&root, &q(vec![body("line 9")], 100)).unwrap();
+        assert_eq!(r.stats.rows_matched, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Paging must be a partition of the one-shot answer: every row once, in
     /// the same order, no matter where the page boundaries land.
     ///
