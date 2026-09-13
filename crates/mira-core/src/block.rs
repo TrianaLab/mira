@@ -870,38 +870,53 @@ fn fs_type(path: &Path) -> Result<Option<String>> {
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8)
             .collect();
-        let name = String::from_utf8_lossy(&name).into_owned();
-        Ok(match name.as_str() {
-            "nfs" | "smbfs" | "cifs" | "webdav" | "afpfs" | "ftp" => Some(name),
-            n if n.contains("fuse") => Some("fuse".into()),
-            _ => None,
-        })
+        Ok(remote_fs(&String::from_utf8_lossy(&name)))
     }
 
-    // Linux reports a magic number. Listed rather than ranged because the set of
-    // filesystems that break `mmap` is small, specific and does not grow often;
-    // anything unrecognised is treated as local, which is the right default for
-    // a check whose false positive is "Mira will not start".
     #[cfg(not(target_os = "macos"))]
     {
         // Masked to 32 bits: `f_type` is `__fsword_t`, which is i64 on x86_64
         // glibc but i32 on some musl and 32-bit targets, where a magic with the
         // high bit set (CIFS, SMB2) arrives sign-extended.
-        let ty = (buf.f_type as u64) & 0xffff_ffff;
-        Ok(match ty {
-            0x6969 => Some("NFS".into()),
-            0x517b => Some("SMB".into()),
-            0xff53_4d42 => Some("CIFS".into()),
-            0xfe53_4d42 => Some("SMB2".into()),
-            0x0102_1997 => Some("9P".into()),
-            0x5346_414f => Some("AFS".into()),
-            0x00c3_6400 => Some("CephFS".into()),
-            0x0116_1970 => Some("GFS2".into()),
-            0x7461_636f => Some("OCFS2".into()),
-            0x0bd0_0bd0 => Some("Lustre".into()),
-            0x6573_5546 => Some("fuse".into()),
-            _ => None,
-        })
+        Ok(remote_fs((buf.f_type as u64) & 0xffff_ffff))
+    }
+}
+
+/// The mounts that break `mmap`, keyed the way this platform names them.
+///
+/// Split from [`fs_type`] for the reason [`check_fs_type`] is: it is a table of
+/// constants, and a `statfs` on any machine that runs the tests returns exactly
+/// one of them — the fallthrough. Left inline, ten of the eleven arms below are
+/// unreachable from a real mount, so a magic with a transposed digit would ship
+/// looking as tested as the rest of the file.
+#[cfg(target_os = "macos")]
+fn remote_fs(name: &str) -> Option<String> {
+    match name {
+        "nfs" | "smbfs" | "cifs" | "webdav" | "afpfs" | "ftp" => Some(name.into()),
+        n if n.contains("fuse") => Some("fuse".into()),
+        _ => None,
+    }
+}
+
+/// Linux reports a magic number rather than a name. Listed rather than ranged
+/// because the set of filesystems that break `mmap` is small, specific and does
+/// not grow often; anything unrecognised is treated as local, which is the right
+/// default for a check whose false positive is "Mira will not start".
+#[cfg(not(target_os = "macos"))]
+fn remote_fs(magic: u64) -> Option<String> {
+    match magic {
+        0x6969 => Some("NFS".into()),
+        0x517b => Some("SMB".into()),
+        0xff53_4d42 => Some("CIFS".into()),
+        0xfe53_4d42 => Some("SMB2".into()),
+        0x0102_1997 => Some("9P".into()),
+        0x5346_414f => Some("AFS".into()),
+        0x00c3_6400 => Some("CephFS".into()),
+        0x0116_1970 => Some("GFS2".into()),
+        0x7461_636f => Some("OCFS2".into()),
+        0x0bd0_0bd0 => Some("Lustre".into()),
+        0x6573_5546 => Some("fuse".into()),
+        _ => None,
     }
 }
 
@@ -2211,6 +2226,52 @@ mod tests {
         // The operator has to be told which mount type, or the message is a
         // refusal with no next step in it.
         assert!(e.to_string().contains("NFS"), "{e}");
+    }
+
+    /// The other half of that rule: that the mounts it is stated over are the
+    /// ones [`remote_fs`] actually names.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_mount_the_check_refuses_is_one_the_table_names() {
+        for name in ["nfs", "smbfs", "cifs", "webdav", "afpfs", "ftp"] {
+            assert_eq!(remote_fs(name).as_deref(), Some(name));
+        }
+        // The FUSE spelling is the implementation's, and there are several of
+        // them — `macfuse`, `osxfuse`, `fuse-t`. All collapse to the one word
+        // the warning is written about.
+        assert_eq!(remote_fs("macfuse").as_deref(), Some("fuse"));
+        assert_eq!(remote_fs("apfs"), None);
+    }
+
+    /// The other half of that rule: that the mounts it is stated over are the
+    /// ones [`remote_fs`] actually names.
+    ///
+    /// Nothing that runs the tests is mounted on any of them, so the only arm a
+    /// live `statfs` reaches is the fallthrough and the eleven above it are
+    /// worth exactly what this test is worth. A transposed digit in a magic is
+    /// a `SIGBUS` on somebody's NFS mount and a green build here.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_mount_the_check_refuses_is_one_the_table_names() {
+        for (magic, want) in [
+            (0x6969_u64, "NFS"),
+            (0x517b, "SMB"),
+            (0xff53_4d42, "CIFS"),
+            (0xfe53_4d42, "SMB2"),
+            (0x0102_1997, "9P"),
+            (0x5346_414f, "AFS"),
+            (0x00c3_6400, "CephFS"),
+            (0x0116_1970, "GFS2"),
+            (0x7461_636f, "OCFS2"),
+            (0x0bd0_0bd0, "Lustre"),
+            (0x6573_5546, "fuse"),
+        ] {
+            assert_eq!(remote_fs(magic).as_deref(), Some(want), "{magic:#x}");
+        }
+        // ext4 and overlayfs: the runner, the container and every deployment
+        // this check is supposed to stay out of the way of.
+        assert_eq!(remote_fs(0xef53), None);
+        assert_eq!(remote_fs(0x794c_7630), None);
     }
 
     /// A cleanup that cannot run is not the failure the caller has to act on.

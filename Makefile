@@ -170,10 +170,16 @@ test: ## Unit tests + the in-process end-to-end suite
 # comparable with every figure measured before it existed.
 COVERAGE_SCOPE := --workspace --exclude xtask
 
+# `--show-missing-lines` because the run that matters is the one on the runner,
+# and a bare percentage there is not enough to act on: a `#[cfg]` can leave a
+# table of match arms unreachable on Linux and covered on this Mac, so the
+# ratchet fails on a diff that raised coverage where its author could see it.
+# The line numbers turn that from a bisect into a read.
 .PHONY: coverage
 coverage: ## Line coverage against the ratchet ($(COVERAGE_MIN)%)
 	$(call need,cargo-llvm-cov)
-	$(CARGO) llvm-cov $(COVERAGE_SCOPE) --locked --summary-only --fail-under-lines $(COVERAGE_MIN)
+	$(CARGO) llvm-cov $(COVERAGE_SCOPE) --locked --summary-only --show-missing-lines \
+	  --fail-under-lines $(COVERAGE_MIN)
 
 .PHONY: coverage-report
 coverage-report: ## Per-file coverage, worst first — what to write tests for next
