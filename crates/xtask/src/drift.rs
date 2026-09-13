@@ -892,18 +892,25 @@ mod tests {
         assert_eq!(unreleased_body("## [Unreleased]\n\n- a thing\n"), None);
     }
 
-    /// And the committed changelog is one `make bump` would accept today.
+    /// And the committed changelog is still shaped the way the reader expects.
     ///
     /// The unit test above proves the reader; this proves the file it reads.
     /// Both matter, because the failure mode being closed is a release that
     /// stops at the first command of the runbook.
+    ///
+    /// Deliberately structural and not "has notes in it": the section is empty
+    /// on purpose for the whole window between a release and the next change,
+    /// starting with the commit that cut this one. Asserting otherwise here
+    /// would turn every release into a red build, which is a worse gate than
+    /// none — and `bumped_changelog` refuses an empty section at the moment it
+    /// actually matters, which is when somebody types `make bump`.
     #[test]
-    fn the_committed_changelog_has_notes_to_promote() {
+    fn the_committed_changelog_still_has_a_section_to_promote() {
         let text = read_or_exit(CHANGELOG);
-        let body = unreleased_body(&text).expect("an [Unreleased] section above a released one");
         assert!(
-            !body.trim().is_empty(),
-            "{CHANGELOG}'s [Unreleased] section is empty, so `make bump` would refuse"
+            unreleased_body(&text).is_some(),
+            "{CHANGELOG} has no `## [Unreleased]` above a released section, so \
+             `make bump` would refuse whatever is written in it"
         );
     }
 
