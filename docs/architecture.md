@@ -476,6 +476,19 @@ verified must therefore stamp a current mtime rather than preserve a stored
 one; restoring a block from object storage is the shape that would otherwise
 bite.
 
+That leaves `skip_validation(true)` above resting on a weaker premise on a
+second open — not "the CRC just proved these bytes" but "this process proved
+them earlier" — and it is worth being exact about which half of that is new.
+The strong reading was never available under `mmap`: a clean page can be
+evicted between the hash and the scan that reads it, and re-faulted from disk,
+so even a single open verifies the bytes as of the CRC and not as of the read.
+Closing *that* would mean copying the body out and validating the copy, which
+is the zero-copy property this section exists to protect. What the cache
+changes is the width of the window, from one open to one process; what it costs
+is detection of media that rots under a mapping this process has already
+verified. A restart re-verifies everything, which is why the map is
+process-scoped and not persisted.
+
 What it is worth is [section 11](#11-performance-model): 1.55× median on a
 single block through the read path, ~1.1× on an unpruned corpus scan and 1.47×
 on a trace lookup. It is not the order of magnitude this document once inferred,
