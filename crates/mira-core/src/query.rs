@@ -3047,9 +3047,16 @@ mod tests {
         // the cursor filter and the JSON of `limit` rows — is the "no term"
         // line, and that is the claim in docs/architecture.md section 11 that
         // the per-block cost is paging rather than scanning.
+        //
+        // Measured twice, because the CRC is the larger half and it is paid
+        // once per file per process rather than once per open (`block::
+        // VERIFIED`). A block published a moment ago is inside the settle
+        // window and re-verifies on every open, which is the first pass; the
+        // second backdates the files to what a block even a minute old looks
+        // like, and the difference between the two columns *is* the checksum.
         let dir = std::env::temp_dir().join(format!("mira-scan-cost-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        crate::block::publish(&dir, "logs", 1, 1, 0, &open.sealed).unwrap();
+        let bref = crate::block::publish(&dir, "logs", 1, 1, 0, &open.sealed).unwrap();
         let one = (
             "no term, limit 1",
             Search {
@@ -3057,14 +3064,72 @@ mod tests {
                 ..all(Vec::new())
             },
         );
-        for (name, s) in [&cases[0], &one, &cases[3], &cases[5]] {
-            let _ = search(&dir, s).unwrap();
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(search(&dir, s).unwrap());
-            }
-            let ns = t.elapsed().as_nanos() as f64 / (reps * n) as f64;
-            println!("  full search: {name:21} {ns:8.3} ns/row");
+        let picks = [&cases[0], &one, &cases[3], &cases[5]];
+        let time_all = || {
+            picks.map(|(name, s)| {
+                let _ = search(&dir, s).unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(search(&dir, s).unwrap());
+                }
+                (*name, t.elapsed().as_nanos() as f64 / (reps * n) as f64)
+            })
+        };
+        let verifying = time_all();
+        // Taken while every open still checksums, so the comparison below is
+        // verified-read against cached-read and not cached against itself.
+        let want: Vec<String> = picks
+            .iter()
+            .map(|(_, s)| search(&dir, s).unwrap().json)
+            .collect();
+
+        // Backdating rather than sleeping out the window: the default 4,096-row
+        // size of this test runs in `make test`, and two seconds of nothing is
+        // not a thing to put in the normal suite.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in std::fs::read_dir(&bref.dir).unwrap() {
+            std::fs::File::options()
+                .write(true)
+                .open(f.unwrap().path())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let settled = time_all();
+
+        // The share is measured; a rate would not be. Dividing the saved time by
+        // the block's bytes gives 26-30 GB/s here, which is not `crc32fast`
+        // being five times its documented speed — it is this denominator being
+        // wrong twice over. `Block::open` does not load every table in the
+        // directory, and a block this size sits in cache where the 4,380 MiB
+        // corpus that produced the 5.2 GB/s figure is bandwidth-bound. So print
+        // what was timed and let the corpus measurement be the corpus
+        // measurement.
+        let bytes: u64 = std::fs::read_dir(&bref.dir)
+            .unwrap()
+            .map(|f| f.unwrap().metadata().unwrap().len())
+            .sum();
+        println!(
+            "  block on disk: {:.1} MiB over {n} rows, {:.0} bytes/row",
+            bytes as f64 / (1024.0 * 1024.0),
+            bytes as f64 / n as f64,
+        );
+        for ((name, was), (_, now)) in verifying.iter().zip(&settled) {
+            println!(
+                "  full search: {name:21} {was:8.3} -> {now:8.3} ns/row  {:.2}x  \
+                 checksum {:4.1}% of the read path",
+                was / now,
+                100.0 * (was - now) / was,
+            );
+        }
+        // The correctness half, and the reason this is not `#[ignore]`d: a
+        // skipped checksum must not change a single answer.
+        for ((name, s), want) in picks.iter().zip(&want) {
+            assert_eq!(
+                &search(&dir, s).unwrap().json,
+                want,
+                "{name} read differently once its tables were cached"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

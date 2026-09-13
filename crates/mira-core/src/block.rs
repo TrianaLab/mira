@@ -29,11 +29,13 @@
 //! correct data from an unlinked file until it drops the mapping. The `Arc` is
 //! the refcount; no lease protocol is needed.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
@@ -1174,6 +1176,111 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
     })
 }
 
+/// What this process has already checksummed, and the file it was.
+///
+/// The CRC is not the expensive part of a *first* read — it is the expensive
+/// part of the second one. A published block never changes, so a scan that
+/// reopens the same corpus re-verifies bytes this same process verified itself,
+/// and at the 5.2 GB/s `crc32fast` runs here that was ~93% of an unpruned scan:
+/// 4,380 MiB of log bodies re-hashed per query to answer a question the
+/// previous query already answered. Verifying once per block per process is the
+/// fix `docs/market.md` named under "Query at scale" and did not apply.
+///
+/// The identity is the path *plus* the length and mtime, never the path alone,
+/// because a name in this tree is not a file for life: [`compact`] renames a new
+/// table over an existing name, which is a different inode with a different
+/// mtime, and must re-verify. Entries are `(len, mtime)` rather than a set of
+/// keys so a replaced file overwrites its predecessor instead of accumulating
+/// beside it.
+///
+/// What this cannot see is a bit that rots under a live file without the mtime
+/// moving. That is the whole of the trade, and it is the reason the cache is
+/// process-scoped rather than persisted: a restart re-verifies everything, so
+/// the window is one process lifetime and not the life of the block. The
+/// alternative — dropping the CRC, or covering fewer tables — either gives up
+/// detection entirely or gives it up for whichever table a query skipped.
+static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, (u64, SystemTime)>>> = OnceLock::new();
+
+/// How old a file's mtime must be before a verification of it is worth
+/// remembering.
+///
+/// Without this the cache has a real hole, and it is not hypothetical — it is
+/// `corrupt_body_is_caught_not_returned_as_data` in `lib.rs`, which opens a
+/// table, flips one bit of the body, and reopens expecting `BadChecksum`. The
+/// flip does not change the length, so if both writes land inside one mtime tick
+/// the identity is unchanged and a *corrupt block reads as already verified*.
+///
+/// A settle window closes it by construction rather than by hoping the clock is
+/// fine-grained. An entry is only recorded once the file has been untouched for
+/// longer than any filesystem's mtime granularity, so a subsequent write is
+/// necessarily in a later tick and necessarily misses. Two seconds is rsync's
+/// quick-check window and for the same reason: 1 s is the worst granularity in
+/// the wild, and doubling it costs nothing here. A published block is renamed
+/// into place and never written again, so by the second query that reads it, it
+/// is hours old — the window only ever excludes a block being written right now,
+/// which is the one that should be re-read anyway.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ponytail: clear-all rather than evict-oldest. Retention churns block paths,
+/// so the map grows with the number of tables this process has ever opened, not
+/// with the number that exist. At ~1,800 tables for the 8.33 GiB corpus this is
+/// four orders of magnitude of headroom; an LRU is the upgrade path if a process
+/// ever opens a million distinct tables and the re-verification spike after a
+/// clear shows up in a p99.
+const VERIFIED_CAP: usize = 1 << 16;
+
+/// What [`open_table`] should do about this file's checksum.
+///
+/// Three states and not a `bool`, because "already checked" and "cannot tell"
+/// both mean "do not record" and only one of them means "do not check". Reading
+/// them off one `Option` is how a cache turns into a hole.
+enum Verify {
+    /// This process has already checksummed this exact file. Skip it.
+    Skip,
+    /// Checksum it. On success, record it under this identity — `None` to check
+    /// it again next time, which is the answer for a file whose metadata would
+    /// not read and for one still inside its settle window.
+    Check(Option<(u64, SystemTime)>),
+}
+
+/// Has this exact file already been checksummed by this process?
+fn verify_plan(path: &Path, file: &File) -> Verify {
+    let Some(id) = file
+        .metadata()
+        .ok()
+        .and_then(|m| Some((m.len(), m.modified().ok()?)))
+    else {
+        return Verify::Check(None);
+    };
+    let map = VERIFIED.get_or_init(Default::default);
+    // A poisoned lock means another thread panicked mid-insert. The map is a
+    // pure cache, so the recovery is to use it anyway rather than to propagate
+    // a panic into every subsequent read.
+    let seen = map.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get(path) == Some(&id) {
+        return Verify::Skip;
+    }
+    drop(seen);
+    // A file still inside its settle window is checked and *not* recorded, so
+    // the next open checks it again. See [`SETTLED`].
+    let settled = SystemTime::now()
+        .duration_since(id.1)
+        .is_ok_and(|age| age >= SETTLED);
+    Verify::Check(settled.then_some(id))
+}
+
+/// Record that `path` passed its checksum as the file `id` describes.
+fn mark_verified(path: &Path, id: (u64, SystemTime)) {
+    let mut seen = VERIFIED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= VERIFIED_CAP {
+        seen.clear();
+    }
+    seen.insert(path.to_path_buf(), id);
+}
+
 /// Open one table of a block with no buffer copies.
 ///
 /// This is a blocking call that can take a hard page fault. It must never run on
@@ -1182,6 +1289,10 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// dedicated reader pool.
 pub fn open_table(path: &Path) -> Result<MappedTable> {
     let file = File::open(path).ctx(path)?;
+    // Off the open descriptor, not the path: `fstat` describes the file this
+    // mapping is about to cover, where a later `stat` of the name could describe
+    // whatever replaced it.
+    let plan = verify_plan(path, &file);
     // SAFETY: the obligation is that nothing modifies or truncates this file
     // while the mapping lives — a truncation is a SIGBUS on the next page
     // touched, which no in-process check can catch. What discharges it is
@@ -1197,8 +1308,9 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
     // a block file in place, and nothing here can — the data directory is
     // Mira's, and that is a deployment property, not a checkable one.
     let mmap = unsafe { Mmap::map(&file) }.ctx(path)?;
-    // Every open CRCs the whole body, so every page is touched. Faulting them in
-    // one at a time caps a cold scan at fault latency; asking for the file up
+    // A first open CRCs the whole body, so every page is touched; a later one
+    // skips the CRC but a scan still reads most of what it mapped. Faulting them
+    // in one at a time caps a cold read at fault latency; asking for the file up
     // front lets the kernel read ahead. A hint, so a failure is not an error.
     let _ = mmap.advise(memmap2::Advice::WillNeed);
 
@@ -1268,13 +1380,22 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
             path: path.to_path_buf(),
             key: CRC_LEN_KEY,
         })?;
-    let actual = crc32fast::hash(&buffer[..body_len]);
-    if actual != expected {
-        return Err(Error::BadChecksum {
-            path: path.to_path_buf(),
-            expected,
-            actual,
-        });
+    // The footer reads above are a few hundred bytes and run either way: they
+    // are what proves `body_len` is in range, and the slicing below trusts it.
+    // Only the hash of the body is skipped, and only for a file this process
+    // has already hashed — see [`VERIFIED`].
+    if let Verify::Check(id) = plan {
+        let actual = crc32fast::hash(&buffer[..body_len]);
+        if actual != expected {
+            return Err(Error::BadChecksum {
+                path: path.to_path_buf(),
+                expected,
+                actual,
+            });
+        }
+        if let Some(id) = id {
+            mark_verified(path, id);
+        }
     }
 
     // Everything from here on comes out of the *body*, not out of the footer.
@@ -1613,6 +1734,61 @@ mod tests {
         // where nothing at all was rejected would mean the checks above never
         // ran.
         assert!(flipped > 0, "no corrupt footer was rejected");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Both halves of what [`VERIFIED`] trades, in one test, because a cache
+    /// whose only test is that it is fast is a cache nobody can review.
+    ///
+    /// The skip is not observable through the public API by design — a cached
+    /// open and a fresh one return the same table — so it is observed the only
+    /// way it can be: corrupt the body *without moving the mtime* and see
+    /// whether the read still succeeds. On a settled file it does, and that is
+    /// the documented trade. Move the mtime and it is caught, which is the part
+    /// that has to keep working.
+    #[test]
+    fn a_settled_table_is_checksummed_once_and_a_touched_one_every_time() {
+        let d = dir("verifycache");
+        let path = d.join("logs.arrow");
+        let want = batch();
+        write_table(&path, &want).unwrap();
+
+        // Backdated past `SETTLED`, which is what a block that was published
+        // even a few seconds ago looks like. Restored after every write below,
+        // so the identity the cache holds never changes.
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let backdate = || {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        backdate();
+        assert_eq!(open_table(&path).unwrap().batches, vec![want]);
+
+        // Flip one bit deep in the covered body. The length does not change and
+        // the mtime is put back, so this is byte-for-byte a different file
+        // wearing the identity the cache remembers.
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = crc_field(&bytes).1 / 2;
+        bytes[mid] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+        backdate();
+        assert!(
+            open_table(&path).is_ok(),
+            "a settled file was re-checksummed; the cache is not doing anything"
+        );
+
+        // The same corruption on a file whose mtime moved is caught, and that
+        // is every real one: a writer that changes a byte changes the mtime,
+        // and nothing in this tree rewrites a published block at all.
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(open_table(&path), Err(Error::BadChecksum { .. })),
+            "a corrupt body with a fresh mtime must still be caught"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
