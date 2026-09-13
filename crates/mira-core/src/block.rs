@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1208,20 +1209,50 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// `scan_cost_per_row` in `query.rs` is the run; section 11 of
 /// `docs/architecture.md` is the write-up.
 ///
-/// The identity is the path *plus* the length and mtime, never the path alone,
-/// because a name in this tree is not a file for life: [`compact`] renames a new
-/// table over an existing name, which is a different inode with a different
-/// mtime, and must re-verify. Entries are `(len, mtime)` rather than a set of
-/// keys so a replaced file overwrites its predecessor instead of accumulating
-/// beside it.
+/// The identity is the path *plus* [`FileId`], never the path alone, because a
+/// name in this tree is not a file for life: [`compact`] renames a new table
+/// over an existing name, and it must re-verify. Entries are keyed by path so a
+/// replaced file overwrites its predecessor instead of accumulating beside it.
 ///
-/// What this cannot see is a bit that rots under a live file without the mtime
-/// moving. That is the whole of the trade, and it is the reason the cache is
-/// process-scoped rather than persisted: a restart re-verifies everything, so
-/// the window is one process lifetime and not the life of the block. The
-/// alternative — dropping the CRC, or covering fewer tables — either gives up
-/// detection entirely or gives it up for whichever table a query skipped.
-static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, (u64, SystemTime)>>> = OnceLock::new();
+/// What this cannot see is a bit that rots under a live file without any of the
+/// three fields moving. That is the whole of the trade, and it is the reason the
+/// cache is process-scoped rather than persisted: a restart re-verifies
+/// everything, so the window is one process lifetime and not the life of the
+/// block. The alternative — dropping the CRC, or covering fewer tables — either
+/// gives up detection entirely or gives it up for whichever table a query
+/// skipped.
+static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, FileId>>> = OnceLock::new();
+
+/// Enough of a file to say it is the same file, for a cache whose wrong answer
+/// is a corrupt block served as good data.
+///
+/// All three fields, and each one is load-bearing against a different way the
+/// bytes under a path change without the others noticing:
+///
+/// * **`len`** is the cheap one and catches a rewrite of a different size.
+/// * **`mtime`** catches a rewrite of the same size. Alone it is not enough,
+///   because a length-preserving write inside one filesystem mtime tick does not
+///   move it — see [`SETTLED`], which closes that by construction.
+/// * **`ino`** catches a *replacement*, which is the case neither of the others
+///   can see. `std::fs::copy` on APFS is `fcopyfile(COPYFILE_ALL)` and preserves
+///   the source's mtime to the nanosecond; so do `cp -p`, `rsync -a`, `tar -xp`
+///   and every backup agent worth using. Restoring a block from a copy of itself
+///   therefore lands bytes this process never verified, at a path it has, under
+///   a length and an mtime it remembers. A new file gets a new inode, and that is
+///   the field that says so.
+///
+/// Keying on the inode *instead* would be worse than either: retention unlinks
+/// block directories continuously and an inode number is reusable the moment its
+/// last link goes, so a fresh table could be handed the number of an expired one
+/// and inherit its verdict. Composed, that is a non-issue — a reused inode would
+/// also have to arrive at the same path carrying the same length and the same
+/// mtime — and each field covers what the others miss.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    mtime: SystemTime,
+    ino: u64,
+}
 
 /// How old a file's mtime must be before a verification of it is worth
 /// remembering.
@@ -1262,16 +1293,20 @@ enum Verify {
     /// Checksum it. On success, record it under this identity — `None` to check
     /// it again next time, which is the answer for a file whose metadata would
     /// not read and for one still inside its settle window.
-    Check(Option<(u64, SystemTime)>),
+    Check(Option<FileId>),
 }
 
 /// Has this exact file already been checksummed by this process?
 fn verify_plan(path: &Path, file: &File) -> Verify {
-    let Some(id) = file
-        .metadata()
-        .ok()
-        .and_then(|m| Some((m.len(), m.modified().ok()?)))
-    else {
+    // Off the open descriptor rather than the path, so every field describes the
+    // file this mapping is about to cover.
+    let Some(id) = file.metadata().ok().and_then(|m| {
+        Some(FileId {
+            len: m.len(),
+            mtime: m.modified().ok()?,
+            ino: m.ino(),
+        })
+    }) else {
         return Verify::Check(None);
     };
     let map = VERIFIED.get_or_init(Default::default);
@@ -1286,13 +1321,13 @@ fn verify_plan(path: &Path, file: &File) -> Verify {
     // A file still inside its settle window is checked and *not* recorded, so
     // the next open checks it again. See [`SETTLED`].
     let settled = SystemTime::now()
-        .duration_since(id.1)
+        .duration_since(id.mtime)
         .is_ok_and(|age| age >= SETTLED);
     Verify::Check(settled.then_some(id))
 }
 
 /// Record that `path` passed its checksum as the file `id` describes.
-fn mark_verified(path: &Path, id: (u64, SystemTime)) {
+fn mark_verified(path: &Path, id: FileId) {
     let mut seen = VERIFIED
         .get_or_init(Default::default)
         .lock()
@@ -1810,6 +1845,65 @@ mod tests {
         assert!(
             matches!(open_table(&path), Err(Error::BadChecksum { .. })),
             "a corrupt body with a fresh mtime must still be caught"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A restore is a *replacement*, and neither the length nor the mtime can
+    /// see one. See [`FileId`]: `std::fs::copy` on APFS preserves the source's
+    /// mtime to the nanosecond, as do `cp -p`, `rsync -a` and every backup
+    /// agent, so a block restored from a copy of itself arrives at a verified
+    /// path wearing a verified length and a verified mtime while carrying bytes
+    /// this process has never hashed. Only the inode is different, which is why
+    /// the inode is in the key.
+    ///
+    /// Driven through a rename rather than a `copy`, because that is both what a
+    /// careful restore does — write beside the target, then rename, the same
+    /// trick [`publish`] uses — and the only way to hold the mtime fixed while
+    /// the inode moves.
+    #[test]
+    fn a_block_replaced_under_a_verified_path_is_checksummed_again() {
+        let d = dir("verifyrestore");
+        let path = d.join("logs.arrow");
+        let want = batch();
+        write_table(&path, &want).unwrap();
+
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let backdate = |p: &Path| {
+            File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        backdate(&path);
+        assert_eq!(open_table(&path).unwrap().batches, vec![want]);
+        let verified = fs::metadata(&path).unwrap();
+
+        // The restore: same bytes but for one flipped bit, so the same length,
+        // and the archived mtime put back exactly as `fs::copy` would have.
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = crc_field(&bytes).1 / 2;
+        bytes[mid] ^= 0x01;
+        let staged = d.join("logs.arrow.restored");
+        fs::write(&staged, &bytes).unwrap();
+        backdate(&staged);
+        fs::rename(&staged, &path).unwrap();
+
+        let restored = fs::metadata(&path).unwrap();
+        assert_eq!(restored.len(), verified.len());
+        assert_eq!(restored.modified().unwrap(), verified.modified().unwrap());
+        assert_ne!(
+            restored.ino(),
+            verified.ino(),
+            "the rename did not replace the file, so this proves nothing"
+        );
+
+        assert!(
+            matches!(open_table(&path), Err(Error::BadChecksum { .. })),
+            "a replaced block wearing the mtime of the one it replaced was \
+             served from the cache without being checksummed"
         );
         let _ = fs::remove_dir_all(&d);
     }

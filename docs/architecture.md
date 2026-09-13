@@ -460,28 +460,42 @@ flips one bit mid-body and asserts the read fails.
 right thing to do on a first read and pure waste on a second: a published block
 never changes, so a scan that reopens the same corpus re-hashes bytes this
 process has already hashed. `open_table` consults a process-scoped map of
-`path -> (len, mtime)` before hashing and writes to it after. Not the path
+`path -> (len, mtime, ino)` before hashing and writes to it after. Not the path
 alone — `compact` renames a new table over an existing name, which is a
 different file that must re-verify.
 
-Nor the inode, which is the obvious alternative and is worse here. Retention
-unlinks whole block directories continuously, and an inode number is reusable
-the moment its last link goes: a new table can be handed the number of an
-expired one and inherit a verdict passed on bytes that no longer exist. A
-length and an mtime have no reuse — the rename that defeats a path key changes
-both.
+All three fields, and each one covers a way the bytes under a path change that
+the others cannot see. The length catches a rewrite of a different size. The
+mtime catches a rewrite of the same size, and alone it is not enough, because a
+length-preserving write inside one filesystem mtime tick does not move it; the
+settle window below is what closes that. The inode catches a
+**replacement**, and nothing else does: `std::fs::copy` on APFS is
+`fcopyfile(COPYFILE_ALL)` and preserves the source's mtime to the nanosecond, as
+do `cp -p`, `rsync -a`, `tar -xp` and every backup agent worth running. A block
+restored from a copy of itself therefore arrives at a path this process has
+verified, wearing a length and an mtime it remembers, carrying bytes it has
+never hashed. That is the one failure this cache must not have — a bad block
+served as good data — and the length and the mtime are both blind to it.
 
-The identity has an obvious hole and the settle window is what closes it. A
-corruption that preserves the length — flipping one bit does — is invisible
-unless the mtime moves, and two writes inside one filesystem mtime tick do not
-move it. So an entry is only recorded once the file has been untouched for
-longer than any filesystem's mtime granularity, which makes a later write
-necessarily a later tick and necessarily a miss. In production that excludes
-only a block being written right now, which is the one that should be re-read
-anyway. Anything that *reconstructs* a file at a path this process has already
-verified must therefore stamp a current mtime rather than preserve a stored
-one; restoring a block from object storage is the shape that would otherwise
-bite.
+The settle window is the rest of that argument. An entry is only recorded once
+the file has been untouched for longer than any filesystem's mtime granularity,
+which makes a later write necessarily a later tick and necessarily a miss. In
+production that excludes only a block being written right now, which is the one
+that should be re-read anyway.
+
+Keying on the inode *instead* would be worse than either, which is the shape
+this was first written in. Retention unlinks block directories continuously and
+an inode number is reusable the moment its last link goes, so a fresh table
+could be handed the number of an expired one and inherit its verdict. Composed,
+that is a non-issue: a reused inode would also have to arrive at the same path
+under the same length and the same mtime.
+
+`a_block_replaced_under_a_verified_path_is_checksummed_again` is the regression
+test, and it is worth saying that it failed against the two-field key — the
+restored block was served from the cache, unchecksummed, exactly as described.
+Three fields also mean a restore is free to preserve whatever it likes: the
+earlier design put the obligation on the caller, who had to stamp a current
+mtime by hand and had no way to be told they had forgotten.
 
 That leaves `skip_validation(true)` above resting on a weaker premise on a
 second open — not "the CRC just proved these bytes" but "this process proved
