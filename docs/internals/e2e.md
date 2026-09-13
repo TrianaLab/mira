@@ -296,10 +296,18 @@ records and scans 1 block, yet costs 62 ms. `rows_matched` is an honest count,
 so the whole block's match set is computed before the head of it is taken — at a
 32 MiB target block that is ~205k rows — but that part is nearly free:
 `MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core --lib scan_cost_per_row`
-puts a predicate at 0.05–5.6 ns/row against 24–25 ns/row for the same block
-through the whole read path. The other 20 ns is `Block::open` faulting the
-mapping in and CRC'ing every table body, which is why `limit 1` costs what the
-whole block costs.
+puts a predicate at 0.05–5.6 ns/row against 16–17 ns/row for the same block
+through the whole read path. The rest is `Block::open` faulting the mapping in,
+which is why `limit 1` costs what the whole block costs.
+
+That test prints **two** columns per predicate, and the second one is the point
+of it. It publishes the block, times the read path with checksum verification
+on, backdates the files so the process-scoped verification cache accepts them
+(`block.rs`'s `SETTLED`), and times it again — so the checksum's share is a
+column of one run rather than something inferred from a rate. It reads 35–39%
+here, a median of 1.55×. Backdating rather than sleeping is deliberate: the
+default 4,096-row size of this test runs in `make test`, and two seconds of
+waiting does not belong in the normal suite.
 
 The metrics route has the same instrument, per point rather than per row:
 

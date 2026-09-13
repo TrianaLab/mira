@@ -9,6 +9,69 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **A block's checksum is verified once per process, not once per open.** A
+  published block never changes, so a scan that reopens the same corpus
+  re-hashes bytes this process already hashed. `open_table` now consults a
+  process-scoped map of `path -> (len, mtime)` — the path alone is not enough,
+  because `compact` renames a new table over an existing name — and an entry is
+  only recorded once the file has been untouched for longer than any
+  filesystem's mtime granularity, so a corruption that preserves the length
+  cannot slip in inside one mtime tick. Worth 1.55x median on a single block
+  through the read path and 1.47x on a trace lookup. **The guarantee is
+  unchanged**: a corrupt block is still refused rather than served, and a
+  restart re-verifies everything.
+- **The "query at scale" gap is closed, and closing it meant withdrawing the
+  measurement it rested on.** `docs/market.md` inferred that an unpruned scan
+  was integrity-check-bound because 4,380 MiB in 885 ms is ~5 GB/s "which is
+  what `crc32fast` does on this machine". Warm, it is nearer 27 GB/s — the
+  agreement was a coincidence published as a mechanism. Measured on both sides
+  of one run instead, re-verification is 35-39% of a single block's read path
+  and about 1.1x of a full-corpus scan. What that scan is bound by is whether
+  the corpus fits in page cache: a paired A/B changing only the corpus size puts
+  it at 27-64 ns/row over 9.6 GiB — where one binary ranges 2.6x against itself
+  and the two arms are not separable — and **8.9 ns/row over 5.01 GiB**, same
+  binary, same predicate, ~187 K rows per block either way. `docs/architecture.md`
+  section 11 now carries a second, named sitting rather than folding the new
+  numbers into the old table; `scan_cost_per_row` prints the checksum's share as
+  a column of its own run so the next such claim is a measurement.
+- **Merging a version bump is the release.** `make bump TO=X.Y.Z`, a pull
+  request, merge — and that is all of it. `ci.yml`'s `tag` job runs downstream
+  of both required contexts on a push to `main`, reads the version out of
+  `Cargo.toml`, and pushes `vX.Y.Z` if that version is not tagged yet. The tag
+  step that used to follow the merge had no decision left in it, which is
+  exactly the kind of step that gets forgotten and leaves a merged release that
+  never shipped. Nothing downstream of the tag moved: the tag is *dispatched*
+  at `release.yml` rather than relied on to trigger it — a tag pushed with
+  `GITHUB_TOKEN` starts no workflow, and `workflow_dispatch` is one of the two
+  events exempt from that — so `publish=true`, the tag-versus-`Cargo.toml`
+  assertion and the `refs/tags/` cosign identity pin are all unchanged, and
+  there is no PAT, deploy key or app token to rotate. A hand-pushed tag still
+  works and is now the recovery path.
+- **The build's own checks are Rust.** `scripts/check_ci.py`,
+  `scripts/check_drift.py` and `scripts/gen_reference.py` are `crates/xtask`,
+  a workspace member that nothing in `mira`'s dependency graph can see — so the
+  crate count and the binary are untouched, while `cargo fmt`, `cargo clippy
+  -D warnings`, `cargo doc -D warnings` and `cargo test` now cover the checker
+  that gates every merge. It was the one part of the build nothing checked, and
+  a regex that quietly stops matching passes forever. `ci` and `drift` were
+  verified byte-identical to the scripts they replace before those were
+  deleted. The port fixed a real bug on the way: the gate graph check panicked
+  on a workflow without a `push:` trigger.
+- **`make build` builds the binary and the example separately.** In one cargo
+  invocation the example's dev-dependencies unify into the normal graph, so the
+  release binary carried `tokio/test-util` and tower middleware nothing serves:
+  5.99 MiB against 5.63. The shipped size is the declared one again.
+
+### Removed
+
+- **Python.** The three scripts above, `scripts/requirements.txt`, and the
+  `python3 -c` one-liners in the `Makefile` — JSON parsing, the coverage badge's
+  figure and two "wait until the data arrives" loops, now `xtask parse-json`,
+  `xtask coverage-json` and `scripts/wait-for-signals.sh`. `mkdocs` is a Python
+  program and still is; nothing else in the tree needs an interpreter.
+
 ## [0.0.3] - 2026-09-12
 
 Two performance gaps that [the comparison page](docs/market.md) listed as having

@@ -3101,10 +3101,11 @@ mod tests {
         // the block's bytes gives 26-30 GB/s here, which is not `crc32fast`
         // being five times its documented speed — it is this denominator being
         // wrong twice over. `Block::open` does not load every table in the
-        // directory, and a block this size sits in cache where the 4,380 MiB
-        // corpus that produced the 5.2 GB/s figure is bandwidth-bound. So print
-        // what was timed and let the corpus measurement be the corpus
-        // measurement.
+        // directory, and a block this size sits in cache where the multi-GiB
+        // corpus that produced the old 5.2 GB/s figure does not — that corpus
+        // is bound by page cache, which is what made 885 ms look like a
+        // checksum rate. So print what was timed and let the corpus
+        // measurement be the corpus measurement.
         let bytes: u64 = std::fs::read_dir(&bref.dir)
             .unwrap()
             .map(|f| f.unwrap().metadata().unwrap().len())

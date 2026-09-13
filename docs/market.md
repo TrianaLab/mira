@@ -172,7 +172,7 @@ at all, so this table is context rather than comparison.
 | **Mira** [^m3] | 2.56 ms absent value | 137 blocks, 0 opened | — | pruning, not scanning |
 | **Mira** [^m3] | 4.49 ms matching value | 27.1M rows, 1 block of 137 | — | pruned to one block |
 | **Mira** [^m3] | 4.74 ms trace by id | 27.1M spans, 2 blocks of 155 | — | bloom sidecar hit |
-| **Mira** [^m3] | 885 ms unpruned scan | 27.07M rows, 137 of 137 | — | every block opened |
+| **Mira** [^m3] | 885 ms unpruned scan | 27.07M rows, 137 of 137 | — | every block opened, corpus over page cache |
 | VictoriaLogs [^v1] | 266 ms absent line | 300 GB, 4 vCPU | no | bloom scan vs prune |
 | VictoriaLogs [^v1] | 2.2 s absent line | 500 GB, 4 vCPU | no | bloom scan vs prune |
 | Quickwit [^q2] | 0.6 s term over 212 GB | n2-standard-16, GCS | yes | no Mira counterpart exists |
@@ -288,28 +288,63 @@ steady over 27,066,368 rows, 30.6M rows/s**, against 1,163 ms and 23.3M rows/s
 on the pre-release binary, and 1,441 ms on the first call after a restart
 against 2,431 ms. Better than it was, and much worse than this page claimed.
 
+It is also more a figure about this machine's memory than about the engine, and
+that took two revisions of this entry to notice. 885 ms over 27,066,368 rows is
+32.7 ns/row; the same scan over a corpus small enough to stay resident is
+**8.9 ns/row**. The paragraphs below are how the difference was found and what
+was wrongly blamed for it on the way.
+
 ClickHouse answers nine heterogeneous queries in 0.68 s hot over 1 billion rows
 and 642 GiB uncompressed, roughly 37x the rows on 2.7x the cores. Per row
-scanned that is about 48x rather than the order of magnitude this page used to
-claim, and a cold Mira call adds another 1.6x on top. Mira's query numbers are a
-pruning result, not a scan result, and when pruning does not fire it does not
-win.
+scanned that is about 48x against the 885 ms row and about 13x against the
+resident-corpus figure — a range that is the page cache rather than the engine,
+and either way not the order of magnitude this page used to claim. A cold Mira
+call adds another 1.6x on top. Mira's query numbers are a pruning result, not a
+scan result, and when pruning does not fire it does not win.
 
-What changed underneath is the diagnosis, and it is the most useful measurement
-in the release. The row-wise scan this entry used to blame is gone: predicates
-are evaluated over contiguous binary-searched parent runs with a `Vec<bool>`
-scatter over root rows and no hash set anywhere. Over two million rows that
-costs 0.047 ns/row for no term at all, 0.485 for a dictionary equality, 1.064
-for a resource attribute, 2.402 for a record attribute and 5.586 for the worst
-case, a UTF-8 `contains`. The same block through the whole read path costs 24 to
-25 ns/row. **The scan is at most 22% of a query's cost and under 2% for the
-cheap predicates; the other ~20 ns/row is `Block::open`** — `mmap` minor faults,
-the dictionary scan, the two child indexes, and above all the CRC32 of every
-table body on every open (`crates/mira-core/src/block.rs:1200`). The arithmetic
-closes: the full scan CRCs 4,380 MiB of log blocks in 885 ms, which is about
-5 GB/s, which is what `crc32fast` does on this machine. A `limit 1` costs 24.374
-ns/row against 25.430 for the whole block, the same fact from the other side.
-The unpruned scan is integrity-check-bound, not scan-bound.
+What changed underneath is the diagnosis, twice, and the second time it was this
+page that was wrong. The row-wise scan this entry originally blamed is gone:
+predicates are evaluated over contiguous binary-searched parent runs with a
+`Vec<bool>` scatter over root rows and no hash set anywhere. Over two million
+rows that costs 0.047 ns/row for no term at all, 0.485 for a dictionary
+equality, 1.064 for a resource attribute, 2.402 for a record attribute and 5.586
+for the worst case, a UTF-8 `contains`. The same block through the whole read
+path costs 16 to 17 ns/row. **The scan is a third of what the dearest predicate
+pays and under 3% of what the cheap ones do; the rest is `Block::open`** —
+`mmap` minor faults, the dictionary scan and the two child indexes. A `limit 1`
+and a whole-block scan cost the same per row, which is the same fact from the
+other side: the block had to be opened either way.
+
+What this page then got wrong was which term inside `Block::open` dominates. It
+said the CRC32 of every table body did, and closed the arithmetic like this: the
+full scan CRCs 4,380 MiB of log blocks in 885 ms, which is about 5 GB/s, which
+is what `crc32fast` does on this machine. It is not. Warm on this machine
+`crc32fast` is nearer **27 GB/s**, so 5 GB/s was some other term's rate and the
+agreement was a coincidence read as a proof. One number matching another number
+is not a mechanism, and this page published it as one.
+
+The patch it named is still the right patch, and it has shipped here rather than
+being named again: a published block never changes, so re-hashing it on every
+open is waste, and it is now verified once per file per process. What that is
+worth was measured on both sides of one run instead of inferred — the checksum
+is **35 to 39%** of a single block's read path, a median of **1.55x** there,
+**1.47x** on a trace lookup, and **about 1.1x** on the unpruned scan. Worth
+taking, and nowhere near what "integrity-check-bound" promises, because the
+premise was the coincidence above.
+
+The unpruned scan is bound by whether the corpus fits in page cache. A paired
+A/B that changes only the corpus size says so: both binaries, same predicate,
+~187 K rows per block either way, back to back. Over **9.6 GiB** and 31.2 M rows
+the scan runs 847 ms on this binary against 981 ms and then 1,992 ms on two
+passes of the pre-fix one — 27 to 64 ns/row, with one binary ranging 570 ms to
+1,469 ms against *itself* over five consecutive calls, which makes the two arms
+not separable at all. Over **5.01 GiB** and 9.0 M rows, ten interleaved samples
+each, it is 79.8 ms against 89.1 — **8.9 against 9.9 ns/row**, medians that
+separate, and a spread of 1.5x rather than 2.6x. Three times cheaper per row on
+the corpus that stays resident, on the same binaries. The OS compressor grew by
+1.6 GiB during the large run: what the wide numbers time is eviction. The 885 ms
+at the top of this entry is 32.7 ns/row, which is the first regime — the
+headline is a page-cache result that this page reported as a checksum result.
 
 Where vectorising did pay is everything that filters. An attribute value that
 matches went from 30.2 ms to 4.49 ms, 6.7x; an unfiltered `limit 100` from 24.4
@@ -337,19 +372,23 @@ now prices it at a flat ~1 µs/point instead of one rising with the point count,
 which at 50,000 points in a block is 1,582 ms against 53.9. It is neutral on the
 harness because the harness's metrics blocks hold ~1,600 points against ~2,000
 attribute rows, where the join is about 7% of the query — the other ~93% is
-twenty-two blocks × ten tables of `mmap` and CRC, which is the same finding as
-the paragraph above, reached from the metrics side.
+twenty-two blocks × ten tables of opening them, which is the same finding as the
+paragraph above, reached from the metrics side.
 
-It stays under gaps with a cause and a path, but the cause named is a different
-one and a shorter one. The old entry set the path at twenty years of SIMD
-kernels, called it a programme rather than a patch and said nothing here should
-be read as a promise it lands soon. Not re-verifying 4,380 MiB of block bodies
-on every full scan is a much smaller piece of work than that — but it is a real
-trade rather than free speed, because the CRC is the reason a corrupt block is
-detected instead of served, so the fix is not to remove it. Verifying once per
-block per process instead of once per open, or verifying only the tables a query
-actually reads, both keep the guarantee and both are patches. Until one of them
-ships, an unpruned scan pays full price to check bytes it is about to discard.
+It stays in this section, and the cause named has changed twice. The first entry
+set the path at twenty years of SIMD kernels and called it a programme rather
+than a patch; the second called it re-verification and called it a patch. The
+patch is applied — the guarantee is intact, because verifying once per process
+is not the same as not verifying — and it was worth 1.1x on the row it was
+supposed to fix, because the cause was wrong both times.
+
+The honest version is shorter and has no patch in it. An unpruned scan over a
+corpus larger than the page cache pays for paging, and the two answers Mira has
+are the two it already ships: prune, so the corpus is not the working set, and
+compact, so the working set is 8.4x smaller. Neither helps a query that
+genuinely has to read everything, and nothing here should be read as a promise
+that anything will. Mira's query numbers are a pruning result. That was true
+before the diagnosis changed and it is what this row is.
 
 ### Gaps that are what the design costs
 

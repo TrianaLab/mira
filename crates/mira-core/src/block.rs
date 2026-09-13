@@ -1178,13 +1178,20 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 
 /// What this process has already checksummed, and the file it was.
 ///
-/// The CRC is not the expensive part of a *first* read — it is the expensive
-/// part of the second one. A published block never changes, so a scan that
-/// reopens the same corpus re-verifies bytes this same process verified itself,
-/// and at the 5.2 GB/s `crc32fast` runs here that was ~93% of an unpruned scan:
-/// 4,380 MiB of log bodies re-hashed per query to answer a question the
-/// previous query already answered. Verifying once per block per process is the
-/// fix `docs/market.md` named under "Query at scale" and did not apply.
+/// The CRC is the right thing to do on a *first* read and pure waste on the
+/// second. A published block never changes, so a scan that reopens the same
+/// corpus re-hashes bytes this same process already hashed, to answer a question
+/// the previous query already answered.
+///
+/// It is worth stating what that is and is not worth, because `docs/market.md`
+/// named this fix on the back of a number that turned out to be a coincidence —
+/// 4,380 MiB in 885 ms is ~5 GB/s, which was read as "that is `crc32fast`'s
+/// rate here" and therefore as ~93% of an unpruned scan. Warm, it is nearer
+/// 27 GB/s. Measured on both sides of one run instead, re-verification is
+/// **35-39%** of a single block's read path, a median of 1.55x there, and about
+/// 1.1x on a full-corpus scan — which is bound by page cache, not by this.
+/// `scan_cost_per_row` in `query.rs` is the run; section 11 of
+/// `docs/architecture.md` is the write-up.
 ///
 /// The identity is the path *plus* the length and mtime, never the path alone,
 /// because a name in this tree is not a file for life: [`compact`] renames a new

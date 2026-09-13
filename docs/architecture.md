@@ -96,12 +96,13 @@ missing, why, and what to do instead today.
   ingest goal is *allocation-lean*: one unavoidable copy of the request body,
   then no per-field heap allocation. The correction table above has the long
   version; "zero-copy" in this document always means queries.
-- **No block cache.** Every query re-opens and re-CRCs each block it touches.
-  This looked like the next big win until it was measured against the two that
-  were taken instead — it is worth a few milliseconds of a 14 ms query, not the
-  10x that page-fault behaviour was (section 11). It becomes worth building the
-  day a working set stops fitting in page cache, because that is when the CRC
-  read stops being free.
+- **No block cache.** Every query re-opens each block it touches — though no
+  longer re-CRCs it, which is a different thing and is now done once per file
+  per process (section 3.3). What is left of the open is `mmap`, the dictionary
+  scan and the two child indexes. This looked like the next big win until it was
+  measured against the two that were taken instead: it is worth a few
+  milliseconds of a 14 ms query, not the 10x that page-fault behaviour was
+  (section 11).
 - **OTAP is the data model, not yet the wire protocol.** No language SDK emits
   OTAP; the only production implementations are the Go
   `otelarrowreceiver`/`exporter` in collector-contrib. OTLP on 4317/4318 is the
@@ -454,6 +455,31 @@ faults in every page of string data, defeating the point of demand paging.
 
 `corrupt_body_is_caught_not_returned_as_data` in `crates/mira-core/src/lib.rs`
 flips one bit mid-body and asserts the read fails.
+
+**The CRC is paid once per file per process, not once per open.** It is the
+right thing to do on a first read and pure waste on a second: a published block
+never changes, so a scan that reopens the same corpus re-hashes bytes this
+process has already hashed. `open_table` consults a process-scoped map of
+`path -> (len, mtime)` before hashing and writes to it after. Not the path
+alone — `compact` renames a new table over an existing name, which is a
+different file that must re-verify.
+
+The identity has an obvious hole and the settle window is what closes it. A
+corruption that preserves the length — flipping one bit does — is invisible
+unless the mtime moves, and two writes inside one filesystem mtime tick do not
+move it. So an entry is only recorded once the file has been untouched for
+longer than any filesystem's mtime granularity, which makes a later write
+necessarily a later tick and necessarily a miss. In production that excludes
+only a block being written right now, which is the one that should be re-read
+anyway. Anything that *reconstructs* a file at a path this process has already
+verified must therefore stamp a current mtime rather than preserve a stored
+one; restoring a block from object storage is the shape that would otherwise
+bite.
+
+What it is worth is [section 11](#11-performance-model): 1.55× median on a
+single block through the read path, ~1.1× on an unpruned corpus scan and 1.47×
+on a trace lookup. It is not the order of magnitude this document once inferred,
+and section 11 says why that inference was wrong.
 
 ### 3.4 Alignment
 
@@ -1640,11 +1666,15 @@ node is a line the eye learns to skip.
   exemplars, so both out-edges of section 7.1 are readable, but the caller follows them
   itself and there is no operation that widens a region rather than answering a
   question.
-- **A block cache.** Every query re-opens and re-CRCs every block it touches. The
-  fix is a process-local `Arc<MappedTable>` map invalidated by `expire`. This was
-  assumed to be the next big win and it is not: section 11 measures the per-block cost as
+- **A block cache.** Every query re-opens every block it touches. The fix is a
+  process-local `Arc<MappedTable>` map invalidated by `expire`. This was assumed
+  to be the next big win and it is not: section 11 measures the per-block cost as
   dominated by faulting the mapping in, which the `MADV_WILLNEED` hint already
-  addresses. A cache saves the `open` and the CRC — real, small.
+  addresses. Half of what such a cache would have saved is taken already and
+  separately — the CRC is verified once per file per process (section 3.3), which
+  needs no cached mapping and so has none of a cache's invalidation surface.
+  What is left for it to save is the `mmap` and the two child indexes: real,
+  small.
 - **A dependency on `otel-arrow-dfe-quiver` 0.54.1.** It is an embeddable
   Arrow segment store from the OTel Arrow maintainers, Apache-2.0, and it already
   ships a CRC32 WAL with replay, immutable IPC segments, `SegmentReader::open_mmap`,
@@ -1714,6 +1744,15 @@ restart, and every one of them is a paired A/B against the 0.0.1 binary run
 back to back in the same sitting; the cold-tier table further down is the same
 1,652 tables.
 
+There is now a **second sitting**, and naming it is better than folding it in.
+It exists because the checksum cache (section 3.3) landed after the table was
+measured, and it covers the query rows only: two corpora from the same
+generator, both read by this binary and by 04561ed back to back. It does not
+re-measure ingest, footprint or cost per GB, because the write path is
+byte-identical across that change and replacing good numbers with ones taken on
+a busier machine is not an improvement. Where the two sittings disagree the
+disagreement is the finding, and it is written up under the last row.
+
 Six flushers per signal rather than one (section 4) changed the *shape* of that
 corpus as well as the rate that produced it: 137 log blocks of ~204,800 rows
 where one flusher sealed 87 of ~330,000. Same bytes, six sealers, so a block is
@@ -1728,13 +1767,18 @@ an engine that is fast at whichever one its authors were watching.
 [End-to-end testing section 3](internals/e2e.md#3-the-load-harness) is how to drive
 it and what it teaches.
 
-Read the two query columns carefully. **Neither is a cold-disk number**: 8.33
-GiB fits in this machine's 18 GiB of page cache, so after one pass everything is
-resident and short of `purge` there is no way back. "First" is the first call
-after a process restart — the pages are in RAM but not in this process's address
-space, so it measures establishing 316 blocks' worth of mappings and faulting
-them in. "Steady" is the same call repeated. The gap between them is
-virtual-memory work, not I/O.
+Read the two query columns carefully. "First" is the first call after a process
+restart; "steady" is the same call repeated. The gap between them is
+virtual-memory work — establishing 316 blocks' worth of mappings and faulting
+them in — and for every row that prunes, so is nearly all of the steady figure.
+
+This paragraph used to go on to say that **neither column is a cold-disk
+number**, because 8.33 GiB fits in this machine's 18 GiB of page cache. That is
+arithmetic, not a measurement, and the second sitting shows it does not hold for
+the last row: 18 GiB shared with a VM, Docker and a browser does not keep 8 GiB
+of corpus resident, and the same scan over a corpus that *does* stay resident is
+three times cheaper per row. Treat the pruning rows as warm and the last row as
+partly not.
 
 | Axis | Target | Measured | |
 |---|---|---|---|
@@ -1744,9 +1788,9 @@ virtual-memory work, not I/O.
 | Query: attribute value, absent | ≤ 10 ms | **8.3 ms** first, **2.6 ms** steady, 0 of 137 blocks | ✓ |
 | Query: attribute value, matching | ≤ 10 ms | **4.1 ms** first, **4.5 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
 | Query: unfiltered `limit 100` | ≤ 10 ms | **29.1 ms** first, **4.6 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
-| Query: trace by id | ≤ 10 ms | **8.3 ms** first, **4.7 ms** steady, 2 of 155 blocks, 73,728 rows | ✓ |
+| Query: trace by id | ≤ 10 ms | **8.3 ms** first, **4.7 ms** steady, 2 of 155 blocks, 73,728 rows — first sitting; the second measures the checksum cache 1.47× under it | ✓ |
 | Query: metric names | — | **8.9 ms** first, **4.7 ms** steady, 24 of 24 blocks | — |
-| Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows | see below |
+| Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows — first sitting, and the row the second sitting has the most to say about | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.20 B/B** hot, **0.14 B/B** compacted | ✓ |
 | Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.63 MiB** / 117 crates | ✓ |
 
@@ -1851,21 +1895,57 @@ Reading these honestly:
   for no term at all, 0.485 for a dictionary equality, 1.064 for a resource
   attribute, 2.402 for a record attribute and **5.586** for the most expensive
   shape there is, a UTF-8 `contains`. The *same block through the whole read
-  path* costs **24 to 25 ns/row**. So the scan is at most 22% of what a query
-  pays, and for most predicates under 2%; the other ~20 ns/row is
-  `Block::open` — the `mmap`'s minor faults, the dictionary scan, the two child
-  indexes, and the CRC32 of every table body (section 3.3), which by construction
-  touches every page. The clearest statement of it is that `limit 1` costs
-  24.374 ns/row against the whole block's 25.430: asking for one row and asking
-  for all of them are the same query, because the block had to be opened either
-  way.
+  path* costs **16 to 17 ns/row**. So the scan is a third of what the dearest
+  predicate pays and under 3% of what the cheap ones do; the rest is
+  `Block::open` — the `mmap`'s minor faults, the dictionary scan and the two
+  child indexes. The clearest statement of it is that `limit 1` and the whole
+  block cost the same per row: asking for one row and asking for all of them are
+  the same query, because the block had to be opened either way.
 
-  The arithmetic closes on the last row of the table. A full scan CRCs the
-  4,371 MiB of log blocks, and 4.58 GB in 885 ms is 5.2 GB/s, which is what
-  `crc32fast` does on this machine. **The unpruned scan is integrity-check-bound,
-  not scan-bound** — and that is a tradeoff rather than a bug, because the CRC is
-  why a corrupt block is refused instead of served (section 3.3). What it is not
-  is a vectorisation problem, which is what this section used to imply.
+  The CRC32 of every table body (section 3.3) used to be in that number, re-paid on
+  every open of a file that by construction never changes. It is now verified
+  once per process (section 3.3), and the harness prices the difference rather than
+  inferring it: it publishes the block, times the read path with verification
+  on, backdates the files so the cache accepts them, and times it again. Three
+  passes at 2,000,000 rows on a 386.1 MiB block, 202 bytes/row, whole block with
+  no term: **26.5 / 22.5 / 24.6 ns/row** becomes **16.1 / 16.6 / 17.1**. Median
+  1.55×, and re-verification was **35–39%** of the read path.
+
+  **The arithmetic that used to close this paragraph closed on a coincidence,
+  and it is withdrawn.** It read: a full scan CRCs 4,371 MiB of log blocks, and
+  4.58 GB in 885 ms is 5.2 GB/s, which is what `crc32fast` does here — therefore
+  the unpruned scan is integrity-check-bound. Warm on this machine `crc32fast`
+  is nearer **27 GB/s**, so 5.2 GB/s was never its rate and the agreement was
+  luck. On a corpus that stays resident, removing the redundant CRC outright
+  moves an unpruned scan by about **1.1×**: worth having, and not what
+  "integrity-check-bound" promises. Where it pays better is the query that opens
+  little and re-opens it often — trace by id over one block of 139,264 rows goes
+  from 3.79 ms to **2.58 ms**, 1.47×, because there the CRC is a large share of
+  a small amount of work. The rows that prune to one block are unchanged, and
+  have to be: the cache saves the *second* verification, so a query that opens a
+  table once in a process's life pays exactly what it paid before.
+
+  What the unpruned row is bound by is the thing the *first* column is bound by,
+  which this section named above the table and then did not follow down. The
+  second sitting says so by changing only the corpus size. Both binaries, same
+  predicate, ~187 K rows per block either way, back to back:
+
+  | Corpus | This binary | 04561ed | Per row | Spread within one binary |
+  |---|---|---|---|---|
+  | 9.6 GiB, 168 log blocks, 31,170,560 rows | 847 ms | 981 / 1,992 ms | 27–64 ns | **2.6×** |
+  | 5.01 GiB, 48 log blocks, 9,011,200 rows | **79.8 ms** | 89.1 ms | **8.9 / 9.9 ns** | 1.5× |
+
+  On the 9.6 GiB corpus the two arms are **not separable** — one binary against
+  itself ranged 570 ms to 1,469 ms across five consecutive calls, and the second
+  pre-fix pass landed at twice the first. That is the measurement, not a failure
+  of it: the OS compressor grew by 1.6 GiB during that run, and what was being
+  timed was eviction. On the 5.01 GiB corpus, ten interleaved samples per arm,
+  the medians separate cleanly and the per-row cost is **three times lower on
+  the same binaries**. **An unpruned scan is bound by whether the corpus fits in
+  page cache**, and 18 GiB of RAM on a machine doing anything else does not hold
+  9 GiB of it. The 885 ms in the table is 32.7 ns/row, which is the upper row's
+  regime — so "neither is a cold-disk number", above the table, was a claim
+  about the page cache that the page cache did not honour.
 
   The history is still worth keeping, because it is how the page-fault term was
   found: the last row was once **10.1 s** and did not improve on repetition,
@@ -1942,21 +2022,27 @@ Reading these honestly:
   that term at 0.047 ns/row, so a 204,800-row block spends about 10 µs of the
   4.6 ms it takes. What is left is O(bytes) in the block's *size*, paid at open,
   which also means `target_block_bytes` is **not** the lever it was once written
-  up as. Halving it halves the bytes each block CRCs and doubles the number of
+  up as. Halving it halves the bytes each block maps and hashes on its first
+  open, and doubles the number of
   blocks, so a query that prunes to one block gets faster and a query that prunes
   to none gets nothing. It is not changed here because it only ever helped the
   first kind, the tradeoff runs the other way for compression ratio and directory
   size, and the number to tune it against is a workload nobody has yet. Sharding
   has already moved it in that direction by accident: six sealers per signal make
   a log block 204,800 rows where one made 330,000.
-- **A block cache went from "worth much less than it looks" to the obvious next
-  lever, and the measurement is what turned it round.** It was ruled a small win
-  on the belief that the `open` and the CRC were the small part of a single-block
-  query. They are not: they are ~80% of it, and on the unpruned scan they are
-  effectively all of it. A cache that holds an opened block's validated mapping
-  is the only thing on the section 10 list that attacks the term that actually
-  dominates. What it cannot do is help a first touch, and it trades resident
-  memory for it — which is the axis this section already scores worst.
+- **A block cache was talked into being the obvious next lever twice, in
+  opposite directions, and neither time by a measurement of the cache.** It was
+  first ruled a small win on the belief that `open` and the CRC were the small
+  part of a single-block query. They are not — they are 55% of the dearest
+  predicate and nearly all of the cheap ones — so the entry was rewritten to
+  call the cache the obvious next lever. That does not follow either: "the term
+  a cache would attack dominates" is an argument for attacking the term, not for
+  attacking it with a cache. The CRC half has since been taken by a
+  process-scoped verification map (section 3.3) that holds no mappings and needs
+  no invalidation, for 1.55× on a single block and ~1.1× on an unpruned corpus
+  scan. What a real cache would add on top is the `mmap` and the two child
+  indexes, it still cannot help a first touch, and it pays in resident memory —
+  the axis this section already scores worst. It stays on the section 10 list.
 - **Cost per GB is 1.20 B/B while a block is hot and 0.14 once it is
   compacted.** 164.0 bytes on disk per 136.9-byte wire record, and it is the
   steadiest figure in this section: across fifteen benchmark runs it moved
@@ -2034,9 +2120,12 @@ Reading these honestly:
   a resident plain block has nothing to fault while a compressed one still has
   to inflate. Even so the two are within the run-to-run noise of each other,
   which is the useful result: the inflate is real, and it is paid back by having
-  8.4× fewer bytes to touch and CRC32 over 8.4× fewer of them. That second half
-  matters more than it looked when this was written, because the CRC is now
-  measured as the dominant per-block term rather than a small one. Cold — which
+  8.4× fewer bytes to touch and CRC32 over 8.4× fewer of them. The second half
+  of that is worth less than an earlier revision of this paragraph claimed: the
+  CRC is paid once per file per process now (section 3.3), so on a compacted
+  block that is read more than once it is 8.4× fewer bytes of a term that is
+  already amortised to near nothing. The first half is the one that carries the
+  comparison. Cold — which
   is the case that matters, since a block is an hour old before it is compacted —
   the arithmetic runs further the same way, because the `MADV_WILLNEED` hint
   above is then faulting 8.4× fewer pages; an earlier measurement over a smaller
