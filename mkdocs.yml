@@ -192,6 +192,7 @@ nav:
       - Architecture: architecture.md
       - Testing architecture: internals/testing.md
       - End-to-end testing: internals/e2e.md
+      - Measurement contract: internals/measurement.md
       - Release architecture: internals/releases.md
       - Contributing: contributing.md
       - Security policy: security.md

@@ -450,12 +450,37 @@ sbom: build ## CycloneDX SBOM, one <crate>.cdx.json beside each Cargo.toml
 	@echo "wrote: $$(ls -1 *.cdx.json crates/*/*.cdx.json 2>/dev/null | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------
-# Drift — numbers the README promises, checked against the tree that ships
+# Drift — numbers the docs promise, checked against the tree that ships and
+# against the load test that measured them
 # ---------------------------------------------------------------------------
 
 .PHONY: drift
 drift: build ## Crate count, binary size and doc numbers still match reality
 	$(XTASK) drift
+
+.PHONY: measurements-check
+measurements-check: ## Every published performance number is the one the last run measured
+	@# `drift` guards numbers the tree produces on every build; this guards
+	@# numbers a load test produces once and five documents then quote. Same
+	@# failure mode either way — somebody re-measures, fixes the README, leaves
+	@# the other four sites quoting the old figure — and nothing else can catch
+	@# it, because the stale figure is still valid prose. No `build` prerequisite:
+	@# it reads measurements.kyaml and the documents, and nothing else.
+	$(XTASK) measurements
+
+.PHONY: measurements-ingest
+measurements-ingest: ## Fold RUN=path/to/run.json back into measurements.kyaml
+	@# Without WRITE=1 this reports and exits 1, which is the useful mode: it
+	@# names every document still quoting a figure that moved. Even with WRITE=1
+	@# it rewrites the registry only, never the prose — the sentence around a
+	@# number is usually a claim about it ("a 26% fall"), and swapping the digits
+	@# under an unchanged claim yields a document that passes this check and is
+	@# wrong. See docs/internals/measurement.md section 5.
+	@test -n "$(RUN)" || { \
+		echo "usage: make measurements-ingest RUN=/tmp/mira-sweep/run.json [WRITE=1]" >&2; \
+		echo "  RUN is the JSON-lines file \`loadgen --emit\` appends to" >&2; \
+		exit 1; }
+	$(XTASK) measurements ingest $(RUN) $(if $(WRITE),--write,)
 
 .PHONY: bump
 bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)

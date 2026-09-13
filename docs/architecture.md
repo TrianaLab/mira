@@ -39,7 +39,7 @@ outside.
 |---|---|---|
 | **Delta-of-delta timestamps** | Arrow IPC has no per-column encodings. Its entire encoding surface is whole-buffer LZ4/ZSTD plus the Dictionary and RunEndEncoded layouts. Implementing DoD means inventing a buffer layout no Arrow reader understands — which forfeits zero-copy, since you must decode into a fresh allocation. Separately, Gorilla's 12× rests on samples landing on exact interval boundaries; OTLP `time_unix_nano` is a wall-clock read with 10⁵–10⁷ ns of jitter between consecutive deltas. | Plain `Timestamp(Nanosecond)`. Sort by time within a block; take the size win at the cold tier from a generic compressor. |
 | **Resource/Scope dedup at block headers** | The Arrow mechanism for a "block header" is `Schema.custom_metadata`, exactly one map per file. That expresses dedup only if a block holds exactly one Resource. A block from any multi-tenant collector holds hundreds. | OTAP section 6.3: `resource_id`/`scope_id` `UInt16` columns in the root table plus separate attribute tables keyed by `parent_id`. A resource with 40 attributes shared by 10,000 records costs 40 rows and 10,000 `u16`s. |
-| **Dictionary-encode high-cardinality maps** | Backwards. Dictionary encoding is a *low*-cardinality technique with a hard ceiling — `Dictionary<UInt16,_>` raises `DictionaryKeyOverflowError` past 65,536 distinct values. `http.url` and `trace_id` are the highest-cardinality data in the system. | Dictionary-encode only enumerable columns: attribute *keys*, `severity_text`. Attribute *values* are plain `Utf8`/`Binary`. |
+| **Dictionary-encode high-cardinality maps** | Half backwards. Dictionary encoding is a *low*-cardinality technique with a hard ceiling — `Dictionary<UInt16,_>` raises `DictionaryKeyOverflowError` past 65,536 distinct values, and `http.url` and `trace_id` are the highest-cardinality data in the system. But the *repetition* the brief was reaching for is real: a few hundred distinct attribute values across a few hundred thousand rows. | Two key widths. Enumerable columns — attribute *keys*, `severity_text`, metric name and unit — take a `UInt16` key and seal the block at `DICT_CAP` rather than fail. The attribute *value* string column `attrs.str` takes a `UInt32` key, which a 32 MiB block cannot fill; it is the one *value* column that is dictionary-encoded, and it is worth 12.9× → 66.2× on one real block's cold ratio (section 11). `attrs.bytes`/`attrs.ser` stay plain `Binary`. |
 | **Zero-copy ingestion** | Impossible on the OTLP path. `prost` memcpies every string unconditionally; varints must be decoded. Even on OTAP, `StreamDecoder` only avoids a copy when the whole message body is one contiguous `Buffer`, and an HTTP/2 body split across DATA frames is `extend_from_slice`'d. | Say **zero-copy queries**, not zero-copy ingestion. The ingest goal is *allocation-lean*: one unavoidable memcpy of the request body, then no per-field heap allocation. |
 | **Lock-free ring buffer for ingestion** | Cargo-culted from LMAX, where an item is a 150 ns order struct. Here an item is an export request costing 10⁵–10⁶ ns to decode and encode, arriving 10²–10⁴ times per second. The queue is four orders of magnitude from being the bottleneck, and a lock-free queue cannot express backpressure. | A bounded `tokio::sync::mpsc` per flusher shard. A full set of them parks the caller for up to `ADMIT_WAIT` (section 4), which propagates backpressure out as HTTP/2 flow control; only a timeout sheds. Revisit if a queue ever appears in a profile. |
 | **4317 and 4318 both served by tonic** | 4318 is not gRPC. Per the OTLP spec it is plain HTTP/1.1 POST of protobuf or JSON to `/v1/{traces,metrics,logs}`. | Two listeners: tonic on 4317, axum on 4318. axum is already in the tree via tonic's `router` feature, so it costs no dependency. |
@@ -130,13 +130,6 @@ missing, why, and what to do instead today.
   Prometheus uses. So "p99 of `http.server.duration`" is not a question this
   engine answers yet; `sum/count` is, and the buckets are there waiting for the
   reader that reads them. Section 13.3 is why alerting does not need them.
-- **No `F_FULLFSYNC` fallback.** `File::sync_all` *is* `fcntl(F_FULLFSYNC)` on
-  Apple targets — 4.2 ms on the reference machine against 28 us for a bare
-  `fsync(2)`, and the published ack latencies were measured against it rather
-  than against the weaker call. The gap is volumes that answer
-  `EINVAL`/`ENOTSUP`, Docker-for-Mac among them: std does not fall back there,
-  and a wrapper that did would have to *count* the fallback rather than quietly
-  weaken the acknowledgement it already returned.
 
 ---
 
@@ -171,11 +164,16 @@ it is measured.
   matters more, which is that neither can be set wrong from outside. There **is**
   a config file ([Configuration](config.md)), and it is not a contradiction: it describes
   *where the process runs* — addresses, data directory, retention policy, replica
-  name. The one key that reaches the engine, `ingest.shards`, is there because the
-  runtime's count of the cores it has can be wrong (section 4), and the default
-  asks nobody: it is a correction, not a tuning surface. The boundary
-  is structural, not documentary. It is also closed — twelve keys, and an unknown
-  one is a startup error naming it — because the alternative is what
+  name. Three keys reach the engine and none of them is a tuning surface.
+  `ingest.shards` is a *correction*: the runtime's count of the cores it has can
+  be wrong (section 4), and the default asks nobody. `ingest.queue` buys queueing
+  and not throughput — the flusher drains at the rate it drains — so it is
+  memory an operator with spare memory can spend on absorbing a burst.
+  `ingest.wal` is a *promise*, not a speed: on means an ack survives SIGKILL at a
+  p99 in the microseconds, off means it survives power loss at a p99 of 2.6 s,
+  and nothing the engine can measure says which one a deployment wants. The
+  boundary is structural, not documentary. It is also closed — thirteen keys, and
+  an unknown one is a startup error naming it — because the alternative is what
   `cluster.peers` was (section 12.2): a key read by nothing that still looks like a
   setting in effect.
 - *Agent-based internals* — the flusher tasks, three signals × `ingest.shards` of
@@ -203,9 +201,12 @@ rules out DataFusion *from the default build*: it would give SQL for free at a
 cost of 47 direct dependencies and a ~1.5M SLoC transitive tree. The binary cost
 was estimated here at 68–92 MB and that was too pessimistic — built at Mira's
 release profile it is **50.0 MiB and 271 crates**, against 5.63 MiB and 117. An
-order of magnitude is still an order of magnitude, so it goes behind a
-`--features sql` cargo feature rather than into the binary everyone downloads;
-what it does not do is displace the hand-rolled ~2,000 LOC fast path, because a
+order of magnitude is still an order of magnitude, so it is out of the binary
+everyone downloads. There is no `--features sql` in the tree: `crates/mira`
+declares `default = []` and `webhook-tls`, and nothing else. The feature is the
+*shape* a SQL surface would take if one is ever asked for — a gate, not a
+default — and section 10 keeps it on the not-built list until someone asks. What
+DataFusion does not do, either way, is displace the hand-rolled ~2,000 LOC fast path, because a
 4.5 ms point lookup that already prunes to one block of 137 has nothing to gain
 from a planner. With traces, metrics, query, MCP and both UIs in it, the default
 build is **5.63 MiB stripped, 117 crates** — the scale the design is defending.
@@ -361,10 +362,16 @@ builder, a single reader and a single semi-join helper cover all three levels:
 | `parent_id` | `UInt32` |
 | `key` | `Dictionary<UInt16, Utf8>` |
 | `type` | `UInt8` — OTAP discriminant, `0..7` |
-| `str` / `int` / `double` / `bool` / `bytes` / `ser` | `Utf8` / `Int64` / `Float64` / `Boolean` / `Binary` / `Binary` |
+| `str` | `Dictionary<UInt32, Utf8>` — the only *value* column that is dictionary-encoded |
+| `int` / `double` / `bool` / `bytes` / `ser` | `Int64` / `Float64` / `Boolean` / `Binary` / `Binary` |
 
 Exactly one value column is non-null per row; `type` says which. The other five
 cost one validity bit each.
+
+`str` is a `UInt32` key rather than `key`'s `UInt16` because attribute values are
+unbounded in principle — a trace id, a URL, a GenAI prompt — so a `u16` would seal
+a high-cardinality tenant's block every few thousand rows. The wider index costs
+0.7% of compressed bytes and buys a ceiling a 32 MiB block cannot reach.
 
 Two deliberate deviations from OTAP, both cheap to reverse:
 - `ser` holds the protobuf encoding of the `AnyValue`, not CBOR. We own both
@@ -394,7 +401,15 @@ Two deliberate deviations from OTAP, both cheap to reverse:
     number_dp.arrow  hist_dp.arrow  hist_bounds.arrow  exp_hist_dp.arrow  summary_dp.arrow
     dp_attrs.arrow  exemplars.arrow  exemplar_attrs.arrow
     attr.idx  zone.idx
+<data>/.wal/<node:08x>-<first_seq:020>.wal          # only with ingest.wal on
 ```
+
+The log is the one thing under `<data>` that is not a block, and the leading dot
+is load-bearing: everything that walks the store filters on the three signal
+directories, and a hidden sibling is one a shell glob does not sweep into a block
+listing by accident. A segment is named for the *first* sequence it holds, which
+is what lets `Wal::open` refuse to resume onto the name of a segment that ended
+torn (section 4).
 
 Those are the tables a block *can* hold, not the ones it does: `publish` skips an
 empty one, so a traces block normally holds five of the nine — the event and link
@@ -687,7 +702,7 @@ default-configured Mira has nothing to replay. What the log buys is the *ack*.
 "Acknowledged means published" costs 2.6 s at p99 (section 11) because the export waits
 for its block to fill or age out, and no amount of tuning fixes that — it is the
 block size, and shrinking the block to fix the ack would trade the read path for
-the write path. So the frame goes to `wal/` first and the ack costs a `write(2)`,
+the write path. So the frame goes to `.wal/` first and the ack costs a `write(2)`,
 which is 7 µs at p50; the publish becomes a background reorganisation of data
 that is already on disk. Two consequences follow, and both are load-bearing.
 What the log tracks: not a high-water mark but a *set* — every sequence handed
@@ -880,11 +895,26 @@ and no signal to tokio. Both go through `spawn_blocking`.
 
 ## 6. Retention worker
 
-A 60-second tick that computes `now - ttl`, calls `scan()`, and `remove_dir_all`s
-every block whose `max_ts` is older. That is the whole worker.
+A 60-second tick that does three things per signal, in this order, and nothing
+else:
 
-TTL is a directory unlink, not a compaction: there is no read-modify-write of
-live data, so retention costs no IO bandwidth and cannot interfere with ingest.
+1. **Expire.** Compute `now - ttl`, call `scan()`, and `remove_dir_all` every
+   block whose `max_ts` is older. With `--offload`, the copy to the object store
+   is the hook that runs just before each unlink (section 12.4).
+2. **Compact.** Rewrite up to `MAX_COMPACT_PER_SWEEP = 8` blocks per signal whose
+   `max_ts` is older than `COLD_AFTER_NS`, table by table, ZSTD into a `.tmp` and
+   rename. Expire runs first on purpose: compressing a block this sweep is about
+   to delete is pure wasted bandwidth.
+3. **Reclaim.** One `statfs`. If free space is under `MIN_FREE = 10%`, drop
+   oldest-first until it is not, logging every block and why. `--offload`
+   deliberately does not apply here — an unreachable store must not be able to
+   stop the floor from reclaiming.
+
+TTL is a directory unlink, so step 1 costs no IO bandwidth and cannot interfere
+with ingest. Step 2 is the one that does read and write live data, and section 11
+prices it: it is bounded to eight blocks per signal per sweep precisely so that
+the bandwidth it costs is a constant an operator can reason about rather than a
+function of how far behind it is.
 
 **No reader lease protocol is needed**, and this is a real result rather than an
 optimism. POSIX specifies that `mmap()` adds a reference to the file that
@@ -985,7 +1015,7 @@ cannot have at all: **entity identity**.
 | `span_id` / parent | the record names a span | exact |
 | span link | async or fan-in causality | `span_links` table (with traces) |
 | exemplar | a metric datapoint sampled a trace | exemplar `trace_id` (with metrics) |
-| **entity + time** | **always** | `resources.key`, section 7.2 — written at seal, not yet selectable; section 7.4 |
+| **entity + time** | **always** | `resources.key`, section 7.2 — readable as a frame, not yet selectable as a predicate; section 7.4 |
 
 The ladder matters more than any single rung. An investigation that starts at an
 untraced error log gets nothing from the first four, and *everything* from the
@@ -1125,10 +1155,15 @@ That runs at memory bandwidth and is not worth a sort at seal time.
 ### 7.4 Indexes: what is needed and what is not
 
 - **Time** — directory names. Built.
-- **Entity** — `resources.key`, written at seal and read by nothing. The write
-  half is built; no read surface exposes an entity selector, so the key-set cache
-  that would make one cheap — tens of `u64` per block, ~4 MB for ten thousand
-  blocks, and therefore no on-disk filter warranted — is not written either. The
+- **Entity** — `resources.key`, written at seal and read by the frame algebra
+  but not by any *predicate*. `frame::entity_keys` loads the column for
+  `anchor`, `expand`/`Peers`, `map`, `names_of` and `entities`, and the key
+  surfaces on `POST /api/v1/entities`, the MCP `list_services` tool and the TUI's
+  entity pane. What is still missing is the selector: `query::Search` has
+  `signal`, `from`, `to`, `terms`, `limit` and `after` and no entity member, so
+  no query prunes a block by entity. That is why the key-set cache that would
+  make one cheap — tens of `u64` per block, ~4 MB for ten thousand blocks, and
+  therefore no on-disk filter warranted — is not written either. The
   order is deliberate: a key has to be in the blocks before a reader can use it,
   so one written today is answerable across the whole retention window on the day
   a reader lands, and one written then is not.
@@ -1300,8 +1335,13 @@ parent ids that matched; `attr_rows` scatters those into a `Vec<bool>` over root
 rows, which the scan then reads by index. No hash set anywhere, which is only
 possible because ids were rebased at ingest (section 0) and are therefore dense
 from zero — resource and scope go through a second boolean array of the same
-shape rather than a join, because entity ids number in the tens. It covers all
-six value columns and every attribute level.
+shape rather than a join, because entity ids number in the tens. It covers every
+attribute level and four of the six value columns — `str`, `int`, `double` and
+`bool`. `bytes` and `ser` (the OTAP Bytes, Slice and Map values) are decoded and
+returned in a result but are not filterable in V0: `AttrPred::test` dispatches
+on the *stored* type and has no arm for them, so a predicate against one matches
+nothing rather than erroring. A filter over a serialised map is a path
+expression, which is a query language, which is section 0.
 
 **Every level means the span's children too.** Record, resource and scope are the
 obvious three; a span's `events` and `links` carry attributes of their own, and
@@ -1391,10 +1431,16 @@ yields the same set `sort(keys).truncate(max_series)` did — a key that belongs
 the smallest `max_series` can never be the maximum of a map already one over. The
 difference is when: accumulating first meant a `query_metric` with no `name`,
 over a store with a request id in a data-point attribute, allocated about a
-kilobyte per distinct series until the process died. What each cap refused is
-reported — `dropped_points` per series, `dropped_series` in `stats` — because a
-chart with a series missing and no way to know it is the failure mode both of
-them exist to prevent. Neither does `get_trace` — a trace is one page or
+kilobyte per distinct series until the process died. `max_points` reports what
+it refused, as `dropped_points` on the series it trimmed, because a chart
+silently missing its spikes is the failure mode the cap exists to prevent.
+`max_series` does not, and that is a gap rather than a decision:
+`Stats::dropped_series` is computed (`series.rs:184`) and then dropped on the
+floor, because `api::envelope` is the only serialiser on every read surface and
+does not carry it — so the 65th series is invisible to HTTP, MCP and the TUI
+alike, which the TUI's own `ponytail:` at `tui.rs:510` says out loud. The fix is
+one field in `envelope` and a badge; it is unbuilt because it widens the
+response object every read surface shares. `get_trace` does not page either — a trace is one page or
 it is a broken trace, and an agent handed a third of one will reason about the
 third.
 
@@ -1732,16 +1778,18 @@ The cost of leaning low is bounded by `max_block_age`: a shard holding an old
 frame pins its siblings' watermarks behind it, and it is at most two seconds from
 sealing.
 
-**Probes are not the UI, and the listening line is not a promise.** `/health` and
-`/readyz` are the same handler — Mira has no warm-up and no cluster to join, so
-there is no state in which it is alive and not ready. `ingest.wal` does not
-change that, though it is the first thing that could have: log replay is the one
-startup task with unbounded duration, and it runs to completion *before* any
-listener binds, so a probe during replay finds a closed port rather than a
-process answering 200 about data it has not recovered yet. Connection refused is
-the honest answer and it is free — answering 200 with the
-per-signal shed and failed counts, so the probe and the log agree about how much
-has been refused. They also exist so that something other than the UI answers at
+**Probes are not the UI, and the listening line is not a promise.** `/health`
+and `/readyz` were one handler once — Mira has no warm-up and no cluster to
+join, so there is no state in which it is alive and not ready. A full volume is
+exactly that state, so they are two answers now: liveness is a constant 200 plus
+the per-signal shed and failed counts, so the probe and the log agree about how
+much has been refused, and readiness is the single question of whether an export
+can still be made durable. `ingest.wal` does not add a third state, though it is
+the first thing that could have: log replay is the one startup task with
+unbounded duration, and it runs after both sockets are bound but *before* either
+accept loop starts — so a probe during replay completes its handshake into the
+kernel backlog and then waits there, and is never answered 200 about data the
+process has not recovered yet. They also exist so that something other than the UI answers at
 those paths: the asset router 404s a path it does not know and deliberately has
 no SPA fallback, because every view in the app lives under the URL hash, so an
 unknown *path* is a probe pointed somewhere wrong rather than a route needing
@@ -1786,11 +1834,13 @@ node is a line the eye learns to skip.
 
 ## 10. What is deliberately not here
 
-- **The frame algebra of section 7.3** — all of it. No `Frame`, no `anchor`, no
-  expander, no `fetch`. A span query returns its links and a series returns its
-  exemplars, so both out-edges of section 7.1 are readable, but the caller follows them
-  itself and there is no operation that widens a region rather than answering a
-  question.
+- **`fetch`, and four of the seven expanders.** The algebra itself is built and
+  section 7.3 says so in its title: `mira_core::frame` is `Frame`, `anchor`,
+  `expand` over `Traces`/`Peers`/`Around`, `map`, `names_of` and `entities`,
+  served at `POST /api/v1/frame`, `/api/v1/map` and `/api/v1/entities`. What is
+  not there is `fetch` — a `Frame` holds identities and there is no operation
+  that renders the records for them, so every widening is another scan — and the
+  four expanders section 7.3 cut with its reasons beside them.
 - **A block cache.** Every query re-opens every block it touches. The fix is a
   process-local `Arc<MappedTable>` map invalidated by `expire`. This was assumed
   to be the next big win and it is not: section 11 measures the per-block cost as
@@ -1813,20 +1863,26 @@ node is a line the eye learns to skip.
   decisions, which this document already reflects.
   Related: do **not** depend on `otel-arrow-dfe-pdata`; it pulls
   `datafusion ^53` non-optionally for two imports.
-- **DataFusion in the default build.** section 1. Behind `--features sql` it is not
-  rejected: 50.0 MiB and 271 crates is a real price, but it is paid only by
-  whoever asks for SQL, and DataFusion 55 pins arrow v59.3.0 — exactly Mira's
-  pin — so there is no second Arrow in the tree.
+- **DataFusion, in any build.** section 1. It is not *rejected* — 50.0 MiB and
+  271 crates behind a cargo feature would be paid only by whoever asks for SQL,
+  and DataFusion 55 pins arrow v59.3.0, exactly Mira's pin, so there would be no
+  second Arrow in the tree. But no such feature exists: `crates/mira` declares
+  `default = []` and `webhook-tls`, `datafusion` is in no manifest and no
+  lockfile, and `--features sql` does not resolve. It is a shape held open, not a
+  build option.
 - **The `F_FULLFSYNC` fallback** (section 9). Not a weaker fsync — the opposite, and it
   was settled by measuring rather than by reading. On this machine
   `File::sync_all()` costs 4,230 us, `fcntl(F_FULLFSYNC)` 4,213 us and a bare
   `libc::fsync(2)` 28 us: `sync_all` *is* `F_FULLFSYNC` on Apple targets, so
   section 11's ack latencies are measured against the stronger barrier and nothing is
-  owed for the ordinary case. What is missing is the Docker-for-Mac
-  `EINVAL`/`ENOTSUP` path section 9 names, where std does not degrade and the durability
-  loss would therefore be silent. The `statfs` guard beside it in that section
-  **is** written: `block::check_filesystem`, called once before anything is
-  mapped.
+  owed for the ordinary case. The Docker-for-Mac `EINVAL`/`ENOTSUP` path section 9
+  names **is** written, and so is the counting section 9 insists on:
+  `mira_core::sync_all`/`sync_data` wrap every sync in `block.rs` and `wal.rs`,
+  degrade to `libc::fsync` on exactly those two errnos, and report the count as
+  `degraded_syncs` on `/api/v1/stats`. So is the `statfs` guard beside it:
+  `block::check_filesystem`, called once before anything is mapped. What stays on
+  this list is the *weaker* fsync — trading the barrier for throughput by
+  default, which would make an ack mean less than it says.
 - **Hand-written SIMD on the decode path.** Protobuf varint decoding is
   inherently serial — each field's length says where the next begins — and
   branchy on wire type, so there is no vector formulation of the inner loop. The
@@ -1846,10 +1902,14 @@ node is a line the eye learns to skip.
   does GB/s, on 1.75 of twelve cores. Revisit when a profile shows syscall
   overhead above ~5% of ingest CPU, or when the log's group commit measures
   submission-bound rather than device-bound.
-- **The query-side half of `NO_IDENTITY`.** The sentinel is written (section 7.2) and
-  the expander that must refuse it is not — not because the query layer is
-  missing, it is not, but because no read surface exposes `resources.key` at all
-  (section 7.4). There is nothing yet for the sentinel to be refused by.
+- ~~**The query-side half of `NO_IDENTITY`.**~~ Built. `Frame::add_entity`
+  (`frame.rs:82`) drops the sentinel with the reason this bullet asked for — "an
+  entity set containing the sentinel means *every resource nobody described*,
+  which is not an entity" — and `frame::entities` exposes `resources.key` on
+  `POST /api/v1/entities`, the MCP `list_services` tool and the TUI, so there is
+  now something for it to be refused by. The bullet is kept struck through rather
+  than deleted because the reasoning for the refusal is what section 7.2 is
+  pointing at.
 
 ---
 
@@ -1882,8 +1942,19 @@ scan repeated ninety times, or blocks the cold tier has not reached yet:
 
 The restart-replay corpus is per-run because what it measures is a difference
 across a restart rather than any absolute. All of them are internally paired and
-**none of their numbers may be divided into the table above**. Each is
-reproducible from a script in `scripts/measure/`, named in the bullet.
+**none of their numbers may be divided into the table above**.
+
+Four of the five are reproducible from a script in `scripts/measure/`, named in
+the bullet that uses them: `restart-replay.sh`, `offload-cycle.sh`,
+`block-reopens.sh`, `lazy-detail.sh`. **The second sitting's 9.6 GiB / 5.01 GiB
+pair is not.** It was built by hand and there is no script that rebuilds it, so
+that one bullet is reproducible in method and not in corpus. The obstacle is
+worth naming because it is fixable and general: `loadgen`'s payload is
+deterministic — the same arguments produce the same bytes — but its stopping
+condition is `--for <duration>`, so the *volume* a run produces depends on how
+fast the box was. A record-count stopping condition would make a corpus
+described by an exact byte count something a second person can rebuild. See
+[the measurement contract](internals/measurement.md).
 
 The plain one is there for a reason worth stating once: **a corpus is not a
 constant while a server is running on it.** The cold tier compacts blocks that
@@ -1982,7 +2053,7 @@ Reading these honestly:
 
   Three runs, `loadgen --for 20s --batch 8192`, fresh store each, means over the
   whole run — `scripts/measure/ingest-probe.sh` is the whole sequence, this
-  table and the worker-count A/B two bullets down:
+  table and the worker-count A/B in the next bullet:
 
   | | 4 conns | 32 conns | 96 conns |
   |---|---|---|---|
@@ -2015,10 +2086,17 @@ Reading these honestly:
   of exactly 12 on a 12-worker runtime says every worker was inside
   `append_then` at once. `runtime.lag` is the same fact with nothing borrowed
   from the client: a task that asks to sleep 50 ms and does no work at all wakes
-  9.7 ms late at four connections, 33.9 at thirty-two and 80.2 at ninety-six,
-  and completes 418, 238 and 192 of the 400 sleeps the window allows. Ack
-  latency cannot separate "working hard" from "cannot schedule anything". This
-  can, and it says the second.
+  9.7 ms late at four connections, 33.9 at thirty-two and 80.2 at ninety-six.
+  The tick counts beside those — 418, 238 and 192 — are **not** out of a fixed
+  denominator, and an earlier draft of this table said they were out of 400,
+  which is impossible on the face of it since 418 is larger. `RUNTIME_LAG` is a
+  free-running probe spawned at process launch and never reset, so its count is
+  over the whole process lifetime and is not comparable across columns; the load
+  window is 20 s of that. What *is* comparable is the cadence the lag implies:
+  a 50 ms sleep that wakes 9.7, 33.9 and 80.2 ms late completes **16.8, 11.9 and
+  7.7 wake-ups per second** against the 20 it asked for. Ack latency cannot
+  separate "working hard" from "cannot schedule anything". This can, and it says
+  the second.
 - **Each obvious suspect is ruled out by a number rather than an argument.**
   Admission backpressure: `submit.admit` — `reserve()` plus the `ADMIT_WAIT`
   park — is a mean of 0.000 to 0.002 ms with a maximum of 6.5 ms at every shape,
@@ -2041,8 +2119,12 @@ Reading these honestly:
   count. Neither needs coordination state and neither changes the format. What
   did land is `Wal::sync()` taking its `F_FULLFSYNC` outside the lock rather than
   inside it: structurally right given the 4,230 µs section 10 already publishes
-  for that call, and **not measured to move any number in the table above**,
-  because the sweep never calls it.
+  for that call, and **not measured to move any number in the table above**. The
+  sweep does call it — four times a second for the life of the process, so ~80
+  times in a 20 s probe run — but at 4,230 µs on a 250 ms period that is a ~2%
+  duty cycle, which lands on whichever exports are unlucky rather than on a mean
+  taken over hundreds of thousands of them. The half a 20 s run never reaches is
+  truncation, which is the 240th tick.
 - **The box, and a number withdrawn.** This machine is not quiet: an
   idle-before baseline swung between 6% and 81% busy across consecutive runs,
   and two runs of the *identical* 96-connection configuration minutes apart
@@ -2075,15 +2157,21 @@ Reading these honestly:
   retention `spawn_blocking` thread, so the ingest rows above are unchanged by
   the flag.
 
-  Compatibility is checked three ways, because a query comparison alone would
+  Compatibility is checked two ways, because a query comparison alone would
   not catch a silently re-encoded block. The same two queries — page one of the
   newest logs, and a predicate that prunes nothing so every block is opened —
   return **byte-identical** responses over the original and the restored corpus.
   `diff -r` over all 137 restored block directories against the store reports
-  **no difference at all**. And a second, independent upload of the same corpus
-  into a different prefix is **byte-identical to the first** under `diff -r`,
-  which is the part a single round trip cannot show: that the writer is copying
-  bytes rather than re-encoding them reproducibly-but-differently. One caveat is
+  **no difference at all**. A third check — a second, independent upload into a
+  different prefix, compared against the first — would be the one that shows the
+  writer copies bytes rather than re-encoding them
+  reproducibly-but-differently. `offload-cycle.sh` does **not** run it; it uses
+  one prefix, and an earlier draft of this paragraph claimed three checks where
+  the script performs two. The check is also the one that needs measuring least:
+  `offload::copy_file` is `io::copy` over the two descriptors, deliberately not
+  `fs::copy` (which on macOS is `fcopyfile(COPYFILE_ALL)` and would carry the
+  source `mtime` across), so there is no encoder in the path for a re-encode to
+  hide in. One caveat is
   itself a measured result: an md5 of a whole query response is the wrong
   instrument and was withdrawn as one here, because two processes over a single
   unchanged directory differ in `elapsed_us` and nowhere else — that field is
@@ -2501,8 +2589,14 @@ Reading these honestly:
 - **A block cache was talked into being the obvious next lever twice, in
   opposite directions, and neither time by a measurement of the cache.** It was
   first ruled a small win on the belief that `open` and the CRC were the small
-  part of a single-block query. They are not — they are 55% of the dearest
-  predicate and nearly all of the cheap ones — so the entry was rewritten to
+  part of a single-block query. They are not. `scan_cost_per_row` at 2,000,000
+  rows, median of four passes, prices the dearest predicate — `body contains` —
+  at **4.99 ns/row** against a whole read path of **18.23 ns/row** while the
+  checksum is being verified and **11.44 ns/row** once the file has settled, so
+  `open` alone is **56%** of that query and `open` plus the CRC is **73%**. On
+  the cheapest predicate, `no term` at 0.04 ns/row, it is essentially all of it.
+  (This entry said "55%" before, without saying which of the two paths it meant;
+  it was the settled one.) So the entry was rewritten to
   call the cache the obvious next lever. That does not follow either: "the term
   a cache would attack dominates" is an argument for attacking the term, not for
   attacking it with a cache.
@@ -2510,7 +2604,10 @@ Reading these honestly:
   Two changes in this release take that term apart without a cache, and they
   attack different halves of it. The **lazy attribute-table load** removes opens
   that should never have happened: the tables a query never reads are never
-  mapped and never hashed, 25% off a logs scan and 44% off a traces one. The
+  mapped and never hashed, **30.8% off a logs scan and 46.8% off a traces one**
+  measured against the binary that already carries the map — the two figures this
+  entry quoted before, 25% and 44%, are the ones withdrawn earlier in this
+  section for having been taken while the cold tier rewrote the corpus. The
   **process-scoped verification map** (section 3.3) removes the repeat hashes on
   the opens that remain, and it holds no mappings and needs no invalidation.
   Neither pays a resident byte. What a real cache would add on top of both is
@@ -2836,8 +2933,14 @@ mounting ext4 or XFS from two nodes at once corrupts it. Mira has never been run
 on one.
 
 So the supported shape of shared-volume mode is **several processes on one
-host** sharing a local directory: an e2e test covers it, and it is the mode the
-`--node` flag exists for. Across hosts, shared-nothing is the supported shape
+host** sharing a local directory, and it is the mode the `--node` flag exists
+for. It is **not covered by a test**, and that is worth stating plainly: the
+measurement in section 12.6 was a two-process run done by hand, and what is in
+the tree is unit coverage of the *mechanisms* it turned up — a failed publish
+leaving no staging directory, `sweep_staging` filtering by signal and node —
+rather than of two writers racing. Covering it properly means two `mira`
+processes over one `TempDir` and an assertion that no published block mixes two
+sealed sets, which is a test level `docs/internals/testing.md` does not have yet. Across hosts, shared-nothing is the supported shape
 and query fan-out (section 12.2, unbuilt) is the answer to covering the whole dataset.
 A cluster filesystem would work in principle and is not claimed. Object storage
 is a larger question — it forecloses mmap entirely — and is deferred to the
@@ -2846,7 +2949,7 @@ market survey rather than guessed at here.
 ### 12.6 The staging path is the one place two writers can still collide
 
 Everything above rests on writers never touching each other's bytes, and the
-final block name delivers that: `{min_ts}-{max_ts}-{node}-{seq}` is unique per
+final block name delivers that: `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}` is unique per
 writer by construction. The *staging* name was not. It was
 `.tmp/{signal}-{node}-{seq}`, which is unique only as long as the two writers
 disagree about `node` — and `node` is derived from `--node`, which defaults to

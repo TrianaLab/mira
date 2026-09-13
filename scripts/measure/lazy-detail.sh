@@ -35,7 +35,7 @@
 # be measured warm here and cold by a client that reconnects to a fresh server.
 # Anyone A/B-ing such a build should run it both ways and say which row is which.
 #
-#   make release && A=./target/release/mira B=/path/to/0.0.3/mira \
+#   make build && A=./target/release/mira B=/path/to/0.0.3/mira \
 #     scripts/measure/lazy-detail.sh
 #
 # `ALABEL`/`BLABEL` name the two columns. They default to the pair this was

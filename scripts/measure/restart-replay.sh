@@ -21,7 +21,7 @@
 # Each boot's `replayed=` is printed beside the counts, because that is the
 # number that explains them.
 #
-#   make release && scripts/measure/restart-replay.sh
+#   make build && scripts/measure/restart-replay.sh
 #   MIRA=/tmp/mira-0.0.3-target/release/mira ROOT=/tmp/mira-restart-base \
 #     scripts/measure/restart-replay.sh
 #

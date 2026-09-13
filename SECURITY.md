@@ -49,8 +49,8 @@ trust boundary is the network, and everything that crosses it is in scope:
   reachable panic as a denial of service, because it is one.
 - **The gzip path.** Every OTLP transport accepts `content-encoding: gzip`. A
   decompression bomb that gets past `ingest.max_request_bytes` (16 MiB by
-  default, and it is the ceiling on what a gzip body may *inflate* to, not on
-  what arrives) is in scope.
+  default, and it is the ceiling on what arrives *and* on what a gzip body may
+  inflate to) is in scope.
 - **The KYAML parser.** `--config` is operator-supplied and therefore trusted,
   but the same parser reads query documents and API bodies off the network, and
   those are not. A crash or an unbounded allocation from a query document is in
@@ -125,10 +125,20 @@ section:
 
 ## Verifying a release
 
-Everything a tag publishes is signed, and the signature is over the **digest**,
-never the tag — a tag is a name and names can be repointed. The release workflow
-also refuses to publish over a coordinate that already exists, so a re-run of a
-released version fails instead of quietly replacing what you verified yesterday.
+Everything signed is signed over the **digest**, never the tag — a tag is a name
+and names can be repointed. The release workflow also refuses to publish over a
+coordinate that already exists, so a re-run of a released version fails instead
+of quietly replacing what you verified yesterday.
+
+"Everything signed" is not everything a tag publishes, and the difference is
+worth stating here rather than leaving to be discovered. The image and the chart
+each carry a cosign signature over their digest; the tarballs and the SBOM carry
+`SHA256SUMS`, which itself carries one SLSA provenance attestation. **The three
+crates.io crates and the `:artifacthub.io` metadata tag carry neither** — the
+`crates` job is a bare `make publish` and the metadata is a plain `oras push`,
+so `cargo install --locked miradb` is verified by the registry's own `.crate`
+checksum and nothing else. The per-artifact table is in
+[Release architecture](https://miradb.dev/internals/releases/#what-is-signed-and-what-is-not).
 
 Every command below has a subject from `v0.0.1` on. They are also the contract
 the workflow's own `verify-release` job runs against every publication — it

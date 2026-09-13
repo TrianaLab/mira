@@ -8,7 +8,7 @@
 # Each shape gets a fresh store, because a sweep that starts with blocks on
 # disk starts with a different amount of work to do.
 #
-#   make release && scripts/measure/ingest-probe.sh
+#   make build && scripts/measure/ingest-probe.sh
 #
 # BIN defaults to the release tree, ROOT to a scratch directory. The ports are
 # not the defaults so this can run beside a real node.

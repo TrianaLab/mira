@@ -50,9 +50,11 @@ transformation step for a field to fall out of.
   configure one against.
 - **Not tunable.** There is no block size, flush interval or cache size to set,
   and there will not be. The config file describes *where the process runs* —
-  twelve keys — and the two that reach the engine do not tune it: `ingest.queue`
-  buys burst room with memory, and `ingest.shards` is there to pin a core count
-  the runtime reads wrong.
+  thirteen keys — and the three that reach the engine do not tune it:
+  `ingest.queue` buys burst room with memory, `ingest.shards` is there to pin a
+  core count the runtime reads wrong, and `ingest.wal` is not a number to guess
+  but a choice between two durability promises, acked in the log or acked at
+  block publication.
 
 ## Where to go next
 
@@ -62,7 +64,7 @@ transformation step for a field to fall out of.
 | [Install](install.md) | one script, a container, or `cargo install` |
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
 | [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
-| [Configuration](config.md) | twelve keys, KYAML, `${env:…}` interpolation |
+| [Configuration](config.md) | thirteen keys, KYAML, `${env:…}` interpolation |
 | [End-to-end testing](internals/e2e.md) | a live binary, a real collector, the load harness |
 | [Architecture](architecture.md) | the reasoning behind every non-obvious choice |
 | [Market position](market.md) | who else is in this space, and where the line is |

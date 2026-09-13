@@ -169,7 +169,10 @@ helm install mira oci://ghcr.io/trianalab/charts/mira \
   --version 0.0.3 --namespace observability --create-namespace
 ```
 
-That is a StatefulSet of one, a PVC, and one Service carrying both ports. No
+That is a StatefulSet of one, a PVC, a ServiceAccount, and two Services — a
+ClusterIP one carrying both ports and the StatefulSet's governing headless one,
+which publishes not-ready addresses so a pod whose volume has filled is still
+reachable by name, which is when someone needs it. No
 operator, no sidecar, no CRDs and nothing to elect: Mira holds no coordination
 state, so the chart has nothing to coordinate. Configuration is the same KYAML
 document as everywhere else, rendered into a ConfigMap — the `config.*` values
@@ -178,7 +181,11 @@ are [Configuration](config.md)'s keys, camelCased per Helm convention
 CPU, memory and disk to give it is [that page's sizing
 table](config.md#sizing), every row anchored to a measured point.
 
-The chart is signed the same way the binaries are:
+The chart is signed, but not the same way the binaries are — it carries a cosign
+signature over its digest and no SLSA provenance, where the tarballs carry
+`SHA256SUMS` with one provenance attestation over that file and no cosign
+signature ([releases.md](internals/releases.md#what-is-signed-and-what-is-not) has the
+per-artifact table):
 
 ```sh
 cosign verify \
@@ -192,9 +199,14 @@ The [chart reference](reference/chart.md) has every value, why it defaults where
 it does, and the argument for a StatefulSet.
 It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira),
 which renders that README, the signature above and the image's current CVE
-report against the same coordinate. Every value is covered by a closed
-`values.schema.json`, so `helm install` rejects a typo'd key before the cluster
-sees it — the same rule Mira's own config file follows.
+report against the same coordinate. Every value the chart itself owns — all of
+`config.*`, `image`, `service`, `ingress`, `persistence`, `serviceAccount` — is
+covered by a `values.schema.json` that is closed at each of those levels, so
+`helm install` rejects a typo'd key before the cluster sees it, the same rule
+Mira's own config file follows. The Kubernetes pass-throughs
+(`resources`, `securityContext`, `podSecurityContext`, `nodeSelector`,
+`tolerations`, `affinity`, `extraEnv`) stay open on purpose: the API server owns
+those schemas, and a copy here would go stale against it.
 
 ## Where it will refuse to start
 

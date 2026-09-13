@@ -1016,7 +1016,7 @@ fn write(rel: &str, body: &str) -> bool {
 /// half a generator cannot write: *why* a key exists, what it trades. So the
 /// generated part is bracketed and the rest is nobody's business but the
 /// author's.
-fn inject(rel: &str, name: &str, body: &str, f: &mut Failures) -> bool {
+pub(crate) fn inject(rel: &str, name: &str, body: &str, f: &mut Failures) -> bool {
     if body.trim().is_empty() {
         return false;
     }
@@ -1080,9 +1080,14 @@ fn cli_page(f: &mut Failures) -> String {
         // closing line points at the page that expands it rather than saying
         // the same sentence a second line down.
         "",
-        "Every flag here is also a config-file key:",
+        "Every flag on the server line is also a config-file key:",
         "[Configuration](../config.md) is the table, with the type, the",
-        "default and what each one sets.",
+        "default and what each one sets. Four here are not, because there is",
+        "nothing for them to persist: `--config` names the file itself,",
+        "`--version` exits, and `--addr` and `--dry-run` belong to `mira mira`",
+        "and `mira update` rather than to the server. The config file is a",
+        "closed set, so writing one of them into it is an `unknown key` at",
+        "boot rather than a setting that is quietly ignored.",
         "",
     ]
     .join("\n");

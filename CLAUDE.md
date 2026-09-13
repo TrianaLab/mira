@@ -101,6 +101,14 @@ backends.
   non-obvious choice, the section explaining *why* is part of the diff.
 - Comments explain **why**, not what. A deliberate simplification with a known
   ceiling gets a `ponytail:` comment naming the ceiling and the upgrade path.
+- **Every published performance number lives in `measurements.kyaml`**, with the
+  sites that quote it listed beside it, and `make measurements-check` fails the
+  build when a site and the registry disagree. Adding a figure to a document
+  without an entry there is how four files end up quoting three different
+  numbers. What each quantity means is
+  [the measurement contract](docs/internals/measurement.md); re-measure with
+  `scripts/measure/conn-sweep.sh` and fold it back with `make
+  measurements-ingest RUN=...`.
 
 ## Driving the TUI headlessly
 

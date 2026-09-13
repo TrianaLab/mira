@@ -11,7 +11,7 @@
 # corpus that absorbed it in between, and the diff then reports the replay
 # rather than the copy. Phase A1b boots until there is nothing left to replay.
 #
-#   make release && scripts/measure/offload-cycle.sh
+#   make build && scripts/measure/offload-cycle.sh
 set -e
 BIN=${BIN:-./target/release}
 ROOT=${ROOT:-/tmp/mira-measure}

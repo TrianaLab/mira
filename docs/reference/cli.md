@@ -39,6 +39,11 @@ already local back into --data-dir, and is safe to re-run.
 same installer as the curl one-liner at https://miradb.dev/install/.
 ```
 
-Every flag here is also a config-file key:
+Every flag on the server line is also a config-file key:
 [Configuration](../config.md) is the table, with the type, the
-default and what each one sets.
+default and what each one sets. Four here are not, because there is
+nothing for them to persist: `--config` names the file itself,
+`--version` exits, and `--addr` and `--dry-run` belong to `mira mira`
+and `mira update` rather than to the server. The config file is a
+closed set, so writing one of them into it is an `unknown key` at
+boot rather than a setting that is quietly ignored.

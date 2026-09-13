@@ -150,7 +150,7 @@ Accepts `from`, `to`, `max_spans`.
 An empty body is valid, and means the last `1h`.
 
 ```yaml
-{ "from": "-15m", "to": "now", "max_spans": "50000" }
+{ "from": "-15m", "to": "now", "max_spans": 50000 }
 ```
 
 Answers under `map`, with the envelope below.

@@ -112,7 +112,7 @@ ci-coverage-json: ## The coverage figure the deployed site publishes
 ci-supply-chain: deps ## The `supply-chain` leg
 
 .PHONY: ci-drift
-ci-drift: drift reference-check ## The `drift` leg
+ci-drift: drift reference-check measurements-check ## The `drift` leg
 
 .PHONY: ci-docs
 ci-docs: docs install-script ## The `docs` leg

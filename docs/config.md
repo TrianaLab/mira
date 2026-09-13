@@ -3,8 +3,11 @@
 **For:** whoever runs the process. <!-- BEGIN GENERATED: count -->
 13
 <!-- END GENERATED: count -->
-keys. One of them changes how the engine runs, and it is there to correct a
-number the runtime can read wrong, not to tune anything.
+keys. Three of them reach the engine rather than describing where it runs, and
+none of them tunes it: `ingest.queue` buys burst room with memory,
+`ingest.shards` is there to correct a core count the runtime can read wrong, and
+`ingest.wal` is not a number to guess but a choice between two correct
+durability promises that no measurement can make for the operator.
 
 Precedence is **flag > file > default**. Everything works with no config file at
 all; the file exists for what a flag cannot express, chiefly interpolation. The
@@ -45,14 +48,22 @@ means `MiB` — every other size in this system is binary and a `MB` that meant
 be able to say `false` to undo what an inherited config turned on, and a flag is
 only ever typed to turn something on.
 
-There is no block size, flush interval, buffer depth, cache size or compaction
-threshold, and there will not be. That is the *self-driving* half of principle 2
+There is no block size, flush interval, cache size or compaction threshold, and
+there will not be. That is the *self-driving* half of principle 2
 in [Architecture section 1](architecture.md#1-principles-and-the-mechanism-each-one-buys):
 the two numbers an operator would most want to tune are constants in the binary,
-with no path from this file to either. `ingest.shards` is not the exception it
-looks like: the engine sizes it from the core count on its own, and the key
-exists to tell it something `available_parallelism` cannot see rather than to
-search for a better value.
+with no path from this file to either.
+
+Two keys look like exceptions and are not. `ingest.shards` is sized from the
+core count on its own, and the key exists to tell the engine something
+`available_parallelism` cannot see rather than to search for a better value.
+`ingest.queue` *is* a buffer depth, and it is here because its cost is memory
+the operator is paying for and the engine cannot see their budget:
+`queue × max_request_bytes × 3` is the worst case resident, one term per signal.
+Raise it when a wide collector fleet shows up as `shed` in `/health`; lower it
+when the RSS ceiling is the binding constraint. Neither key is a throughput
+dial — the flusher drains at the rate it drains, and a queue deep enough to
+hide a permanently overloaded node only moves the shed into a latency tail.
 
 ## The file
 
@@ -171,7 +182,7 @@ acknowledgement means. Read-your-writes holds either way: a query reads the open
 block as well as the published ones.
 
 **On (the default).** Acknowledged means logged: the export has been framed and
-`write(2)`n to `wal/`, so it is in the page cache and the block that will hold
+`write(2)`n to `.wal/`, so it is in the page cache and the block that will hold
 it is a background reorganisation of data already recoverable. p50 7 µs, p99
 39 µs for a 4 KiB body. It survives the process dying, `panic = "abort"`, `SIGKILL` and the OOM
 killer. It does not survive power loss or a kernel panic for up to

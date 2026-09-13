@@ -13,9 +13,19 @@ measurements on one Apple M3 Pro (12 cores, 18 GiB), one process, generator
 co-resident — reproduce them with [the load harness](internals/e2e.md#3-the-load-harness).
 
 The `=` column says whether a claim can honestly sit in the same row as Mira's.
-It is `no` for 128 of the 133 claims surveyed, and the four-word reason says why.
-The only fair reading of a row marked `no` is order-of-magnitude, and a row
-marked `no` for *wrong axis* is not a reading at all.
+<!-- BEGIN GENERATED: market-claim-tally -->
+Across the six tables that carry one there are 62 marked rows. 13 are Mira's own
+and take `—`; of the 49 competitor claims, **38 are `no`**, 10 are `yes` and one
+is `~`.
+<!-- END GENERATED: market-claim-tally -->
+The four-word reason beside each says why. The only fair reading of a row marked
+`no` is order-of-magnitude, and a row marked `no` for *wrong axis* is not a
+reading at all.
+
+What each of Mira's own numbers means — the denominator, what is inside the
+measurement and what is outside it — is
+[the measurement contract](internals/measurement.md). Read that before dividing
+any row here by any other.
 
 Tables are per axis rather than one row per competitor, because no competitor
 publishes the same axis as its neighbour and a row per engine would be a column
@@ -33,12 +43,19 @@ of blanks.
 
 ## Ingest, one node
 
-Mira's row is a **consumed-CPU** measurement and every other row is a
-**provisioned-CPU** one. That is the whole difficulty of this table: 1.75 cores
-is CPU-seconds the server actually burned over the wall clock of the run, and
-nobody else publishes that, so their vCPU column is a purchase order and Mira's
-is a meter reading. Both bases are given below rather than picking the flattering
-one.
+Mira's row is a **consumed-CPU** measurement and most other rows are
+**provisioned-CPU** ones. That is the whole difficulty of this table: 1.75 cores
+is CPU-seconds the server actually burned over the wall clock of the run, so for
+most of these rows their vCPU column is a purchase order and Mira's is a meter
+reading. Both bases are given below rather than picking the flattering one.
+
+**Two rows are the exception and it matters.** Loki's 2.75 and Quickwit's 2.2
+come from the same benchmark [^q2], whose "Mean vCPU" row is a meter reading on a
+16-vCPU `n2-standard-16` — consumed, not provisioned, and published alongside
+total CPU-minutes. Those two are the only competitor figures on this page that
+are the same *kind* of quantity as Mira's 1.75, and they are still not the same
+*measurement*: that run is explicitly unsaturated at 17% CPU, so its meter reads
+an offered load rather than a ceiling.
 
 | Engine | Published | Their hardware | = | Reason |
 |---|---|---|---|---|
@@ -67,9 +84,9 @@ process was given is **14.7 MiB/s per provisioned core**, against Quickwit's
 read it as an ordering rather than a ratio.
 
 On consumed CPU it is 100.9 MiB/s per core, a 15x gap, and that number should
-not be quoted against these rows. Nobody else reports utilisation, so the gap it
-measures is partly Mira's and partly the fact that a benchmark rig provisions
-headroom it does not use. The reason to record it at all is what it says about
+not be quoted against these rows. Only the two [^q2] rows report utilisation at
+all, so for the rest the gap it measures is partly Mira's and partly the fact
+that a benchmark rig provisions headroom it does not use. The reason to record it at all is what it says about
 Mira rather than about them: at the operating point the engine leaves ten of
 twelve cores idle, so the ingest ceiling on this box is not the engine's
 arithmetic.
@@ -101,13 +118,25 @@ One caveat that belongs next to the number rather than in a footnote, because it
 is the row's weakness: Mira's RSS is **not flat in connection count**, and 232
 MiB is the one-connection row, not the throughput headline. The same process
 reaches 689 MiB at the four connections that produce 1,350,502 records/s, 1,243
-MiB at eight and 1,648 MiB at ninety-six. RSS counts mapped block pages and more
-concurrency keeps more blocks open, so past four connections Mira sits above
-ClickHouse's 1.12 GiB rather than below it. Sharding the flusher pulled the
-four-connection figure down from 1,366 MiB to 689 for the same throughput —
-smaller blocks sealed by six tasks hold less anonymous memory than large ones
-sealed by one — but it did not change the shape, and the shape is the caveat.
-Both ends of that range are in the README's table; quoting only the low end
+MiB at eight and 1,648 MiB at ninety-six, so past four connections Mira sits
+above ClickHouse's 1.12 GiB rather than below it.
+
+The term that scales is **decoded exports, not mapped block pages** — the open
+block count is a constant. `pipeline` runs `(cores / 2).clamp(1, 16)` flushers
+per signal whatever the connection count, and each holds exactly one builder, so
+this box has eighteen open blocks at one connection and eighteen at ninety-six.
+What grows is `ingest.queue`: 128 slots per signal, each able to hold a decoded
+export at ~1.29 MiB, plus every decode in flight. Sharding the flusher is what
+pulled the four-connection figure from 1,366 MiB to 689 at the same throughput,
+and for that reason — six flushers drain their slots where one left them full,
+so the exports that used to sit in the queue are not resident at all. Six open
+blocks per signal is *more* block state than one, and the number still fell. The
+same A/B is written up in
+[architecture section 11](architecture.md#11-performance-model) and
+[e2e section 3](internals/e2e.md#3-the-load-harness).
+
+The whole range is here rather than in the README, whose table quotes the
+throughput headline and no footprint figure at all; quoting only the low end
 would be quoting the sweep's best case as its result.
 
 ## Artifact — stripped binary
@@ -229,7 +258,8 @@ file — and it is defensible at two orders of magnitude.
 **4. Supply-chain surface.** 117 crates on `cargo tree --edges normal` for one
 target triple, with `zstd-sys` as the only C dependency. Parseable, measured with
 the identical command, is 462 (3.9x); Quickwit is 1,171 lockfile entries against
-Mira's 211 (5.6x); the Go stacks carry 331–425 modules. The honest exception is
+Mira's 209 (5.6x — `Cargo.lock` has 213 `[[package]]` stanzas, four of which are
+the workspace's own crates); the Go stacks carry 331–425 modules. The honest exception is
 VictoriaLogs at 98 vendored packages, which is parity and also one C dependency.
 
 ## Where Mira is not ahead
@@ -405,9 +435,12 @@ Where vectorising did pay is everything that filters. An attribute value that
 matches went from 30.2 ms to 4.49 ms, 6.7x; an unfiltered `limit 100` from 24.4
 to 4.61, 5.3x; a substring that fills the limit from 26.6 to 7.62, 3.5x. On the
 eight-reader read mix `attr` p50 improved 5.1x and `errors` p50 4.6x, taking the
-whole mix from 40 to 50 queries/s. Two classes did not improve and belong in the
-same sentence as the ones that did: `tail` p50 went from 1.42–1.54 ms to
-1.72–1.74, and `series` p50 from 575–616 ms to 686–702.
+whole mix from 40 to 50 queries/s. Two classes did not move and belong in the
+same sentence as the ones that did: `trace`, which is a `trace.idx` lookup with
+almost no rows left to filter, and `series`, whose p50 went from 575–616 ms to
+686–702. A third class, `tail`, matched nothing on this corpus — the data is
+older than the window it asks for — so its numbers time the empty path and are
+quoted in neither direction.
 
 The `series` figure was first written up here as a regression, and it is not
 one. The metrics module is byte-identical across the change, and the one
@@ -489,8 +522,10 @@ dictionary and a posting-list format spent on the reader this engine is not for.
 Losing the row is the correct outcome, not a deferral.
 
 **Horizontal scale.** No cross-replica query fan-out, by design. Quickwit at
-Binance sustains 18.5 GB/s across 2,800 vCPU; Datadog and Honeycomb operate
-fleets whose size they decline to publish. Mira's answer is independent replicas
+Binance reports 1.6 PB a day — 18.5 GB/s — across 2,800 vCPU [^qb], which this
+page rejects below as a *rate* because the denominator is requested vCPU rather
+than observed CPU, and cites here only as evidence that the deployment is that
+wide; Datadog and Honeycomb operate fleets whose size they decline to publish. Mira's answer is independent replicas
 behind an L4 balancer and a replication factor of one — a lost disk is lost data
 for that node's share. A scope decision, not a benchmark result, but a buyer
 reads it as a loss and should hear it here rather than discover it.
@@ -640,7 +675,7 @@ sprint; each one buys something in the tables above.
 | **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
 | **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
 | **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
-| **A Grafana datasource plugin** | "Install nothing. Point Grafana's built-in Loki and Tempo datasources at Mira." A signed plugin is a second artifact in a second language with a third-party review and a signing subscription. There is no version of that where "one binary" is literally true. |
+| **A Grafana datasource plugin** | "Install nothing. Mira ships the UI, and `POST /api/v1/query` is the whole read surface." A signed plugin is a second artifact in a second language with a third-party review and a signing subscription, and there is no version of that where "one binary" is literally true. Nor is there a plugin-free route: Mira serves no Loki `query_range` and no Tempo `/api/traces`, so the built-in datasources have nothing to point at, and adding those two APIs would be two more query dialects on a surface whose closedness is the thing bounding it against DataFusion — the SQL row above. |
 | **Ingest-side shaping: drop rules, sampling, transforms** | "Shaping belongs in the Collector, and here is a reference `otelcol` config." Shaping rules are a filter graph and the Collector already is one. The buyer's real question is "who is costing me money", which is cost *attribution*, not a quota. |
 | **Loki's cardinality guards** (`max_streams_per_user`, `max_label_names_per_series: 15`) | "Those exist to protect Loki's index. Mira has no such index." Refusing them is a feature claim, not a gap. |
 | **Prometheus `remote_read`** | It would make Mira a dumb sample pipe streaming raw points to a Prometheus that evaluates locally — the worst possible shape for a columnar store, and it forfeits every pushdown the engine exists to do. |

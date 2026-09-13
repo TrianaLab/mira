@@ -1231,9 +1231,11 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// 4,380 MiB in 885 ms is ~5 GB/s, which was read as "that is `crc32fast`'s
 /// rate here" and therefore as ~93% of an unpruned scan. Warm, it is nearer
 /// 27 GB/s. Measured on both sides of one run instead, re-verification is
-/// **35-39%** of a single block's read path, a median of 1.55x there, and about
-/// 1.1x on a full-corpus scan — which is bound by page cache, not by this.
-/// `scan_cost_per_row` in `query.rs` is the run; section 11 of
+/// **between a quarter and two fifths** of a single block's read path, and
+/// about 1.1x on a full-corpus scan — which is bound by page cache, not by
+/// this. The "35-39%, a median of 1.55x" this comment used to carry was three
+/// samples of a quantity that moves between 1.14x and 2.21x, and is withdrawn
+/// as a median. `scan_cost_per_row` in `query.rs` is the run; section 11 of
 /// `docs/architecture.md` is the write-up.
 ///
 /// The identity is the path *plus* [`FileId`], never the path alone, because a
