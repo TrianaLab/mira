@@ -26,6 +26,15 @@
 # reports and what a client sees less the socket. Medians over PASSES x REPS
 # samples per case per build.
 #
+# The process boundary is one server per build per pass: 4 cases x (WARM + REPS)
+# queries inside it, then killed. That is deliberate for the A/B here -- neither
+# binary carries per-process state about a block, so a long-lived process only
+# warms the page cache, which is what the warm-ups are for. It stops being
+# neutral the moment a build under test *does* carry such state: a verification
+# cache, say, is empty at exec and full from the second pass onward, so it would
+# be measured warm here and cold by a client that reconnects to a fresh server.
+# Anyone A/B-ing such a build should run it both ways and say which row is which.
+#
 #   make release && A=./target/release/mira B=/path/to/0.0.3/mira \
 #     scripts/measure/lazy-detail.sh
 set -e

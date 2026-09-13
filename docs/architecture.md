@@ -2080,7 +2080,10 @@ Reading these honestly:
   1,750,266,368) on this corpus. `scripts/measure/lazy-detail.sh` prices the
   split against the released 0.0.3 binary — two binaries alternating pass by
   pass over one corpus, medians of 7 × 5 samples, `blocks_scanned` printed beside
-  every median and equal to `blocks_total` in every row:
+  every median and equal to `blocks_total` in every row. One server process per
+  build per pass, with two warm-ups per case inside it, which is neutral here
+  because neither binary keeps per-process state about a block; it would not be
+  neutral against a build that did:
 
   | case | 0.0.3 | branch | delta |
   |---|---:|---:|---:|
