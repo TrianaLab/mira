@@ -1979,12 +1979,7 @@ mod tests {
             ..Default::default()
         }));
         // The sweep is a `spawn_blocking`, so yielding is not enough to see it.
-        for _ in 0..200 {
-            if blocks(&dir) == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        until(|| blocks(&dir) == 0).await;
         assert_eq!(blocks(&dir), 0, "a block older than its TTL is unlinked");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2050,11 +2045,18 @@ mod tests {
         tracing::subscriber::with_default(sub, f)
     }
 
-    /// Polls `done` for two seconds. The sweeps below run on a blocking thread,
-    /// so yielding is not enough to see one land, and a fixed sleep is either a
+    /// Polls `done` for a minute. The sweeps below run on a blocking thread, so
+    /// yielding is not enough to see one land, and a fixed sleep is either a
     /// flake on a loaded machine or dead time on an idle one.
+    ///
+    /// The budget was two seconds and that was not enough: with all twelve cores
+    /// busy, three of the sweep tests here fail together, because a
+    /// `spawn_blocking` that has to queue behind the machine takes longer than
+    /// the poll waits. Polling is what makes a generous budget free — the wait
+    /// ends when the condition holds, so a minute costs an idle machine nothing
+    /// and only ever spends itself on a failure that was going to happen anyway.
     async fn until(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..200 {
+        for _ in 0..6_000 {
             if done() {
                 return true;
             }

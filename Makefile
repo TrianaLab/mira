@@ -75,11 +75,20 @@ LOADGEN := target/release/examples/loadgen
 #
 # What is left is noise rather than drift, and it is what caps how tightly this
 # can be pulled. `pipeline.rs`'s retention-sweep logging — the `Ok(n)` and `Err`
-# arms around line 1450 — is covered only when a background sweep happens to drop
-# or compact a block before the test that started it returns, which moves about
+# arms around line 1450 — is covered only when a background sweep drops or
+# compacts a block before the test that started it returns, which moved about
 # five lines run to run on one tree on one host. So 99.22 and not the 99.25 the
-# runner just printed: a gate that goes red on a re-run of the same commit is a
-# gate that teaches people to re-run it.
+# runner printed: a gate that goes red on a re-run of the same commit is a gate
+# that teaches people to re-run it.
+#
+# Most of that race has since been closed at the source: the tests poll for the
+# sweep rather than assume it, and their budget was two seconds, which is not
+# enough on a machine whose cores are all busy — under load three of them failed
+# together. The budget is a minute now and polling makes that free. Whoever
+# raises this next should check whether those five lines have gone quiet on the
+# runner rather than inherit the allowance: the honest floor may now be the
+# figure CI prints, but that has to be read off a green Linux run and not
+# assumed from here.
 COVERAGE_MIN ?= 99.22
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
