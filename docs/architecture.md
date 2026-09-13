@@ -1866,13 +1866,15 @@ each the median of three; the query rows are that corpus, read back after a
 restart, and every one of them is a paired A/B against the 0.0.1 binary run
 back to back in the same sitting.
 
-Three bullets below are the exception and say so where they appear: the
+Four bullets below are the exception and say so where they appear. The
 cold-tier, lazy-verification and block-reopen figures come from a **second,
 smaller corpus** — 137 blocks, 3,599,317,452 bytes (3.352 GiB), 62 logs / 64
 traces / 11 metrics — because each of them round-trips the whole corpus through
-an upload or a full scan and doing that to 8.33 GiB takes long enough that the
-box moves underneath it. Their numbers are internally paired on that corpus and
-must not be divided into the table above. Each is reproducible from a script in
+an upload or a full scan, and doing that to 8.33 GiB takes long enough that the
+box moves underneath it. The restart-replay bullet builds a corpus of its own
+per run, because what it measures is the difference across a restart rather than
+any absolute. All four are internally paired and none of their numbers may be
+divided into the table above. Each is reproducible from a script in
 `scripts/measure/`, named in the bullet.
 
 There is now a **second sitting**, and naming it is better than folding it in.
@@ -2105,26 +2107,45 @@ Reading these honestly:
   The 25% is the floor, not the headline.
 - **The per-process verification cache: measured, and not built.** The second
   half of the same idea is to remember that a block was verified so a later open
-  can skip the hash. The access pattern has to justify it first, and on this
-  corpus it does not: `scripts/measure/block-reopens.sh` runs 18 representative
-  queries over 126 distinct blocks and records **21 block opens in total** — 12
-  queries open exactly one block, 3 open three, 3 open none. A cache with
-  nothing to hit is state for its own sake.
+  can skip the hash. Two numbers were taken before deciding, and only one of
+  them carries the decision.
 
-  The ceiling is measured too, with a throwaway build whose CRC comparison was
-  patched to always pass (built into a scratch target dir and reverted
-  immediately; it is not on this branch and not behind a flag). Against the
-  branch, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
-  scan-miss-traces −29.5% (32,954 → 23,239), scan-attr −26.0% (63,662 → 47,085),
-  page-100 −24.1% (3,865 → 2,933). That is what a cache that **never misses**
-  could buy, against 25% and 44% the lazy split already took with no new state
-  and no new failure mode. **Decision: not yet.** It is worth revisiting if a
-  workload appears whose block reopens are counted in hundreds rather than 21 —
-  and the note for whoever does is that the key must not be the path. A
-  compaction can replace a file under a verified path; the key has to come off
-  the open descriptor (`ino` alongside length and mtime) or be invalidated from
-  inside the compaction path, or the cache turns "a bad block is never served"
-  into a stale lookup.
+  The weaker one first, with what it does not show stated plainly.
+  `scripts/measure/block-reopens.sh` runs 18 representative queries over 126
+  distinct blocks and records **21 block opens in total** — 12 queries open
+  exactly one block, 3 open three, 3 open none. That is a measure of how much
+  block spread a sample of queries has, and it is **not** the quantity a
+  process-scoped cache is priced on: the cache lives for the process, so what
+  decides it is how often a long-lived server reopens the same path across
+  thousands of queries against a hot recent window, and eighteen queries against
+  a denominator of 126 blocks cannot see that. It is recorded because it is what
+  was measured, not because it settles anything.
+
+  The one that does carry it is the ceiling, from a throwaway build whose CRC
+  comparison was patched to always pass (built into a scratch target dir and
+  reverted immediately; it is not on this branch and not behind a flag). Against
+  the branch, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
+  scan-miss-traces −29.5% (32,954 → 23,239), scan-attr −26.0% (63,662 →
+  47,085), page-100 −24.1% (3,865 → 2,933). That is what a cache that **never
+  misses** could buy — and the lazy split above already took 25% and 44% with no
+  new state, no new failure mode and no resident memory. **Decision: not yet.**
+  A cache is a map, a key-invalidation rule and a memory-footprint regression on
+  the axis this section scores worst, in exchange for at most 18–30% on the
+  opens that survive the split.
+
+  Two caveats on that ceiling, because it is the number the decision rests on.
+  It is corpus- and block-shape-dependent: it is the CRC's share of the read
+  path, so a corpus of fewer, larger blocks spends a larger fraction of each
+  open inside the hash and would measure a bigger share from the same method.
+  And "make verification free and re-time it" is the method, whatever mechanism
+  does the making-free — a patched comparison and a pre-warmed verification map
+  are measuring the same quantity, so two such figures taken on two corpora are
+  not in dispute with each other.
+
+  If it is ever built, the key must not be the path. A compaction can replace a
+  file under a verified path; the key has to come off the open descriptor (`ino`
+  alongside length and mtime) or be invalidated from inside the compaction path,
+  or the cache turns "a bad block is never served" into a stale lookup.
 - **A restart replays past the slowest shard, and it is the allowed direction.**
   `scripts/measure/restart-replay.sh`, three paired runs per binary, one restart
   each: the rows the corpus gained across the restart were 0.255% (+26,000 of
@@ -2365,12 +2386,18 @@ Reading these honestly:
   predicate and nearly all of the cheap ones — so the entry was rewritten to
   call the cache the obvious next lever. That does not follow either: "the term
   a cache would attack dominates" is an argument for attacking the term, not for
-  attacking it with a cache. The CRC half has since been taken by a
-  process-scoped verification map (section 3.3) that holds no mappings and needs
-  no invalidation, for 1.55× on a single block and ~1.1× on an unpruned corpus
-  scan. What a real cache would add on top is the `mmap` and the two child
-  indexes, it still cannot help a first touch, and it pays in resident memory —
-  the axis this section already scores worst. It stays on the section 10 list.
+  attacking it with a cache.
+
+  Two changes in this release take that term apart without a cache, and they
+  attack different halves of it. The **lazy attribute-table load** removes opens
+  that should never have happened: the tables a query never reads are never
+  mapped and never hashed, 25% off a logs scan and 44% off a traces one. The
+  **process-scoped verification map** (section 3.3) removes the repeat hashes on
+  the opens that remain, and it holds no mappings and needs no invalidation.
+  Neither pays a resident byte. What a real cache would add on top of both is
+  the `mmap` and the two child indexes, it still cannot help the first open in a
+  process, and it does pay in resident memory — the axis this section already
+  scores worst. It stays on the section 10 list.
 - **Cost per GB is 1.20 B/B while a block is hot and 0.14 once it is
   compacted.** 164.0 bytes on disk per 136.9-byte wire record, and it is the
   steadiest figure in this section: across fifteen benchmark runs it moved
