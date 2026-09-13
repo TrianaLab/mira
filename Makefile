@@ -65,12 +65,22 @@ LOADGEN := target/release/examples/loadgen
 #     I/O failure arms — a `warn!` on an unlinkable block, a FUSE mount — that
 #     need root or a full volume to reach.
 #
-# Set a tenth of a point below the Mac figure for the host drift documented
-# above, not as slack: raise it off a green Linux run in CI, where the real
-# ceiling is legible. 99.21 is read off run 34723128743, which measured 99.22 on
-# Linux (21,969 lines, 172 uncovered) against 99.25 on this Mac — the drift is
-# real and is why the Mac figure is never the one written here.
-COVERAGE_MIN ?= 99.21
+# The host drift above is real but its *direction* is not a constant, and as of
+# this line it has reversed. `block.rs`'s `statfs` table was most of it — eleven
+# filesystem magics on Linux against five names on macOS, and no mount the tests
+# run on reaches either — so the runner carried ten uncovered lines this Mac did
+# not have. Now that the table has a test of its own, both hosts leave the same
+# 41 lines of `block.rs` uncovered, and run 34751106092 measured 99.2532 on Linux
+# (22,095 lines, 165 uncovered) against 99.2304 on this Mac.
+#
+# What is left is noise rather than drift, and it is what caps how tightly this
+# can be pulled. `pipeline.rs`'s retention-sweep logging — the `Ok(n)` and `Err`
+# arms around line 1450 — is covered only when a background sweep happens to drop
+# or compact a block before the test that started it returns, which moves about
+# five lines run to run on one tree on one host. So 99.22 and not the 99.25 the
+# runner just printed: a gate that goes red on a re-run of the same commit is a
+# gate that teaches people to re-run it.
+COVERAGE_MIN ?= 99.22
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
 # count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor
