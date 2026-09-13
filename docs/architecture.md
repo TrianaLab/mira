@@ -464,6 +464,13 @@ process has already hashed. `open_table` consults a process-scoped map of
 alone — `compact` renames a new table over an existing name, which is a
 different file that must re-verify.
 
+Nor the inode, which is the obvious alternative and is worse here. Retention
+unlinks whole block directories continuously, and an inode number is reusable
+the moment its last link goes: a new table can be handed the number of an
+expired one and inherit a verdict passed on bytes that no longer exist. A
+length and an mtime have no reuse — the rename that defeats a path key changes
+both.
+
 The identity has an obvious hole and the settle window is what closes it. A
 corruption that preserves the length — flipping one bit does — is invisible
 unless the mtime moves, and two writes inside one filesystem mtime tick do not
