@@ -157,10 +157,11 @@ needs an XML parser, and neither is in the crate graph the README counts. See
 [Architecture section 6.1](architecture.md#61-offload-a-copy-before-the-unlink).
 
 The cost, on the box in [End-to-end testing section
-3](internals/e2e.md#3-the-load-harness): 3.35 GiB across 142 blocks took 0.612 s
-to unlink, and 16.288 s to copy-then-unlink to a `file://` target on the same
-disk — 218.5 MiB/s out, 206.1 MiB/s back. The sweep is a background tick and no
-export waits on it, but it is the same disk ingest is writing to.
+3](internals/e2e.md#3-the-load-harness): 3.35 GiB across 137 blocks took 0.693 s
+to unlink, and 14.922 s to copy-then-unlink to a `file://` target on the same
+disk — 241.2 MiB/s out, 206.3 MiB/s back, medians over repeated runs of
+`scripts/measure/offload-cycle.sh`. The sweep is a background tick and no export
+waits on it, but it is the same disk ingest is writing to.
 
 ## `ingest.wal`
 

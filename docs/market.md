@@ -479,10 +479,14 @@ The cold half is closed, and this release closes it. `--offload <uri>` copies a
 sealed block to an object store immediately before retention unlinks it, under
 the same time-range-encoded directory name it had locally — so the store's own
 list API is the catalogue and Mira builds nothing extra. Measured on one corpus
-of 142 blocks and 3.35 GiB: **15.7 s of retention-thread time to upload
-(218.5 MiB/s), 16.6 s to restore, 42 ms to list all 142**, a second restore
-copying nothing, and the restored directories byte-identical to the store's
-under `diff -r`. It is deliberately not a tier — reads never consult the store,
+of 137 blocks and 3.35 GiB: **14.2 s of retention-thread time to upload
+(241.2 MiB/s), a median 16.6 s to restore, 50 ms to list all 137**[^m4], a second
+restore copying nothing, and the restored directories byte-identical to the
+store's under `diff -r`. The restore figure is a median of three runs that
+spread from 12.8 s to 19.5 s, so read it as bracketing the upload rather than
+confirming it; an earlier draft of this paragraph claimed the two directions
+agreed within 6% and that claim was withdrawn when the second and third samples
+arrived. It is deliberately not a tier — reads never consult the store,
 `mira offload restore` is the whole retrieval path, and `file://` is the only
 scheme, which means a mounted bucket rather than a signing library.
 
@@ -628,6 +632,7 @@ argument.
 [^m1]: `cargo bench -p miradb-core --bench encode_bench`; [Architecture section 11](architecture.md#11-performance-model).
 [^m2]: `cargo run --release -p miradb-core --example tier` over all 1,652 tables of an 8.33 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
 [^m3]: [Architecture section 11](architecture.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
+[^m4]: `scripts/measure/offload-cycle.sh`; the upload figure is the offload sweep less the plain unlink sweep, medians of two runs each; [Architecture section 11](architecture.md#11-performance-model).
 [^g1]: <https://greptime.com/blogs/2026-03-24-ingestion-protocol-benchmark>
 [^g2]: <https://greptime.com/blogs/2025-03-10-log-benchmark-greptimedb>
 [^oa1]: <https://github.com/open-telemetry/otel-arrow>

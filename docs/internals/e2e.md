@@ -340,6 +340,29 @@ server — `--conns 64 --readers 8` is 72 client threads competing with the thin
 they measure. A `--conns 0` run reports no ingest section and its storage line
 is the total only.
 
+### The one-off scripts
+
+Five things the harness cannot express, because each needs a second process, a
+second binary, a restart in the middle or the internal probes on. They live in
+`scripts/measure/`, they are POSIX `sh`, and each prints the figure that a
+bullet in [architecture section 11](../architecture.md#11-performance-model)
+quotes:
+
+| script | answers |
+|---|---|
+| `ingest-probe.sh` | where an export's milliseconds go at 4, 32 and 96 connections, plus the `TOKIO_WORKER_THREADS` 12-against-48 A/B — this is the ingest-ceiling diagnosis |
+| `offload-cycle.sh` | ingest → offload → list → restore → read back, and the same retention sweep without `--offload` as the thing the offload sweep is measured against |
+| `lazy-detail.sh` | paired A/B of two binaries over one corpus, alternating pass by pass, medians with the sample count asserted |
+| `block-reopens.sh` | how many times one process opens the same block, which is the input to the verification-cache decision |
+| `restart-replay.sh` | how many rows a corpus gains across a restart, on each of two binaries |
+
+Two habits they share are worth stealing. Every one of them greps its server log
+for `nearly full` and aborts if the free-space reclaimer fired, because a
+reclaimed corpus is a faster scan and the A/B then reports the volume rather
+than the code. And every one that publishes a median asserts the sample count
+first: a response body has no trailing newline, so a capture that forgets to
+re-line-break them silently "medians" one value, and only the count catches it.
+
 ## 4. telemetrygen
 
 `telemetrygen` ships in `opentelemetry-collector-contrib` and shapes data the way

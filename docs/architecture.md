@@ -456,7 +456,32 @@ faults in every page of string data, defeating the point of demand paging.
 `corrupt_body_is_caught_not_returned_as_data` in `crates/mira-core/src/lib.rs`
 flips one bit mid-body and asserts the read fails.
 
-**The CRC is paid once per file per process, not once per open.** It is the
+Two things then decide what a query actually pays for that guarantee: *which*
+tables it verifies, and *how often* it verifies each one. They are independent
+and this release changes both.
+
+**The CRC is per table, and that is what lets a query skip one.** Each `.arrow`
+file carries its own `mira.crc32`, so `block::open_table` verifies exactly the
+one file it is opening and nothing else in the block. `Block::open` therefore
+takes the root table and stops; `Block::detail` maps the three attribute levels
+and, for traces, the child tables, and it is called on exactly two occasions —
+a predicate that names an attribute, because the predicate is evaluated against
+those tables, and a block that produced a row, because rendering a row emits
+its attributes. A block that matches nothing and is asked nothing about
+attributes is never hashed past its root, and on the measured corpus that is
+42.9% of a logs block and 45.7% of a traces block left unread (section 11).
+
+None of that weakens the guarantee. What changes is *which* tables a query
+reads; every table it reads is verified in full before a byte of it is
+returned, and a corrupt attribute table that no query has touched is caught by
+the first query that touches it.
+`a_corrupt_attribute_table_is_caught_by_every_query_that_reads_it_and_no_other`
+corrupts one `log_attrs.arrow` and pins all three halves of that: the scan that
+does not read it succeeds, the attribute predicate fails `BadChecksum`, and so
+does the query that renders one of its rows. Going back to an eager load fails
+the first; rendering without the verified load fails the third.
+
+**And the CRC is paid once per file per process, not once per open.** It is the
 right thing to do on a first read and pure waste on a second: a published block
 never changes, so a scan that reopens the same corpus re-hashes bytes this
 process has already hashed. `open_table` consults a process-scoped map of
@@ -510,10 +535,12 @@ is detection of media that rots under a mapping this process has already
 verified. A restart re-verifies everything, which is why the map is
 process-scoped and not persisted.
 
-What it is worth is [section 11](#11-performance-model): 1.55× median on a
-single block through the read path, ~1.1× on an unpruned corpus scan and 1.47×
-on a trace lookup. It is not the order of magnitude this document once inferred,
-and section 11 says why that inference was wrong.
+What it is worth is [section 11](#11-performance-model), and the two changes
+stack rather than compete: the lazy load removes opens that should never have
+happened, and the cache removes the repeat hashes on the opens that remain.
+Section 11 measures each against the binary that preceded it and then both
+together, because the cache's own figures were first taken against the eager
+`Block::open` that no longer exists.
 
 ### 3.4 Alignment
 
@@ -1837,8 +1864,16 @@ GiB of Arrow across 1,652 tables in 137 log blocks, 155 trace blocks and 24
 metric blocks. The ingest rows are separate 30 s runs against a fresh server,
 each the median of three; the query rows are that corpus, read back after a
 restart, and every one of them is a paired A/B against the 0.0.1 binary run
-back to back in the same sitting; the cold-tier table further down is the same
-1,652 tables.
+back to back in the same sitting.
+
+Three bullets below are the exception and say so where they appear: the
+cold-tier, lazy-verification and block-reopen figures come from a **second,
+smaller corpus** — 137 blocks, 3,599,317,452 bytes (3.352 GiB), 62 logs / 64
+traces / 11 metrics — because each of them round-trips the whole corpus through
+an upload or a full scan and doing that to 8.33 GiB takes long enough that the
+box moves underneath it. Their numbers are internally paired on that corpus and
+must not be divided into the table above. Each is reproducible from a script in
+`scripts/measure/`, named in the bullet.
 
 There is now a **second sitting**, and naming it is better than folding it in.
 It exists because the checksum cache (section 3.3) landed after the table was
@@ -1926,7 +1961,8 @@ Reading these honestly:
   ```
 
   Three runs, `loadgen --for 20s --batch 8192`, fresh store each, means over the
-  whole run:
+  whole run — `scripts/measure/ingest-probe.sh` is the whole sequence, this
+  table and the worker-count A/B two bullets down:
 
   | | 4 conns | 32 conns | 96 conns |
   |---|---|---|---|
@@ -1998,29 +2034,116 @@ Reading these honestly:
   process during one run, which do not care what the rest of the machine was
   doing. Reproducing it should move the absolute rates and leave the ratios
   alone.
-- **`--offload` costs the retention sweep and nothing else.** One corpus, one
-  box, back to back: 142 blocks, 3,592,328,340 bytes, three signals (62 logs, 68
-  traces, 12 metrics). The same sweep over the same corpus is **0.612 s** as the
-  unlink it always was and **16.288 s** with `--offload file://`, so the copy is
-  15.68 s — **218.5 MiB/s**, which is `read` + `write` + `fsync` per file on this
-  volume. `mira offload restore` brings it all back in **16.620 s**
-  (206.1 MiB/s); the two directions agreeing within 6% is the check that neither
-  is doing something clever. `mira offload list` over all 142 blocks is **42 ms**,
-  one `readdir` per partition, which is the entire catalogue. A second `restore`
-  copies **0** blocks. Both costs land on the retention `spawn_blocking` thread,
-  so the ingest rows above are unchanged by the flag.
+- **`--offload` costs the retention sweep and nothing else.**
+  `scripts/measure/offload-cycle.sh`, one corpus, one box, back to back: 137
+  blocks, 3,599,317,452 bytes (3.352 GiB), three signals (62 logs, 64 traces, 11
+  metrics). The same sweep over the same corpus is **0.868 s and 0.518 s** as the
+  unlink it always was and **14.999 s and 14.844 s** with `--offload file://`, so
+  against the medians the copy is 14.229 s — **241.2 MiB/s**, which is `read` +
+  `write` + `fsync` per file on this volume. `mira offload restore` brings it all
+  back in **12.786 s, 16.642 s and 19.489 s**, a median of 16.642 s =
+  **206.3 MiB/s** but a spread of 176.1 to 268.5 MiB/s across three runs.
 
-  Compatibility is checked twice, because a query comparison alone would not
-  catch a silently re-encoded block. The same two queries — page one of the
+  An earlier revision of this bullet read the two directions "agreeing within
+  6%" as a check that neither was doing something clever. It is withdrawn: at
+  n=1 each that agreement was a coincidence of two samples, and the restore
+  samples alone vary by 52%. What the three restores support is weaker and
+  honest — they bracket the upload figure rather than contradict it, and the
+  volume, not the code, is what this section can see. `mira offload list` over
+  all 137 blocks is **0.050 s**, one `readdir` per partition, which is the entire
+  catalogue. A second `restore` copies **0** blocks. Both costs land on the
+  retention `spawn_blocking` thread, so the ingest rows above are unchanged by
+  the flag.
+
+  Compatibility is checked three ways, because a query comparison alone would
+  not catch a silently re-encoded block. The same two queries — page one of the
   newest logs, and a predicate that prunes nothing so every block is opened —
   return **byte-identical** responses over the original and the restored corpus.
-  And `diff -r` over all 142 restored block directories against the store
-  reports **no difference at all**. One caveat is itself a measured result: an
-  md5 of a whole query response is the wrong instrument and was withdrawn as
-  one here, because two processes over a single unchanged directory differ in
-  `elapsed_us` and nowhere else — that field is normalised before the comparison
-  above, and the fact that it is the *only* unstable field is what makes the
-  comparison worth anything.
+  `diff -r` over all 137 restored block directories against the store reports
+  **no difference at all**. And a second, independent upload of the same corpus
+  into a different prefix is **byte-identical to the first** under `diff -r`,
+  which is the part a single round trip cannot show: that the writer is copying
+  bytes rather than re-encoding them reproducibly-but-differently. One caveat is
+  itself a measured result: an md5 of a whole query response is the wrong
+  instrument and was withdrawn as one here, because two processes over a single
+  unchanged directory differ in `elapsed_us` and nowhere else — that field is
+  normalised before the comparison above, and the fact that it is the *only*
+  unstable field is what makes the comparison worth anything.
+- **A query verifies the tables it reads, and 0.0.3 read tables no query
+  wanted.** The per-table CRC32 shipped in 0.0.3 (section 3.3), so nothing about
+  the format changed here; what changed is that `Block::open` mapped and hashed
+  every attribute level of every block it opened, including blocks a scan was
+  about to reject. Those tables are **42.9% of a logs block** (787,378,052 of
+  1,837,123,124 bytes) and **45.7% of a traces block** (799,601,216 of
+  1,750,266,368) on this corpus. `scripts/measure/lazy-detail.sh` prices the
+  split against the released 0.0.3 binary — two binaries alternating pass by
+  pass over one corpus, medians of 7 × 5 samples, `blocks_scanned` printed beside
+  every median and equal to `blocks_total` in every row:
+
+  | case | 0.0.3 | branch | delta |
+  |---|---:|---:|---:|
+  | scan-miss-logs, 62/62 blocks, 10,848,000 rows | 75,158 µs | 56,347 µs | **−25.0%** |
+  | scan-miss-traces, 64/64 blocks, 11,016,000 rows | 57,452 µs | 32,428 µs | **−43.6%** |
+  | scan-attr (control) | 63,009 µs | 60,722 µs | −3.6% |
+  | page-100 (control) | 3,746 µs | 3,833 µs | +2.3% |
+
+  The two controls are the point of the run. `scan-attr` is the *same query
+  shape* as `scan-miss-logs` — same corpus, every block scanned, zero matches —
+  except that its predicate names an attribute, so both builds must read the
+  attribute tables; `page-100` renders a hundred rows, so both builds must read
+  theirs. Neither may move, and neither does: their sample ranges overlap almost
+  entirely (scan-attr 54,369–82,618 against 53,309–83,014) while
+  scan-miss-traces does not overlap at all (50,268–74,889 against
+  28,126–38,424). A run where the controls had moved with the treatments would
+  have been measuring the box.
+
+  Traces gains more than logs because of what is left after the map and the
+  hash come out. The traces predicate is over `name`, a dictionary column
+  resolved once and then matched on u16 codes, so nearly all of that query
+  *was* the map and the hash. The logs predicate is a substring scan over a
+  `Utf8` `body` column, which is real work that not-hashing does not remove.
+  The 25% is the floor, not the headline.
+- **The per-process verification cache: measured, and not built.** The second
+  half of the same idea is to remember that a block was verified so a later open
+  can skip the hash. The access pattern has to justify it first, and on this
+  corpus it does not: `scripts/measure/block-reopens.sh` runs 18 representative
+  queries over 126 distinct blocks and records **21 block opens in total** — 12
+  queries open exactly one block, 3 open three, 3 open none. A cache with
+  nothing to hit is state for its own sake.
+
+  The ceiling is measured too, with a throwaway build whose CRC comparison was
+  patched to always pass (built into a scratch target dir and reverted
+  immediately; it is not on this branch and not behind a flag). Against the
+  branch, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
+  scan-miss-traces −29.5% (32,954 → 23,239), scan-attr −26.0% (63,662 → 47,085),
+  page-100 −24.1% (3,865 → 2,933). That is what a cache that **never misses**
+  could buy, against 25% and 44% the lazy split already took with no new state
+  and no new failure mode. **Decision: not yet.** It is worth revisiting if a
+  workload appears whose block reopens are counted in hundreds rather than 21 —
+  and the note for whoever does is that the key must not be the path. A
+  compaction can replace a file under a verified path; the key has to come off
+  the open descriptor (`ino` alongside length and mtime) or be invalidated from
+  inside the compaction path, or the cache turns "a bad block is never served"
+  into a stale lookup.
+- **A restart replays past the slowest shard, and it is the allowed direction.**
+  `scripts/measure/restart-replay.sh`, three paired runs per binary, one restart
+  each: the rows the corpus gained across the restart were 0.255% (+26,000 of
+  10,188,000), 0% and 0% on this branch and 0%, 1.318% (+130,000 of 9,866,000)
+  and 0% on 0.0.3. Traces gained nothing in any of the six. Both medians are 0%
+  and the largest single excursion is the **baseline's**, so this is not a
+  regression in the change — it is a property of the log, surfaced by measuring
+  for it.
+
+  The mechanism is `Wal::watermark_for`, which returns the oldest unpublished
+  sequence across a signal's shards. One slow shard pins the watermark low, and
+  a boot then replays frames that a published block already covers. The
+  function's own comment says being too low is the allowed direction of error:
+  duplicated rows over lost ones. No loss was observed in any run. It is
+  recorded here because it is a measurable cost of the no-coordination-state
+  rule (there is no committed cursor to reconcile against) and because it
+  invalidates any before/after corpus comparison taken across a restart —
+  `offload-cycle.sh` drains to `replayed=0` before it takes a baseline for
+  exactly this reason.
 - **What changed the shape of the curve was admission, not arithmetic.** The
   first revision shed the moment the queue was full, and at 96 connections that
   read 333,373 records/s with 93% of exports getting a 503 — four cores busy
