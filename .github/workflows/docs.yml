@@ -7,7 +7,7 @@ name: docs
 #
 # A trigger-level `paths:` filter is safe here and forbidden in `ci` for the
 # same reason: this workflow is not a required status context, so a run that
-# never starts blocks nothing. scripts/check_ci.py enforces both halves.
+# never starts blocks nothing. `xtask ci` enforces both halves.
 on:
   push:
     branches: [main]

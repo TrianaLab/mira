@@ -62,7 +62,7 @@ needs no second toolchain, no Docker daemon and no several minutes.
 ## Running the pipeline locally
 
 `.github/workflows/ci.yml` is a dispatcher and nothing else. Every `run:` step
-in it is a `make ci-*` call into `ci.mk` — `scripts/check_ci.py` fails
+in it is a `make ci-*` call into `ci.mk` — `cargo run -p xtask -- ci` fails
 the build if one ever is not — so a leg that goes red on a runner is a leg you
 can reproduce with one command, and there is no shell living in YAML for anyone
 to debug by pushing commits and waiting six minutes.

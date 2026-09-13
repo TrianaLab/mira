@@ -21,7 +21,7 @@ image:
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (default is the chart appVersion). Deliberately
   # empty: the chart version, the app version and the image tag are one number
-  # (`scripts/check_drift.py` enforces it), so pinning it here would only be a
+  # (`make drift` enforces it), so pinning it here would only be a
   # fourth place for it to drift.
   tag: ""
 

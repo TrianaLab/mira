@@ -82,7 +82,7 @@ strictly cheaper than reconciling that by hand.
 ## The job graph
 
 Every job `needs: meta`, and every job is in `verify-release`'s `needs` closure —
-`scripts/check_ci.py` enforces that statically, which is how a publisher that
+`make workflows` enforces that statically, which is how a publisher that
 silently skips is caught at PR time rather than discovered in a green run that
 published nothing.
 
@@ -214,7 +214,7 @@ restates it, and the right-hand column is what stops it rotting.
 `make bump TO=X.Y.Z` writes every row above and then regenerates the last two,
 so step 1 is one command and `make drift` is how you check it did. The middle
 column exists because the writer and the gate are deliberately the same thing:
-`VERSION_SITES` in `scripts/check_drift.py` is one table of anchored patterns,
+`version_sites()` in `crates/xtask/src/drift.rs` is one table of anchored patterns,
 read forwards to check and backwards to write. A gate maintained separately
 from the writer drifts, and it drifts in the bad direction — the writer is what
 people actually run.

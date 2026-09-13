@@ -1,7 +1,7 @@
 # The pipeline, as targets you can run.
 #
 # `.github/workflows/ci.yml` is a dispatcher over this file: every `run:` in it
-# is a `make ci-*` target defined here, and `scripts/check_ci.py` fails the
+# is a `make ci-*` target defined here, and `cargo run -p xtask -- ci` fails the
 # build if one ever is not. So a leg going red on a runner is a leg you can
 # reproduce with one command, and there is no shell in YAML for anyone to debug
 # by pushing commits.
@@ -194,10 +194,6 @@ ci-tool-actionlint: ## Install the pinned actionlint (CI; locally use your own)
 	tar -xzf actionlint.tgz actionlint
 	sudo install actionlint /usr/local/bin/actionlint
 	rm actionlint actionlint.tgz
-
-.PHONY: ci-tool-python
-ci-tool-python: ## Install what the check scripts import
-	pip install -r scripts/requirements.txt
 
 .PHONY: ci-tool-chart
 ci-tool-chart: ## Install the pinned chart tooling (CI; locally use your own)

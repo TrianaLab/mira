@@ -784,7 +784,7 @@ jobs:
           #
           # The assertion is a real UUID rather than a diff against the tree,
           # because this job deliberately has no checkout: everything it looks
-          # at comes back off the wire. `scripts/check_drift.py` is what holds
+          # at comes back off the wire. `cargo run -p xtask -- drift` is what holds
           # the ID to the right one; this holds the push to having happened.
           oras pull "${CHARTS}/mira:artifacthub.io" --output pulled
           grep -Eq '^repositoryID: [0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' \

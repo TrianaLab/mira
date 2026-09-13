@@ -163,7 +163,7 @@ glibc the README promises (through `glibc-floor`), and `e2e` is level 8.
 `section` has a `--selftest`, because every way that gate can break makes it
 pass. `workflows` runs two things that do not subsume each other: actionlint
 will not notice that a job nothing depends on cannot fail a PR, and
-`check_ci.py` will not notice a typo in a `${{ }}` expression.
+`xtask ci` will not notice a typo in a `${{ }}` expression.
 
 ## Coverage is a ratchet
 
@@ -195,14 +195,14 @@ behaviour: that is what the measurement does.
 Three things, and they are all in `ci.mk`: which legs a diff needs, the tool
 versions everyone has to agree on, and the grouping of gates into legs.
 `ci.yml` is a dispatcher over that file — every
-`run:` in it is a `make ci-*` target, and `check_ci.py` fails the build if one
+`run:` in it is a `make ci-*` target, and `xtask ci` fails the build if one
 is not — so `make ci` runs the whole pipeline on one host and a red leg is
 reproducible with one command.
 
 `ci.yml` computes a `changes` matrix first and every job is conditional on it,
 so a docs-only PR does not build the workspace. Two aggregate jobs — `required`
 and `security-required` — sit downstream of everything and are the contexts the
-branch ruleset requires; `check_ci.py` enforces that no job can escape their
+branch ruleset requires; `xtask ci` enforces that no job can escape their
 `needs` closure, which is how a silently-skipped gate is caught statically at
 PR time rather than noticed later.
 

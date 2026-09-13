@@ -114,7 +114,7 @@ section:
 - `Cargo.lock` is committed and the install path is `cargo install --locked`,
   so the dependency set that was audited is the dependency set that builds.
 - Every third-party GitHub Action is pinned to a full commit SHA, checked by
-  `scripts/check_ci.py` in CI. A tag is a mutable pointer, and a mutable pointer
+  `make workflows` in CI. A tag is a mutable pointer, and a mutable pointer
   in `uses:` is arbitrary code execution holding a token with `packages: write`.
 - The release path is rehearsed on every pull request: `release-dry-run` runs the
   same `make dist` that a tag runs. The first time we build a release is not the

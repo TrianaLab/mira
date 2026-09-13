@@ -1,0 +1,38 @@
+# The tooling that used to be three Python scripts.
+#
+# A workspace member rather than a standalone project on purpose: `cargo fmt`,
+# `cargo clippy -D warnings` and `cargo doc -D warnings` already run over the
+# workspace, so the checker that gates every pull request is held to the same
+# bar as the thing it gates. A tool outside the workspace is a tool nobody
+# compiles until the day it breaks.
+#
+# It is *not* a dependency of `mira`, so none of this reaches the shipped
+# binary. `cargo tree -p miradb` — the crate count CLAUDE.md calls a product
+# property — cannot see a crate nothing in `mira`'s graph depends on, which is
+# why adding this member leaves the declared count alone.
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The scripts this replaces were regex-driven reads of Rust source, Markdown and
+# YAML. Hand-rolling that would be a rewrite rather than a port — a different
+# program, with different bugs, gating the same merges.
+regex = "1"
+# Workflow YAML, and the two JSON files the Makefile used to hand to `python -c`
+# (JSON is a subset of YAML 1.2, so one parser answers both). YAML 1.2 also
+# retires the `on:` trap for free: `on` is a plain string here, not the boolean
+# `True` a YAML 1.1 parser hands back.
+#
+# The same version `mira` pins, because `deny.toml` sets `multiple-versions =
+# "deny"` over the whole lockfile: a tool that drags in a second copy of a
+# parser the product already has is a second parser to audit.
+yaml-rust2 = "0.12.0"

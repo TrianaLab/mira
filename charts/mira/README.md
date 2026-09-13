@@ -163,7 +163,7 @@ cosign verify \
 | fullnameOverride | string | `""` | Override the full release name. |
 | image.pullPolicy | string | `"IfNotPresent"` | `IfNotPresent`, because the tag is an immutable release version: re-pulling it on every restart costs a registry round trip and can never return anything different. Use `Always` only if you retag. |
 | image.repository | string | `"ghcr.io/trianalab/mira"` | One binary on `distroless/cc`. The published image carries the same bytes as the release tarball rather than a second compile, so one attestation covers both. |
-| image.tag | string | `""` | Overrides the image tag (default is the chart appVersion). Deliberately empty: the chart version, the app version and the image tag are one number (`scripts/check_drift.py` enforces it), so pinning it here would only be a fourth place for it to drift. |
+| image.tag | string | `""` | Overrides the image tag (default is the chart appVersion). Deliberately empty: the chart version, the app version and the image tag are one number (`make drift` enforces it), so pinning it here would only be a fourth place for it to drift. |
 | imagePullSecrets | list | `[]` | Pull secrets, for a private mirror of the image. Empty because the public image needs none. |
 | ingress.annotations | object | `{}` | Annotations on the Ingress. Only 4318 is routed: OTLP/gRPC needs a per-controller backend-protocol annotation and an h2c-capable data path, so gRPC ingress is left to whoever knows which controller they run. |
 | ingress.className | string | `""` | IngressClass name. |
