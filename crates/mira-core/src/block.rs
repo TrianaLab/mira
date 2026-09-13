@@ -717,9 +717,36 @@ pub fn scan(root: &Path, signal: &str) -> Result<Vec<BlockRef>> {
 /// live data, so retention costs no IO bandwidth and cannot interfere with
 /// ingest.
 pub fn expire(root: &Path, signal: &str, cutoff_ns: i64) -> Result<usize> {
+    expire_with(root, signal, cutoff_ns, &|_| Ok(()))
+}
+
+/// [`expire`], with something to do to each block before it is unlinked.
+///
+/// The hook exists for one caller — [`crate::offload`], copying the block to an
+/// object store — and the ordering is the whole point of putting it here rather
+/// than in a sweep of its own. A hook that returns an error keeps its block:
+/// the delete is skipped, the sweep continues, and the next minute tries again.
+/// So the failure direction is fixed at "two copies, never zero", and there is
+/// no window in which a block exists in neither place. A separate upload pass
+/// running beside `expire` could not promise that without a marker file to
+/// coordinate them, which is the coordination state principle 4 rules out.
+pub fn expire_with(
+    root: &Path,
+    signal: &str,
+    cutoff_ns: i64,
+    before_delete: &dyn Fn(&BlockRef) -> Result<()>,
+) -> Result<usize> {
     let mut dropped = 0;
     for block in scan(root, signal)? {
         if block.max_ts < cutoff_ns {
+            if let Err(e) = before_delete(&block) {
+                tracing::warn!(
+                    block = %block.dir.display(),
+                    error = %e,
+                    "cannot offload block; keeping it locally and retrying next sweep",
+                );
+                continue;
+            }
             match fs::remove_dir_all(&block.dir) {
                 Ok(()) => dropped += 1,
                 // Another replica sharing this volume expired it first. Racing

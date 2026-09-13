@@ -53,6 +53,10 @@ pub struct Config {
     /// latency is bounded by time and not by the caller's traffic.
     pub max_block_age: Duration,
     pub retention: Duration,
+    /// Where a block goes just before retention unlinks it, or `None` to
+    /// unlink it outright. Parsed in `main` so an unsupported scheme is a
+    /// refusal to start rather than a warning at 3am.
+    pub offload: Option<mira_core::offload::Target>,
     /// How many exports may wait for one signal's flusher. See
     /// `crate::config::Config::queue`, which is where the reasoning is.
     ///
@@ -99,6 +103,7 @@ impl Default for Config {
             target_block_bytes: 32 << 20,
             max_block_age: Duration::from_secs(2),
             retention: Duration::from_secs(7 * 24 * 3600),
+            offload: None,
             queue: 128,
             shards: 1,
             wal: None,
@@ -439,6 +444,8 @@ impl<R: prost::Message> Ingest<R> {
     /// frame in the log's page cache, which is section 11's 2.6 s p99 turned into
     /// microseconds and is why the log exists.
     pub async fn submit(&self, req: R) -> Result<(), Rejected> {
+        let _t_submit = mira_core::diag::Scope::new(&mira_core::diag::SUBMIT_TOTAL);
+        let t_admit = std::time::Instant::now();
         let (ack, wait) = oneshot::channel();
         // Wait for room, and only shed once the wait has run out. The first
         // revision shed the moment the queue was full, on the reasoning that a
@@ -476,13 +483,16 @@ impl<R: prost::Message> Ingest<R> {
                 }
             }
         };
+        mira_core::diag::SUBMIT_ADMIT.record(t_admit.elapsed().as_nanos() as u64);
         if let Some(wal) = &self.wal {
             // Re-encoded, not the bytes off the wire: tonic decodes before the
             // handler sees the request, and a KYAML body was never protobuf at
             // all. Measured at 864 MiB/s against the 244 MiB/s decode already in
             // the path — see `mira_core::wal`'s module docs for why owning a
             // tonic `Codec` to avoid it is the worse trade.
+            let t_enc = std::time::Instant::now();
             let body = req.encode_to_vec();
+            mira_core::diag::WAL_ENCODE.record(t_enc.elapsed().as_nanos() as u64);
             // The enqueue rides inside the append so the queue cannot reorder
             // what the log numbered — see `Wal::append_then`.
             return match wal.append_then(self.signal, &body, move |seq| {
@@ -511,6 +521,7 @@ impl<R: prost::Message> Ingest<R> {
             ack,
             wal_seq: None,
         });
+        let _t_ack = mira_core::diag::Scope::new(&mira_core::diag::SUBMIT_WAIT_ACK);
         match wait.await {
             Ok(Ok(())) => Ok(()),
             // One counter for both refusals after acceptance: the difference
@@ -1408,6 +1419,7 @@ async fn retention(cfg: Arc<Config>) {
         let dir = cfg.data_dir.clone();
         let ttl = cfg.retention;
         let node = cfg.node;
+        let offload = cfg.offload.clone();
         let swept = tokio::task::spawn_blocking(move || {
             // Wall clock is only used to place the horizons; block timestamps
             // themselves come from the data, never from this clock.
@@ -1425,7 +1437,14 @@ async fn retention(cfg: Arc<Config>) {
             // One signal failing must not skip the others; a full disk is
             // exactly when the remaining sweeps matter most.
             let results = SIGNALS.map(|s| {
-                let dropped = block::expire(&dir, s, cutoff);
+                // With `--offload`, the copy is the hook `expire_with` runs
+                // just before each unlink, so the block is in the store before
+                // it leaves the disk and a copy that fails keeps its block for
+                // the next sweep. Without it, this is the unlink it always was.
+                let dropped = match &offload {
+                    Some(t) => block::expire_with(&dir, s, cutoff, &|b| t.push(s, b).map(|_| ())),
+                    None => block::expire(&dir, s, cutoff),
+                };
                 // Expire first: compressing a block this sweep is about to
                 // delete is pure wasted bandwidth.
                 let cold = block::compact(&dir, s, node, now - block::COLD_AFTER_NS);
@@ -1434,6 +1453,14 @@ async fn retention(cfg: Arc<Config>) {
             // Last, and only then: the TTL is the policy, and free space is the
             // floor under it. A sweep that expired enough by the clock has
             // nothing to do here and pays one `statfs` to find that out.
+            //
+            // `--offload` deliberately does not apply here. This path runs
+            // because the volume is nearly full and its whole contract is to
+            // get back over the floor now; putting a copy to an object store in
+            // front of each unlink means an unreachable store stops reclaiming
+            // and the disk fills, which is the failure the floor exists to
+            // prevent. So a block dropped by the floor is gone, and the WARN it
+            // already logs per block is the record of it.
             (results, reclaim(&dir, MIN_FREE))
         })
         .await;

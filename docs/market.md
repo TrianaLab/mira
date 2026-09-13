@@ -274,9 +274,41 @@ against 55 ms at four: a full queue waits for a slot instead of returning a 503,
 so nothing is shed on any row of the sweep and the backpressure is paid in wait
 time, which is the trade and not a free win. And the server is not CPU-bound at
 any shape it was offered — 2.23 of twelve cores at the 1,537,875 records/s peak,
-and the same 2.23 at the 96-connection row that is 26% slower. Whatever sets the
-ceiling is now neither the flusher nor arithmetic, and this sweep cannot see it,
-which is why the row stays in this section rather than moving up the page.
+and the same 2.23 at the 96-connection row that is 26% slower.
+
+The previous version of this paragraph said the sweep could not see what set
+that ceiling. It can now, from inside the process rather than off the curve:
+**it is the write-ahead log's single mutex, held across the `write(2)` rather
+than around a queue push.** One `Wal` serves all three signals and every shard.
+`wal.lock_wait` is 82% and 84% of total submit time at 32 and 96 connections;
+the mutex is occupied 74% to 93% of a run's wall clock, and 90–98% of what it is
+held for is the write itself; and its in-flight high-water mark equals the tokio
+worker count *exactly* — 12 of 12, 47 of 48 — which is every runtime worker
+parked in the kernel on one lock, and is why ten cores sit idle while ack
+latency climbs. A task that asks to sleep 50 ms and does no work at all returns
+80 ms late at 96 connections against 9.7 ms at four, which is the same finding
+with nothing borrowed from the client. At 2.2–2.9 ms an append the log can
+serialise 345–440 appends/s, so **the ceiling is 1.7 to 2.6 M records/s whatever
+the connection count**; connections past the plateau add waiters, not appends.
+Adding runtime workers makes it worse: 12 against 48 at 96 connections, same
+binary back to back, is 2,229,315 against 1,675,695 records/s with 6.4x the lock
+wait and the same total time under the lock.
+
+That is a diagnosis and not a fix, and the fix is not in this release. Group
+commit — one `writev` of whatever is waiting at the lock, ack still after the
+write lands — or one log per signal would both lift it without coordination
+state and without a format change, and neither is in the tree because neither
+can be validated to this page's standard on the box available. Which is the
+second thing to report: two runs of the identical 96-connection configuration
+minutes apart returned 1,814,829 and 2,229,315 records/s, and **the 26% fall
+from 32 to 96 connections that the table above publishes did not reproduce on
+the day the diagnosis was measured — the fall was 5%.** The table's rates were
+taken on a quieter day and are left as they were rather than restated from a
+noisier one; the ratios in this paragraph are all taken inside one process
+during one run and do not depend on what else the machine was doing.
+[Architecture section 11](architecture.md#11-performance-model) has the probe
+table, the three hypotheses it rules out and the one-line command that prints
+it.
 
 **Query at scale.** This row opens with a correction. The figure it used to
 carry — 175 ms steady over 24.0M rows, 137M rows/s — does not reproduce: four
@@ -435,20 +467,47 @@ behind an L4 balancer and a replication factor of one — a lost disk is lost da
 for that node's share. A scope decision, not a benchmark result, but a buyer
 reads it as a loss and should hear it here rather than discover it.
 
-This one cannot be closed. Fan-out needs a replica to know which replicas exist
-and which of them holds what, and that is membership and a shared catalogue,
-which is coordination state — the one thing the stateless principle spends
-everything else to avoid. Winning this row means becoming
+The hot half cannot be closed. Fan-out needs a replica to know which replicas
+exist and which of them holds what, and that is membership and a shared
+catalogue, which is coordination state — the one thing the stateless principle
+spends everything else to avoid. Winning this row means becoming
 the thing every other row on this page is winning against. The answer is not a
 better implementation, it is a second process in front, and that is the
 operator's choice to make rather than Mira's to ship.
 
+The cold half is closed, and this release closes it. `--offload <uri>` copies a
+sealed block to an object store immediately before retention unlinks it, under
+the same time-range-encoded directory name it had locally — so the store's own
+list API is the catalogue and Mira builds nothing extra. Measured on one corpus
+of 142 blocks and 3.35 GiB: **15.7 s of retention-thread time to upload
+(218.5 MiB/s), 16.6 s to restore, 42 ms to list all 142**, a second restore
+copying nothing, and the restored directories byte-identical to the store's
+under `diff -r`. It is deliberately not a tier — reads never consult the store,
+`mira offload restore` is the whole retrieval path, and `file://` is the only
+scheme, which means a mounted bucket rather than a signing library.
+
+A stateless query proxy in front of N replicas — static config, no membership,
+no catalogue, nothing to reconcile after a restart — would close the hot half
+too, and it is **not recommended yet**. Not because it is hard, but because
+nothing has measured a single node's ceiling to be the binding constraint: the
+ingest ceiling above is 1.7–2.6 M records/s on a laptop, and this page's own
+query finding is that an unpruned scan is bound by whether the corpus fits page
+cache, which fan-out does not change. Hash-based ingest routing on the 64-bit
+entity identity hash is the piece that would make fan-out worth having — it is
+what makes one replica's answer *complete* for one entity — and it only makes
+sense alongside the proxy, never before it. Build both when an operator arrives
+with a workload that exceeds one node; the reasoning is in
+[architecture section 12.2](architecture.md#122-query-still-not-built).
+
 **Cost per GB.** No measured dollar figure, only bytes on disk. Quickwit's $8.4
-per ingested TB per month is structurally unreachable for any engine on local
-block storage — the like-for-like gp3 figure is ~$29.2 — and that is a property
-of object storage, not a tuning difference. Matching it means putting blocks in
-a bucket, and a block in a bucket cannot be read by `mmap`, which is the read
-path. Not a gap: a different product.
+per ingested TB per month is structurally unreachable for any engine *serving
+reads* off local block storage — the like-for-like gp3 figure is ~$29.2 — and
+that is a property of object storage, not a tuning difference. `--offload <uri>`
+narrows the gap rather than closing it: the cold tier can live in a bucket and
+the local disk only has to hold `storage.retention`. But a block in a bucket
+still cannot be read by `mmap`, which is the read path, so getting it back is a
+`restore` and not a query. What is left of the gap is the read path's, and there
+it is not a gap: it is a different product.
 
 **Ack latency with the log off.** p50 657 ms, p99 2.6 s, block-seal-bound.
 Nobody else publishes an ack latency so there is no row to lose, but the number
@@ -554,7 +613,8 @@ sprint; each one buys something in the tables above.
 | **Loki's cardinality guards** (`max_streams_per_user`, `max_label_names_per_series: 15`) | "Those exist to protect Loki's index. Mira has no such index." Refusing them is a feature claim, not a gap. |
 | **Prometheus `remote_read`** | It would make Mira a dumb sample pipe streaming raw points to a Prometheus that evaluates locally — the worst possible shape for a columnar store, and it forfeits every pushdown the engine exists to do. |
 | **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no Resource, no Scope and no semconv; every synthesised series lands in the no-identity bucket. Keep the lossy hop outside Mira. |
-| **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | Exactly one new flag will ever exist: `--offload <uri>`, because a URI is an address. Every competitor's tiering config is a documented foot-gun. |
+| **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | "There is one flag and it is an address: `--offload <uri>`." Now shipped, and still one flag: the period is `storage.retention`, because the block leaving the disk *is* the event, and there is no cache to size because reads never consult the store — `mira offload restore` is the whole retrieval path. Every competitor's tiering config is a documented foot-gun. |
+| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 117-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
 | **Per-record deletion (GDPR erasure)** | This one hurts: it breaks block immutability, which is what reader safety rests on. The answer is tenant-as-path-prefix so deletion stays an unlink of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
 | **SAML** | "Put an OIDC bridge in front of Mira." SAML needs a certificate and a metadata store; OIDC needs a JWKS fetch. |
 | **A Kubernetes operator / CRDs** | A controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile. |

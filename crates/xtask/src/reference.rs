@@ -813,11 +813,15 @@ fn http_page(f: &mut Failures) -> String {
 const PARSED: [(&str, &str); 2] = [("positive", "count"), ("whole", "count")];
 
 /// How a Rust type reads to an operator writing KYAML.
-const TYPES: [(&str, &str); 7] = [
+const TYPES: [(&str, &str); 8] = [
     ("String", "string"),
     ("SocketAddr", "host:port"),
     ("PathBuf", "path"),
     ("Option<PathBuf>", "path"),
+    // The only optional string is `storage.offload`, and what it holds is a
+    // URI. If a second one ever wants a different word, this is the line that
+    // has to become a per-field override.
+    ("Option<String>", "uri"),
     ("Duration", "duration"),
     ("usize", "size"),
     ("bool", "boolean"),

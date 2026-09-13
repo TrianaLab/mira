@@ -116,6 +116,11 @@ pub struct Config {
     /// How long a block is kept. Retention is a delete of whole blocks, so the
     /// oldest data disappears in block-sized steps rather than row by row.
     pub retention: Duration,
+    /// Where a block goes before retention unlinks it, or `None` to unlink it
+    /// outright. Off by default: retention deleting data is the documented
+    /// behaviour, and a flag that silently started keeping everything would be
+    /// a disk bill nobody asked for. See `mira_core::offload`.
+    pub offload: Option<String>,
     /// The largest export either listener will decode. See
     /// `receiver::Receivers::max_request_bytes` for why it is one number.
     pub max_request_bytes: usize,
@@ -225,6 +230,7 @@ impl Default for Config {
             http: "0.0.0.0:4318".parse().unwrap(),
             data_dir: PathBuf::from("./mira-data"),
             retention: Duration::from_secs(7 * 24 * 3600),
+            offload: None,
             // Eight times axum's default and four times tonic's. A stock
             // collector batches 8192 records, which is already past 2 MiB of
             // spans, and an exporter reads 413 as permanent — so the cost of
@@ -282,6 +288,9 @@ impl Config {
         if let Some(v) = get(&root, "storage.retention", env)? {
             cfg.retention = duration(&v).map_err(|e| format!("storage.retention: {e}"))?;
         }
+        if let Some(v) = get(&root, "storage.offload", env)? {
+            cfg.offload = Some(v);
+        }
         if let Some(v) = get(&root, "ingest.max_request_bytes", env)? {
             cfg.max_request_bytes =
                 bytes(&v).map_err(|e| format!("ingest.max_request_bytes: {e}"))?;
@@ -311,12 +320,13 @@ impl Config {
 }
 
 /// Every path this file may contain, in the order [`Config::parse`] reads them.
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 13] = [
     "node",
     "listen.grpc",
     "listen.http",
     "storage.dir",
     "storage.retention",
+    "storage.offload",
     "ingest.max_request_bytes",
     "ingest.queue",
     "ingest.shards",

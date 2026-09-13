@@ -865,6 +865,68 @@ data out of an unlinked file. The `Arc` *is* the refcount and the kernel holds
 the inode. The one rule: never truncate or rewrite a published block — that
 gives readers `SIGBUS`, whereas unlinking does not.
 
+### 6.1 `--offload`: a copy before the unlink
+
+`--offload <uri>` puts a copy of a block in an object store immediately before
+retention unlinks it. One flag, because a URI is an address, and the only
+tiering knob there will be: no offload period, no cache path, no cache size, no
+eviction policy. The period is `storage.retention`, because the block leaving
+the disk *is* the event.
+
+**The naming is the catalogue.** An offloaded block lands at
+`<uri>/<signal>/p=<epoch_hour>/<block>` — byte for byte the layout of section
+3.2, time range still in the directory name. The store's own list API is
+therefore the manifest exactly as `readdir` is locally: `mira offload list` is
+`block::scan` pointed at the other root, parsing `min_ts`, `max_ts`, node and
+sequence back out of the names it gets. Nothing is written that a future binary
+has to understand and nothing records what has been uploaded.
+
+**The ordering is the design.** The copy is a hook `expire_with` runs just
+before each `remove_dir_all`, so the failure direction is fixed at *two copies,
+never zero*: a copy that fails logs, keeps its block, and is retried next sweep.
+The alternative — a separate upload pass that marks what it has done — needs a
+marker both passes agree on, which is coordination state, which is what
+principle 4 spends everything to avoid. Doing the copy inside the unlink makes
+the filesystem's own presence and absence the marker.
+
+**Staging, so a killed copy is not a block.** Each block is written to
+`<root>/.tmp/<signal>-<name>-<pid>` and renamed into place, so a partial
+directory never appears in a listing and never blocks the retry. A rename that
+loses to another replica's is success, not an error — both wrote the same
+immutable bytes. The restore path stages under the same
+`<node:08x>-restore-` shape `block::sweep_staging` already clears at boot, so a
+killed restore costs no new code.
+
+**`file://` only, and that is not a placeholder.** Everything after the prefix
+is a path, so `file:///srv/cold`, `file://./cold` and a bucket already mounted
+into the filesystem all work. `s3://` is refused at startup, and the reason is
+the dependency budget rather than the effort: signing a request needs
+HMAC-SHA256 and reading a listing needs an XML parser, and neither is in the
+crate graph the README counts. An operator who wants S3 mounts it; `mira` never
+learns what a bucket is.
+
+**An offloaded block is not `mmap`-able, and nothing pretends otherwise.** Reads
+never consult the store. `mira offload restore` copies blocks back into a data
+directory and the server picks them up on its next scan — that is the whole
+retrieval path. No transparent fetch, no cache tier, no partially-local block.
+It is also what keeps section 9's refusal to `mmap` a networked filesystem
+intact: the mapped file is always the local one.
+
+**The copy is a `read`/`write` loop on purpose**, not `fs::copy`. On macOS
+`fs::copy` is `fclonefileat`/`fcopyfile(COPYFILE_ALL)` and *preserves mtime*, so
+a block restored from a two-month-old offload would land with a two-month-old
+stamp on bytes written seconds ago. Nothing in this tree reads mtime in anger —
+retention keys on the `max_ts` in the directory name, so a restored block's
+expiry is the same either way — but a restore is the one operation that changes
+what is at a path, and `(len, mtime)` is how everything *outside* Mira notices
+that: `rsync`, a backup agent, `find -mtime`, any cache keyed on a path's
+identity. Writing the bytes makes the stamp current as a consequence of the
+write, with no call anyone has to remember.
+`offload_restore_stamps_current_mtime` is the test that fails if someone reaches
+for the faster call.
+
+The measured cost of all of it is in section 11.
+
 ---
 
 ## 7. Correlation
@@ -1844,12 +1906,121 @@ Reading these honestly:
   passes span 6% and 16% — and then falls away to 1,136,941 at 96. That is a new
   shape: before `ingest.shards` (section 4) the curve peaked at four connections
   and declined from there, and 96 returned 734,142. Ten idle cores at the plateau
-  means the ceiling is somewhere other than the engine's arithmetic. This run does not say where, and it
-  cannot: the generator is co-resident and encoding 8192 protobuf records per
-  batch is inside the same loop, so part of the per-batch cost is the harness's.
-  Separating them wants the generator on a second machine, which is the one
-  thing a single-laptop harness cannot do. Until then, treat the aggregate as a
-  floor and the per-core figure as the comparable one.
+  means the ceiling is somewhere other than the engine's arithmetic, and the next
+  bullet names it. Two caveats stay on the aggregate whatever the cause: the
+  generator is co-resident and encoding 8192 protobuf records per batch inside
+  the same loop, so part of the per-batch cost is the harness's, and separating
+  them wants the generator on a second machine, which is the one thing a
+  single-laptop harness cannot do. Treat the aggregate as a floor and the
+  per-core figure as the comparable one.
+- **The plateau is one mutex held across a `write(2)`, and the measurement ships
+  with the binary.** The sweep above cannot see the cause from outside: a
+  closed-loop generator reports `connections × batch / ack latency`, so every
+  hypothesis predicts the same curve, and CPU is flat at 2.23 cores at both ends
+  of it. `mira_core::diag` answers it from inside — two `Instant::now()` pairs
+  and five relaxed atomics per export, under 150 ns against a critical section
+  measured in milliseconds — and prints only when its target is enabled:
+
+  ```sh
+  RUST_LOG=mira=info,mira_core=info,mira::probe=debug mira --data-dir ./data
+  ```
+
+  Three runs, `loadgen --for 20s --batch 8192`, fresh store each, means over the
+  whole run:
+
+  | | 4 conns | 32 conns | 96 conns |
+  |---|---|---|---|
+  | records/s | 1,297,149 | 1,917,983 | 1,814,829 |
+  | ack p50 | 8.3 ms | 64.3 ms | 199.9 ms |
+  | `submit.total` | 7.571 ms | 22.117 ms | 26.177 ms |
+  | `submit.admit` | 0.000 ms | 0.002 ms | 0.001 ms |
+  | `wal.encode` | 0.733 ms | 1.545 ms | 1.400 ms |
+  | `wal.lock_wait` | 3.920 ms | 18.152 ms | 22.067 ms |
+  | `wal.held` | 2.915 ms | 2.272 ms | 2.611 ms |
+  | of which `wal.write` | 2.849 ms | 2.042 ms | 2.422 ms |
+  | `runtime.lag`, ticks | 9.7 ms, 418 | 33.9 ms, 238 | 80.2 ms, 192 |
+  | `wal.inflight_max` | 4 | 12 | 12 |
+
+  Read down a column rather than across, for the reason three bullets below.
+  **`wal.lock_wait` is 52% of `submit.total` at four connections and 82% and 84%
+  at thirty-two and ninety-six.** There is one `Wal` behind all three signals and
+  all `ingest.shards` shards; `wal.held` times the append count is 15.2 s, 14.7 s
+  and 18.6 s of a twenty-second run, so **the single mutex is occupied 74% to 93%
+  of the wall clock**, and 90–98% of what it is held for is the three
+  `write_all`s. At 2.2–2.9 ms an append the log serialises at most 345 to 440
+  appends per second, and at ~5,100 records an append that is a hard **1.7 to
+  2.6 M records/s whatever the connection count**. Connections past the plateau
+  add waiters, not appends.
+
+  `wal.inflight_max` is what makes it a runtime failure rather than only a
+  throughput one. `std::sync::Mutex` on aarch64-apple-darwin is the pthread
+  backend, so a contended `lock()` parks the OS thread in the kernel — and a
+  parked tokio worker runs no other task and is not replaced. A high-water mark
+  of exactly 12 on a 12-worker runtime says every worker was inside
+  `append_then` at once. `runtime.lag` is the same fact with nothing borrowed
+  from the client: a task that asks to sleep 50 ms and does no work at all wakes
+  9.7 ms late at four connections, 33.9 at thirty-two and 80.2 at ninety-six,
+  and completes 418, 238 and 192 of the 400 sleeps the window allows. Ack
+  latency cannot separate "working hard" from "cannot schedule anything". This
+  can, and it says the second.
+- **Each obvious suspect is ruled out by a number rather than an argument.**
+  Admission backpressure: `submit.admit` — `reserve()` plus the `ADMIT_WAIT`
+  park — is a mean of 0.000 to 0.002 ms with a maximum of 6.5 ms at every shape,
+  so the bounded channel is not where the time goes, and `reserve()` is a
+  first-fit `try_reserve` across shards touching atomics only, so shard dispatch
+  goes with it. Park/wake under saturation is real but it is *inside*
+  `wal.lock_wait`, not beside it. And more runtime workers is not the fix, which
+  is the paired A/B worth keeping: 96 connections, same binary, same box, back to
+  back, `TOKIO_WORKER_THREADS` 12 against 48 — **2,229,315 records/s against
+  1,675,695, a 25% loss, `wal.lock_wait` up 6.4x from 16.3 ms to 104.5 ms and
+  `wal.inflight_max` from 12 to 47**, while the total time the mutex was *held*
+  barely moved, 14.98 s against 14.50 s. Four times the workers bought four
+  times the queue and the same serialised section.
+- **What this costs, and what did not land.** The fix is not in this release and
+  the honest reason is that neither candidate can be validated to this section's
+  standard on this box. Group commit — one `writev` of whatever is waiting at the
+  lock, the ack still after the write lands, never a `BufWriter` that acks bytes
+  still in userspace — is the direct answer; one log per signal is the cheap one,
+  three mutexes instead of one, bounded by the signal count rather than the core
+  count. Neither needs coordination state and neither changes the format. What
+  did land is `Wal::sync()` taking its `F_FULLFSYNC` outside the lock rather than
+  inside it: structurally right given the 4,230 µs section 10 already publishes
+  for that call, and **not measured to move any number in the table above**,
+  because the sweep never calls it.
+- **The box, and a number withdrawn.** This machine is not quiet: an
+  idle-before baseline swung between 6% and 81% busy across consecutive runs,
+  and two runs of the *identical* 96-connection configuration minutes apart
+  returned 1,814,829 and 2,229,315 records/s, a 23% spread. **The 26% fall from
+  32 to 96 connections that the ingest row publishes did not reproduce on the
+  day the diagnosis was measured — the fall was 5%.** The published rates were
+  taken on a quieter day and are left as they were rather than restated from a
+  noisier one, and the diagnosis deliberately rests on ratios taken inside one
+  process during one run, which do not care what the rest of the machine was
+  doing. Reproducing it should move the absolute rates and leave the ratios
+  alone.
+- **`--offload` costs the retention sweep and nothing else.** One corpus, one
+  box, back to back: 142 blocks, 3,592,328,340 bytes, three signals (62 logs, 68
+  traces, 12 metrics). The same sweep over the same corpus is **0.612 s** as the
+  unlink it always was and **16.288 s** with `--offload file://`, so the copy is
+  15.68 s — **218.5 MiB/s**, which is `read` + `write` + `fsync` per file on this
+  volume. `mira offload restore` brings it all back in **16.620 s**
+  (206.1 MiB/s); the two directions agreeing within 6% is the check that neither
+  is doing something clever. `mira offload list` over all 142 blocks is **42 ms**,
+  one `readdir` per partition, which is the entire catalogue. A second `restore`
+  copies **0** blocks. Both costs land on the retention `spawn_blocking` thread,
+  so the ingest rows above are unchanged by the flag.
+
+  Compatibility is checked twice, because a query comparison alone would not
+  catch a silently re-encoded block. The same two queries — page one of the
+  newest logs, and a predicate that prunes nothing so every block is opened —
+  return **byte-identical** responses over the original and the restored corpus.
+  And `diff -r` over all 142 restored block directories against the store
+  reports **no difference at all**. One caveat is itself a measured result: an
+  md5 of a whole query response is the wrong instrument and was withdrawn as
+  one here, because two processes over a single unchanged directory differ in
+  `elapsed_us` and nowhere else — that field is normalised before the comparison
+  above, and the fact that it is the *only* unstable field is what makes the
+  comparison worth anything.
 - **What changed the shape of the curve was admission, not arithmetic.** The
   first revision shed the moment the queue was full, and at 96 connections that
   read 333,373 records/s with 93% of exports getting a 503 — four cores busy
@@ -2319,6 +2490,31 @@ does not re-broadcast.
 nodes with one down must not quietly return six sevenths of the data and let the
 user draw a conclusion from it. Every response has to name which peers answered,
 and that requirement is why this is not a two-hour feature.
+
+**Recommended: still not built, and not next either.** A stateless proxy in
+front of N replicas with the peer set in static config would close this without
+coordination state *in Mira* — the proxy holds no durable state, so killing and
+restarting it reconciles nothing. Cheap to build. The reason it is not scheduled
+is that nothing has measured a single node's ceiling to be the binding
+constraint for the buyer this design is written for. Section 11 puts ingest at
+1.7–2.6 M records/s on a laptop, and the query finding in the same section is
+that an unpruned scan is bound by whether the corpus fits page cache — which
+fan-out does not change, since each peer still scans its own share off its own
+disk. Building it speculatively means committing to the partial-results contract
+above, the hop flag, and a second deployable, in exchange for a ceiling no
+workload has yet reached.
+
+Hash-based ingest routing is the piece that would make it worth having, and it
+only makes sense alongside the proxy, never on its own. `hash(entity_id) mod N`
+over the 64-bit identity hash section 7.2 already computes would put one
+entity's records on one replica, which is what makes a single peer's answer
+*complete* for that entity rather than a fragment of it — and the same routing
+on a consistent hash ring keeps a scale-out from reshuffling everything.
+Rebalance stays operator-triggered, because an automatic one is a placement
+decision and placement is coordination state (12.4). Routing without fan-out is
+strictly worse than today: it concentrates an entity on one node while queries
+still only see the node they landed on. So the order is fixed — proxy first,
+routing second, both when a workload exceeds one node, and neither before.
 
 ### 12.3 Discovery without membership — still not built
 

@@ -26,13 +26,15 @@ use axum::routing::get;
 use config::Config;
 
 const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION]
+     [--data-dir PATH] [--retention DURATION] [--offload URI]
      [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
      [--self-telemetry] [--telemetry-interval DURATION]
      [--alerts FILE] [--version]
 
-mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
-mira update [--version VERSION] [--dry-run]
+mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+mira offload list    [--config FILE] --offload URI
+mira offload restore [--config FILE] --offload URI [--data-dir PATH]
+mira update  [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
 also come from the file via ${env:VAR} — see https://miradb.dev/config/.
@@ -40,6 +42,12 @@ also come from the file via ${env:VAR} — see https://miradb.dev/config/.
 `mira mira` opens the terminal UI. With --data-dir it reads a block directory
 in-process and needs no server running; with --addr it queries one over HTTP.
 `mira tui` is the same thing, for anyone who guesses that first.
+
+--offload sends a block to an object store just before retention deletes it,
+under the same directory name it had locally — so the store's own listing is
+the catalog and there is nothing else to keep in sync. `mira offload list`
+reads that listing; `mira offload restore` copies every block in it that is not
+already local back into --data-dir, and is safe to re-run.
 
 `mira update` replaces this binary with the latest GitHub release, using the
 same installer as the curl one-liner at https://miradb.dev/install/.";
@@ -80,6 +88,7 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
             "--http" => cfg.http = value()?.parse().map_err(|e| format!("--http: {e}"))?,
             "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
             "--retention" => cfg.retention = config::duration(&value()?)?,
+            "--offload" => cfg.offload = Some(value()?),
             "--max-request-bytes" => cfg.max_request_bytes = config::bytes(&value()?)?,
             "--queue" => cfg.queue = config::positive(&value()?)?,
             "--shards" => cfg.shards = config::whole(&value()?)?,
@@ -96,6 +105,74 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
         }
     }
     Ok(cfg)
+}
+
+/// `mira offload list` and `mira offload restore`.
+///
+/// Both are `readdir` against the store and nothing else. There is no state
+/// here to be stale, no index to rebuild and nothing to reconcile with a
+/// running server: a `restore` into the data directory of a live node is a
+/// block appearing in it, which is the same event as a publish and is already
+/// how the read path learns about anything (section 4).
+fn offload_cmd(argv: &[String]) -> Result<(), String> {
+    let verb = argv.first().map(String::as_str).unwrap_or("");
+    if !matches!(verb, "list" | "restore") {
+        return Err(format!("mira offload takes `list` or `restore`\n\n{USAGE}"));
+    }
+    let cfg = load_from(argv[1..].to_vec())?;
+    let uri = cfg
+        .offload
+        .as_deref()
+        .ok_or_else(|| format!("mira offload needs --offload URI\n\n{USAGE}"))?;
+    let target = mira_core::offload::Target::parse(uri).map_err(|e| e.to_string())?;
+    let node = mira_core::block::node_id(&cfg.node);
+    if verb == "restore" {
+        // The same guard `serve_with` runs, for the same reason and before the
+        // same `mmap`: restoring a corpus onto a network mount and then
+        // pointing a server at it is a SIGBUS deferred by one command.
+        mira_core::block::check_filesystem(&cfg.data_dir).map_err(|e| e.to_string())?;
+    }
+    let (mut blocks, mut bytes) = (0u64, 0u64);
+    for signal in pipeline::SIGNALS {
+        for b in target.list(signal).map_err(|e| e.to_string())? {
+            let name = b.dir.file_name().unwrap_or_default().to_string_lossy();
+            let size = block_bytes(&b.dir);
+            blocks += 1;
+            bytes += size;
+            let what = match verb {
+                "restore" => match target
+                    .pull(signal, &b, &cfg.data_dir, node)
+                    .map_err(|e| e.to_string())?
+                {
+                    true => "restored",
+                    false => "present",
+                },
+                _ => "",
+            };
+            println!(
+                "{signal:<8} {} .. {}  {:>10}  {name} {what}",
+                tui::stamp(b.min_ts),
+                tui::stamp(b.max_ts),
+                size,
+            );
+        }
+    }
+    println!("{blocks} blocks, {bytes} bytes");
+    Ok(())
+}
+
+/// Sum of the block's files. Not derivable from the name — the name carries
+/// everything needed to *prune*, which is the claim the layout makes; how many
+/// bytes are behind it is a `stat` per file and only this command wants it.
+fn block_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// Where a `mira mira` invocation should read from.
@@ -202,6 +279,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // interleaved with a `sudo` prompt is a prompt someone does not answer.
     if argv.first().is_some_and(|a| a == "update") {
         return update::run(&argv[1..]).map_err(Into::into);
+    }
+    if argv.first().is_some_and(|a| a == "offload") {
+        return offload_cmd(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() });
     }
     if argv.first().is_some_and(|a| a == "mira" || a == "tui") {
         if argv.iter().any(|a| a == "-h" || a == "--help") {
@@ -325,6 +405,14 @@ async fn serve_with(
         data_dir: cfg.data_dir,
         node,
         retention: cfg.retention,
+        // Parsed here rather than in the sweep, so `--offload s3://…` is a
+        // refusal to start with the sentence explaining why, not a warning
+        // logged every minute while retention quietly deletes.
+        offload: cfg
+            .offload
+            .as_deref()
+            .map(mira_core::offload::Target::parse)
+            .transpose()?,
         queue: cfg.queue,
         shards: pipeline::shard_count(
             cfg.shards,
@@ -409,6 +497,32 @@ async fn serve_with(
     // the UI, the TUI and an agent learn that alerting is off, and a 404 is
     // indistinguishable from an old build.
     alert::spawn(api.clone());
+    // The two tasks `mira_core::diag` needs to be readable, spawned only when
+    // someone has asked to read it. The probes in `submit` and in the log are
+    // always on and cost ~150 ns an export; these two are a 20 Hz wakeup and a
+    // formatted line, which is not worth running on every node forever for an
+    // answer nobody is looking at.
+    if tracing::enabled!(target: "mira::probe", tracing::Level::DEBUG) {
+        // A task that does no work at all, so how late it wakes is a property
+        // of the runtime and not of the load. See `diag::RUNTIME_LAG`.
+        tokio::spawn(async {
+            loop {
+                let t = std::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                mira_core::diag::RUNTIME_LAG
+                    .record(t.elapsed().as_nanos().saturating_sub(50_000_000) as u64);
+            }
+        });
+        tokio::spawn(async {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                t.tick().await;
+                // Cumulative from start, so two dumps are a rate and one is a
+                // mean over the run.
+                tracing::debug!(target: "mira::probe", "{}", mira_core::diag::dump());
+            }
+        });
+    }
     let serve = axum::serve(
         http_socket,
         receiver::http_router(recv)

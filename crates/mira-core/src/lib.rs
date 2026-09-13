@@ -20,12 +20,14 @@
 pub mod attrs;
 pub mod block;
 pub mod bloom;
+pub mod diag;
 pub mod error;
 pub mod frame;
 pub mod identity;
 pub mod json;
 pub mod logs;
 pub mod metrics;
+pub mod offload;
 pub mod query;
 pub mod schema;
 pub mod series;
@@ -1817,6 +1819,121 @@ mod tests {
         .unwrap();
         assert_eq!(r.stats.rows_matched, 1_000);
         assert_eq!(r.stats.blocks_scanned, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A block that has been to an object store and back answers exactly what
+    /// it answered before it left — in both tiers.
+    ///
+    /// This is the claim `--offload` has to make and the only one worth
+    /// testing at this level. Everything below the query is what would break
+    /// if the copy were not byte-exact: `Block::open` checks `mira.crc32` over
+    /// the whole body on every table it maps, so a single flipped or dropped
+    /// byte is an `Error::BadChecksum` here and not a wrong answer. The cold
+    /// block is in the set on purpose — it carries a `cold` marker and ZSTD
+    /// table bodies, so a copy that moved only `*.arrow` would leave a block
+    /// that reads as hot and a compaction sweep that rewrites it again.
+    #[test]
+    fn an_offloaded_block_comes_back_answering_the_same_query() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-offload-e2e-{}", std::process::id()));
+        let store = root.join("cold-store");
+        let data = root.join("data");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let now = 4 * block::COLD_AFTER_NS;
+        let node = block::node_id("a");
+        let mut dirs = Vec::new();
+        for (seq, base) in [
+            (now - 90 * 60 * 1_000_000_000) as u64,
+            (now - 60 * 1_000_000_000) as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request("checkout", 500, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            dirs.push(
+                block::publish(&data, "logs", node, seq as u64, 0, &sealed)
+                    .unwrap()
+                    .dir,
+            );
+        }
+        // One of the two through the cold tier, so the round trip is tested
+        // over both on-disk shapes rather than only the uncompressed one.
+        assert_eq!(
+            block::compact(&data, "logs", node, now - block::COLD_AFTER_NS).unwrap(),
+            1
+        );
+
+        let ask = || {
+            query::search(
+                &data,
+                &Search {
+                    signal: Signal::Logs,
+                    from: 0,
+                    to: i64::MAX,
+                    terms: vec![Term {
+                        target: Target::Attr("service.name".into()),
+                        op: Op::Eq,
+                        value: QV::Str("checkout".into()),
+                    }],
+                    limit: 2_000,
+                    after: None,
+                },
+            )
+            .unwrap()
+        };
+        let before = ask();
+        assert_eq!(
+            (before.stats.rows_matched, before.stats.blocks_scanned),
+            (1_000, 2)
+        );
+
+        // The sweep retention would run: copy, then unlink, block by block.
+        let t = offload::Target::parse(&format!("file://{}", store.display())).unwrap();
+        let dropped =
+            block::expire_with(&data, "logs", i64::MAX, &|b| t.push("logs", b).map(|_| ()))
+                .unwrap();
+        assert_eq!(dropped, 2);
+        assert!(ask().stats.rows_matched == 0, "the local copies are gone");
+
+        // The store's own listing is the catalog: no index was written, and
+        // what comes back out of `readdir` is what went in.
+        let listed = t.list("logs").unwrap();
+        assert_eq!(listed.len(), 2);
+        for b in &listed {
+            assert!(t.pull("logs", b, &data, node).unwrap());
+        }
+
+        let after = ask();
+        assert_eq!(after.stats.rows_matched, before.stats.rows_matched);
+        assert_eq!(after.stats.blocks_scanned, before.stats.blocks_scanned);
+        // Byte-identical rendered rows, not just the same count: a copy that
+        // reordered tables or lost a sidecar could still match on totals.
+        assert_eq!(after.json, before.json);
+        // The tier survived with the bytes. `cold` is written last by
+        // `compact` and is the only thing that stops the next sweep rewriting
+        // an already-compressed block, so a copy that dropped it would cost
+        // one pointless full rewrite per restored block per hour.
+        let cold: Vec<_> = block::scan(&data, "logs")
+            .unwrap()
+            .iter()
+            .map(|b| b.dir.join("cold").exists())
+            .collect();
+        assert_eq!(cold, vec![true, false], "one cold, one hot, as they left");
+        // And the compressed one is still compressed, which `open_table`
+        // answering at all already proves the CRC over: a ZSTD body whose
+        // checksum did not survive the copy is `BadChecksum`, not a wrong row.
+        let hot = block::open_table(&dirs[1].join("logs.arrow")).unwrap();
+        assert_eq!(hot.zero_copy_ratio().0, hot.zero_copy_ratio().1);
+        let (inside, total) = block::open_table(&dirs[0].join("logs.arrow"))
+            .unwrap()
+            .zero_copy_ratio();
+        assert!(inside < total, "the restored cold block decompressed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

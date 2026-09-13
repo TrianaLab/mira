@@ -12,13 +12,15 @@ is no daemon, agent or sidecar to run alongside any of them.
 ```console
 $ mira --help
 mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION]
+     [--data-dir PATH] [--retention DURATION] [--offload URI]
      [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
      [--self-telemetry] [--telemetry-interval DURATION]
      [--alerts FILE] [--version]
 
-mira mira [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
-mira update [--version VERSION] [--dry-run]
+mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+mira offload list    [--config FILE] --offload URI
+mira offload restore [--config FILE] --offload URI [--data-dir PATH]
+mira update  [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
 also come from the file via ${env:VAR} — see https://miradb.dev/config/.
@@ -26,6 +28,12 @@ also come from the file via ${env:VAR} — see https://miradb.dev/config/.
 `mira mira` opens the terminal UI. With --data-dir it reads a block directory
 in-process and needs no server running; with --addr it queries one over HTTP.
 `mira tui` is the same thing, for anyone who guesses that first.
+
+--offload sends a block to an object store just before retention deletes it,
+under the same directory name it had locally — so the store's own listing is
+the catalog and there is nothing else to keep in sync. `mira offload list`
+reads that listing; `mira offload restore` copies every block in it that is not
+already local back into --data-dir, and is safe to re-run.
 
 `mira update` replaces this binary with the latest GitHub release, using the
 same installer as the curl one-liner at https://miradb.dev/install/.

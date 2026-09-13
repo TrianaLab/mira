@@ -1,7 +1,7 @@
 # Configuration
 
 **For:** whoever runs the process. <!-- BEGIN GENERATED: count -->
-12
+13
 <!-- END GENERATED: count -->
 keys. One of them changes how the engine runs, and it is there to correct a
 number the runtime can read wrong, not to tune anything.
@@ -25,6 +25,7 @@ so `{ "cluster": {} }` is `unknown key "cluster"`.
 | [`listen.http`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.http) | `--http` | host:port | `0.0.0.0:4318` | Where OTLP/HTTP, the query API, the MCP endpoint and the web UI listen — one port, because they are one surface over one set of blocks. |
 | [`storage.dir`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.data_dir) | `--data-dir` | path | `./mira-data` | The block directory. It is the whole manifest: no catalogue, no index file, nothing outside it to keep in sync. |
 | [`storage.retention`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.retention) | `--retention` | duration | `7d` | How long a block is kept. Retention is a delete of whole blocks, so the oldest data disappears in block-sized steps rather than row by row. |
+| [`storage.offload`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.offload) | `--offload` | uri | `unset` | Where a block goes before retention unlinks it, or `None` to unlink it outright. Off by default: retention deleting data is the documented behaviour, and a flag that silently started keeping everything would be a disk bill nobody asked for. See `mira_core::offload`. |
 | [`ingest.max_request_bytes`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.max_request_bytes) | `--max-request-bytes` | size | `16MiB` | The largest export either listener will decode. See `receiver::Receivers::max_request_bytes` for why it is one number. |
 | [`ingest.queue`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.queue) | `--queue` | count | `128` | How many exports may be queued for one signal's flusher before the next one has to wait for a slot — and is shed with a 503 only if none frees up within `pipeline::ADMIT_WAIT`. |
 | [`ingest.shards`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.shards) | `--shards` | count | `0` | How many flushers a signal runs, or 0 for "one per two cores". |
@@ -122,6 +123,44 @@ with a broken reference does not stop the process booting.
 
 There is no second `MIRA_*` override mechanism. `${env:...}` covers every case
 in one visible file.
+
+## `storage.offload`
+
+A URI, or nothing. Nothing is the default, so retention still means delete.
+
+Set it and the sweep copies each expiring block to that URI *before* it unlinks
+the local one — two copies, then one, never zero. A copy that fails logs and
+keeps its block for the next sweep. The copy goes under the same directory name
+it had locally (`{signal}/p={epoch_hour}/{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`),
+which is the whole catalogue: the store's listing is the index and there is
+nothing else to keep in sync. Only blocks retention was already about to delete
+are ever touched — sealed, immutable, long since compacted. The ingest path does
+not know this key exists.
+
+**An offloaded block is not queryable.** There is no read-through and no lazy
+fetch; a query answers from `mmap` over local blocks exactly as it did before.
+Getting data back is explicit:
+
+```sh
+mira offload list    --offload file:///backup/mira
+mira offload restore --offload file:///backup/mira --data-dir ./mira-data
+```
+
+`restore` copies every block in the listing that is not already local, and is
+safe to re-run — a second run copies nothing. A running server picks restored
+blocks up on its next scan.
+
+**`file://` is the only scheme**, and it is a path, not a placeholder: a mounted
+bucket (`s3fs`, `gcsfuse`, `rclone mount`), an NFS export, a second disk. A
+native `s3://` is refused at startup — signing needs HMAC-SHA256 and a listing
+needs an XML parser, and neither is in the crate graph the README counts. See
+[Architecture section 6.1](architecture.md#61-offload-a-copy-before-the-unlink).
+
+The cost, on the box in [End-to-end testing section
+3](internals/e2e.md#3-the-load-harness): 3.35 GiB across 142 blocks took 0.612 s
+to unlink, and 16.288 s to copy-then-unlink to a `file://` target on the same
+disk — 218.5 MiB/s out, 206.1 MiB/s back. The sweep is a background tick and no
+export waits on it, but it is the same disk ingest is writing to.
 
 ## `ingest.wal`
 
@@ -374,7 +413,8 @@ differ 10x in rate.
 
 A full volume takes the replica out of the Service via `/readyz` rather than
 losing data, so the failure mode of under-sizing is a stopped intake and not a
-corrupt store. `storage.retention` is the knob that prevents it.
+corrupt store. `storage.retention` is the knob that prevents it, and
+`storage.offload` is how the data outlives the volume it was sized for.
 
 ## Several replicas
 
