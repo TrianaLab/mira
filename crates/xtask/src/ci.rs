@@ -80,9 +80,22 @@ const MAKE_DISPATCHED: [&str; 1] = ["ci.yml"];
 /// Jobs that are deliberately NOT reachable from a required context.
 ///
 /// Each needs a reason, and the reason is read by a human, so write it for one.
-/// Empty is the right state — an entry here is an admission that something runs
-/// on PRs without being able to block a merge.
-const UNREACHABLE_ALLOWLIST: [(&str, &str); 0] = [];
+/// Empty is very nearly the right state — an entry here is usually an admission
+/// that something runs on pull requests without being able to block a merge.
+///
+/// The exception is a job *downstream* of a gate. That is the one shape where
+/// unreachable is stronger than reachable rather than weaker: it cannot start
+/// until the gate has passed, and the check below walks `needs:` forwards, so it
+/// sees the edge pointing the wrong way and cannot tell the two apart. Widening
+/// the walk to accept "needs a gate" would also accept `needs: [required]` plus
+/// `if: always()`, which runs on a red main — so the exemption is written down
+/// one job at a time instead.
+const UNREACHABLE_ALLOWLIST: [(&str, &str); 1] = [(
+    "tag",
+    "downstream of both gates, not upstream: it `needs: [required, \
+     security-required]` and runs only on a push to main, so there is no pull \
+     request for it to fail to block",
+)];
 
 /// Actions from these owners still have to be SHA-pinned; nobody is exempt.
 ///
@@ -552,21 +565,30 @@ mod tests {
     }
 
     /// The whole point of the file, reduced: a job nothing depends on runs on
-    /// every pull request and can never block one.
+    /// every pull request and can never block one — and the allowlist is the
+    /// only thing that excuses it, one named job at a time.
     #[test]
     fn a_job_outside_the_gates_closure_is_a_failure() {
-        let doc = yaml(
+        // Every allowlisted job, so the bidirectional half does not fire on a
+        // fixture too small to contain them. That is also the assertion: these
+        // are as orphaned as `orphan` and only the allowlist tells them apart.
+        let excused: String = UNREACHABLE_ALLOWLIST
+            .iter()
+            .map(|(id, _)| format!("  {id}: {{}}\n"))
+            .collect();
+        let doc = yaml(&format!(
             "on:\n  pull_request:\n\
              jobs:\n\
-             \x20 lint: {}\n\
-             \x20 orphan: {}\n\
+             \x20 lint: {{}}\n\
+             \x20 orphan: {{}}\n\
+             {excused}\
              \x20 gate:\n\
              \x20   name: required\n\
              \x20   if: always()\n\
              \x20   needs: [lint]\n\
              \x20   steps:\n\
-             \x20     - run: echo \"${{ join(needs.*.result, ' ') }}\"\n",
-        );
+             \x20     - run: echo \"${{{{ join(needs.*.result, ' ') }}}}\"\n"
+        ));
         let jobs = jobs_of(&doc);
         let mut f = Failures::default();
         check_gates("t.yml", &jobs, &triggers(&doc), &mut f);

@@ -129,6 +129,15 @@ ci-release-dry-run: dist publish-dry ## The `release-dry-run` leg
 .PHONY: ci-helm
 ci-helm: chart ## The `helm` leg
 
+# Not part of `ci`, and the only target in either file that *writes* to the
+# repository. It is here rather than in the Makefile because it is not a gate:
+# nothing about it is reproducible on a laptop, and running it by accident
+# cuts a release. The `tag` job that calls it needs both required contexts and
+# only runs on a push to main, so a pull request can never reach it.
+.PHONY: ci-tag
+ci-tag: ## Tag a merged version bump, so merging is the whole release
+	sh scripts/tag-release.sh
+
 # ---------------------------------------------------------------------------
 # Everything a pull request runs
 # ---------------------------------------------------------------------------

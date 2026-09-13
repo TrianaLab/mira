@@ -458,7 +458,8 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 	$(CARGO) update --workspace --quiet
 	$(MAKE) --no-print-directory helm-docs
 	@echo
-	@echo "Now: \`make drift\` to verify, then a PR — docs/internals/releases.md."
+	@echo "Now: \`make drift\` to verify, then a PR. Merging it cuts $(TO) —"
+	@echo "there is no tag to remember. See docs/internals/releases.md."
 
 .PHONY: workflows
 workflows: ## Lint the workflows, and check every CI job can block a merge
@@ -473,13 +474,13 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 		exit 1; }
 	actionlint
 	$(XTASK) ci
-	@# actionlint shellchecks every `run:` block for free, and `make
-	@# install-script` shellchecks the installer. These two are the scripts
-	@# neither one reaches: `ci-changes.sh` used to be a `run:` block and
-	@# `wait-for-signals.sh` used to be Python inside a recipe, so lifting
-	@# either into a file would have quietly dropped it out of a linter.
+	@# actionlint shellchecks every `run:` block for free, so the scripts those
+	@# blocks call have to be checked somewhere too — lifting shell out of YAML
+	@# must not be how it stops being linted. A glob rather than a list: the
+	@# list is what rots, and re-checking get-mira.sh (which `make
+	@# install-script` also does, with more) costs nothing.
 	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
-	shellcheck scripts/ci-changes.sh scripts/wait-for-signals.sh
+	shellcheck scripts/*.sh
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs

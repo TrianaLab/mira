@@ -415,3 +415,32 @@ jobs:
             esac
           done
           exit "${rc}"
+
+  # Merging a version bump is the release. Nothing else in this file writes to
+  # the repository, and this job is the reason the two gates above are `needs:`
+  # rather than `if:` — it must be unreachable unless every leg was green, and a
+  # pull request must never reach it at all.
+  #
+  # It is the one job not in a required context's closure, because it is
+  # *downstream* of both of them; crates/xtask/src/ci.rs carries the exemption
+  # with that reason, so the graph check stays honest rather than being widened.
+  #
+  # scripts/tag-release.sh is a no-op unless Cargo.toml names a version that has
+  # no tag, so it runs on every push to main and cuts a release on almost none.
+  tag:
+    name: tag
+    needs: [required, security-required]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # To push the tag, and to dispatch release.yml at it. The second is the
+      # load-bearing one: a tag pushed with GITHUB_TOKEN does not start a
+      # workflow, and `workflow_dispatch` is one of the two events exempt from
+      # that rule — which is what lets this work with no PAT and no deploy key.
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: make ci-tag
