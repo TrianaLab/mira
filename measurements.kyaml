@@ -1,0 +1,545 @@
+# Every performance number Mira publishes, once.
+#
+# A figure quoted in four files is a figure that will be right in three of them
+# after the next run. `xtask drift` already solved that shape for the crate count
+# and the binary size; this file is the same idea for everything a load test
+# produces. One entry per quantity, the sites that quote it listed beside it, and
+# `cargo run -p xtask -- measurements` failing the build when a site disagrees.
+#
+# Each entry has five parts and all five are load-bearing:
+#
+#   key         a name a harness can emit and this file can be keyed by.
+#   value       the measured number. This is the variable. Everything else in
+#               the tree is a rendering of it.
+#   unit        what the number counts.
+#   measures    what the quantity *is* — the numerator, the denominator, and
+#               what sits inside the measurement and outside it. A number
+#               without this cannot be compared with anyone else's, which is the
+#               whole failure mode docs/internals/measurement.md exists to stop.
+#   provenance  the command that produces it. `unscripted` where none does, and
+#               that is a gap named rather than hidden.
+#   quoted      how prose spells it, and where. Several renderings per value is
+#               normal — e2e.md prints 886,147 and the README rounds to 886k —
+#               and every one of them is checked.
+#
+# To re-measure:
+#
+#   make build && scripts/measure/conn-sweep.sh
+#   make measurements-ingest RUN=/tmp/mira-sweep/run.json
+#
+# The sweep appends one JSON object per pass; the ingest takes the median per key
+# across them and reports every value that moved and every site that now lies.
+# `WRITE=1` updates the values here. It deliberately does not rewrite the prose,
+# because the sentence around a number is a claim ("worth between a quarter and
+# two fifths") that a new number can invalidate in a way no formatter can see.
+
+# The box every figure below was taken on. A measurement without one is a
+# measurement of nothing: docs/internals/measurement.md#the-box says why this
+# machine's noise floor is part of the reading.
+box:
+  machine: Apple M3 Pro, 12 cores, 18 GiB
+  os: macOS, aarch64-apple-darwin
+  build: release profile, --locked, generator co-resident with the server
+
+# The corpus the section 11 query rows were read from. It came off a `--for` run,
+# so these bytes are reproducible in method rather than byte for byte; the
+# argument that rebuilds the same shape is `--records 54172384 --conns 4
+# --batch 8192`, which is 826 rounds per connection of 2 x 8192 + 12 records, and
+# it is what conn-sweep.sh runs. The first sweep through it replaces the figures
+# below and closes this gap.
+corpus:
+  logs: 27066368
+  spans: 27066368
+  points: 39648
+  bytes: 8944889856
+  tables: 1652
+  blocks: 316
+
+measurements:
+
+  # ---------------------------------------------------------------------------
+  # Ingest. One connection sweep produces every row here; the shapes are the
+  # ones the docs quote, not every shape the sweep runs.
+  # ---------------------------------------------------------------------------
+
+  - key: ingest.records_per_s.conns1
+    value: 629384
+    unit: records/s
+    measures: >
+      Records the server acknowledged, divided by the harness's wall clock.
+      A record is one log record, one span or one metric data point — not one
+      export and not one byte. Acknowledged means the 200 came back, which under
+      ack-after-durability means the bytes are in the log. Shed exports are not
+      counted and the run asserts there were none.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "629,384"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.records_per_s.conns4
+    value: 1350502
+    unit: records/s
+    measures: >
+      As ingest.records_per_s.conns1, at four writer connections — the shape
+      quoted for a paired comparison because it is the one that reproduces, 10%
+      across three passes against 39% at ninety-six.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1,350,502"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.records_per_s.conns32
+    value: 1537875
+    unit: records/s
+    measures: >
+      As ingest.records_per_s.conns1, at thirty-two. The peak of a plateau
+      rather than a peak: sixteen and thirty-two are within 2% of each other on
+      medians whose passes span 6% and 16%.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1,537,875"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
+
+  - key: ingest.records_per_s.conns96
+    value: 1136941
+    unit: records/s
+    measures: >
+      As ingest.records_per_s.conns1, at ninety-six — past the plateau, where
+      added connections buy waiters on one log mutex rather than appends.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1,136,941"
+        sites:
+          [
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+            CHANGELOG.md,
+          ]
+
+  - key: ingest.cores.conns1
+    value: 0.71
+    unit: cores
+    measures: >
+      CPU-seconds the *server* process burned during the run, divided by wall
+      clock. A meter reading, not a core count somebody chose: the harness takes
+      `ps -o cputime=` either side of the run and differences it. The generator's
+      own CPU is not in it, and the generator is on the same twelve cores.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "0.71"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.cores.conns4
+    value: 1.75
+    unit: cores
+    measures: As ingest.cores.conns1, at four connections.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1.75"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.cores.conns32
+    value: 2.23
+    unit: cores
+    measures: >
+      As ingest.cores.conns1, at thirty-two — and, to two decimals, the same at
+      ninety-six, which is the observation the plateau diagnosis rests on: ten of
+      twelve cores idle at both ends of a 26% throughput fall.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "2.23"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
+
+  - key: ingest.per_core.conns1
+    value: 886147
+    unit: records/s/core
+    measures: >
+      ingest.records_per_s.conns1 divided by ingest.cores.conns1. The comparable
+      figure: an aggregate rate is a property of the offered load and moves with
+      `--conns` without a line of the server changing. Highest at one connection,
+      where there is nothing to contend over, so it is a ceiling and not an
+      operating point.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "886,147"
+        sites: [docs/internals/e2e.md]
+      - as: "886k"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
+
+  - key: ingest.per_core.conns96
+    value: 515288
+    unit: records/s/core
+    measures: As ingest.per_core.conns1, at ninety-six connections.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "515,288"
+        sites: [docs/internals/e2e.md]
+
+  - key: ingest.wire_mib_s.conns4
+    value: 176.5
+    unit: MiB/s
+    measures: >
+      Uncompressed OTLP protobuf written to the socket, including request
+      headers, divided by wall clock. Not bytes on disk and not a compressed
+      figure — the comparison peers publish a wire rate, so this is the one that
+      can sit beside theirs. At four connections Mira's record averages 137 B.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "176.5"
+        sites: [docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.ack_p50_ms.conns4
+    value: 8.5
+    unit: ms
+    measures: >
+      Milliseconds from the first byte of an export written to the socket to the
+      200 read back, p50 over every export of the run. With `ingest.wal` on — the
+      default — that is a `write(2)` into the page cache and not a block seal.
+      Client-side, so it includes the loopback round trip.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "8.5 ms"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.ack_p99_ms.conns4
+    value: 55
+    unit: ms
+    measures: As ingest.ack_p50_ms.conns4, at p99.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "55 ms"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: ingest.ack_p99_ms.conns96
+    value: 2661
+    unit: ms
+    measures: >
+      As ingest.ack_p99_ms.conns4, at ninety-six — eighteen times the four-
+      connection figure for 14% more throughput, which is what the plateau costs.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "2,661"
+        sites: [docs/market.md, docs/internals/e2e.md]
+      - as: "2.7 s"
+        sites: [docs/market.md]
+
+  - key: ingest.ack_p50_ms.logoff
+    value: 657
+    unit: ms
+    measures: >
+      As ingest.ack_p50_ms.conns4 but with `ingest.wal` off, where the
+      acknowledgement waits for the block seal rather than a page-cache write.
+      A different quantity from the row above, not a worse measurement of the
+      same one.
+    provenance: unscripted
+    quoted:
+      - as: "657"
+        sites: [docs/architecture.md, docs/market.md, CHANGELOG.md]
+
+  - key: ingest.ack_p99_ms.logoff
+    value: 2647
+    unit: ms
+    measures: As ingest.ack_p50_ms.logoff, at p99.
+    provenance: unscripted
+    quoted:
+      - as: "2,647"
+        sites: [docs/architecture.md]
+
+  # ---------------------------------------------------------------------------
+  # Resident footprint. Sampled from outside, because Mira reads through mmap
+  # and a heap counter would report a flattering number.
+  # ---------------------------------------------------------------------------
+
+  - key: rss_mib.conns1
+    value: 232
+    unit: MiB
+    measures: >
+      Peak resident set of the server process over the run, `ps -o rss=` at
+      4 Hz. Whole process: both UIs, the query path and every mapped block page
+      a query touched. Uncapped — no memory cgroup, unlike every peer figure it
+      is quoted against.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "232 MiB"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  - key: rss_mib.conns4
+    value: 689
+    unit: MiB
+    measures: As rss_mib.conns1, at four connections.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "689 MiB"
+        sites:
+          [
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+            CHANGELOG.md,
+          ]
+
+  - key: rss_mib.conns96
+    value: 1648
+    unit: MiB
+    measures: >
+      As rss_mib.conns1, at ninety-six. RSS is not flat in connection count and
+      this row is why the headline footprint figure is labelled with its shape.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1,648 MiB"
+        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+
+  # ---------------------------------------------------------------------------
+  # Query. The section 11 table, read back from the corpus above after a
+  # restart. "First" is the first call into a fresh process; "steady" is the
+  # same call repeated. No script rebuilds these — see the gap below.
+  # ---------------------------------------------------------------------------
+
+  - key: query.attr_absent.steady_ms
+    value: 2.6
+    unit: ms
+    measures: >
+      The server's own `elapsed_us`, not a client round trip: time inside the
+      query handler for an attribute equality that matches nothing anywhere in
+      the store. Zero of 137 blocks opened — the Bloom sidecar answers it — so
+      this prices the pruning path and nothing else.
+    provenance: unscripted
+    quoted:
+      - as: "2.6 ms"
+        sites: [README.md, docs/architecture.md]
+
+  - key: query.attr_absent.first_ms
+    value: 8.3
+    unit: ms
+    measures: >
+      As query.attr_absent.steady_ms, on the first call after a process restart.
+      The gap between first and steady is virtual-memory work — establishing 316
+      blocks' worth of mappings and faulting them in.
+    provenance: unscripted
+    quoted:
+      - as: "8.3 ms"
+        sites: [docs/architecture.md]
+
+  - key: query.attr_match.first_ms
+    value: 4.1
+    unit: ms
+    measures: >
+      As query.attr_absent.first_ms, for an attribute equality that does match:
+      1 of 137 blocks opened, 204,800 rows scanned.
+    provenance: unscripted
+    quoted:
+      - as: "4.1 ms"
+        sites: [docs/architecture.md]
+
+  - key: query.unfiltered_100.first_ms
+    value: 29.1
+    unit: ms
+    measures: >
+      As query.attr_absent.first_ms, for `limit 100` with no predicate. One
+      block, 204,800 rows — the cost is the block open, not the limit.
+    provenance: unscripted
+    quoted:
+      - as: "29.1"
+        sites: [docs/architecture.md]
+
+  - key: query.trace_by_id.steady_ms
+    value: 4.7
+    unit: ms
+    measures: >
+      As query.attr_absent.steady_ms, for every span of one trace id out of
+      27.1M spans on disk. A trace id carries no time bound, so every block is a
+      candidate and only `trace.idx` prunes: 2 of 155 blocks opened, 73,728 rows.
+    provenance: unscripted
+    quoted:
+      - as: "4.7 ms"
+        sites: [README.md, docs/architecture.md, docs/agents.md]
+
+  - key: query.metric_names.first_ms
+    value: 8.9
+    unit: ms
+    measures: >
+      As query.attr_absent.first_ms, for the metric-name catalogue: 24 of 24
+      blocks, because every metric block can hold a name no other one does.
+    provenance: unscripted
+    quoted:
+      - as: "8.9 ms"
+        sites: [docs/architecture.md]
+
+  - key: query.substring_scan.steady_ms
+    value: 885
+    unit: ms
+    measures: >
+      As query.attr_absent.steady_ms, for a substring with no time bound over
+      27,066,368 rows and 137 of 137 blocks — the unprunable case, and the only
+      row of the table that is not warm: 8.33 GiB does not stay resident in 18
+      GiB shared with a VM, Docker and a browser.
+    provenance: unscripted
+    quoted:
+      - as: "885 ms"
+        sites: [docs/architecture.md, docs/market.md, CHANGELOG.md]
+
+  - key: query.substring_scan.first_ms
+    value: 1441
+    unit: ms
+    measures: As query.substring_scan.steady_ms, on the first call after a restart.
+    provenance: unscripted
+    quoted:
+      - as: "1,441"
+        sites: [docs/architecture.md, docs/market.md]
+
+  # ---------------------------------------------------------------------------
+  # Cost per GB, and the durability floor under the ack.
+  # ---------------------------------------------------------------------------
+
+  - key: cost.hot_bytes_per_byte
+    value: 1.20
+    unit: B/B
+    measures: >
+      Bytes the data directory grew during the run, divided by uncompressed OTLP
+      protobuf bytes the harness sent. Above 1.0 because a hot block carries
+      sidecars and is not yet compressed. A delta on both sides: a total over a
+      store that already had blocks in it would be meaningless.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1.20"
+        sites: [docs/architecture.md]
+
+  - key: cost.compacted_bytes_per_byte
+    value: 0.14
+    unit: B/B
+    measures: >
+      As cost.hot_bytes_per_byte, once the cold tier has rewritten the block
+      ZSTD-compressed. The figure to quote for retention sizing; the hot one is
+      the transient.
+    provenance: scripts/measure/offload-cycle.sh
+    quoted:
+      - as: "0.14"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
+
+  - key: wal.append_p50_us
+    value: 7
+    unit: us
+    measures: >
+      p50 of one durable log append for a 4 KiB body, measured inside the
+      process. It is a buffered `write(2)` plus the fixed per-append work, not an
+      fsync — the fsync is the sweep's, four times a second, and is
+      fsync.full_us below.
+    provenance: unscripted
+    quoted:
+      - as: "7 µs"
+        sites: [README.md, docs/architecture.md, CHANGELOG.md]
+
+  - key: fsync.full_us
+    value: 4230
+    unit: us
+    measures: >
+      `File::sync_all()` on this volume, which on macOS is `F_FULLFSYNC` — a
+      real platter-or-flash barrier, not a page-cache flush. Quoted as the cost
+      the log sweep pays 4 Hz, a ~2% duty cycle on a 250 ms period.
+    provenance: unscripted
+    quoted:
+      - as: "4,230"
+        sites: [docs/architecture.md]
+
+  # ---------------------------------------------------------------------------
+  # The corpus itself. These are the denominators every query row divides by, so
+  # they are measurements too.
+  # ---------------------------------------------------------------------------
+
+  - key: corpus.records.logs
+    value: 27066368
+    unit: records
+    measures: >
+      Log records in the section 11 corpus, and separately the span count — the
+      generator emits one batch of each per round, so the two are equal by
+      construction and a difference between them is a bug in the run.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "27,066,368"
+        sites: [docs/architecture.md, docs/market.md]
+      - as: "27.1"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/agents.md,
+            CHANGELOG.md,
+          ]
+
+  - key: corpus.records.points
+    value: 39648
+    unit: points
+    measures: >
+      Metric data points in the section 11 corpus. Three orders of magnitude
+      below the other two signals, which is why a metrics block holds ~1,600
+      points and the metrics join's cost is invisible in a mixed run.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "39,648"
+        sites: [docs/architecture.md]
+
+  - key: corpus.gib
+    value: 8.33
+    unit: GiB
+    measures: Arrow IPC bytes on disk for the section 11 corpus, sidecars included.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "8.33 GiB"
+        sites: [docs/architecture.md, docs/market.md]
+
+  - key: corpus.tables
+    value: 1652
+    unit: tables
+    measures: >
+      Arrow tables across the corpus — the file count `find -name '*.arrow'`
+      returns. Not the block count: a block is a directory of tables, and how
+      many depends on how many attribute levels the signal has.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "1,652"
+        sites: [docs/architecture.md, docs/market.md]
+
+  - key: corpus.blocks.logs
+    value: 137
+    unit: blocks
+    measures: >
+      Log blocks in the section 11 corpus, and the denominator of every
+      "N of 137 blocks" in the query table. Six flushers per signal seal ~204,800
+      rows each; one flusher sealed 87 blocks of ~330,000 for the same bytes.
+    provenance: scripts/measure/conn-sweep.sh
+    quoted:
+      - as: "137"
+        sites:
+          [
+            README.md,
+            docs/architecture.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+            CHANGELOG.md,
+          ]

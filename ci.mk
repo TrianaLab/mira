@@ -1,7 +1,7 @@
 # The pipeline, as targets you can run.
 #
 # `.github/workflows/ci.yml` is a dispatcher over this file: every `run:` in it
-# is a `make ci-*` target defined here, and `scripts/check_ci.py` fails the
+# is a `make ci-*` target defined here, and `cargo run -p xtask -- ci` fails the
 # build if one ever is not. So a leg going red on a runner is a leg you can
 # reproduce with one command, and there is no shell in YAML for anyone to debug
 # by pushing commits.
@@ -112,7 +112,7 @@ ci-coverage-json: ## The coverage figure the deployed site publishes
 ci-supply-chain: deps ## The `supply-chain` leg
 
 .PHONY: ci-drift
-ci-drift: drift reference-check ## The `drift` leg
+ci-drift: drift reference-check measurements-check ## The `drift` leg
 
 .PHONY: ci-docs
 ci-docs: docs install-script ## The `docs` leg
@@ -128,6 +128,15 @@ ci-release-dry-run: dist publish-dry ## The `release-dry-run` leg
 
 .PHONY: ci-helm
 ci-helm: chart ## The `helm` leg
+
+# Not part of `ci`, and the only target in either file that *writes* to the
+# repository. It is here rather than in the Makefile because it is not a gate:
+# nothing about it is reproducible on a laptop, and running it by accident
+# cuts a release. The `tag` job that calls it needs both required contexts and
+# only runs on a push to main, so a pull request can never reach it.
+.PHONY: ci-tag
+ci-tag: ## Tag a merged version bump, so merging is the whole release
+	sh scripts/tag-release.sh
 
 # ---------------------------------------------------------------------------
 # Everything a pull request runs
@@ -194,10 +203,6 @@ ci-tool-actionlint: ## Install the pinned actionlint (CI; locally use your own)
 	tar -xzf actionlint.tgz actionlint
 	sudo install actionlint /usr/local/bin/actionlint
 	rm actionlint actionlint.tgz
-
-.PHONY: ci-tool-python
-ci-tool-python: ## Install what the check scripts import
-	pip install -r scripts/requirements.txt
 
 .PHONY: ci-tool-chart
 ci-tool-chart: ## Install the pinned chart tooling (CI; locally use your own)

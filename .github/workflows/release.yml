@@ -22,8 +22,20 @@ name: release
 # The steps that build artifacts are `make` targets, not shell in this file, for
 # the reason the Makefile header gives: ci.yml's `release-dry-run` leg runs the
 # same targets on every pull request, so the release path is rehearsed rather
-# than first executed in anger. `workflow_dispatch` then runs the whole thing
-# with publishing switched off, so the first real tag is never the first test.
+# than first executed in anger. `workflow_dispatch` at a branch then runs the
+# whole thing with publishing switched off, so the first real tag is never the
+# first test.
+#
+# Nobody pushes the tag by hand any more: ci.yml's `tag` job cuts it when a
+# version bump merges. That job pushes with GITHUB_TOKEN, which does not start a
+# workflow, so the `push: tags:` trigger below does not fire for it — the job
+# calls `gh workflow run release.yml --ref vX.Y.Z` instead, and
+# `workflow_dispatch` is one of the two events exempt from the loop protection.
+# A dispatch at a tag ref is a real release: `meta` branches on GITHUB_REF_TYPE,
+# not on the event, so `publish=true` and the OIDC subject stays
+# `refs/tags/vX.Y.Z` — which is what `verify-release` pins. The `push` trigger
+# stays for the hand-pushed case, which is now the recovery path rather than the
+# normal one. docs/internals/releases.md has the whole argument.
 on:
   push:
     tags: ['v*']
@@ -784,7 +796,7 @@ jobs:
           #
           # The assertion is a real UUID rather than a diff against the tree,
           # because this job deliberately has no checkout: everything it looks
-          # at comes back off the wire. `scripts/check_drift.py` is what holds
+          # at comes back off the wire. `cargo run -p xtask -- drift` is what holds
           # the ID to the right one; this holds the push to having happened.
           oras pull "${CHARTS}/mira:artifacthub.io" --output pulled
           grep -Eq '^repositoryID: [0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' \

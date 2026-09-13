@@ -67,8 +67,9 @@ are the "a team's services" row of
 than guessed and gives CPU, memory and disk per day against the record rate.
 Two things it will tell you that are not obvious from here: memory tracks the
 number of concurrent exporters and not the ingest rate at all, and the on-disk
-cost per record is 8x higher above ~38k records/s per signal, where compaction
-stops keeping up.
+cost per record is 8x higher above ~27k records/s per signal — about 55k in
+total for the usual half-logs half-spans stream — where compaction stops
+keeping up.
 
 ## Replicas
 
@@ -88,7 +89,12 @@ pod's whole command line is `--config /etc/mira/mira.yaml`. The keys under
 `config` are the closed set from
 [Configuration](https://miradb.dev/config/) —
 an unknown key stops Mira at boot rather than being ignored, and this chart's
-`values.schema.json` is closed for the same reason.
+`values.schema.json` is closed over every subtree the chart owns for the same
+reason. It is *not* closed over the subtrees Kubernetes owns — `global`, the
+annotation and label maps, `resources`, `securityContext`, `podSecurityContext`,
+`nodeSelector`, `affinity`, `tolerations` and `extraEnv` all pass through
+unvalidated, because the API server is the thing with the authoritative schema
+for them and a second copy here would reject a field the cluster accepts.
 
 `listen` and `storage.dir` are deliberately not values: the container always
 listens on `0.0.0.0:4317` and `0.0.0.0:4318` and always writes to `/data`. A
@@ -163,7 +169,7 @@ cosign verify \
 | fullnameOverride | string | `""` | Override the full release name. |
 | image.pullPolicy | string | `"IfNotPresent"` | `IfNotPresent`, because the tag is an immutable release version: re-pulling it on every restart costs a registry round trip and can never return anything different. Use `Always` only if you retag. |
 | image.repository | string | `"ghcr.io/trianalab/mira"` | One binary on `distroless/cc`. The published image carries the same bytes as the release tarball rather than a second compile, so one attestation covers both. |
-| image.tag | string | `""` | Overrides the image tag (default is the chart appVersion). Deliberately empty: the chart version, the app version and the image tag are one number (`scripts/check_drift.py` enforces it), so pinning it here would only be a fourth place for it to drift. |
+| image.tag | string | `""` | Overrides the image tag (default is the chart appVersion). Deliberately empty: the chart version, the app version and the image tag are one number (`make drift` enforces it), so pinning it here would only be a fourth place for it to drift. |
 | imagePullSecrets | list | `[]` | Pull secrets, for a private mirror of the image. Empty because the public image needs none. |
 | ingress.annotations | object | `{}` | Annotations on the Ingress. Only 4318 is routed: OTLP/gRPC needs a per-controller backend-protocol annotation and an h2c-capable data path, so gRPC ingress is left to whoever knows which controller they run. |
 | ingress.className | string | `""` | IngressClass name. |

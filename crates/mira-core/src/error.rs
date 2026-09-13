@@ -73,6 +73,18 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// `--offload` named a scheme this build does not implement. See
+    /// `offload::Target::parse` for why the list is one entry long.
+    #[error(
+        "--offload {uri}: only file:// is implemented. Everything after the \
+         prefix is a path, so file:///srv/cold and file://./cold both work, and \
+         a bucket already mounted into the filesystem is reached that way. \
+         s3:// is not in this binary: signing a request needs HMAC-SHA256 and \
+         reading a listing needs an XML parser, and neither is in the crate \
+         graph the README counts."
+    )]
+    OffloadScheme { uri: String },
+
     /// An export bigger than the WAL will frame. Distinct from a corrupt
     /// length on read: this one is the caller's fault and is answerable with a
     /// 4xx, so it must not be confused with the file being damaged.

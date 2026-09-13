@@ -40,17 +40,55 @@ paths, the `[lib] name`s and the installed binary are all still `mira`.
    changelog section you just wrote, `drift` checks it. The full list, and what
    guards each one, is under
    [Where the version lives](#where-the-version-lives).
-3. **Open a normal PR.** The point is to make CI run `drift`, `chart` and
-   `docs` against the bumped tree before a tag can be cut from it.
-4. **Tag the merged commit.**
-   ```sh
-   git tag vX.Y.Z && git push origin vX.Y.Z
-   ```
-   `meta` re-checks the tag against `Cargo.toml` and fails the whole run before
-   anything builds if they disagree, because `mira --version` prints
-   `CARGO_PKG_VERSION` and nothing downstream can fix that afterwards.
-5. **Watch `verify-release`.** It is the terminal job and the only one whose
+3. **Open a normal PR, and merge it when it is green.** That is the release.
+4. **Watch `verify-release`.** It is the terminal job and the only one whose
    success means anything to a stranger.
+
+There is no tag step. `ci.yml`'s `tag` job runs on every push to `main`,
+downstream of both required contexts, and `scripts/tag-release.sh` reads
+`Cargo.toml`: if that version already has a tag it says so and exits, and if it
+does not, it pushes `vX.Y.Z`. Almost every push to main releases nothing; the
+one that merged a bump releases.
+
+That used to be `git tag vX.Y.Z && git push origin vX.Y.Z`, typed by hand, and
+it was a step with no decision in it — the number was chosen in step 2, reviewed
+in step 3 and cross-checked by `drift` against fifteen files. A step with no
+decision is a step that gets forgotten, and forgetting this one leaves a merged
+release that never shipped. The bump PR is still the gate; it is just no longer
+followed by a chore.
+
+### Why the tag is dispatched and not just pushed
+
+A tag pushed with `GITHUB_TOKEN` does **not** start a workflow. That is GitHub's
+loop protection and there is no flag for it — the two events exempt from the
+rule are `workflow_dispatch` and `repository_dispatch`. So `tag-release.sh`
+pushes the tag and then runs `gh workflow run release.yml --ref vX.Y.Z`.
+
+The point of dispatching *at the tag* rather than making `release.yml` trigger
+on the push to `main` is the OIDC subject. `meta` branches on `GITHUB_REF_TYPE`,
+so a dispatch at a tag ref is a tag run in every respect — same version, same
+`publish=true`, same tag-versus-`Cargo.toml` assertion — and the certificate
+identity is still `release.yml@refs/tags/vX.Y.Z`, which is what
+`verify-release` pins and what every signature Mira has already published was
+raised under. Triggering off the branch would move that subject to
+`refs/heads/main`, and the pin is not something to change quietly.
+
+It also means no credential. A PAT, a deploy key or a GitHub App token would all
+have worked, and all three are a secret somebody has to rotate; `github.token`
+with `contents: write` and `actions: write` on that one job is not.
+
+Running `release.yml` from the Actions tab **at a branch** is still the
+rehearsal: `publish=false`, `version=<crate>-dev.<sha7>`, and every push, sign
+and upload step skipped. At a *tag* it is a real release, by the same
+`GITHUB_REF_TYPE` branch — which is the behaviour that has always been there,
+and now something relies on it.
+
+`meta` re-checks the tag against `Cargo.toml` and fails the whole run before
+anything builds if they disagree, because `mira --version` prints
+`CARGO_PKG_VERSION` and nothing downstream can fix that afterwards. Nothing
+automated can make them disagree any more — the tag is *derived* from
+`Cargo.toml` — but the assertion stays, because a hand-pushed tag is still a
+tag.
 
 A tag with a suffix — `v0.2.0-rc.1` — is marked a GitHub prerelease, and a plain
 `vX.Y.Z` is not, including while Mira is pre-1.0. That is deliberate:
@@ -58,10 +96,6 @@ A tag with a suffix — `v0.2.0-rc.1` — is marked a GitHub prerelease, and a p
 `scripts/get-mira.sh` resolves when no `--version` is given, so flagging `0.x`
 would turn the install one-liner off. The pre-1.0 warning lives in `CHANGELOG.md`
 and `SECURITY.md` instead.
-
-To rehearse without publishing, run the workflow from the Actions tab:
-`workflow_dispatch` sets `publish=false` and `version=<crate>-dev.<sha7>`, and
-every push, sign and upload step is skipped.
 
 ## Two irreversible facts
 
@@ -82,7 +116,7 @@ strictly cheaper than reconciling that by hand.
 ## The job graph
 
 Every job `needs: meta`, and every job is in `verify-release`'s `needs` closure —
-`scripts/check_ci.py` enforces that statically, which is how a publisher that
+`make workflows` enforces that statically, which is how a publisher that
 silently skips is caught at PR time rather than discovered in a green run that
 published nothing.
 
@@ -214,7 +248,7 @@ restates it, and the right-hand column is what stops it rotting.
 `make bump TO=X.Y.Z` writes every row above and then regenerates the last two,
 so step 1 is one command and `make drift` is how you check it did. The middle
 column exists because the writer and the gate are deliberately the same thing:
-`VERSION_SITES` in `scripts/check_drift.py` is one table of anchored patterns,
+`version_sites()` in `crates/xtask/src/drift.rs` is one table of anchored patterns,
 read forwards to check and backwards to write. A gate maintained separately
 from the writer drifts, and it drifts in the bad direction — the writer is what
 people actually run.
@@ -244,11 +278,15 @@ push triggers `release.yml` only — so no tests, no clippy and no `make drift`
 run on the release path. The tag-versus-`Cargo.toml` assertion is the only thing
 re-checked.
 
-This is survivable because nothing reaches `main` un-gated and tags are cut from
-already-green commits. The residual hole is a tag cut from a *stale* `main`
-commit: `helm package --version/--app-version` overrides two of `Chart.yaml`'s
-three version fields, but not the `artifacthub.io/images` annotation, so a chart
-could ship advertising an image tag that is not the one being released.
+This is survivable because nothing reaches `main` un-gated, and because the
+`tag` job `needs: [required, security-required]` — so the commit a tag names is
+by construction the commit both gates just passed on, rather than a commit
+somebody believed was green. That also closes what used to be the residual hole
+here, a tag cut from a *stale* `main` commit: `helm package
+--version/--app-version` overrides two of `Chart.yaml`'s three version fields
+but not the `artifacthub.io/images` annotation, so a stale tag could ship a
+chart advertising an image tag that is not the one being released. A hand-pushed
+tag can still do that, and is still the only way to.
 
 ## Rehearsal, and what only the tag can run
 
@@ -256,7 +294,8 @@ could ship advertising an image tag that is not the one being released.
 real tarball, SBOM and checksum targets, then a full `cargo publish --workspace`
 that packages all three crates, resolves each against the one before it out of a
 temporary registry and compiles them, stopping at the upload — on every code PR.
-`workflow_dispatch` runs the whole DAG with `publish=false`. Both have passed.
+`workflow_dispatch` **at a branch** runs the whole DAG with `publish=false`.
+Both have passed.
 
 `publish=false` skips every network-publishing step, so `cosign sign`,
 `helm push`, the `Digest:` scrape off `helm push`'s stderr and the Artifact Hub

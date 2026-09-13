@@ -29,11 +29,14 @@
 //! correct data from an unlinked file until it drops the mapping. The `Arc` is
 //! the refcount; no lease protocol is needed.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
@@ -714,9 +717,36 @@ pub fn scan(root: &Path, signal: &str) -> Result<Vec<BlockRef>> {
 /// live data, so retention costs no IO bandwidth and cannot interfere with
 /// ingest.
 pub fn expire(root: &Path, signal: &str, cutoff_ns: i64) -> Result<usize> {
+    expire_with(root, signal, cutoff_ns, &|_| Ok(()))
+}
+
+/// [`expire`], with something to do to each block before it is unlinked.
+///
+/// The hook exists for one caller — [`crate::offload`], copying the block to an
+/// object store — and the ordering is the whole point of putting it here rather
+/// than in a sweep of its own. A hook that returns an error keeps its block:
+/// the delete is skipped, the sweep continues, and the next minute tries again.
+/// So the failure direction is fixed at "two copies, never zero", and there is
+/// no window in which a block exists in neither place. A separate upload pass
+/// running beside `expire` could not promise that without a marker file to
+/// coordinate them, which is the coordination state principle 4 rules out.
+pub fn expire_with(
+    root: &Path,
+    signal: &str,
+    cutoff_ns: i64,
+    before_delete: &dyn Fn(&BlockRef) -> Result<()>,
+) -> Result<usize> {
     let mut dropped = 0;
     for block in scan(root, signal)? {
         if block.max_ts < cutoff_ns {
+            if let Err(e) = before_delete(&block) {
+                tracing::warn!(
+                    block = %block.dir.display(),
+                    error = %e,
+                    "cannot offload block; keeping it locally and retrying next sweep",
+                );
+                continue;
+            }
             match fs::remove_dir_all(&block.dir) {
                 Ok(()) => dropped += 1,
                 // Another replica sharing this volume expired it first. Racing
@@ -868,38 +898,53 @@ fn fs_type(path: &Path) -> Result<Option<String>> {
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8)
             .collect();
-        let name = String::from_utf8_lossy(&name).into_owned();
-        Ok(match name.as_str() {
-            "nfs" | "smbfs" | "cifs" | "webdav" | "afpfs" | "ftp" => Some(name),
-            n if n.contains("fuse") => Some("fuse".into()),
-            _ => None,
-        })
+        Ok(remote_fs(&String::from_utf8_lossy(&name)))
     }
 
-    // Linux reports a magic number. Listed rather than ranged because the set of
-    // filesystems that break `mmap` is small, specific and does not grow often;
-    // anything unrecognised is treated as local, which is the right default for
-    // a check whose false positive is "Mira will not start".
     #[cfg(not(target_os = "macos"))]
     {
         // Masked to 32 bits: `f_type` is `__fsword_t`, which is i64 on x86_64
         // glibc but i32 on some musl and 32-bit targets, where a magic with the
         // high bit set (CIFS, SMB2) arrives sign-extended.
-        let ty = (buf.f_type as u64) & 0xffff_ffff;
-        Ok(match ty {
-            0x6969 => Some("NFS".into()),
-            0x517b => Some("SMB".into()),
-            0xff53_4d42 => Some("CIFS".into()),
-            0xfe53_4d42 => Some("SMB2".into()),
-            0x0102_1997 => Some("9P".into()),
-            0x5346_414f => Some("AFS".into()),
-            0x00c3_6400 => Some("CephFS".into()),
-            0x0116_1970 => Some("GFS2".into()),
-            0x7461_636f => Some("OCFS2".into()),
-            0x0bd0_0bd0 => Some("Lustre".into()),
-            0x6573_5546 => Some("fuse".into()),
-            _ => None,
-        })
+        Ok(remote_fs((buf.f_type as u64) & 0xffff_ffff))
+    }
+}
+
+/// The mounts that break `mmap`, keyed the way this platform names them.
+///
+/// Split from [`fs_type`] for the reason [`check_fs_type`] is: it is a table of
+/// constants, and a `statfs` on any machine that runs the tests returns exactly
+/// one of them — the fallthrough. Left inline, ten of the eleven arms below are
+/// unreachable from a real mount, so a magic with a transposed digit would ship
+/// looking as tested as the rest of the file.
+#[cfg(target_os = "macos")]
+fn remote_fs(name: &str) -> Option<String> {
+    match name {
+        "nfs" | "smbfs" | "cifs" | "webdav" | "afpfs" | "ftp" => Some(name.into()),
+        n if n.contains("fuse") => Some("fuse".into()),
+        _ => None,
+    }
+}
+
+/// Linux reports a magic number rather than a name. Listed rather than ranged
+/// because the set of filesystems that break `mmap` is small, specific and does
+/// not grow often; anything unrecognised is treated as local, which is the right
+/// default for a check whose false positive is "Mira will not start".
+#[cfg(not(target_os = "macos"))]
+fn remote_fs(magic: u64) -> Option<String> {
+    match magic {
+        0x6969 => Some("NFS".into()),
+        0x517b => Some("SMB".into()),
+        0xff53_4d42 => Some("CIFS".into()),
+        0xfe53_4d42 => Some("SMB2".into()),
+        0x0102_1997 => Some("9P".into()),
+        0x5346_414f => Some("AFS".into()),
+        0x00c3_6400 => Some("CephFS".into()),
+        0x0116_1970 => Some("GFS2".into()),
+        0x7461_636f => Some("OCFS2".into()),
+        0x0bd0_0bd0 => Some("Lustre".into()),
+        0x6573_5546 => Some("fuse".into()),
+        _ => None,
     }
 }
 
@@ -1174,6 +1219,154 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
     })
 }
 
+/// What this process has already checksummed, and the file it was.
+///
+/// The CRC is the right thing to do on a *first* read and pure waste on the
+/// second. A published block never changes, so a scan that reopens the same
+/// corpus re-hashes bytes this same process already hashed, to answer a question
+/// the previous query already answered.
+///
+/// It is worth stating what that is and is not worth, because `docs/market.md`
+/// named this fix on the back of a number that turned out to be a coincidence —
+/// 4,380 MiB in 885 ms is ~5 GB/s, which was read as "that is `crc32fast`'s
+/// rate here" and therefore as ~93% of an unpruned scan. Warm, it is nearer
+/// 27 GB/s. Measured on both sides of one run instead, re-verification is
+/// **between a quarter and two fifths** of a single block's read path, and
+/// about 1.1x on a full-corpus scan — which is bound by page cache, not by
+/// this. The "35-39%, a median of 1.55x" this comment used to carry was three
+/// samples of a quantity that moves between 1.14x and 2.21x, and is withdrawn
+/// as a median. `scan_cost_per_row` in `query.rs` is the run; section 11 of
+/// `docs/architecture.md` is the write-up.
+///
+/// The identity is the path *plus* [`FileId`], never the path alone, because a
+/// name in this tree is not a file for life: [`compact`] renames a new table
+/// over an existing name, and it must re-verify. Entries are keyed by path so a
+/// replaced file overwrites its predecessor instead of accumulating beside it.
+///
+/// What this cannot see is a bit that rots under a live file without any of the
+/// three fields moving. That is the whole of the trade, and it is the reason the
+/// cache is process-scoped rather than persisted: a restart re-verifies
+/// everything, so the window is one process lifetime and not the life of the
+/// block. The alternative — dropping the CRC, or covering fewer tables — either
+/// gives up detection entirely or gives it up for whichever table a query
+/// skipped.
+static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, FileId>>> = OnceLock::new();
+
+/// Enough of a file to say it is the same file, for a cache whose wrong answer
+/// is a corrupt block served as good data.
+///
+/// All three fields, and each one is load-bearing against a different way the
+/// bytes under a path change without the others noticing:
+///
+/// * **`len`** is the cheap one and catches a rewrite of a different size.
+/// * **`mtime`** catches a rewrite of the same size. Alone it is not enough,
+///   because a length-preserving write inside one filesystem mtime tick does not
+///   move it — see [`SETTLED`], which closes that by construction.
+/// * **`ino`** catches a *replacement*, which is the case neither of the others
+///   can see. `std::fs::copy` on APFS is `fcopyfile(COPYFILE_ALL)` and preserves
+///   the source's mtime to the nanosecond; so do `cp -p`, `rsync -a`, `tar -xp`
+///   and every backup agent worth using. Restoring a block from a copy of itself
+///   therefore lands bytes this process never verified, at a path it has, under
+///   a length and an mtime it remembers. A new file gets a new inode, and that is
+///   the field that says so.
+///
+/// Keying on the inode *instead* would be worse than either: retention unlinks
+/// block directories continuously and an inode number is reusable the moment its
+/// last link goes, so a fresh table could be handed the number of an expired one
+/// and inherit its verdict. Composed, that is a non-issue — a reused inode would
+/// also have to arrive at the same path carrying the same length and the same
+/// mtime — and each field covers what the others miss.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    mtime: SystemTime,
+    ino: u64,
+}
+
+/// How old a file's mtime must be before a verification of it is worth
+/// remembering.
+///
+/// Without this the cache has a real hole, and it is not hypothetical — it is
+/// `corrupt_body_is_caught_not_returned_as_data` in `lib.rs`, which opens a
+/// table, flips one bit of the body, and reopens expecting `BadChecksum`. The
+/// flip does not change the length, so if both writes land inside one mtime tick
+/// the identity is unchanged and a *corrupt block reads as already verified*.
+///
+/// A settle window closes it by construction rather than by hoping the clock is
+/// fine-grained. An entry is only recorded once the file has been untouched for
+/// longer than any filesystem's mtime granularity, so a subsequent write is
+/// necessarily in a later tick and necessarily misses. Two seconds is rsync's
+/// quick-check window and for the same reason: 1 s is the worst granularity in
+/// the wild, and doubling it costs nothing here. A published block is renamed
+/// into place and never written again, so by the second query that reads it, it
+/// is hours old — the window only ever excludes a block being written right now,
+/// which is the one that should be re-read anyway.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ponytail: clear-all rather than evict-oldest. Retention churns block paths,
+/// so the map grows with the number of tables this process has ever opened, not
+/// with the number that exist. At ~1,800 tables for the 8.33 GiB corpus this is
+/// four orders of magnitude of headroom; an LRU is the upgrade path if a process
+/// ever opens a million distinct tables and the re-verification spike after a
+/// clear shows up in a p99.
+const VERIFIED_CAP: usize = 1 << 16;
+
+/// What [`open_table`] should do about this file's checksum.
+///
+/// Three states and not a `bool`, because "already checked" and "cannot tell"
+/// both mean "do not record" and only one of them means "do not check". Reading
+/// them off one `Option` is how a cache turns into a hole.
+enum Verify {
+    /// This process has already checksummed this exact file. Skip it.
+    Skip,
+    /// Checksum it. On success, record it under this identity — `None` to check
+    /// it again next time, which is the answer for a file whose metadata would
+    /// not read and for one still inside its settle window.
+    Check(Option<FileId>),
+}
+
+/// Has this exact file already been checksummed by this process?
+fn verify_plan(path: &Path, file: &File) -> Verify {
+    // Off the open descriptor rather than the path, so every field describes the
+    // file this mapping is about to cover.
+    let Some(id) = file.metadata().ok().and_then(|m| {
+        Some(FileId {
+            len: m.len(),
+            mtime: m.modified().ok()?,
+            ino: m.ino(),
+        })
+    }) else {
+        return Verify::Check(None);
+    };
+    let map = VERIFIED.get_or_init(Default::default);
+    // A poisoned lock means another thread panicked mid-insert. The map is a
+    // pure cache, so the recovery is to use it anyway rather than to propagate
+    // a panic into every subsequent read.
+    let seen = map.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get(path) == Some(&id) {
+        return Verify::Skip;
+    }
+    drop(seen);
+    // A file still inside its settle window is checked and *not* recorded, so
+    // the next open checks it again. See [`SETTLED`].
+    let settled = SystemTime::now()
+        .duration_since(id.mtime)
+        .is_ok_and(|age| age >= SETTLED);
+    Verify::Check(settled.then_some(id))
+}
+
+/// Record that `path` passed its checksum as the file `id` describes.
+fn mark_verified(path: &Path, id: FileId) {
+    let mut seen = VERIFIED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= VERIFIED_CAP {
+        seen.clear();
+    }
+    seen.insert(path.to_path_buf(), id);
+}
+
 /// Open one table of a block with no buffer copies.
 ///
 /// This is a blocking call that can take a hard page fault. It must never run on
@@ -1182,6 +1375,10 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// dedicated reader pool.
 pub fn open_table(path: &Path) -> Result<MappedTable> {
     let file = File::open(path).ctx(path)?;
+    // Off the open descriptor, not the path: `fstat` describes the file this
+    // mapping is about to cover, where a later `stat` of the name could describe
+    // whatever replaced it.
+    let plan = verify_plan(path, &file);
     // SAFETY: the obligation is that nothing modifies or truncates this file
     // while the mapping lives — a truncation is a SIGBUS on the next page
     // touched, which no in-process check can catch. What discharges it is
@@ -1197,8 +1394,9 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
     // a block file in place, and nothing here can — the data directory is
     // Mira's, and that is a deployment property, not a checkable one.
     let mmap = unsafe { Mmap::map(&file) }.ctx(path)?;
-    // Every open CRCs the whole body, so every page is touched. Faulting them in
-    // one at a time caps a cold scan at fault latency; asking for the file up
+    // A first open CRCs the whole body, so every page is touched; a later one
+    // skips the CRC but a scan still reads most of what it mapped. Faulting them
+    // in one at a time caps a cold read at fault latency; asking for the file up
     // front lets the kernel read ahead. A hint, so a failure is not an error.
     let _ = mmap.advise(memmap2::Advice::WillNeed);
 
@@ -1268,13 +1466,22 @@ pub fn open_table(path: &Path) -> Result<MappedTable> {
             path: path.to_path_buf(),
             key: CRC_LEN_KEY,
         })?;
-    let actual = crc32fast::hash(&buffer[..body_len]);
-    if actual != expected {
-        return Err(Error::BadChecksum {
-            path: path.to_path_buf(),
-            expected,
-            actual,
-        });
+    // The footer reads above are a few hundred bytes and run either way: they
+    // are what proves `body_len` is in range, and the slicing below trusts it.
+    // Only the hash of the body is skipped, and only for a file this process
+    // has already hashed — see [`VERIFIED`].
+    if let Verify::Check(id) = plan {
+        let actual = crc32fast::hash(&buffer[..body_len]);
+        if actual != expected {
+            return Err(Error::BadChecksum {
+                path: path.to_path_buf(),
+                expected,
+                actual,
+            });
+        }
+        if let Some(id) = id {
+            mark_verified(path, id);
+        }
     }
 
     // Everything from here on comes out of the *body*, not out of the footer.
@@ -1616,6 +1823,120 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// Both halves of what [`VERIFIED`] trades, in one test, because a cache
+    /// whose only test is that it is fast is a cache nobody can review.
+    ///
+    /// The skip is not observable through the public API by design — a cached
+    /// open and a fresh one return the same table — so it is observed the only
+    /// way it can be: corrupt the body *without moving the mtime* and see
+    /// whether the read still succeeds. On a settled file it does, and that is
+    /// the documented trade. Move the mtime and it is caught, which is the part
+    /// that has to keep working.
+    #[test]
+    fn a_settled_table_is_checksummed_once_and_a_touched_one_every_time() {
+        let d = dir("verifycache");
+        let path = d.join("logs.arrow");
+        let want = batch();
+        write_table(&path, &want).unwrap();
+
+        // Backdated past `SETTLED`, which is what a block that was published
+        // even a few seconds ago looks like. Restored after every write below,
+        // so the identity the cache holds never changes.
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let backdate = || {
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        backdate();
+        assert_eq!(open_table(&path).unwrap().batches, vec![want]);
+
+        // Flip one bit deep in the covered body. The length does not change and
+        // the mtime is put back, so this is byte-for-byte a different file
+        // wearing the identity the cache remembers.
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = crc_field(&bytes).1 / 2;
+        bytes[mid] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+        backdate();
+        assert!(
+            open_table(&path).is_ok(),
+            "a settled file was re-checksummed; the cache is not doing anything"
+        );
+
+        // The same corruption on a file whose mtime moved is caught, and that
+        // is every real one: a writer that changes a byte changes the mtime,
+        // and nothing in this tree rewrites a published block at all.
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(open_table(&path), Err(Error::BadChecksum { .. })),
+            "a corrupt body with a fresh mtime must still be caught"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A restore is a *replacement*, and neither the length nor the mtime can
+    /// see one. See [`FileId`]: `std::fs::copy` on APFS preserves the source's
+    /// mtime to the nanosecond, as do `cp -p`, `rsync -a` and every backup
+    /// agent, so a block restored from a copy of itself arrives at a verified
+    /// path wearing a verified length and a verified mtime while carrying bytes
+    /// this process has never hashed. Only the inode is different, which is why
+    /// the inode is in the key.
+    ///
+    /// Driven through a rename rather than a `copy`, because that is both what a
+    /// careful restore does — write beside the target, then rename, the same
+    /// trick [`publish`] uses — and the only way to hold the mtime fixed while
+    /// the inode moves.
+    #[test]
+    fn a_block_replaced_under_a_verified_path_is_checksummed_again() {
+        let d = dir("verifyrestore");
+        let path = d.join("logs.arrow");
+        let want = batch();
+        write_table(&path, &want).unwrap();
+
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let backdate = |p: &Path| {
+            File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        backdate(&path);
+        assert_eq!(open_table(&path).unwrap().batches, vec![want]);
+        let verified = fs::metadata(&path).unwrap();
+
+        // The restore: same bytes but for one flipped bit, so the same length,
+        // and the archived mtime put back exactly as `fs::copy` would have.
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = crc_field(&bytes).1 / 2;
+        bytes[mid] ^= 0x01;
+        let staged = d.join("logs.arrow.restored");
+        fs::write(&staged, &bytes).unwrap();
+        backdate(&staged);
+        fs::rename(&staged, &path).unwrap();
+
+        let restored = fs::metadata(&path).unwrap();
+        assert_eq!(restored.len(), verified.len());
+        assert_eq!(restored.modified().unwrap(), verified.modified().unwrap());
+        assert_ne!(
+            restored.ino(),
+            verified.ino(),
+            "the rename did not replace the file, so this proves nothing"
+        );
+
+        assert!(
+            matches!(open_table(&path), Err(Error::BadChecksum { .. })),
+            "a replaced block wearing the mtime of the one it replaced was \
+             served from the cache without being checksummed"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// The corruption a CRC over `[0, body_len)` could never have caught, driven
     /// directly rather than waited for: a footer that parses cleanly and names a
     /// *wider* type than the body holds.
@@ -1943,6 +2264,50 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A hook that fails keeps its block, and the sweep carries on.
+    ///
+    /// This is the ordering `--offload` is built on, stated as a test: the
+    /// unlink is downstream of the copy, so a store that is unreachable costs
+    /// disk rather than data. Mutation check: run the hook after
+    /// `remove_dir_all`, or ignore its error, and the first assertion returns
+    /// 2 instead of 1.
+    #[test]
+    fn a_failing_before_delete_hook_keeps_its_block() {
+        let root = dir("hook");
+        let node = node_id("a");
+        let first = publish(&root, "logs", node, 0, 0, &sealed(1_000, 2_000))
+            .unwrap()
+            .dir;
+        let second = publish(&root, "logs", node, 1, 0, &sealed(3_000, 4_000))
+            .unwrap()
+            .dir;
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let dropped = expire_with(&root, "logs", i64::MAX, &|b| {
+            seen.borrow_mut().push(b.seq);
+            match b.seq {
+                0 => Err(Error::OffloadScheme {
+                    uri: "file://nowhere".into(),
+                }),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(dropped, 1);
+        assert_eq!(*seen.borrow(), vec![0, 1], "every block was offered");
+        assert!(first.is_dir(), "the block whose copy failed is still here");
+        assert!(!second.exists(), "the one beside it went");
+        // And the next sweep retries it, which is the other half of "two
+        // copies, never zero": a failure is a delay, not a leak.
+        assert_eq!(
+            expire_with(&root, "logs", i64::MAX, &|_| Ok(())).unwrap(),
+            1
+        );
+        assert!(scan(&root, "logs").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Free space, for the ingest side to back off on. Only the shape can be
     /// asserted here — the number belongs to whatever volume the test runs on.
     #[test]
@@ -2028,6 +2393,52 @@ mod tests {
         // The operator has to be told which mount type, or the message is a
         // refusal with no next step in it.
         assert!(e.to_string().contains("NFS"), "{e}");
+    }
+
+    /// The other half of that rule: that the mounts it is stated over are the
+    /// ones [`remote_fs`] actually names.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_mount_the_check_refuses_is_one_the_table_names() {
+        for name in ["nfs", "smbfs", "cifs", "webdav", "afpfs", "ftp"] {
+            assert_eq!(remote_fs(name).as_deref(), Some(name));
+        }
+        // The FUSE spelling is the implementation's, and there are several of
+        // them — `macfuse`, `osxfuse`, `fuse-t`. All collapse to the one word
+        // the warning is written about.
+        assert_eq!(remote_fs("macfuse").as_deref(), Some("fuse"));
+        assert_eq!(remote_fs("apfs"), None);
+    }
+
+    /// The other half of that rule: that the mounts it is stated over are the
+    /// ones [`remote_fs`] actually names.
+    ///
+    /// Nothing that runs the tests is mounted on any of them, so the only arm a
+    /// live `statfs` reaches is the fallthrough and the eleven above it are
+    /// worth exactly what this test is worth. A transposed digit in a magic is
+    /// a `SIGBUS` on somebody's NFS mount and a green build here.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_mount_the_check_refuses_is_one_the_table_names() {
+        for (magic, want) in [
+            (0x6969_u64, "NFS"),
+            (0x517b, "SMB"),
+            (0xff53_4d42, "CIFS"),
+            (0xfe53_4d42, "SMB2"),
+            (0x0102_1997, "9P"),
+            (0x5346_414f, "AFS"),
+            (0x00c3_6400, "CephFS"),
+            (0x0116_1970, "GFS2"),
+            (0x7461_636f, "OCFS2"),
+            (0x0bd0_0bd0, "Lustre"),
+            (0x6573_5546, "fuse"),
+        ] {
+            assert_eq!(remote_fs(magic).as_deref(), Some(want), "{magic:#x}");
+        }
+        // ext4 and overlayfs: the runner, the container and every deployment
+        // this check is supposed to stay out of the way of.
+        assert_eq!(remote_fs(0xef53), None);
+        assert_eq!(remote_fs(0x794c_7630), None);
     }
 
     /// A cleanup that cannot run is not the failure the caller has to act on.

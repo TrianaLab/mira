@@ -36,13 +36,43 @@
 //! There is deliberately no userspace buffering. A `BufWriter` would batch the
 //! syscalls, but bytes sitting in a `Vec` in this process do not survive the
 //! process dying, which is exactly the failure this log is claiming to cover.
-//! One `write(2)` per export at a few tens of microseconds is affordable
-//! because an export is a batch and not a record: the append rate is section
-//! 11's "Ingest throughput" row divided by the batch size, and the load
-//! generator sends 8,192 records per export. At one connection that row is
-//! 629,384 records/s, so 77 appends/s; at the thirty-two-connection plateau,
-//! 1,537,875 records/s is 188. Three digits of appends per second is not a rate
-//! a syscall per append can be the ceiling of.
+//! That argument still holds and is the reason a buffer is not the fix below.
+//!
+//! # The append rate is not the ceiling; the serialised section is
+//!
+//! This paragraph used to finish the one above by pricing the syscall: one
+//! `write(2)` per export "at a few tens of microseconds", against 188 appends
+//! per second at the thirty-two-connection plateau, and concluded that "three
+//! digits of appends per second is not a rate a syscall per append can be the
+//! ceiling of". Measured, it is off by two orders of magnitude and it was the
+//! wrong quantity.
+//!
+//! [`crate::diag`] times the wait and the hold separately. At the plateau
+//! `wal.write` means 2.1–2.6 ms, not tens of microseconds, and `wal.held` —
+//! the whole critical section — means 2.2–3.0 ms, of which the write is ~95%.
+//! At 250–330 appends/s that is 73–78% occupancy of **one** mutex shared by
+//! all three signals and every shard, and `wal.lock_wait` is 77–89% of the
+//! whole of `submit` in every configuration measured. The arithmetic above
+//! omitted hold time and the fact that the lock is global, which together are
+//! the entire effect.
+//!
+//! Two consequences worth stating plainly. `Mutex` here resolves to the pthread
+//! backend, so a contended `lock()` parks the OS thread in the kernel — a
+//! parked tokio worker runs no other task and is not replaced, which is why
+//! `wal.inflight_max` comes out equal to the worker count exactly, and why a
+//! task that only sleeps 50 ms returns 110 ms late at 96 connections. And
+//! adding workers does not help: 12 to 48 moved throughput 2% and multiplied
+//! `wal.lock_wait` by six, because the ceiling is the serialised section rather
+//! than scheduling capacity.
+//!
+//! ponytail: one global log with one mutex, and the ceiling is ~1/2.5 ms ≈ 400
+//! appends/s, or roughly 2.2M records/s at 8,192-record exports. The upgrade
+//! path is group commit — one `writev` for every frame that arrived while the
+//! last write was in flight, with the ack still released after the write, so it
+//! is not the `BufWriter` ruled out above — or one log per signal, which is
+//! three mutexes for free. Neither needs coordination state. Neither is in this
+//! tree, because neither can be validated to section 11's standard on the box
+//! that produced these numbers; see `docs/market.md`.
 //!
 //! # The frame is the OTLP request, in its canonical protobuf encoding
 //!
@@ -259,6 +289,15 @@ struct Inner {
 /// can block under writeback pressure, so **callers must not invoke these from
 /// a tokio runtime worker** — section 5's rule that blocking work goes through
 /// `spawn_blocking` applies here for the same reason it applies to `publish`.
+///
+/// `pipeline::submit` breaks that rule, and the ingest plateau is what it costs.
+/// It calls [`Wal::append_then`] directly from the worker handling the export,
+/// so the mutex below is contended by runtime workers and taken with a
+/// `lock()` that parks them in the kernel. Moving the call to `spawn_blocking`
+/// is not the fix either: it would unpark the workers and leave the same single
+/// serialised section, now with a thread handoff per append on top. The fix is
+/// to make the section shorter or to stop having one of it — see the module
+/// docs, which name both and say why neither is in this tree yet.
 pub struct Wal {
     inner: Mutex<Inner>,
     dir: PathBuf,
@@ -374,7 +413,16 @@ impl Wal {
             });
         };
 
+        // Three probes, described in `crate::diag`: how long this caller waits
+        // for the one mutex all three signals and every shard share, how long
+        // it then holds it, and how many callers are inside at once. Section
+        // 11's ingest plateau is diagnosed from the ratio between the first two
+        // and it is not reproducible without them.
+        let _inflight = crate::diag::wal_scope();
+        let t_enter = std::time::Instant::now();
         let mut inner = self.lock();
+        crate::diag::WAL_LOCK_WAIT.record(t_enter.elapsed().as_nanos() as u64);
+        let t_held = std::time::Instant::now();
 
         if inner.written >= SEGMENT_BYTES {
             self.roll(&mut inner)?;
@@ -403,15 +451,18 @@ impl Wal {
         // is the case `FrameReader` is built to stop at. It cannot corrupt a
         // frame that was already complete, because the file is opened in
         // append mode and nothing rewrites what is behind the offset.
+        let t_write = std::time::Instant::now();
         inner.file.write_all(&header).ctx(&inner.path)?;
         inner.file.write_all(body).ctx(&inner.path)?;
         inner.file.write_all(&crc.to_le_bytes()).ctx(&inner.path)?;
+        crate::diag::WAL_WRITE.record(t_write.elapsed().as_nanos() as u64);
 
         inner.written += (HEADER_LEN + body.len() + CRC_LEN) as u64;
         inner.next_seq += 1;
         inner.dirty = true;
         inner.pending[signal.index()].insert(seq);
         then(seq);
+        crate::diag::WAL_HELD.record(t_held.elapsed().as_nanos() as u64);
         Ok(seq)
     }
 
@@ -476,22 +527,68 @@ impl Wal {
     /// `F_FULLFSYNC` and costs about 4 ms, which is the whole reason it is not
     /// on the ack path.
     pub fn sync(&self) -> Result<()> {
-        let mut inner = self.lock();
-        if !inner.dirty && inner.retired.is_empty() {
-            return Ok(());
-        }
-        // Retired segments first: they are older, so they are what a power cut
-        // would lose the most of. Taken out of the struct rather than iterated
-        // in place so a failure part-way through does not re-sync the ones that
-        // already succeeded on the next tick.
-        for (path, file) in std::mem::take(&mut inner.retired) {
-            crate::sync_data(&file).ctx(&path)?;
-        }
-        if inner.dirty {
-            crate::sync_data(&inner.file).ctx(&inner.path)?;
+        // Everything this needs is collected under the lock and forced outside
+        // it. `F_FULLFSYNC` is 4,230 us on this machine and the timer fires
+        // four times a second, so holding the log's mutex across it stalled
+        // every appender in the process for milliseconds, four times a second,
+        // plus once more per segment rolled since the last tick. That does not
+        // move the mean — it is ~2% duty cycle — but it lands as a whole
+        // multiple of a 2.2 ms append on whichever exports are unlucky, and a
+        // tail latency is made of rare things (see `retired`, which exists for
+        // exactly this reason one level down).
+        //
+        // Nothing about the ordering guarantee needs the lock held: an fsync
+        // forces bytes `write(2)` already ordered, and forcing them late is
+        // indistinguishable from a tick that had not fired yet.
+        let (retired, live, dirty) = {
+            let mut inner = self.lock();
+            if !inner.dirty && inner.retired.is_empty() {
+                return Ok(());
+            }
+            // Taken out of the struct rather than iterated in place so a
+            // failure part-way through does not re-sync the ones that already
+            // succeeded on the next tick.
+            let retired = std::mem::take(&mut inner.retired);
+            let dirty = inner.dirty;
+            // Cleared before the force, not after. An append that lands while
+            // this is in flight sets it again and is covered by the next tick;
+            // clearing afterwards would instead swallow that append's flag and
+            // leave bytes nothing ever forces.
             inner.dirty = false;
+            let live = dirty
+                .then(|| {
+                    inner
+                        .file
+                        .try_clone()
+                        .ctx(&inner.path)
+                        .map(|f| (inner.path.clone(), f))
+                })
+                .transpose()?;
+            (retired, live, dirty)
+        };
+
+        // Retired segments first: they are older, so they are what a power cut
+        // would lose the most of.
+        let force = || -> Result<()> {
+            for (path, file) in &retired {
+                crate::sync_data(file).ctx(path)?;
+            }
+            if let Some((path, file)) = &live {
+                crate::sync_data(file).ctx(path)?;
+            }
+            Ok(())
+        };
+        let forced = force();
+        // Put the flag back: these bytes are still unforced, and a tick that
+        // failed must not be the reason the next one skips them. Written flat
+        // rather than as `inspect_err` so that the part no test can reach is
+        // the one assignment and not a four-line closure: `sync_data` degrades
+        // to `fsync` rather than failing, so nothing short of a filesystem
+        // going away under the process gets here.
+        if dirty && forced.is_err() {
+            self.lock().dirty = true;
         }
-        Ok(())
+        forced
     }
 
     /// The sequence that will be handed to the next append.

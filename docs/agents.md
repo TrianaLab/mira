@@ -78,10 +78,11 @@ Three properties matter more than the list:
   and `from`/`to` go to anything. `truncated: true` means the answer is a sample and the
   model should narrow rather than conclude.
 
-Every response also carries `stats` — `blocks_total`, `blocks_scanned`, `rows_scanned`,
-`rows_matched`, `elapsed_us`. That is the agent's own cost signal: `rows_matched` above
-`limit` means it is looking at a page, and `blocks_scanned` well below `blocks_total`
-means the pruning did its job.
+Every response that scans blocks also carries `stats` — `blocks_total`,
+`blocks_scanned`, `rows_scanned`, `rows_matched`, `elapsed_us`. That is the agent's own
+cost signal: `rows_matched` above `limit` means it is looking at a page, and
+`blocks_scanned` well below `blocks_total` means the pruning did its job. `list_alerts`
+is the one tool without it, because it reads in-memory rule state and scans nothing.
 
 ## A root-cause investigation, end to end
 

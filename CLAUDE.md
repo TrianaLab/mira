@@ -56,7 +56,7 @@ existed when the line was last edited; raise it when you raise coverage, never
 lower it.
 
 `ci.yml` is a dispatcher: every `run:` in it is a `make ci-*` target in `ci.mk`,
-and `scripts/check_ci.py` fails the build if one is not — so never write shell
+and `make workflows` fails the build if one is not — so never write shell
 into that file. `make ci` runs every leg here, `make ci-<leg>` runs one, and
 `make ci-changes` says which legs a diff needs. Gates go in the `Makefile`; only
 leg grouping, the path filter and pinned runner tool versions go in `ci.mk`.
@@ -83,7 +83,7 @@ ls -l target/release/mira
 `--target` is not optional: the graph is host-dependent (`core-foundation-sys`
 is macOS-only), so without it a Linux runner counts one crate fewer than this
 Mac and the drift gate fires on the runner rather than on a real change.
-`scripts/check_drift.py` pins the same triple.
+`crates/xtask` pins the same triple.
 
 That count includes the three workspace members, so it is three above the number
 the README states. If it moves, update the README bullet, `docs/architecture.md`
@@ -101,6 +101,14 @@ backends.
   non-obvious choice, the section explaining *why* is part of the diff.
 - Comments explain **why**, not what. A deliberate simplification with a known
   ceiling gets a `ponytail:` comment naming the ceiling and the upgrade path.
+- **Every published performance number lives in `measurements.kyaml`**, with the
+  sites that quote it listed beside it, and `make measurements-check` fails the
+  build when a site and the registry disagree. Adding a figure to a document
+  without an entry there is how four files end up quoting three different
+  numbers. What each quantity means is
+  [the measurement contract](docs/internals/measurement.md); re-measure with
+  `scripts/measure/conn-sweep.sh` and fold it back with `make
+  measurements-ingest RUN=...`.
 
 ## Driving the TUI headlessly
 

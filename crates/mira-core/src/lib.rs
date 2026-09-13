@@ -20,12 +20,14 @@
 pub mod attrs;
 pub mod block;
 pub mod bloom;
+pub mod diag;
 pub mod error;
 pub mod frame;
 pub mod identity;
 pub mod json;
 pub mod logs;
 pub mod metrics;
+pub mod offload;
 pub mod query;
 pub mod schema;
 pub mod series;
@@ -977,6 +979,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A query reads the attribute tables when it needs them and not before —
+    /// and every table it does read is still checksummed in full.
+    ///
+    /// The two halves are one test on purpose, because each is the other's
+    /// guard. Corrupt one block's `log_attrs.arrow` and leave everything else
+    /// alone:
+    ///
+    ///   - a query with no attribute predicate that the damaged block does not
+    ///     contribute a row to *succeeds*, having scanned that block's root
+    ///     table and never touched its attributes;
+    ///   - a query with an attribute predicate over it fails `BadChecksum`;
+    ///   - a query that emits one of its rows fails `BadChecksum`.
+    ///
+    /// Reverting `query::Block::open` to loading the attribute tables eagerly
+    /// fails the first assertion — the corrupt file is read by a query that
+    /// never looks at it. Dropping the CRC check, or rendering a block without
+    /// having loaded its detail through the verified path, fails the other
+    /// two: a bad block would be served.
+    #[test]
+    fn a_corrupt_attribute_table_is_caught_by_every_query_that_reads_it_and_no_other() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-attr-crc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Different row counts, so a body substring picks one block out. Block
+        // 0 is older and smaller, and it is the one that gets damaged.
+        let mut dirs = Vec::new();
+        for (seq, (service, n, base)) in [("checkout", 3usize, 1_000u64), ("payments", 10, 5_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request(service, n, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            let p = block::publish(&root, "logs", block::node_id("a"), seq as u64, 0, &sealed);
+            dirs.push(p.unwrap().dir);
+        }
+        let damaged = dirs[0].join("log_attrs.arrow");
+
+        // One byte, inside the region the footer's `mira.crc32.len` covers. The
+        // CRC is checked before a single byte of the body is parsed, so this is
+        // an error and not a malformed-Arrow panic — and the assertion below is
+        // what says the mutation landed where it was aimed.
+        let mut bytes = std::fs::read(&damaged).unwrap();
+        bytes[64] ^= 0xff;
+        std::fs::write(&damaged, &bytes).unwrap();
+        assert!(
+            matches!(block::open_table(&damaged), Err(Error::BadChecksum { .. })),
+            "the corruption must be detectable at all, or the rest proves nothing"
+        );
+
+        let q = |terms: Vec<Term>, limit: usize| Search {
+            signal: Signal::Logs,
+            from: 0,
+            to: i64::MAX,
+            terms,
+            limit,
+            after: None,
+        };
+        let body = |v: &str| Term {
+            target: Target::Field("body".into()),
+            op: Op::Contains,
+            value: QV::Str(v.into()),
+        };
+
+        // `contains` has no zone summary, so nothing prunes: both blocks are
+        // opened and every row of both is compared. Only the ten-row block
+        // holds "line 7", so the damaged block contributes nothing and is never
+        // rendered.
+        let r = query::search(&root, &q(vec![body("line 7")], 100)).unwrap();
+        assert_eq!(r.stats.blocks_total, 2);
+        assert_eq!(r.stats.blocks_scanned, 2, "neither block may prune");
+        assert_eq!(r.stats.rows_scanned, 13, "3 + 10 root rows, all compared");
+        assert_eq!(r.stats.rows_matched, 1);
+
+        // ...and the same query over a token no row holds still reads both root
+        // tables and still does not care that one block's attributes are junk.
+        let r = query::search(&root, &q(vec![body("zqxjw")], 100)).unwrap();
+        assert_eq!(r.stats.blocks_scanned, 2);
+        assert_eq!(r.stats.rows_matched, 0);
+
+        // An attribute predicate is evaluated against the attribute tables, so
+        // now it is read — and refused. "http.method" is on every row of both
+        // blocks, so the bloom sidecar cannot prune the damaged one.
+        let attr = Term {
+            target: Target::Attr("http.method".into()),
+            op: Op::Eq,
+            value: QV::Str("GET".into()),
+        };
+        let e = query::search(&root, &q(vec![attr], 100))
+            .err()
+            .expect("an attribute predicate over a damaged block must not succeed");
+        assert!(
+            matches!(&e, Error::BadChecksum { path, .. } if path == &damaged),
+            "an attribute predicate must verify what it reads, got {e}"
+        );
+
+        // And so is rendering: a row of the damaged block emits its attributes,
+        // so a query that reaches it fails rather than returning a row with
+        // attributes read out of unverified bytes.
+        let e = query::search(&root, &q(vec![], 100))
+            .err()
+            .expect("rendering a row of a damaged block must not succeed");
+        assert!(
+            matches!(&e, Error::BadChecksum { path, .. } if path == &damaged),
+            "a rendered row must verify what it reads, got {e}"
+        );
+
+        // The undamaged block on its own is still perfectly readable: the
+        // failure above is this file's, not the query's.
+        let r = query::search(&root, &q(vec![body("line 9")], 100)).unwrap();
+        assert_eq!(r.stats.rows_matched, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Paging must be a partition of the one-shot answer: every row once, in
     /// the same order, no matter where the page boundaries land.
     ///
@@ -1817,6 +1936,121 @@ mod tests {
         .unwrap();
         assert_eq!(r.stats.rows_matched, 1_000);
         assert_eq!(r.stats.blocks_scanned, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A block that has been to an object store and back answers exactly what
+    /// it answered before it left — in both tiers.
+    ///
+    /// This is the claim `--offload` has to make and the only one worth
+    /// testing at this level. Everything below the query is what would break
+    /// if the copy were not byte-exact: `Block::open` checks `mira.crc32` over
+    /// the whole body on every table it maps, so a single flipped or dropped
+    /// byte is an `Error::BadChecksum` here and not a wrong answer. The cold
+    /// block is in the set on purpose — it carries a `cold` marker and ZSTD
+    /// table bodies, so a copy that moved only `*.arrow` would leave a block
+    /// that reads as hot and a compaction sweep that rewrites it again.
+    #[test]
+    fn an_offloaded_block_comes_back_answering_the_same_query() {
+        use query::{Op, Search, Signal, Target, Term, Value as QV};
+
+        let root = std::env::temp_dir().join(format!("mira-offload-e2e-{}", std::process::id()));
+        let store = root.join("cold-store");
+        let data = root.join("data");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let now = 4 * block::COLD_AFTER_NS;
+        let node = block::node_id("a");
+        let mut dirs = Vec::new();
+        for (seq, base) in [
+            (now - 90 * 60 * 1_000_000_000) as u64,
+            (now - 60 * 1_000_000_000) as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut b = logs::LogsBuilder::new();
+            b.append_request(&request("checkout", 500, base)).unwrap();
+            let sealed = b.finish().unwrap();
+            dirs.push(
+                block::publish(&data, "logs", node, seq as u64, 0, &sealed)
+                    .unwrap()
+                    .dir,
+            );
+        }
+        // One of the two through the cold tier, so the round trip is tested
+        // over both on-disk shapes rather than only the uncompressed one.
+        assert_eq!(
+            block::compact(&data, "logs", node, now - block::COLD_AFTER_NS).unwrap(),
+            1
+        );
+
+        let ask = || {
+            query::search(
+                &data,
+                &Search {
+                    signal: Signal::Logs,
+                    from: 0,
+                    to: i64::MAX,
+                    terms: vec![Term {
+                        target: Target::Attr("service.name".into()),
+                        op: Op::Eq,
+                        value: QV::Str("checkout".into()),
+                    }],
+                    limit: 2_000,
+                    after: None,
+                },
+            )
+            .unwrap()
+        };
+        let before = ask();
+        assert_eq!(
+            (before.stats.rows_matched, before.stats.blocks_scanned),
+            (1_000, 2)
+        );
+
+        // The sweep retention would run: copy, then unlink, block by block.
+        let t = offload::Target::parse(&format!("file://{}", store.display())).unwrap();
+        let dropped =
+            block::expire_with(&data, "logs", i64::MAX, &|b| t.push("logs", b).map(|_| ()))
+                .unwrap();
+        assert_eq!(dropped, 2);
+        assert!(ask().stats.rows_matched == 0, "the local copies are gone");
+
+        // The store's own listing is the catalog: no index was written, and
+        // what comes back out of `readdir` is what went in.
+        let listed = t.list("logs").unwrap();
+        assert_eq!(listed.len(), 2);
+        for b in &listed {
+            assert!(t.pull("logs", b, &data, node).unwrap());
+        }
+
+        let after = ask();
+        assert_eq!(after.stats.rows_matched, before.stats.rows_matched);
+        assert_eq!(after.stats.blocks_scanned, before.stats.blocks_scanned);
+        // Byte-identical rendered rows, not just the same count: a copy that
+        // reordered tables or lost a sidecar could still match on totals.
+        assert_eq!(after.json, before.json);
+        // The tier survived with the bytes. `cold` is written last by
+        // `compact` and is the only thing that stops the next sweep rewriting
+        // an already-compressed block, so a copy that dropped it would cost
+        // one pointless full rewrite per restored block per hour.
+        let cold: Vec<_> = block::scan(&data, "logs")
+            .unwrap()
+            .iter()
+            .map(|b| b.dir.join("cold").exists())
+            .collect();
+        assert_eq!(cold, vec![true, false], "one cold, one hot, as they left");
+        // And the compressed one is still compressed, which `open_table`
+        // answering at all already proves the CRC over: a ZSTD body whose
+        // checksum did not survive the copy is `BadChecksum`, not a wrong row.
+        let hot = block::open_table(&dirs[1].join("logs.arrow")).unwrap();
+        assert_eq!(hot.zero_copy_ratio().0, hot.zero_copy_ratio().1);
+        let (inside, total) = block::open_table(&dirs[0].join("logs.arrow"))
+            .unwrap()
+            .zero_copy_ratio();
+        assert!(inside < total, "the restored cold block decompressed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

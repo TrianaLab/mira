@@ -769,9 +769,20 @@ impl<'a> Scan<'a> {
             return Ok((None, Vec::new()));
         }
 
-        let Some(b) = Block::open(bref, self.q.signal)? else {
+        let Some(mut b) = Block::open(bref, self.q.signal)? else {
             return Ok((None, Vec::new()));
         };
+        // An attribute predicate is evaluated against the attribute tables, so
+        // they have to be there before `select`. Nothing else in `select`
+        // reads them: a `Target::Field` term is a column of the root.
+        if self
+            .q
+            .terms
+            .iter()
+            .any(|t| matches!(t.target, Target::Attr(_)))
+        {
+            b.detail(bref)?;
+        }
         let sel = b.select(self.q, bref);
         let hits = b.time().map_or_else(Vec::new, |time| {
             sel.iter()
@@ -785,6 +796,15 @@ impl<'a> Scan<'a> {
                 })
                 .collect()
         });
+        // Rendering a row emits its attributes at every level, and the render
+        // pass runs after the fan-out has joined. Loading here rather than
+        // there keeps the page-ins parallel, at the cost of loading for a block
+        // whose hits are later sorted out of the limit — an over-approximation
+        // bounded by the blocks that matched at all, against the alternative of
+        // every block that was looked at.
+        if !hits.is_empty() {
+            b.detail(bref)?;
+        }
         Ok((Some(b), hits))
     }
 }
@@ -822,6 +842,16 @@ pub(crate) struct Block {
     /// Rows that hang off a root row rather than being one: a span's events and
     /// its links. Empty for logs.
     children: Vec<Child>,
+    /// Whether the five fields above have been read yet.
+    ///
+    /// They are not read at open. `block::open_table` CRC32s every byte it
+    /// maps — that is the guarantee, not overhead — and on this corpus the
+    /// attribute tables are 42.9% of a logs block and 45.7% of a traces block
+    /// (`log_attrs` 768,352 KiB of 1,794,752; `span_attrs` 780,372 of
+    /// 1,710,020). A query with no attribute predicate that lands on a block
+    /// contributing no rows was hashing all of that to read a timestamp
+    /// column. See [`Block::detail`] for who asks for them and when.
+    detail: bool,
 }
 
 /// A child table and the attribute table keyed by its `id`.
@@ -925,13 +955,49 @@ impl Block {
         let Some(root) = load(signal.root())? else {
             return Ok(None);
         };
-        let mut children = Vec::new();
-        for &(label, table, attrs) in child_tables(signal) {
+        Ok(Some(Block {
+            signal,
+            attrs: None,
+            resource_attrs: None,
+            scope_attrs: None,
+            children: Vec::new(),
+            detail: false,
+            root,
+        }))
+    }
+
+    /// Map everything that is not the root table: the three attribute levels
+    /// and, for traces, the child tables and their own attributes.
+    ///
+    /// Separate from [`open`](Self::open) because these are the expensive
+    /// tables and most blocks in a scan need none of them. Two callers ask,
+    /// both in `scan_one`: a query carrying an attribute predicate, before
+    /// `select`, because the predicate is evaluated against them; and any
+    /// block that produced a hit, because rendering a row emits its
+    /// attributes. A block that matches nothing and is asked nothing about
+    /// attributes never maps them and never hashes them.
+    ///
+    /// Idempotent, so the two callers can both fire without checking.
+    ///
+    /// This does not weaken the checksum: what changes is *which* tables a
+    /// query reads, and every table it reads is still verified in full before
+    /// a byte of it is returned. A corrupt attribute table that no query
+    /// touches is caught by the first query that touches it.
+    fn detail(&mut self, bref: &Src) -> Result<()> {
+        if self.detail {
+            return Ok(());
+        }
+        self.detail = true;
+        let load = |name: &str| bref.load(name);
+        self.attrs = load(self.signal.attrs())?.map(Attrs::new);
+        self.resource_attrs = load("resource_attrs")?.map(Attrs::new);
+        self.scope_attrs = load("scope_attrs")?.map(Attrs::new);
+        for &(label, table, attrs) in child_tables(self.signal) {
             // A block whose spans carried no events writes no `span_events`
             // file at all (`publish` skips empty tables), which is absence, not
             // damage.
             if let Some(rows) = load(table)? {
-                children.push(Child {
+                self.children.push(Child {
                     label,
                     by_parent: crate::series::index_by_parent(&rows),
                     parent_of_id: index_parent_of_id(&rows),
@@ -940,14 +1006,7 @@ impl Block {
                 });
             }
         }
-        Ok(Some(Block {
-            signal,
-            attrs: load(signal.attrs())?.map(Attrs::new),
-            resource_attrs: load("resource_attrs")?.map(Attrs::new),
-            scope_attrs: load("scope_attrs")?.map(Attrs::new),
-            children,
-            root,
-        }))
+        Ok(())
     }
 
     /// The root's time column as a raw slice, straight out of the mapping.
@@ -2966,7 +3025,11 @@ mod tests {
         let open = bench_block(rows);
         let (lo, hi) = (open.sealed.min_ts, open.sealed.max_ts);
         let src = Src::open(&open);
-        let b = Block::open(&src, Signal::Logs).unwrap().unwrap();
+        let mut b = Block::open(&src, Signal::Logs).unwrap().unwrap();
+        // Half the cases below are attribute predicates, which `scan_one` would
+        // have loaded the tables for before calling `select`. This measures
+        // `select`, so it does the same thing by hand.
+        b.detail(&src).unwrap();
         let n = b.root.num_rows();
         assert_eq!(n, rows);
 
@@ -3047,9 +3110,16 @@ mod tests {
         // the cursor filter and the JSON of `limit` rows — is the "no term"
         // line, and that is the claim in docs/architecture.md section 11 that
         // the per-block cost is paging rather than scanning.
+        //
+        // Measured twice, because the CRC is the larger half and it is paid
+        // once per file per process rather than once per open (`block::
+        // VERIFIED`). A block published a moment ago is inside the settle
+        // window and re-verifies on every open, which is the first pass; the
+        // second backdates the files to what a block even a minute old looks
+        // like, and the difference between the two columns *is* the checksum.
         let dir = std::env::temp_dir().join(format!("mira-scan-cost-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        crate::block::publish(&dir, "logs", 1, 1, 0, &open.sealed).unwrap();
+        let bref = crate::block::publish(&dir, "logs", 1, 1, 0, &open.sealed).unwrap();
         let one = (
             "no term, limit 1",
             Search {
@@ -3057,14 +3127,73 @@ mod tests {
                 ..all(Vec::new())
             },
         );
-        for (name, s) in [&cases[0], &one, &cases[3], &cases[5]] {
-            let _ = search(&dir, s).unwrap();
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                std::hint::black_box(search(&dir, s).unwrap());
-            }
-            let ns = t.elapsed().as_nanos() as f64 / (reps * n) as f64;
-            println!("  full search: {name:21} {ns:8.3} ns/row");
+        let picks = [&cases[0], &one, &cases[3], &cases[5]];
+        let time_all = || {
+            picks.map(|(name, s)| {
+                let _ = search(&dir, s).unwrap();
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(search(&dir, s).unwrap());
+                }
+                (*name, t.elapsed().as_nanos() as f64 / (reps * n) as f64)
+            })
+        };
+        let verifying = time_all();
+        // Taken while every open still checksums, so the comparison below is
+        // verified-read against cached-read and not cached against itself.
+        let want: Vec<String> = picks
+            .iter()
+            .map(|(_, s)| search(&dir, s).unwrap().json)
+            .collect();
+
+        // Backdating rather than sleeping out the window: the default 4,096-row
+        // size of this test runs in `make test`, and two seconds of nothing is
+        // not a thing to put in the normal suite.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for f in std::fs::read_dir(&bref.dir).unwrap() {
+            std::fs::File::options()
+                .write(true)
+                .open(f.unwrap().path())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let settled = time_all();
+
+        // The share is measured; a rate would not be. Dividing the saved time by
+        // the block's bytes gives 26-30 GB/s here, which is not `crc32fast`
+        // being five times its documented speed — it is this denominator being
+        // wrong twice over. `Block::open` does not load every table in the
+        // directory, and a block this size sits in cache where the multi-GiB
+        // corpus that produced the old 5.2 GB/s figure does not — that corpus
+        // is bound by page cache, which is what made 885 ms look like a
+        // checksum rate. So print what was timed and let the corpus
+        // measurement be the corpus measurement.
+        let bytes: u64 = std::fs::read_dir(&bref.dir)
+            .unwrap()
+            .map(|f| f.unwrap().metadata().unwrap().len())
+            .sum();
+        println!(
+            "  block on disk: {:.1} MiB over {n} rows, {:.0} bytes/row",
+            bytes as f64 / (1024.0 * 1024.0),
+            bytes as f64 / n as f64,
+        );
+        for ((name, was), (_, now)) in verifying.iter().zip(&settled) {
+            println!(
+                "  full search: {name:21} {was:8.3} -> {now:8.3} ns/row  {:.2}x  \
+                 checksum {:4.1}% of the read path",
+                was / now,
+                100.0 * (was - now) / was,
+            );
+        }
+        // The correctness half, and the reason this is not `#[ignore]`d: a
+        // skipped checksum must not change a single answer.
+        for ((name, s), want) in picks.iter().zip(&want) {
+            assert_eq!(
+                &search(&dir, s).unwrap().json,
+                want,
+                "{name} read differently once its tables were cached"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

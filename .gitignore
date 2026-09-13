@@ -44,7 +44,9 @@ target
 # cargo-cyclonedx output from `make sbom`
 *.cdx.json
 
-# CPython bytecode for the scripts under scripts/, written on first import.
+# CPython bytecode. Nothing under scripts/ is Python any more — the checks are
+# `crates/xtask` — but mkdocs still runs in .venv-docs/ and a stray import here
+# should not be a commit.
 __pycache__/
 
 # Agent worktrees and session scratch. Never a commit.

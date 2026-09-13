@@ -194,10 +194,12 @@ query, run on the same blocks the screen above reads.
   rows written    30.7k
   blocks          1 on disk  ·  1 published
   bytes on disk   9.1 MiB  ·  310 B/row
+  rejected        0 shed  ·  0 failed  ·  0 refused
 ── metrics ──────────────────────────────────────────────────────────────────────────────────────────────────────────
   rows written    4608
   blocks          1 on disk  ·  1 published
   bytes on disk   895.6 KiB  ·  199 B/row
+  rejected        0 shed  ·  0 failed  ·  0 refused
 ```
 
 **65 MiB peak resident** for 51,237 records ingested and 17 queries served, in a
@@ -221,8 +223,13 @@ curl -s localhost:4318/mcp -H 'content-type: application/json' -d '{
   "params": { "name": "query_records", "arguments": {
     "signal": "traces",
     "where": [ { "attr": "exception.type", "eq": "payments.CardDeclined" } ],
-    "limit": 1 } } }'
+    "limit": 1 } } }' | jq -r '.result.content[0].text'
 ```
+
+MCP is JSON-RPC, so the 200 body is
+`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"…"}],"isError":false}}`
+and the answer is the JSON string in `text` — which is why the `jq` is there.
+The same object comes back unwrapped from `POST /api/v1/query`.
 
 ```json
 {

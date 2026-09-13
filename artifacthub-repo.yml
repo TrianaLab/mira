@@ -4,7 +4,7 @@
 # badge to a repository whose metadata it can fetch and whose `repositoryID`
 # matches the one it issued — which is why the ID below is the real one and not
 # a placeholder: a wrong ID is not a warning, it is a silently unverified
-# repository. `scripts/check_drift.py` fails the build if the placeholder ever
+# repository. `cargo run -p xtask -- drift` fails the build if the placeholder ever
 # comes back.
 #
 # For an OCI repository there is no `index.yaml` to put this beside, so it

@@ -36,13 +36,17 @@ MIRA_DIFF_SEED=12858170866899772564 cargo test -p miradb-core --test differentia
 ## 2. A live instance and the built-in generator
 
 ```sh
-make build      # cargo build --release --locked --bin mira --example loadgen
+make build      # two `cargo build --release --locked -p miradb` runs: --bin mira, then --example loadgen
 ./target/release/mira --data-dir /tmp/mira-dev
 ```
 
 Name the example: `cargo build --release` on its own does **not** build one, and
 `target/release/examples/loadgen` — which every command below runs — is simply
-absent afterwards.
+absent afterwards. Name it in a *second* invocation, too: an example compiles
+against the dev-dependencies, so selecting both in one command unifies their
+features into the binary's own graph and links 371 KiB of `tokio/test-util` and
+`tower` middleware into the shipped artifact. `make build` is the one-liner that
+gets this right; the reasoning is in the target's own comment.
 
 `4317` is OTLP/gRPC, `4318` is OTLP/HTTP plus the query API, MCP and the UI.
 
@@ -59,11 +63,12 @@ report.
 Liveness is a constant 200 — a flusher that stops takes the process with it, so
 answering at all is the answer, and restarting a node whose volume is full fixes
 nothing. Readiness asks whether an export can still be made *durable*, so it
-turns 503 once publishes have been failing for `pipeline::UNREADY_AFTER`, which
-is the state that should take a node out of a Service's endpoints:
+turns 503 once publishes have been failing for `pipeline::UNREADY_AFTER` — 120
+seconds — which is the state that should take a node out of a Service's
+endpoints. `stalled_s` appears only in that body, so it is never below 120:
 
 ```json
-{"status":"unavailable","signal":"logs","stalled_s":63,
+{"status":"unavailable","signal":"logs","stalled_s":180,
  "reason":"this node has not been able to store an export for this signal; the usual cause is a full or unwritable volume"}
 ```
 
@@ -124,12 +129,14 @@ alone:
 ```
 
 ```
---for 30s        how long to run     (with --demo: how much history to lay down)
+--for 30s        stop on a clock     (with --demo: how much history to lay down)
+--records N      stop on a count      (use this for anything you will publish)
 --conns 64       writer connections   (0 = read-only)
 --readers 8      query threads        (0 = write-only, the default)
 --batch 8192     records per export   (the Collector batch processor's default)
 --pid N          the server's pid, for the resident-set axis
 --data-dir PATH  the server's data dir, for the cost-per-GB axis
+--emit PATH      append the run's figures as JSON, for measurements.kyaml
 --addr HOST:PORT
 --demo           the realistic generator instead of the harness (section 2)
 --selftest       assert the demo's invariants in memory and exit (section 2)
@@ -139,6 +146,16 @@ alone:
 which they have to be: Mira reads through `mmap`, so most of what it costs a
 machine is page cache it never allocated and a heap counter would report a
 flattering number.
+
+`--records` and `--for` are the same run with different stopping conditions, and
+only one of them leaves a reproducible corpus behind. `--records N` divides the
+rounds evenly across the connections before the first byte goes out, so a slow
+box sends exactly the bytes a fast one did and takes longer; `--for` sends
+whatever fits in the time, which measures the afternoon. `--emit` writes what the
+run measured, keyed the way `measurements.kyaml` is keyed, appending one object
+per line so a multi-pass sweep lands in one file —
+[the measurement contract](measurement.md) is what those keys mean and
+`scripts/measure/conn-sweep.sh` is the sweep that produces the published set.
 
 ### Reading it
 
@@ -274,9 +291,17 @@ server's CPU time either side of the run and print the delta, so the `cpu` line
 reports both:
 
 ```
-ingest   992305 records/s   129.7 MiB/s wire   0 shed   0 resets
-cpu      1.13 cores busy   865147 records/s/core
+$ ./target/release/examples/loadgen --records 20000000 --conns 4 --batch 8192 \
+    --pid $P --data-dir /tmp/mira-e2e
+ingest   1199561 records/s   156.7 MiB/s wire   0 shed   0 resets
+         9961472 logs + 9961472 spans + 14592 points in 16.6s, 4 conns x 8192 records
+cpu      1.31 cores busy   912891 records/s/core
 ```
+
+Do not check that division to two decimals: the per-core figure divides by the
+*unrounded* core count, so `1199561 / 1.31` is 915,695 and the line says 912,891.
+An earlier version of this page printed a pair that could not be reconciled at
+any rounding, which is how the habit of checking started.
 
 The aggregate rate is a property of the offered load — raise `--conns` and it
 moves without a line of the server changing. The per-core rate is a property of
@@ -295,11 +320,40 @@ binary and the same command. Nothing in the output says so; the only tell is
 records and scans 1 block, yet costs 62 ms. `rows_matched` is an honest count,
 so the whole block's match set is computed before the head of it is taken — at a
 32 MiB target block that is ~205k rows — but that part is nearly free:
-`MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core --lib scan_cost_per_row`
-puts a predicate at 0.05–5.6 ns/row against 24–25 ns/row for the same block
-through the whole read path. The other 20 ns is `Block::open` faulting the
-mapping in and CRC'ing every table body, which is why `limit 1` costs what the
-whole block costs.
+```sh
+MIRA_BENCH_ROWS=2000000 cargo test --release -p miradb-core --lib scan_cost_per_row -- --nocapture
+```
+
+`-- --nocapture` is not optional. Every figure this test reports is a
+`println!`, and libtest swallows stdout on a passing test — without it the
+command runs to a silent `ok` and prints nothing.
+
+It puts a predicate at **0.04–5.3 ns/row** against **16.4–22.7 ns/row** for the
+same block through the whole read path, or **9.7–15.8** once the file has
+settled and the checksum is not re-run (four passes, 2,000,000 rows). The rest is
+`Block::open` faulting the mapping in, which is why `limit 1` costs what the
+whole block costs: on the dearest predicate, `body contains` at 4.99 ns/row
+against a settled path of 11.44, the open is 56% of the query, and on the
+cheapest it is essentially all of it.
+
+That test prints **two** columns per predicate, and the second one is the point
+of it. It publishes the block, times the read path with checksum verification
+on, backdates the files so the process-scoped verification cache accepts them
+(`block.rs`'s `SETTLED`), and times it again — so the checksum's share is a
+column of one run rather than something inferred from a rate. It reads between a
+quarter and two fifths at 2,000,000 rows. Backdating rather than sleeping is
+deliberate: the default 4,096-row size of this test runs in `make test`, and two
+seconds of waiting does not belong in the normal suite.
+
+**Take more than three passes of it.** The whole-block ratio moves 1.14× to
+2.21× pass to pass on this box; nine paired passes put the median at 1.37× and
+1.47× on two binaries whose ranges overlap almost entirely. A three-pass median
+off that spread is a number with one significant figure wearing two, and section
+11 withdrew one for exactly that reason. Note also what this harness cannot see:
+every case it times asserts `hit > 0`, so every case returns rows, and a query
+that returns rows reads the attribute tables to render them. A change to *which*
+tables an open reads is invisible here by construction —
+`scripts/measure/lazy-detail.sh` is the instrument for that.
 
 The metrics route has the same instrument, per point rather than per row:
 
@@ -331,6 +385,61 @@ still gives a true cost per record. The total on the same line is not a delta.
 server — `--conns 64 --readers 8` is 72 client threads competing with the thing
 they measure. A `--conns 0` run reports no ingest section and its storage line
 is the total only.
+
+### The one-off scripts
+
+Five things the harness cannot express, because each needs a second process, a
+second binary, a restart in the middle or the internal probes on. They live in
+`scripts/measure/`, they are POSIX `sh`, and each prints the figure that a
+bullet in [architecture section 11](../architecture.md#11-performance-model)
+quotes:
+
+| script | answers |
+|---|---|
+| `ingest-probe.sh` | where an export's milliseconds go at 4, 32 and 96 connections, plus the `TOKIO_WORKER_THREADS` 12-against-48 A/B — this is the ingest-ceiling diagnosis |
+| `offload-cycle.sh` | ingest → offload → list → restore → read back, and the same retention sweep without `--offload` as the thing the offload sweep is measured against |
+| `lazy-detail.sh` | paired A/B of two binaries over one corpus, alternating pass by pass, medians with the sample count asserted |
+| `block-reopens.sh` | how many times one process opens the same block, which is the input to the verification-cache decision |
+| `restart-replay.sh` | how many rows a corpus gains across a restart, on each of two binaries |
+
+Three habits are worth stealing. The three that compare two corpora or two
+binaries — `lazy-detail.sh`, `offload-cycle.sh`, `restart-replay.sh` — grep the
+server log for `nearly full` and abort if the free-space reclaimer fired,
+because a reclaimed corpus is a faster scan and the A/B then reports the volume
+rather than the code. `ingest-probe.sh` and `block-reopens.sh` have no such
+guard and do not need one: neither compares two corpora, and both report a ratio
+taken inside a single run. Every one that publishes a median asserts the sample count
+first: a response body has no trailing newline, so a capture that forgets to
+re-line-break them silently "medians" one value, and only the count catches it.
+And `lazy-detail.sh` fingerprints the corpus — table count and total bytes —
+before the run and after every pass, and stops the moment it moves.
+
+That last one is not defensive programming, it is a bug that shipped. **A corpus
+is not a constant while a server is running on it.** The cold tier compacts
+blocks that have aged out of their partition hour, eight per signal per sweep,
+from inside the server the harness keeps starting — so a run over freshly
+written blocks begins on a plain corpus and ends on a compacted one, both arms
+drift upward together, and the pooled median reports how far through the
+transition each pass landed. It published a table that had to be withdrawn.
+There is no knob to turn it off (`docs/config.md`: no compaction settings,
+deliberately), so the harness refuses instead: leave a server on the corpus
+until `find "$CORPUS" -name cold | wc -l` stops climbing, then run.
+
+Its knobs, since the defaults are only right for the pair it was written for:
+
+| var | what it is for |
+|---|---|
+| `A`, `B` | the two binaries. `B` runs first in every pass |
+| `ALABEL`, `BLABEL` | the column headers. Section 11 reads these back as "which binary", so set them whenever `B` is not 0.0.3 |
+| `CORPUS`, `OUT` | the block directory to measure over, and where the raw samples land |
+| `PASSES`, `REPS`, `WARM` | passes of the pair, timed samples per case per pass, and untimed warm-ups before them |
+| `REUSE=1` | skip the measuring entirely and re-report over the samples already in `OUT` — which is how you get a second statistic out of a run without paying for it twice, and why `OUT` is no longer cleared unconditionally |
+
+It prints two deltas per case and **the paired one is the answer**: the median of
+the per-pass differences, which cancels the drift that every process mapping a
+multi-gigabyte corpus puts on the box. The pooled median over all
+`PASSES × REPS` samples is printed beside it, and when the two disagree it is the
+pooled one that is measuring the volume. Read the two controls to confirm which.
 
 ## 4. telemetrygen
 

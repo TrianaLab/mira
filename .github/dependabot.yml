@@ -1,10 +1,11 @@
 version: 2
 
-# Four ecosystems, because the repo has four: the Rust workspace, the workflows,
-# the Svelte UI under crates/mira/ui, and the pinned MkDocs requirements under
-# docs/. Everything is grouped, because an ungrouped weekly run on a tree this
-# size opens a dozen PRs nobody reads, and a dependency bot that gets ignored is
-# worse than none — it trains you to ignore the one that matters.
+# Five ecosystems, because the repo has five: the Rust workspace, the workflows,
+# the Svelte UI under crates/mira/ui, the pinned MkDocs requirements under
+# docs/, and the Dockerfile's base images. Everything is grouped, because an
+# ungrouped weekly run on a tree this size opens a dozen PRs nobody reads, and a
+# dependency bot that gets ignored is worse than none — it trains you to ignore
+# the one that matters.
 updates:
   - package-ecosystem: cargo
     directory: /
@@ -96,3 +97,34 @@ updates:
       mkdocs:
         patterns:
           - "*"
+
+  # The Dockerfile's base images: the rust compile stage, distroless/cc (which
+  # exists only to donate libgcc_s) and distroless/base-nossl (the runtime).
+  # All three are digest-pinned, which is what makes the image reproducible and
+  # also what makes them invisible — a digest never looks out of date, so
+  # without this entry the runtime base silently ages and its CVEs age with it.
+  # That matters more here than for most repos: the Dockerfile's own comment
+  # records choosing base-nossl over cc to drop 29 Trivy findings to 18, and
+  # that number only stays true if something keeps bumping it.
+  #
+  # NOT grouped, and the limit is 1. Each of these is a separate decision with
+  # a separate blast radius — a rust: bump changes what compiles, a runtime
+  # bump changes what ships — and there are only three, so the anti-noise
+  # argument that groups everything above does not apply.
+  #
+  # Review note, because this is the one ecosystem here that can produce a
+  # plausible-looking wrong answer: the runtime pin is a *multi-platform index*
+  # digest, which is what lets one line resolve for both linux/amd64 and
+  # linux/arm64. Dependabot has been known to rewrite such a pin to a
+  # single-platform manifest digest, and the arm64 build then fails to resolve
+  # at release time rather than in the PR. Check a bump of that line with
+  # `docker buildx imagetools inspect` before merging; the Dockerfile says the
+  # same thing at the pin itself.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: deps

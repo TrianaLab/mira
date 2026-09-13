@@ -34,7 +34,10 @@ is the only state there is.
 | **5.63 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 Apple M3 Pro, one process, reproducible with the load harness in this
-repository. The full sweep:
+repository. What each number measures — the numerator, the denominator, and what
+is outside the measurement:
+**[the measurement contract](docs/internals/measurement.md)**, which also carries
+every published figure in one generated table. The full sweep:
 **[end-to-end testing](docs/internals/e2e.md)**. Why they land there:
 **[architecture section 11](docs/architecture.md#11-performance-model)**. How
 they read against the market, including where Mira is behind:

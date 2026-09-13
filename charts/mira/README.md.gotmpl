@@ -67,8 +67,9 @@ are the "a team's services" row of
 than guessed and gives CPU, memory and disk per day against the record rate.
 Two things it will tell you that are not obvious from here: memory tracks the
 number of concurrent exporters and not the ingest rate at all, and the on-disk
-cost per record is 8x higher above ~38k records/s per signal, where compaction
-stops keeping up.
+cost per record is 8x higher above ~27k records/s per signal — about 55k in
+total for the usual half-logs half-spans stream — where compaction stops
+keeping up.
 
 ## Replicas
 
@@ -88,7 +89,12 @@ pod's whole command line is `--config /etc/mira/mira.yaml`. The keys under
 `config` are the closed set from
 [Configuration](https://miradb.dev/config/) —
 an unknown key stops Mira at boot rather than being ignored, and this chart's
-`values.schema.json` is closed for the same reason.
+`values.schema.json` is closed over every subtree the chart owns for the same
+reason. It is *not* closed over the subtrees Kubernetes owns — `global`, the
+annotation and label maps, `resources`, `securityContext`, `podSecurityContext`,
+`nodeSelector`, `affinity`, `tolerations` and `extraEnv` all pass through
+unvalidated, because the API server is the thing with the authoritative schema
+for them and a second copy here would reject a field the cluster accepts.
 
 `listen` and `storage.dir` are deliberately not values: the container always
 listens on `0.0.0.0:4317` and `0.0.0.0:4318` and always writes to `/data`. A

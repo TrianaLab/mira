@@ -1,7 +1,7 @@
 # cargo-deny: the dependency budget with teeth.
 #
 # CLAUDE.md calls the crate count and the "zstd-sys is the only C dependency"
-# rule product properties. scripts/check_drift.py checks the count; this file
+# rule product properties. `xtask drift` checks the count; this file
 # checks everything about those crates that a count cannot see — that none of
 # them has an open advisory, that none of them has a licence Mira cannot ship
 # under, that none of them arrived from somewhere other than crates.io, and
@@ -90,7 +90,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 # The C-backed crates most likely to arrive by accident, usually because
-# someone enabled a default feature. scripts/check_drift.py catches the general
+# someone enabled a default feature. `xtask drift` catches the general
 # case by walking `cc`'s reverse dependencies; this list exists so the common
 # ones fail with a message that says what to do instead.
 deny = [

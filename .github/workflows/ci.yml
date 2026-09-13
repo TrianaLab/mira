@@ -5,7 +5,7 @@ name: ci
 # protection then waits for it forever — the classic way a repo ends up with
 # PRs that can never merge. Filtering happens in the `changes` job instead,
 # where a skipped leg still resolves the `required` gate at the bottom.
-# scripts/check_ci.py fails the build if anyone reintroduces one.
+# `cargo run -p xtask -- ci` fails the build if anyone reintroduces one.
 #
 # The weekly run is not redundant with the other two. Every leg here is gated on
 # the `changes` job, and a CVE does not open a pull request: `supply-chain`
@@ -33,7 +33,7 @@ env:
 
 jobs:
   # This file is a dispatcher. Every `run:` below is a `make ci-*` target
-  # defined in `ci.mk`, and `scripts/check_ci.py` fails the build if one ever is
+  # defined in `ci.mk`, and `cargo run -p xtask -- ci` fails the build if one ever is
   # not — so every leg here is one command on a laptop, and there is no shell in
   # YAML for anyone to debug by pushing commits.
   #
@@ -318,16 +318,12 @@ jobs:
           # The section-sign gate below reads commit messages, so it needs the
           # commits — a shallow clone has the tree but not the range.
           fetch-depth: 0
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
       - run: make ci-tool-actionlint
-      - run: make ci-tool-python
 
       # Every job in this file must be reachable from a required context below,
       # every `run:` must be a `make ci-*` call, every `uses:` must be
       # SHA-pinned, and no required workflow may carry a trigger-level path
-      # filter. Plus the U+00A7 scan over authored files. See scripts/check_ci.py
+      # filter. Plus the U+00A7 scan over authored files. See crates/xtask/src/ci.rs
       # and scripts/check-section-sign.sh.
       - run: make ci-meta
 
@@ -351,7 +347,7 @@ jobs:
 
   # Two status contexts, and branch protection requires both. Every leg above
   # feeds into one of them, so adding a job never means remembering to update a
-  # setting in the GitHub UI — and `scripts/check_ci.py` fails if a job is ever
+  # setting in the GitHub UI — and `xtask ci` fails if a job is ever
   # added that neither gate can see.
   #
   # They are split rather than merged because the *contexts* are the stable API
@@ -361,7 +357,7 @@ jobs:
   # a settings change and without diluting what `required` means.
   #
   # These two are the only `run:` steps in this file that are not a make call,
-  # and scripts/check_ci.py allowlists them by name. They read
+  # and crates/xtask/src/ci.rs allowlists them by name. They read
   # `join(needs.*.result)` — workflow state that exists nowhere but here — so
   # there is nothing for a local target to reproduce.
   required:
@@ -404,7 +400,7 @@ jobs:
         # Same three-case loop as `required`, and for the same reasons — see the
         # comments there. Duplicated rather than factored into a composite
         # action because the check that keeps this honest, in
-        # scripts/check_ci.py, reads `join(needs.*.result` out of the job body:
+        # crates/xtask/src/ci.rs, reads `join(needs.*.result` out of the job body:
         # hide it behind a `uses:` and the gate can quietly stop inspecting
         # anything.
         run: |
@@ -419,3 +415,32 @@ jobs:
             esac
           done
           exit "${rc}"
+
+  # Merging a version bump is the release. Nothing else in this file writes to
+  # the repository, and this job is the reason the two gates above are `needs:`
+  # rather than `if:` — it must be unreachable unless every leg was green, and a
+  # pull request must never reach it at all.
+  #
+  # It is the one job not in a required context's closure, because it is
+  # *downstream* of both of them; crates/xtask/src/ci.rs carries the exemption
+  # with that reason, so the graph check stays honest rather than being widened.
+  #
+  # scripts/tag-release.sh is a no-op unless Cargo.toml names a version that has
+  # no tag, so it runs on every push to main and cuts a release on almost none.
+  tag:
+    name: tag
+    needs: [required, security-required]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # To push the tag, and to dispatch release.yml at it. The second is the
+      # load-bearing one: a tag pushed with GITHUB_TOKEN does not start a
+      # workflow, and `workflow_dispatch` is one of the two events exempt from
+      # that rule — which is what lets this work with no PAT and no deploy key.
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: make ci-tag

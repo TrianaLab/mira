@@ -55,6 +55,23 @@
 //!
 //! Everything is derived from a counter, not a random source: the same
 //! arguments produce the same bytes, so two runs are comparable.
+//!
+//! Two runs produce the same *corpus* only under `--records N`, and the
+//! difference is worth its own flag. `--for 40s` stops on a clock, so the volume
+//! it leaves behind measures how fast the box was that afternoon — which is why
+//! architecture section 11 can describe one of its corpora by an exact byte count
+//! and still not hand anyone a command that rebuilds it. `--records` stops on a
+//! count: the work is divided evenly across the connections up front, nothing
+//! consults a clock to decide when to stop, and the same command on a slower
+//! machine produces the same bytes and takes longer. Use it for anything whose
+//! number will be published, and `--for` for soaks.
+//!
+//! `--emit run.json` writes what the run measured as JSON, keyed the way
+//! `measurements.kyaml` is keyed, so `xtask measurements ingest` can fold it
+//! back in. It appends one object per line rather than truncating, so a sweep
+//! over several shapes and several passes accumulates into one file — and that
+//! is what `ingest` wants, because it takes the median per key across the passes
+//! it finds rather than believing whichever one ran last.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -123,16 +140,20 @@ fn main() {
     let mut data_dir: Option<std::path::PathBuf> = None;
     let mut demo = false;
     let mut batch_set = false;
+    let mut records: Option<u64> = None;
+    let mut emit: Option<std::path::PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || args.next().expect("missing value");
         match a.as_str() {
             "--addr" => addr = v(),
             "--for" => secs = duration(&v()),
+            "--records" => records = Some(v().parse().expect("--records")),
             "--conns" => conns = v().parse().expect("--conns"),
             "--readers" => readers = v().parse().expect("--readers"),
             "--pid" => pid = Some(v().parse().expect("--pid")),
             "--data-dir" => data_dir = Some(v().into()),
+            "--emit" => emit = Some(v().into()),
             "--batch" => {
                 batch_set = true;
                 BATCH.store(v().parse().expect("--batch"), Ordering::Relaxed);
@@ -141,9 +162,14 @@ fn main() {
             "--selftest" => return selftest(),
             _ => {
                 eprintln!(
-                    "usage: loadgen [--addr host:port] [--for 30s] [--conns 8] [--batch 2000]\n\
-                     \x20              [--readers 0] [--pid N] [--data-dir PATH]\n\
+                    "usage: loadgen [--addr host:port] [--for 30s | --records N]\n\
+                     \x20              [--conns 8] [--batch 2000] [--readers 0]\n\
+                     \x20              [--pid N] [--data-dir PATH] [--emit PATH]\n\
                      \x20              [--demo] [--selftest]\n\
+                     \n\
+                     --records N stops on a count rather than a clock, so the corpus\n\
+                     a run leaves behind is the same on a fast box and a slow one.\n\
+                     Publish numbers off --records; use --for for soaks.\n\
                      \n\
                      --demo generates a realistic four-service shop instead of the\n\
                      benchmark filler, and `--for` then means how much *history* to\n\
@@ -154,6 +180,11 @@ fn main() {
             }
         }
     }
+    assert!(
+        !(demo && records.is_some()),
+        "--records is for the benchmark generator; --demo's shape is set by \
+         --for and DEMO_BATCHES"
+    );
     assert!(
         conns + readers > 0,
         "nothing to do: --conns and --readers are both 0"
@@ -177,8 +208,19 @@ fn main() {
     // the process may have been running for hours before the run.
     let cpu0 = pid.and_then(cpu_seconds);
 
+    // `--records` divides the work up front instead of polling a clock: one
+    // round is an export of each signal, every connection owns the same number
+    // of rounds, and nothing in the writer loop then depends on how fast the box
+    // is. Integer division, so the actual total is at or just under what was
+    // asked for and is printed rather than assumed.
+    let per_round = 2 * batch() as u64 + SERVICES.len() as u64 * 3;
+    let rounds = records.map(|n| (n / (conns.max(1) as u64 * per_round)).max(1));
+
     let t0 = Instant::now();
-    let deadline = t0 + Duration::from_secs(secs);
+    // A `--records` run has no deadline. The hour is a backstop so that a server
+    // which stops answering cannot leave the RSS sampler running until morning;
+    // what actually ends the samplers is the writers clearing `WRITING`.
+    let deadline = t0 + Duration::from_secs(if rounds.is_some() { 3_600 } else { secs });
     let base = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -227,7 +269,11 @@ fn main() {
                         n += 1;
                         continue;
                     }
-                    if Instant::now() >= deadline {
+                    let done = match rounds {
+                        Some(r) => n >= r,
+                        None => Instant::now() >= deadline,
+                    };
+                    if done {
                         break;
                     }
                     // Timestamps advance with the wall clock so the default
@@ -269,7 +315,10 @@ fn main() {
     for w in workers {
         all.merge(w.join().unwrap());
     }
-    if demo {
+    // Both of the run shapes that end on work rather than on the shared
+    // deadline. A `--for` run does not clear it, because `--conns 0 --readers 8`
+    // has no writers and its readers must still run to the deadline.
+    if demo || rounds.is_some() {
         WRITING.store(false, Ordering::Relaxed);
     }
     let mut reads = Reads::default();
@@ -278,8 +327,21 @@ fn main() {
     }
     let el = t0.elapsed().as_secs_f64();
 
+    // What `--emit` will write, filled in beside each figure as it is printed
+    // rather than recomputed afterwards — two expressions for one number is how
+    // a transcript and a registry come to disagree.
+    let mut run = Emit::new(conns);
+
     if conns > 0 {
         let n = all.logs + all.spans + all.points;
+        run.at("ingest.records_per_s", 0, n as f64 / el);
+        run.at(
+            "ingest.wire_mib_s",
+            1,
+            all.bytes as f64 / el / (1 << 20) as f64,
+        );
+        run.at("ingest.ack_p50_ms", 1, all.acks.p(0.50));
+        run.at("ingest.ack_p99_ms", 0, all.acks.p(0.99));
         println!(
             "ingest   {:.0} records/s   {:.1} MiB/s wire   {} shed   {} resets\n\
              \x20        {} logs + {} spans + {} points in {el:.1}s, \
@@ -304,9 +366,15 @@ fn main() {
     // the figure worth putting in a table is the one with CPU underneath it.
     if let (Some(a), Some(b)) = (cpu0, pid.and_then(cpu_seconds)) {
         let cores = (b - a) / el;
+        run.at("ingest.cores", 2, cores);
         print!("cpu      {cores:.2} cores busy");
         let n = all.logs + all.spans + all.points;
         if n > 0 && cores > 0.0 {
+            // The printed per-core figure divides by the *unrounded* cores, so a
+            // transcript that shows `1.13 cores busy` beside a per-core rate is
+            // not an arithmetic identity a reader can check to two decimals —
+            // which is how an inconsistent pair of numbers once got published.
+            run.at("ingest.per_core", 0, n as f64 / el / cores);
             print!("   {:.0} records/s/core", n as f64 / el / cores);
         }
         println!();
@@ -314,6 +382,7 @@ fn main() {
     reads.report(el);
     if let Some(rss) = rss {
         let (rss, anon) = rss.join().unwrap();
+        run.at("rss_mib", 0, rss);
         print!("memory   peak RSS {rss:.0} MiB");
         // Absent rather than 0 when the platform did not answer: a zero here
         // would read as "this engine allocates nothing", which is the one thing
@@ -340,6 +409,13 @@ fn main() {
             // the store grew by more than the wire — which the sidecars and an
             // uncompacted block directory can genuinely make it, briefly.
             let grew = disk.saturating_sub(disk0);
+            // No connection-count suffix: what a byte of wire costs on disk is
+            // not a property of how many sockets delivered it.
+            run.plain(
+                "cost.hot_bytes_per_byte",
+                2,
+                grew as f64 / all.bytes.max(1) as f64,
+            );
             print!(
                 "   +{:.2} GiB this run   {:.0} B/record   {:.2}x the wire bytes",
                 grew as f64 / (1u64 << 30) as f64,
@@ -348,6 +424,71 @@ fn main() {
             );
         }
         println!();
+    }
+    if let Some(path) = &emit {
+        run.write(path);
+    }
+}
+
+/// What `--emit` collects: the run's figures, keyed the way
+/// `measurements.kyaml` is keyed.
+///
+/// Appends one JSON object per line rather than truncating, so a sweep that runs
+/// several shapes accumulates into one file and `xtask measurements ingest`
+/// reads the lot. Keys carry the connection count, because a rate at four
+/// connections and a rate at ninety-six are two measurements and not two samples
+/// of one.
+///
+/// Written by hand because this file has no serialisation dependency and should
+/// not grow one for eight numbers: `serde_json` is not in the tree, and
+/// `measurements.kyaml` is KYAML anyway, which JSON is a subset of.
+struct Emit {
+    conns: usize,
+    keys: Vec<(String, String)>,
+}
+
+impl Emit {
+    fn new(conns: usize) -> Self {
+        Emit {
+            conns,
+            keys: Vec::new(),
+        }
+    }
+
+    /// A figure that belongs to this run's connection count.
+    fn at(&mut self, key: &str, decimals: usize, v: f64) {
+        let key = format!("{key}.conns{}", self.conns);
+        self.keys.push((key, format!("{v:.decimals$}")));
+    }
+
+    /// A figure that does not.
+    fn plain(&mut self, key: &str, decimals: usize, v: f64) {
+        self.keys.push((key.into(), format!("{v:.decimals$}")));
+    }
+
+    fn write(&self, path: &std::path::Path) {
+        let body: Vec<String> = self
+            .keys
+            .iter()
+            .map(|(k, v)| format!("\"{k}\": {v}"))
+            .collect();
+        let line = format!("{{{}}}\n", body.join(", "));
+        let r = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        match r {
+            Ok(()) => println!(
+                "emit     {} keys appended to {}",
+                self.keys.len(),
+                path.display()
+            ),
+            // Not fatal. The run happened and its numbers are on stdout; losing
+            // the machine-readable copy is worth a line on stderr and not a
+            // non-zero exit that reads as "the benchmark failed".
+            Err(e) => eprintln!("loadgen: cannot write {}: {e}", path.display()),
+        }
     }
 }
 

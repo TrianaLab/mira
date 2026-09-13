@@ -1,7 +1,7 @@
 # This file is the single source of truth for every quality gate in Mira.
 #
 # CI does not reimplement a single one of them: .github/workflows/ci.yml is a
-# dispatcher, every `run:` in it is a `make ci-*` target, and check_ci.py fails
+# dispatcher, every `run:` in it is a `make ci-*` target, and `xtask ci` fails
 # the build if one is not. That is the whole point — a gate that only exists in
 # YAML is a gate no contributor can run, and a gate that exists in both places
 # is two gates that drift. Adding a check means adding it here; wiring it into
@@ -20,7 +20,15 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 CARGO   ?= cargo
+# Only mkdocs, which is a Python program. Every check that used to be a script
+# under `scripts/` is now `crates/xtask` — see below.
 PYTHON  ?= python3
+# The checks that read this tree: workflow linting, drift, the version bump and
+# the reference generator. A workspace member rather than three scripts, so
+# `fmt`, `clippy -D warnings` and `cargo doc` hold the checker to the bar it
+# enforces, and a contributor needs one toolchain instead of two. It is not in
+# `mira`'s dependency graph, so the crate count is untouched.
+XTASK   := $(CARGO) run --quiet --locked -p xtask --
 UI_DIR  := crates/mira/ui
 BIN     := target/release/mira
 # The load harness and the demo generator. `cargo build --release` does *not*
@@ -57,19 +65,38 @@ LOADGEN := target/release/examples/loadgen
 #     I/O failure arms — a `warn!` on an unlinkable block, a FUSE mount — that
 #     need root or a full volume to reach.
 #
-# Set a tenth of a point below the Mac figure for the host drift documented
-# above, not as slack: raise it off a green Linux run in CI, where the real
-# ceiling is legible. 99.21 is read off run 34723128743, which measured 99.22 on
-# Linux (21,969 lines, 172 uncovered) against 99.25 on this Mac — the drift is
-# real and is why the Mac figure is never the one written here.
-COVERAGE_MIN ?= 99.21
+# The host drift above is real but its *direction* is not a constant, and as of
+# this line it has reversed. `block.rs`'s `statfs` table was most of it — eleven
+# filesystem magics on Linux against five names on macOS, and no mount the tests
+# run on reaches either — so the runner carried ten uncovered lines this Mac did
+# not have. Now that the table has a test of its own, both hosts leave the same
+# 41 lines of `block.rs` uncovered, and run 34751106092 measured 99.2532 on Linux
+# (22,095 lines, 165 uncovered) against 99.2304 on this Mac.
+#
+# What is left is noise rather than drift, and it is what caps how tightly this
+# can be pulled. `pipeline.rs`'s retention-sweep logging — the `Ok(n)` and `Err`
+# arms around line 1450 — is covered only when a background sweep drops or
+# compacts a block before the test that started it returns, which moved about
+# five lines run to run on one tree on one host. So 99.22 and not the 99.25 the
+# runner printed: a gate that goes red on a re-run of the same commit is a gate
+# that teaches people to re-run it.
+#
+# Most of that race has since been closed at the source: the tests poll for the
+# sweep rather than assume it, and their budget was two seconds, which is not
+# enough on a machine whose cores are all busy — under load three of them failed
+# together. The budget is a minute now and polling makes that free. Whoever
+# raises this next should check whether those five lines have gone quiet on the
+# runner rather than inherit the allowance: the honest floor may now be the
+# figure CI prints, but that has to be read off a green Linux run and not
+# assumed from here.
+COVERAGE_MIN ?= 99.22
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
 # count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor
 # old enough that nobody is forced onto a newer toolchain to use Mira). A
 # declared MSRV that is never compiled against is a wish, so `make msrv` builds
 # with exactly it.
-MSRV := $(shell $(PYTHON) -c "import re,sys; sys.stdout.write(re.search(r'rust-version\s*=\s*\"([^\"]+)\"', open('Cargo.toml').read()).group(1))")
+MSRV := $(shell sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 
 export CARGO_TERM_COLOR ?= always
 
@@ -153,15 +180,30 @@ test: ## Unit tests + the in-process end-to-end suite
 	@# ride behind a flag instead of in a test module, and this is what runs it.
 	$(CARGO) run --quiet --locked --example loadgen -- --selftest
 
+# What the ratchet measures: the shipped crates, not the tooling.
+#
+# `xtask` is a workspace member, so `--workspace` would sweep it in and dilute a
+# number that is supposed to describe the product. It has its own tests and they
+# run under `cargo test --workspace` like everything else; what it does not get
+# is a vote on whether `mira` is well tested. Excluding it also keeps the ratchet
+# comparable with every figure measured before it existed.
+COVERAGE_SCOPE := --workspace --exclude xtask
+
+# `--show-missing-lines` because the run that matters is the one on the runner,
+# and a bare percentage there is not enough to act on: a `#[cfg]` can leave a
+# table of match arms unreachable on Linux and covered on this Mac, so the
+# ratchet fails on a diff that raised coverage where its author could see it.
+# The line numbers turn that from a bisect into a read.
 .PHONY: coverage
 coverage: ## Line coverage against the ratchet ($(COVERAGE_MIN)%)
 	$(call need,cargo-llvm-cov)
-	$(CARGO) llvm-cov --workspace --locked --summary-only --fail-under-lines $(COVERAGE_MIN)
+	$(CARGO) llvm-cov $(COVERAGE_SCOPE) --locked --summary-only --show-missing-lines \
+	  --fail-under-lines $(COVERAGE_MIN)
 
 .PHONY: coverage-report
 coverage-report: ## Per-file coverage, worst first — what to write tests for next
 	$(call need,cargo-llvm-cov)
-	$(CARGO) llvm-cov --workspace --locked --summary-only
+	$(CARGO) llvm-cov $(COVERAGE_SCOPE) --locked --summary-only
 
 # The README's coverage badge reads this file over HTTP at render time, so the
 # number on the badge is the number the run that published the site measured —
@@ -184,9 +226,8 @@ COVERAGE_JSON := site/coverage.json
 coverage-json: ## Measure coverage into site/coverage.json — what the README badge reads
 	$(call need,cargo-llvm-cov)
 	@mkdir -p $(dir $(COVERAGE_JSON))
-	$(CARGO) llvm-cov --workspace --locked --summary-only --json \
-	  | $(PYTHON) -c 'import json,math,sys; p=json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"]; json.dump({"line": math.floor(p*100)/100, "commit": sys.argv[2]}, open(sys.argv[1],"w"))' \
-	    $(COVERAGE_JSON) "$${GITHUB_SHA:-$$(git rev-parse HEAD)}"
+	$(CARGO) llvm-cov $(COVERAGE_SCOPE) --locked --summary-only --json \
+	  | $(XTASK) coverage-json $(COVERAGE_JSON) "$${GITHUB_SHA:-$$(git rev-parse HEAD)}"
 	@echo; cat $(COVERAGE_JSON); echo
 
 # ---------------------------------------------------------------------------
@@ -195,7 +236,24 @@ coverage-json: ## Measure coverage into site/coverage.json — what the README b
 
 .PHONY: build
 build: ## Release binary and the load harness (the artifact; see `make drift`)
-	$(CARGO) build --release --locked --bin mira --example loadgen
+	@# `-p miradb`, and two invocations rather than one. Both halves of that are
+	@# worth 371 KiB of shipped binary, because cargo resolves features once per
+	@# invocation across everything the invocation selects:
+	@#
+	@#   * an example is compiled against the dev-dependencies, so building it
+	@#     alongside the binary unifies their features into the *normal* graph —
+	@#     `tokio` gains `test-util`, `tower` gains half a dozen middleware
+	@#     layers, and all of it links into the artifact;
+	@#   * without `-p`, the selected set is every default workspace member, so
+	@#     `xtask`'s dependencies join the same resolution for a binary that does
+	@#     not depend on them.
+	@#
+	@# `dist-tarball` depends on this target, so that is the artifact that ships.
+	@# Nothing in `mira` calls any of what the wider resolutions drag in. The
+	@# cost is a second compile of the dev-unified tokio; binary size is a scored
+	@# axis (docs/architecture.md section 11), so the trade is not close.
+	$(CARGO) build --release --locked -p miradb --bin mira
+	$(CARGO) build --release --locked -p miradb --example loadgen
 
 .PHONY: run
 run: ## Run a local instance against ./mira-data
@@ -236,64 +294,31 @@ DEMO_RULES  ?= docs/e2e/alerts.kyaml
 # A port already in use is the commonest way a first run fails, and on its own it
 # fails as an `Address already in use` from inside the listener setup with no
 # mention of which of the two ports it was. Say it first, and name it.
+#
+# curl rather than nc, which is three different programs with three different
+# flag sets across macOS and Linux. Exit 7 is "could not connect" — anything
+# else, including a timeout or a protocol error from the h2c port, means
+# something answered and the port is taken.
 define PORTCHECK
-import socket, sys
-busy = [p for p in (4317, 4318) if socket.socket().connect_ex(("127.0.0.1", p)) == 0]
-if busy:
-    ports = " and ".join(str(p) for p in busy)
-    print("error: port %s already in use, so Mira cannot listen there." % ports)
-    print("  something is already on it - another Mira, or a collector.")
-    print("  find it with:  lsof -nP -iTCP:%s -sTCP:LISTEN" % busy[0])
-    print("  then:          make demo")
-    sys.exit(1)
+busy=
+for p in 4317 4318; do
+  rc=0
+  curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$$p/" || rc=$$?
+  [ "$$rc" -eq 7 ] || busy="$${busy:+$$busy and }$$p"
+done
+[ -z "$$busy" ] || {
+  echo "error: port $$busy already in use, so Mira cannot listen there."
+  echo "  something is already on it - another Mira, or a collector."
+  echo "  find it with:  lsof -nP -iTCP:$${busy%% *} -sTCP:LISTEN"
+  echo "  then:          make demo"
+  exit 1
+}
 endef
 export PORTCHECK
 
-# "Wait for the first block to seal" is not a sleep. Exports are acked after
-# durability, so the honest test is the one the user is about to run: ask each
-# signal for a row and stop when all three have one. A sleep would be right on
-# this machine and wrong on a slower one, which is how a demo that "sometimes
-# opens empty" happens.
-define WAITDATA
-import sys, time, urllib.error, urllib.request
-
-CHECKS = [
-    ("logs",    "/api/v1/query",          '{"signal":"logs","from":"-24h","to":"now","limit":1}',   '"rows":[]'),
-    ("traces",  "/api/v1/query",          '{"signal":"traces","from":"-24h","to":"now","limit":1}', '"rows":[]'),
-    ("metrics", "/api/v1/metrics/names",  '{}',                                                     '"names":[]'),
-]
-
-def ask(path, body):
-    req = urllib.request.Request(
-        "http://127.0.0.1:4318" + path,
-        data=body.encode(),
-        headers={"content-type": "application/yaml"},
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.read().decode()
-
-left = list(CHECKS)
-deadline = time.monotonic() + 60
-while left and time.monotonic() < deadline:
-    still = []
-    for name, path, body, empty in left:
-        try:
-            if empty in ask(path, body):
-                still.append((name, path, body, empty))
-        except (urllib.error.URLError, OSError):
-            still.append((name, path, body, empty))
-    left = still
-    if left:
-        time.sleep(0.3)
-if left:
-    print("warning: %s still has no sealed block after 60s." % ", ".join(x[0] for x in left))
-    print("  the server is up; look at the log named above before filing anything.")
-endef
-export WAITDATA
-
 .PHONY: demo
 demo: build ## Server + realistic telemetry + the UI, in one command. Ctrl-C stops it.
-	@$(PYTHON) -c "$$PORTCHECK"
+	@bash -euo pipefail -c "$$PORTCHECK"
 	@mkdir -p "$(DEMO_DIR)"
 	@echo "==> mira on $(DEMO_DIR), log in $(DEMO_LOG)"
 	@"$(BIN)" --data-dir "$(DEMO_DIR)" --alerts "$(DEMO_RULES)" >"$(DEMO_LOG)" 2>&1 & \
@@ -304,7 +329,7 @@ demo: build ## Server + realistic telemetry + the UI, in one command. Ctrl-C sto
 	         printf '  delete it with:                  make demo-clean\n'; }; \
 	trap stop EXIT; trap 'exit 0' INT TERM; \
 	for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do \
-	  if $(PYTHON) -c "import urllib.request as u; u.urlopen('http://127.0.0.1:4318/health', timeout=2)" 2>/dev/null; then break; fi; \
+	  if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:4318/health; then break; fi; \
 	  if ! kill -0 $$pid 2>/dev/null; then \
 	    echo "error: mira exited during startup. its log said:"; cat "$(DEMO_LOG)"; exit 1; fi; \
 	  sleep 0.4; \
@@ -312,7 +337,7 @@ demo: build ## Server + realistic telemetry + the UI, in one command. Ctrl-C sto
 	echo "==> generating $(DEMO_WINDOW) of telemetry for a four-service shop"; \
 	"$(LOADGEN)" --demo --for "$(DEMO_WINDOW)"; \
 	echo "==> waiting for the first block of each signal to seal"; \
-	$(PYTHON) -c "$$WAITDATA"; \
+	scripts/wait-for-signals.sh 60 warn; \
 	printf '\n  UI            http://localhost:4318/\n'; \
 	printf '  terminal UI   %s mira --addr localhost:4318   (a alerts, d node)\n' "$(BIN)"; \
 	printf '  alerts        curl -s localhost:4318/api/v1/alerts\n'; \
@@ -386,7 +411,7 @@ doc: ## rustdoc for the whole workspace, warnings are errors
 reference: build doc ## Regenerate the reference pages from the code they document
 	@# `build` for the binary whose `--help` is the CLI page, `doc` for the
 	@# rustdoc tree the generated links are checked against.
-	$(PYTHON) scripts/gen_reference.py
+	$(XTASK) reference
 
 .PHONY: reference-check
 reference-check: reference ## Fail if a committed reference page is stale
@@ -425,16 +450,41 @@ sbom: build ## CycloneDX SBOM, one <crate>.cdx.json beside each Cargo.toml
 	@echo "wrote: $$(ls -1 *.cdx.json crates/*/*.cdx.json 2>/dev/null | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------
-# Drift — numbers the README promises, checked against the tree that ships
+# Drift — numbers the docs promise, checked against the tree that ships and
+# against the load test that measured them
 # ---------------------------------------------------------------------------
 
 .PHONY: drift
 drift: build ## Crate count, binary size and doc numbers still match reality
-	$(PYTHON) scripts/check_drift.py
+	$(XTASK) drift
+
+.PHONY: measurements-check
+measurements-check: ## Every published performance number is the one the last run measured
+	@# `drift` guards numbers the tree produces on every build; this guards
+	@# numbers a load test produces once and five documents then quote. Same
+	@# failure mode either way — somebody re-measures, fixes the README, leaves
+	@# the other four sites quoting the old figure — and nothing else can catch
+	@# it, because the stale figure is still valid prose. No `build` prerequisite:
+	@# it reads measurements.kyaml and the documents, and nothing else.
+	$(XTASK) measurements
+
+.PHONY: measurements-ingest
+measurements-ingest: ## Fold RUN=path/to/run.json back into measurements.kyaml
+	@# Without WRITE=1 this reports and exits 1, which is the useful mode: it
+	@# names every document still quoting a figure that moved. Even with WRITE=1
+	@# it rewrites the registry only, never the prose — the sentence around a
+	@# number is usually a claim about it ("a 26% fall"), and swapping the digits
+	@# under an unchanged claim yields a document that passes this check and is
+	@# wrong. See docs/internals/measurement.md section 5.
+	@test -n "$(RUN)" || { \
+		echo "usage: make measurements-ingest RUN=/tmp/mira-sweep/run.json [WRITE=1]" >&2; \
+		echo "  RUN is the JSON-lines file \`loadgen --emit\` appends to" >&2; \
+		exit 1; }
+	$(XTASK) measurements ingest $(RUN) $(if $(WRITE),--write,)
 
 .PHONY: bump
 bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
-	@# The gate and the writer are the same table in check_drift.py, so this
+	@# The gate and the writer are the same table in crates/xtask, so this
 	@# reaches exactly the sites `make drift` checks and no others — in
 	@# particular it leaves docs/internals/releases.md alone, which recounts
 	@# past releases by number on purpose.
@@ -454,17 +504,18 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 		echo "  SECURITY.md, docs/install.md, the issue template, CHANGELOG.md" >&2; \
 		echo "  then regenerates Cargo.lock and charts/mira/README.md" >&2; \
 		exit 1; }
-	$(PYTHON) scripts/check_drift.py --bump $(TO)
+	$(XTASK) drift --bump $(TO)
 	$(CARGO) update --workspace --quiet
 	$(MAKE) --no-print-directory helm-docs
 	@echo
-	@echo "Now: \`make drift\` to verify, then a PR — docs/internals/releases.md."
+	@echo "Now: \`make drift\` to verify, then a PR. Merging it cuts $(TO) —"
+	@echo "there is no tag to remember. See docs/internals/releases.md."
 
 .PHONY: workflows
 workflows: ## Lint the workflows, and check every CI job can block a merge
-	@# actionlint is the syntax and shellcheck pass; check_ci.py is the
+	@# actionlint is the syntax and shellcheck pass; `xtask ci` is the
 	@# semantic one. Neither subsumes the other: actionlint will not notice
-	@# that a job nothing depends on cannot fail a PR, and check_ci.py will not
+	@# that a job nothing depends on cannot fail a PR, and `xtask ci` will not
 	@# notice a typo in a `${{ }}` expression.
 	@command -v actionlint >/dev/null 2>&1 || { \
 		echo "error: actionlint is not installed."; \
@@ -472,12 +523,14 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 		echo "  else:  go install github.com/rhysd/actionlint/cmd/actionlint@latest"; \
 		exit 1; }
 	actionlint
-	$(PYTHON) scripts/check_ci.py
-	@# actionlint shellchecks every `run:` block for free. `ci-changes.sh` used
-	@# to be one, so lifting it into a file would have quietly dropped that —
-	@# and it is still the workflow, just spelled somewhere greppable.
+	$(XTASK) ci
+	@# actionlint shellchecks every `run:` block for free, so the scripts those
+	@# blocks call have to be checked somewhere too — lifting shell out of YAML
+	@# must not be how it stops being linted. A glob rather than a list: the
+	@# list is what rots, and re-checking get-mira.sh (which `make
+	@# install-script` also does, with more) costs nothing.
 	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
-	shellcheck scripts/ci-changes.sh
+	shellcheck scripts/*.sh
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs
@@ -647,7 +700,7 @@ helm-unittest: ## The chart's own test suites
 .PHONY: helm-schema
 helm-schema: ## values.schema.json parses, admits the defaults, and refuses a typo
 	$(call need_bin,helm,brew install helm   (see https://helm.sh/docs/intro/install/))
-	$(PYTHON) -c "import json; json.load(open('$(CHART)/values.schema.json'))"
+	$(XTASK) parse-json $(CHART)/values.schema.json
 	@# Helm validates values against the schema on every template and install,
 	@# so `helm-template` above already proves the shipped defaults satisfy it.
 	@# What that cannot prove is that the schema *refuses* anything: a schema
@@ -887,55 +940,6 @@ scan-image: dist-image ## Trivy over the release image; a fixable HIGH/CRITICAL 
 	@# permanent tail of MEDIUM glibc findings that would drown the signal.
 	trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress $(SCAN_IMAGE)
 
-# The three questions `make demo` waits on (WAITDATA, above), asked as
-# assertions rather than as a warning. This is the only test in the tree where
-# the client on the wire is not ours — the stock collector gzips by default,
-# batches on its own schedule, and drops a batch permanently rather than retry
-# if the server answers UNIMPLEMENTED — so a timeout here is a failed gate.
-define E2EASSERT
-import sys, time, urllib.error, urllib.request
-
-CHECKS = [
-    ("traces",  "/api/v1/query",         '{"signal":"traces","from":"-24h","to":"now","limit":1}', '"rows":[]'),
-    ("logs",    "/api/v1/query",         '{"signal":"logs","from":"-24h","to":"now","limit":1}',   '"rows":[]'),
-    ("metrics", "/api/v1/metrics/names", '{}',                                                     '"names":[]'),
-]
-
-def ask(path, body):
-    req = urllib.request.Request(
-        "http://127.0.0.1:4318" + path,
-        data=body.encode(),
-        headers={"content-type": "application/yaml"},
-    )
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return r.read().decode()
-
-# Generous on purpose: the runner pulls two images, starts a collector, runs
-# four one-shot generators and waits for a block to seal. Slow is fine here;
-# never is the failure this gate is looking for.
-left = list(CHECKS)
-deadline = time.monotonic() + 240
-while left and time.monotonic() < deadline:
-    still = []
-    for check in left:
-        name, path, body, empty = check
-        try:
-            if empty in ask(path, body):
-                still.append(check)
-            else:
-                print("  %s: came back out of Mira" % name)
-        except (urllib.error.URLError, OSError):
-            still.append(check)
-    left = still
-    if left:
-        time.sleep(1)
-if left:
-    sys.exit("error: %s never arrived - generator -> collector -> mira -> query API is broken"
-             % ", ".join(c[0] for c in left))
-print("e2e: all three signals made the full trip")
-endef
-export E2EASSERT
-
 .PHONY: e2e
 e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, asserted
 	@# dist-image copies the host binary in, so on macOS the image builds happily
@@ -950,6 +954,15 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 	@# of compiling a second time inside the Dockerfile; everything else about
 	@# the stack is exactly what a reader of that section types.
 	docker compose -f $(E2E_COMPOSE) build --build-arg BIN=prebuilt mira
+	@# The assertion at the end is the same three questions `make demo` waits on,
+	@# asked as a gate rather than as a warning. This is the only test in the
+	@# tree where the client on the wire is not ours — the stock collector gzips
+	@# by default, batches on its own schedule, and drops a batch permanently
+	@# rather than retry if the server answers UNIMPLEMENTED — so a timeout here
+	@# is a failure. Four minutes is generous on purpose: the runner pulls two
+	@# images, starts a collector, runs four one-shot generators and waits for a
+	@# block to seal. Slow is fine; never is what this is looking for.
+	@#
 	@# Every service, not `mira otelcol`, and `ps -a` before the logs. The two
 	@# things the narrow version could not show are the two that matter when
 	@# this fails: which containers are still up (a name that stops resolving is
@@ -964,7 +977,7 @@ e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, assert
 	       docker compose -f $(E2E_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; \
 	       exit $$rc' EXIT; \
 	docker compose -f $(E2E_COMPOSE) up -d; \
-	$(PYTHON) -c "$$E2EASSERT"
+	scripts/wait-for-signals.sh 240 assert
 
 # ---------------------------------------------------------------------------
 # The pipeline

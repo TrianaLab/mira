@@ -2263,7 +2263,7 @@ fn hms(ns: i64) -> String {
     )
 }
 
-fn stamp(ns: i64) -> String {
+pub(crate) fn stamp(ns: i64) -> String {
     let (tm, ms) = civil(ns);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{ms:03}",

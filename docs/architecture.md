@@ -39,7 +39,7 @@ outside.
 |---|---|---|
 | **Delta-of-delta timestamps** | Arrow IPC has no per-column encodings. Its entire encoding surface is whole-buffer LZ4/ZSTD plus the Dictionary and RunEndEncoded layouts. Implementing DoD means inventing a buffer layout no Arrow reader understands — which forfeits zero-copy, since you must decode into a fresh allocation. Separately, Gorilla's 12× rests on samples landing on exact interval boundaries; OTLP `time_unix_nano` is a wall-clock read with 10⁵–10⁷ ns of jitter between consecutive deltas. | Plain `Timestamp(Nanosecond)`. Sort by time within a block; take the size win at the cold tier from a generic compressor. |
 | **Resource/Scope dedup at block headers** | The Arrow mechanism for a "block header" is `Schema.custom_metadata`, exactly one map per file. That expresses dedup only if a block holds exactly one Resource. A block from any multi-tenant collector holds hundreds. | OTAP section 6.3: `resource_id`/`scope_id` `UInt16` columns in the root table plus separate attribute tables keyed by `parent_id`. A resource with 40 attributes shared by 10,000 records costs 40 rows and 10,000 `u16`s. |
-| **Dictionary-encode high-cardinality maps** | Backwards. Dictionary encoding is a *low*-cardinality technique with a hard ceiling — `Dictionary<UInt16,_>` raises `DictionaryKeyOverflowError` past 65,536 distinct values. `http.url` and `trace_id` are the highest-cardinality data in the system. | Dictionary-encode only enumerable columns: attribute *keys*, `severity_text`. Attribute *values* are plain `Utf8`/`Binary`. |
+| **Dictionary-encode high-cardinality maps** | Half backwards. Dictionary encoding is a *low*-cardinality technique with a hard ceiling — `Dictionary<UInt16,_>` raises `DictionaryKeyOverflowError` past 65,536 distinct values, and `http.url` and `trace_id` are the highest-cardinality data in the system. But the *repetition* the brief was reaching for is real: a few hundred distinct attribute values across a few hundred thousand rows. | Two key widths. Enumerable columns — attribute *keys*, `severity_text`, metric name and unit — take a `UInt16` key and seal the block at `DICT_CAP` rather than fail. The attribute *value* string column `attrs.str` takes a `UInt32` key, which a 32 MiB block cannot fill; it is the one *value* column that is dictionary-encoded, and it is worth 12.9× → 66.2× on one real block's cold ratio (section 11). `attrs.bytes`/`attrs.ser` stay plain `Binary`. |
 | **Zero-copy ingestion** | Impossible on the OTLP path. `prost` memcpies every string unconditionally; varints must be decoded. Even on OTAP, `StreamDecoder` only avoids a copy when the whole message body is one contiguous `Buffer`, and an HTTP/2 body split across DATA frames is `extend_from_slice`'d. | Say **zero-copy queries**, not zero-copy ingestion. The ingest goal is *allocation-lean*: one unavoidable memcpy of the request body, then no per-field heap allocation. |
 | **Lock-free ring buffer for ingestion** | Cargo-culted from LMAX, where an item is a 150 ns order struct. Here an item is an export request costing 10⁵–10⁶ ns to decode and encode, arriving 10²–10⁴ times per second. The queue is four orders of magnitude from being the bottleneck, and a lock-free queue cannot express backpressure. | A bounded `tokio::sync::mpsc` per flusher shard. A full set of them parks the caller for up to `ADMIT_WAIT` (section 4), which propagates backpressure out as HTTP/2 flow control; only a timeout sheds. Revisit if a queue ever appears in a profile. |
 | **4317 and 4318 both served by tonic** | 4318 is not gRPC. Per the OTLP spec it is plain HTTP/1.1 POST of protobuf or JSON to `/v1/{traces,metrics,logs}`. | Two listeners: tonic on 4317, axum on 4318. axum is already in the tree via tonic's `router` feature, so it costs no dependency. |
@@ -96,12 +96,13 @@ missing, why, and what to do instead today.
   ingest goal is *allocation-lean*: one unavoidable copy of the request body,
   then no per-field heap allocation. The correction table above has the long
   version; "zero-copy" in this document always means queries.
-- **No block cache.** Every query re-opens and re-CRCs each block it touches.
-  This looked like the next big win until it was measured against the two that
-  were taken instead — it is worth a few milliseconds of a 14 ms query, not the
-  10x that page-fault behaviour was (section 11). It becomes worth building the
-  day a working set stops fitting in page cache, because that is when the CRC
-  read stops being free.
+- **No block cache.** Every query re-opens each block it touches — though no
+  longer re-CRCs it, which is a different thing and is now done once per file
+  per process (section 3.3). What is left of the open is `mmap`, the dictionary
+  scan and the two child indexes. This looked like the next big win until it was
+  measured against the two that were taken instead: it is worth a few
+  milliseconds of a 14 ms query, not the 10x that page-fault behaviour was
+  (section 11).
 - **OTAP is the data model, not yet the wire protocol.** No language SDK emits
   OTAP; the only production implementations are the Go
   `otelarrowreceiver`/`exporter` in collector-contrib. OTLP on 4317/4318 is the
@@ -129,13 +130,6 @@ missing, why, and what to do instead today.
   Prometheus uses. So "p99 of `http.server.duration`" is not a question this
   engine answers yet; `sum/count` is, and the buckets are there waiting for the
   reader that reads them. Section 13.3 is why alerting does not need them.
-- **No `F_FULLFSYNC` fallback.** `File::sync_all` *is* `fcntl(F_FULLFSYNC)` on
-  Apple targets — 4.2 ms on the reference machine against 28 us for a bare
-  `fsync(2)`, and the published ack latencies were measured against it rather
-  than against the weaker call. The gap is volumes that answer
-  `EINVAL`/`ENOTSUP`, Docker-for-Mac among them: std does not fall back there,
-  and a wrapper that did would have to *count* the fallback rather than quietly
-  weaken the acknowledgement it already returned.
 
 ---
 
@@ -170,11 +164,16 @@ it is measured.
   matters more, which is that neither can be set wrong from outside. There **is**
   a config file ([Configuration](config.md)), and it is not a contradiction: it describes
   *where the process runs* — addresses, data directory, retention policy, replica
-  name. The one key that reaches the engine, `ingest.shards`, is there because the
-  runtime's count of the cores it has can be wrong (section 4), and the default
-  asks nobody: it is a correction, not a tuning surface. The boundary
-  is structural, not documentary. It is also closed — twelve keys, and an unknown
-  one is a startup error naming it — because the alternative is what
+  name. Three keys reach the engine and none of them is a tuning surface.
+  `ingest.shards` is a *correction*: the runtime's count of the cores it has can
+  be wrong (section 4), and the default asks nobody. `ingest.queue` buys queueing
+  and not throughput — the flusher drains at the rate it drains — so it is
+  memory an operator with spare memory can spend on absorbing a burst.
+  `ingest.wal` is a *promise*, not a speed: on means an ack survives SIGKILL at a
+  p99 in the microseconds, off means it survives power loss at a p99 of 2.6 s,
+  and nothing the engine can measure says which one a deployment wants. The
+  boundary is structural, not documentary. It is also closed — thirteen keys, and
+  an unknown one is a startup error naming it — because the alternative is what
   `cluster.peers` was (section 12.2): a key read by nothing that still looks like a
   setting in effect.
 - *Agent-based internals* — the flusher tasks, three signals × `ingest.shards` of
@@ -202,9 +201,12 @@ rules out DataFusion *from the default build*: it would give SQL for free at a
 cost of 47 direct dependencies and a ~1.5M SLoC transitive tree. The binary cost
 was estimated here at 68–92 MB and that was too pessimistic — built at Mira's
 release profile it is **50.0 MiB and 271 crates**, against 5.63 MiB and 117. An
-order of magnitude is still an order of magnitude, so it goes behind a
-`--features sql` cargo feature rather than into the binary everyone downloads;
-what it does not do is displace the hand-rolled ~2,000 LOC fast path, because a
+order of magnitude is still an order of magnitude, so it is out of the binary
+everyone downloads. There is no `--features sql` in the tree: `crates/mira`
+declares `default = []` and `webhook-tls`, and nothing else. The feature is the
+*shape* a SQL surface would take if one is ever asked for — a gate, not a
+default — and section 10 keeps it on the not-built list until someone asks. What
+DataFusion does not do, either way, is displace the hand-rolled ~2,000 LOC fast path, because a
 4.5 ms point lookup that already prunes to one block of 137 has nothing to gain
 from a planner. With traces, metrics, query, MCP and both UIs in it, the default
 build is **5.63 MiB stripped, 117 crates** — the scale the design is defending.
@@ -360,10 +362,16 @@ builder, a single reader and a single semi-join helper cover all three levels:
 | `parent_id` | `UInt32` |
 | `key` | `Dictionary<UInt16, Utf8>` |
 | `type` | `UInt8` — OTAP discriminant, `0..7` |
-| `str` / `int` / `double` / `bool` / `bytes` / `ser` | `Utf8` / `Int64` / `Float64` / `Boolean` / `Binary` / `Binary` |
+| `str` | `Dictionary<UInt32, Utf8>` — the only *value* column that is dictionary-encoded |
+| `int` / `double` / `bool` / `bytes` / `ser` | `Int64` / `Float64` / `Boolean` / `Binary` / `Binary` |
 
 Exactly one value column is non-null per row; `type` says which. The other five
 cost one validity bit each.
+
+`str` is a `UInt32` key rather than `key`'s `UInt16` because attribute values are
+unbounded in principle — a trace id, a URL, a GenAI prompt — so a `u16` would seal
+a high-cardinality tenant's block every few thousand rows. The wider index costs
+0.7% of compressed bytes and buys a ceiling a 32 MiB block cannot reach.
 
 Two deliberate deviations from OTAP, both cheap to reverse:
 - `ser` holds the protobuf encoding of the `AnyValue`, not CBOR. We own both
@@ -393,7 +401,15 @@ Two deliberate deviations from OTAP, both cheap to reverse:
     number_dp.arrow  hist_dp.arrow  hist_bounds.arrow  exp_hist_dp.arrow  summary_dp.arrow
     dp_attrs.arrow  exemplars.arrow  exemplar_attrs.arrow
     attr.idx  zone.idx
+<data>/.wal/<node:08x>-<first_seq:020>.wal          # only with ingest.wal on
 ```
+
+The log is the one thing under `<data>` that is not a block, and the leading dot
+is load-bearing: everything that walks the store filters on the three signal
+directories, and a hidden sibling is one a shell glob does not sweep into a block
+listing by accident. A segment is named for the *first* sequence it holds, which
+is what lets `Wal::open` refuse to resume onto the name of a segment that ended
+torn (section 4).
 
 Those are the tables a block *can* hold, not the ones it does: `publish` skips an
 empty one, so a traces block normally holds five of the nine — the event and link
@@ -454,6 +470,94 @@ faults in every page of string data, defeating the point of demand paging.
 
 `corrupt_body_is_caught_not_returned_as_data` in `crates/mira-core/src/lib.rs`
 flips one bit mid-body and asserts the read fails.
+
+Two things then decide what a query actually pays for that guarantee: *which*
+tables it verifies, and *how often* it verifies each one. They are independent
+and this release changes both.
+
+**The CRC is per table, and that is what lets a query skip one.** Each `.arrow`
+file carries its own `mira.crc32`, so `block::open_table` verifies exactly the
+one file it is opening and nothing else in the block. `Block::open` therefore
+takes the root table and stops; `Block::detail` maps the three attribute levels
+and, for traces, the child tables, and it is called on exactly two occasions —
+a predicate that names an attribute, because the predicate is evaluated against
+those tables, and a block that produced a row, because rendering a row emits
+its attributes. A block that matches nothing and is asked nothing about
+attributes is never hashed past its root, and on the measured corpus that is
+42.9% of a *plain* logs block and 45.7% of a plain traces block left unread —
+5.5% and 6.3% once the cold tier has compacted it, where the saving is
+decompression rather than bytes (section 11).
+
+None of that weakens the guarantee. What changes is *which* tables a query
+reads; every table it reads is verified in full before a byte of it is
+returned, and a corrupt attribute table that no query has touched is caught by
+the first query that touches it.
+`a_corrupt_attribute_table_is_caught_by_every_query_that_reads_it_and_no_other`
+corrupts one `log_attrs.arrow` and pins all three halves of that: the scan that
+does not read it succeeds, the attribute predicate fails `BadChecksum`, and so
+does the query that renders one of its rows. Going back to an eager load fails
+the first; rendering without the verified load fails the third.
+
+**And the CRC is paid once per file per process, not once per open.** It is the
+right thing to do on a first read and pure waste on a second: a published block
+never changes, so a scan that reopens the same corpus re-hashes bytes this
+process has already hashed. `open_table` consults a process-scoped map of
+`path -> (len, mtime, ino)` before hashing and writes to it after. Not the path
+alone — `compact` renames a new table over an existing name, which is a
+different file that must re-verify.
+
+All three fields, and each one covers a way the bytes under a path change that
+the others cannot see. The length catches a rewrite of a different size. The
+mtime catches a rewrite of the same size, and alone it is not enough, because a
+length-preserving write inside one filesystem mtime tick does not move it; the
+settle window below is what closes that. The inode catches a
+**replacement**, and nothing else does: `std::fs::copy` on APFS is
+`fcopyfile(COPYFILE_ALL)` and preserves the source's mtime to the nanosecond, as
+do `cp -p`, `rsync -a`, `tar -xp` and every backup agent worth running. A block
+restored from a copy of itself therefore arrives at a path this process has
+verified, wearing a length and an mtime it remembers, carrying bytes it has
+never hashed. That is the one failure this cache must not have — a bad block
+served as good data — and the length and the mtime are both blind to it.
+
+The settle window is the rest of that argument. An entry is only recorded once
+the file has been untouched for longer than any filesystem's mtime granularity,
+which makes a later write necessarily a later tick and necessarily a miss. In
+production that excludes only a block being written right now, which is the one
+that should be re-read anyway.
+
+Keying on the inode *instead* would be worse than either, which is the shape
+this was first written in. Retention unlinks block directories continuously and
+an inode number is reusable the moment its last link goes, so a fresh table
+could be handed the number of an expired one and inherit its verdict. Composed,
+that is a non-issue: a reused inode would also have to arrive at the same path
+under the same length and the same mtime.
+
+`a_block_replaced_under_a_verified_path_is_checksummed_again` is the regression
+test, and it is worth saying that it failed against the two-field key — the
+restored block was served from the cache, unchecksummed, exactly as described.
+Three fields also mean a restore is free to preserve whatever it likes: the
+earlier design put the obligation on the caller, who had to stamp a current
+mtime by hand and had no way to be told they had forgotten.
+
+That leaves `skip_validation(true)` above resting on a weaker premise on a
+second open — not "the CRC just proved these bytes" but "this process proved
+them earlier" — and it is worth being exact about which half of that is new.
+The strong reading was never available under `mmap`: a clean page can be
+evicted between the hash and the scan that reads it, and re-faulted from disk,
+so even a single open verifies the bytes as of the CRC and not as of the read.
+Closing *that* would mean copying the body out and validating the copy, which
+is the zero-copy property this section exists to protect. What the cache
+changes is the width of the window, from one open to one process; what it costs
+is detection of media that rots under a mapping this process has already
+verified. A restart re-verifies everything, which is why the map is
+process-scoped and not persisted.
+
+What it is worth is [section 11](#11-performance-model), and the two changes
+stack rather than compete: the lazy load removes opens that should never have
+happened, and the cache removes the repeat hashes on the opens that remain.
+Section 11 measures each against the binary that preceded it and then both
+together, because the cache's own figures were first taken against the eager
+`Block::open` that no longer exists.
 
 ### 3.4 Alignment
 
@@ -598,7 +702,7 @@ default-configured Mira has nothing to replay. What the log buys is the *ack*.
 "Acknowledged means published" costs 2.6 s at p99 (section 11) because the export waits
 for its block to fill or age out, and no amount of tuning fixes that — it is the
 block size, and shrinking the block to fix the ack would trade the read path for
-the write path. So the frame goes to `wal/` first and the ack costs a `write(2)`,
+the write path. So the frame goes to `.wal/` first and the ack costs a `write(2)`,
 which is 7 µs at p50; the publish becomes a background reorganisation of data
 that is already on disk. Two consequences follow, and both are load-bearing.
 What the log tracks: not a high-water mark but a *set* — every sequence handed
@@ -791,11 +895,26 @@ and no signal to tokio. Both go through `spawn_blocking`.
 
 ## 6. Retention worker
 
-A 60-second tick that computes `now - ttl`, calls `scan()`, and `remove_dir_all`s
-every block whose `max_ts` is older. That is the whole worker.
+A 60-second tick that does three things per signal, in this order, and nothing
+else:
 
-TTL is a directory unlink, not a compaction: there is no read-modify-write of
-live data, so retention costs no IO bandwidth and cannot interfere with ingest.
+1. **Expire.** Compute `now - ttl`, call `scan()`, and `remove_dir_all` every
+   block whose `max_ts` is older. With `--offload`, the copy to the object store
+   is the hook that runs just before each unlink (section 12.4).
+2. **Compact.** Rewrite up to `MAX_COMPACT_PER_SWEEP = 8` blocks per signal whose
+   `max_ts` is older than `COLD_AFTER_NS`, table by table, ZSTD into a `.tmp` and
+   rename. Expire runs first on purpose: compressing a block this sweep is about
+   to delete is pure wasted bandwidth.
+3. **Reclaim.** One `statfs`. If free space is under `MIN_FREE = 10%`, drop
+   oldest-first until it is not, logging every block and why. `--offload`
+   deliberately does not apply here — an unreachable store must not be able to
+   stop the floor from reclaiming.
+
+TTL is a directory unlink, so step 1 costs no IO bandwidth and cannot interfere
+with ingest. Step 2 is the one that does read and write live data, and section 11
+prices it: it is bounded to eight blocks per signal per sweep precisely so that
+the bandwidth it costs is a constant an operator can reason about rather than a
+function of how far behind it is.
 
 **No reader lease protocol is needed**, and this is a real result rather than an
 optimism. POSIX specifies that `mmap()` adds a reference to the file that
@@ -804,6 +923,68 @@ mapping goes away. A query holding an `Arc<Mmap>` therefore keeps reading correc
 data out of an unlinked file. The `Arc` *is* the refcount and the kernel holds
 the inode. The one rule: never truncate or rewrite a published block — that
 gives readers `SIGBUS`, whereas unlinking does not.
+
+### 6.1 `--offload`: a copy before the unlink
+
+`--offload <uri>` puts a copy of a block in an object store immediately before
+retention unlinks it. One flag, because a URI is an address, and the only
+tiering knob there will be: no offload period, no cache path, no cache size, no
+eviction policy. The period is `storage.retention`, because the block leaving
+the disk *is* the event.
+
+**The naming is the catalogue.** An offloaded block lands at
+`<uri>/<signal>/p=<epoch_hour>/<block>` — byte for byte the layout of section
+3.2, time range still in the directory name. The store's own list API is
+therefore the manifest exactly as `readdir` is locally: `mira offload list` is
+`block::scan` pointed at the other root, parsing `min_ts`, `max_ts`, node and
+sequence back out of the names it gets. Nothing is written that a future binary
+has to understand and nothing records what has been uploaded.
+
+**The ordering is the design.** The copy is a hook `expire_with` runs just
+before each `remove_dir_all`, so the failure direction is fixed at *two copies,
+never zero*: a copy that fails logs, keeps its block, and is retried next sweep.
+The alternative — a separate upload pass that marks what it has done — needs a
+marker both passes agree on, which is coordination state, which is what
+principle 4 spends everything to avoid. Doing the copy inside the unlink makes
+the filesystem's own presence and absence the marker.
+
+**Staging, so a killed copy is not a block.** Each block is written to
+`<root>/.tmp/<signal>-<name>-<pid>` and renamed into place, so a partial
+directory never appears in a listing and never blocks the retry. A rename that
+loses to another replica's is success, not an error — both wrote the same
+immutable bytes. The restore path stages under the same
+`<node:08x>-restore-` shape `block::sweep_staging` already clears at boot, so a
+killed restore costs no new code.
+
+**`file://` only, and that is not a placeholder.** Everything after the prefix
+is a path, so `file:///srv/cold`, `file://./cold` and a bucket already mounted
+into the filesystem all work. `s3://` is refused at startup, and the reason is
+the dependency budget rather than the effort: signing a request needs
+HMAC-SHA256 and reading a listing needs an XML parser, and neither is in the
+crate graph the README counts. An operator who wants S3 mounts it; `mira` never
+learns what a bucket is.
+
+**An offloaded block is not `mmap`-able, and nothing pretends otherwise.** Reads
+never consult the store. `mira offload restore` copies blocks back into a data
+directory and the server picks them up on its next scan — that is the whole
+retrieval path. No transparent fetch, no cache tier, no partially-local block.
+It is also what keeps section 9's refusal to `mmap` a networked filesystem
+intact: the mapped file is always the local one.
+
+**The copy is a `read`/`write` loop on purpose**, not `fs::copy`. On macOS
+`fs::copy` is `fclonefileat`/`fcopyfile(COPYFILE_ALL)` and *preserves mtime*, so
+a block restored from a two-month-old offload would land with a two-month-old
+stamp on bytes written seconds ago. Nothing in this tree reads mtime in anger —
+retention keys on the `max_ts` in the directory name, so a restored block's
+expiry is the same either way — but a restore is the one operation that changes
+what is at a path, and `(len, mtime)` is how everything *outside* Mira notices
+that: `rsync`, a backup agent, `find -mtime`, any cache keyed on a path's
+identity. Writing the bytes makes the stamp current as a consequence of the
+write, with no call anyone has to remember.
+`offload_restore_stamps_current_mtime` is the test that fails if someone reaches
+for the faster call.
+
+The measured cost of all of it is in section 11.
 
 ---
 
@@ -834,7 +1015,7 @@ cannot have at all: **entity identity**.
 | `span_id` / parent | the record names a span | exact |
 | span link | async or fan-in causality | `span_links` table (with traces) |
 | exemplar | a metric datapoint sampled a trace | exemplar `trace_id` (with metrics) |
-| **entity + time** | **always** | `resources.key`, section 7.2 — written at seal, not yet selectable; section 7.4 |
+| **entity + time** | **always** | `resources.key`, section 7.2 — readable as a frame, not yet selectable as a predicate; section 7.4 |
 
 The ladder matters more than any single rung. An investigation that starts at an
 untraced error log gets nothing from the first four, and *everything* from the
@@ -974,10 +1155,15 @@ That runs at memory bandwidth and is not worth a sort at seal time.
 ### 7.4 Indexes: what is needed and what is not
 
 - **Time** — directory names. Built.
-- **Entity** — `resources.key`, written at seal and read by nothing. The write
-  half is built; no read surface exposes an entity selector, so the key-set cache
-  that would make one cheap — tens of `u64` per block, ~4 MB for ten thousand
-  blocks, and therefore no on-disk filter warranted — is not written either. The
+- **Entity** — `resources.key`, written at seal and read by the frame algebra
+  but not by any *predicate*. `frame::entity_keys` loads the column for
+  `anchor`, `expand`/`Peers`, `map`, `names_of` and `entities`, and the key
+  surfaces on `POST /api/v1/entities`, the MCP `list_services` tool and the TUI's
+  entity pane. What is still missing is the selector: `query::Search` has
+  `signal`, `from`, `to`, `terms`, `limit` and `after` and no entity member, so
+  no query prunes a block by entity. That is why the key-set cache that would
+  make one cheap — tens of `u64` per block, ~4 MB for ten thousand blocks, and
+  therefore no on-disk filter warranted — is not written either. The
   order is deliberate: a key has to be in the blocks before a reader can use it,
   so one written today is answerable across the whole retention window on the day
   a reader lands, and one written then is not.
@@ -1149,8 +1335,13 @@ parent ids that matched; `attr_rows` scatters those into a `Vec<bool>` over root
 rows, which the scan then reads by index. No hash set anywhere, which is only
 possible because ids were rebased at ingest (section 0) and are therefore dense
 from zero — resource and scope go through a second boolean array of the same
-shape rather than a join, because entity ids number in the tens. It covers all
-six value columns and every attribute level.
+shape rather than a join, because entity ids number in the tens. It covers every
+attribute level and four of the six value columns — `str`, `int`, `double` and
+`bool`. `bytes` and `ser` (the OTAP Bytes, Slice and Map values) are decoded and
+returned in a result but are not filterable in V0: `AttrPred::test` dispatches
+on the *stored* type and has no arm for them, so a predicate against one matches
+nothing rather than erroring. A filter over a serialised map is a path
+expression, which is a query language, which is section 0.
 
 **Every level means the span's children too.** Record, resource and scope are the
 obvious three; a span's `events` and `links` carry attributes of their own, and
@@ -1240,10 +1431,16 @@ yields the same set `sort(keys).truncate(max_series)` did — a key that belongs
 the smallest `max_series` can never be the maximum of a map already one over. The
 difference is when: accumulating first meant a `query_metric` with no `name`,
 over a store with a request id in a data-point attribute, allocated about a
-kilobyte per distinct series until the process died. What each cap refused is
-reported — `dropped_points` per series, `dropped_series` in `stats` — because a
-chart with a series missing and no way to know it is the failure mode both of
-them exist to prevent. Neither does `get_trace` — a trace is one page or
+kilobyte per distinct series until the process died. `max_points` reports what
+it refused, as `dropped_points` on the series it trimmed, because a chart
+silently missing its spikes is the failure mode the cap exists to prevent.
+`max_series` does not, and that is a gap rather than a decision:
+`Stats::dropped_series` is computed (`series.rs:184`) and then dropped on the
+floor, because `api::envelope` is the only serialiser on every read surface and
+does not carry it — so the 65th series is invisible to HTTP, MCP and the TUI
+alike, which the TUI's own `ponytail:` at `tui.rs:510` says out loud. The fix is
+one field in `envelope` and a badge; it is unbuilt because it widens the
+response object every read surface shares. `get_trace` does not page either — a trace is one page or
 it is a broken trace, and an agent handed a third of one will reason about the
 third.
 
@@ -1581,16 +1778,18 @@ The cost of leaning low is bounded by `max_block_age`: a shard holding an old
 frame pins its siblings' watermarks behind it, and it is at most two seconds from
 sealing.
 
-**Probes are not the UI, and the listening line is not a promise.** `/health` and
-`/readyz` are the same handler — Mira has no warm-up and no cluster to join, so
-there is no state in which it is alive and not ready. `ingest.wal` does not
-change that, though it is the first thing that could have: log replay is the one
-startup task with unbounded duration, and it runs to completion *before* any
-listener binds, so a probe during replay finds a closed port rather than a
-process answering 200 about data it has not recovered yet. Connection refused is
-the honest answer and it is free — answering 200 with the
-per-signal shed and failed counts, so the probe and the log agree about how much
-has been refused. They also exist so that something other than the UI answers at
+**Probes are not the UI, and the listening line is not a promise.** `/health`
+and `/readyz` were one handler once — Mira has no warm-up and no cluster to
+join, so there is no state in which it is alive and not ready. A full volume is
+exactly that state, so they are two answers now: liveness is a constant 200 plus
+the per-signal shed and failed counts, so the probe and the log agree about how
+much has been refused, and readiness is the single question of whether an export
+can still be made durable. `ingest.wal` does not add a third state, though it is
+the first thing that could have: log replay is the one startup task with
+unbounded duration, and it runs after both sockets are bound but *before* either
+accept loop starts — so a probe during replay completes its handshake into the
+kernel backlog and then waits there, and is never answered 200 about data the
+process has not recovered yet. They also exist so that something other than the UI answers at
 those paths: the asset router 404s a path it does not know and deliberately has
 no SPA fallback, because every view in the app lives under the URL hash, so an
 unknown *path* is a probe pointed somewhere wrong rather than a route needing
@@ -1635,16 +1834,22 @@ node is a line the eye learns to skip.
 
 ## 10. What is deliberately not here
 
-- **The frame algebra of section 7.3** — all of it. No `Frame`, no `anchor`, no
-  expander, no `fetch`. A span query returns its links and a series returns its
-  exemplars, so both out-edges of section 7.1 are readable, but the caller follows them
-  itself and there is no operation that widens a region rather than answering a
-  question.
-- **A block cache.** Every query re-opens and re-CRCs every block it touches. The
-  fix is a process-local `Arc<MappedTable>` map invalidated by `expire`. This was
-  assumed to be the next big win and it is not: section 11 measures the per-block cost as
+- **`fetch`, and four of the seven expanders.** The algebra itself is built and
+  section 7.3 says so in its title: `mira_core::frame` is `Frame`, `anchor`,
+  `expand` over `Traces`/`Peers`/`Around`, `map`, `names_of` and `entities`,
+  served at `POST /api/v1/frame`, `/api/v1/map` and `/api/v1/entities`. What is
+  not there is `fetch` — a `Frame` holds identities and there is no operation
+  that renders the records for them, so every widening is another scan — and the
+  four expanders section 7.3 cut with its reasons beside them.
+- **A block cache.** Every query re-opens every block it touches. The fix is a
+  process-local `Arc<MappedTable>` map invalidated by `expire`. This was assumed
+  to be the next big win and it is not: section 11 measures the per-block cost as
   dominated by faulting the mapping in, which the `MADV_WILLNEED` hint already
-  addresses. A cache saves the `open` and the CRC — real, small.
+  addresses. Half of what such a cache would have saved is taken already and
+  separately — the CRC is verified once per file per process (section 3.3), which
+  needs no cached mapping and so has none of a cache's invalidation surface.
+  What is left for it to save is the `mmap` and the two child indexes: real,
+  small.
 - **A dependency on `otel-arrow-dfe-quiver` 0.54.1.** It is an embeddable
   Arrow segment store from the OTel Arrow maintainers, Apache-2.0, and it already
   ships a CRC32 WAL with replay, immutable IPC segments, `SegmentReader::open_mmap`,
@@ -1658,20 +1863,26 @@ node is a line the eye learns to skip.
   decisions, which this document already reflects.
   Related: do **not** depend on `otel-arrow-dfe-pdata`; it pulls
   `datafusion ^53` non-optionally for two imports.
-- **DataFusion in the default build.** section 1. Behind `--features sql` it is not
-  rejected: 50.0 MiB and 271 crates is a real price, but it is paid only by
-  whoever asks for SQL, and DataFusion 55 pins arrow v59.3.0 — exactly Mira's
-  pin — so there is no second Arrow in the tree.
+- **DataFusion, in any build.** section 1. It is not *rejected* — 50.0 MiB and
+  271 crates behind a cargo feature would be paid only by whoever asks for SQL,
+  and DataFusion 55 pins arrow v59.3.0, exactly Mira's pin, so there would be no
+  second Arrow in the tree. But no such feature exists: `crates/mira` declares
+  `default = []` and `webhook-tls`, `datafusion` is in no manifest and no
+  lockfile, and `--features sql` does not resolve. It is a shape held open, not a
+  build option.
 - **The `F_FULLFSYNC` fallback** (section 9). Not a weaker fsync — the opposite, and it
   was settled by measuring rather than by reading. On this machine
   `File::sync_all()` costs 4,230 us, `fcntl(F_FULLFSYNC)` 4,213 us and a bare
   `libc::fsync(2)` 28 us: `sync_all` *is* `F_FULLFSYNC` on Apple targets, so
   section 11's ack latencies are measured against the stronger barrier and nothing is
-  owed for the ordinary case. What is missing is the Docker-for-Mac
-  `EINVAL`/`ENOTSUP` path section 9 names, where std does not degrade and the durability
-  loss would therefore be silent. The `statfs` guard beside it in that section
-  **is** written: `block::check_filesystem`, called once before anything is
-  mapped.
+  owed for the ordinary case. The Docker-for-Mac `EINVAL`/`ENOTSUP` path section 9
+  names **is** written, and so is the counting section 9 insists on:
+  `mira_core::sync_all`/`sync_data` wrap every sync in `block.rs` and `wal.rs`,
+  degrade to `libc::fsync` on exactly those two errnos, and report the count as
+  `degraded_syncs` on `/api/v1/stats`. So is the `statfs` guard beside it:
+  `block::check_filesystem`, called once before anything is mapped. What stays on
+  this list is the *weaker* fsync — trading the barrier for throughput by
+  default, which would make an ack mean less than it says.
 - **Hand-written SIMD on the decode path.** Protobuf varint decoding is
   inherently serial — each field's length says where the next begins — and
   branchy on wire type, so there is no vector formulation of the inner loop. The
@@ -1691,10 +1902,14 @@ node is a line the eye learns to skip.
   does GB/s, on 1.75 of twelve cores. Revisit when a profile shows syscall
   overhead above ~5% of ingest CPU, or when the log's group commit measures
   submission-bound rather than device-bound.
-- **The query-side half of `NO_IDENTITY`.** The sentinel is written (section 7.2) and
-  the expander that must refuse it is not — not because the query layer is
-  missing, it is not, but because no read surface exposes `resources.key` at all
-  (section 7.4). There is nothing yet for the sentinel to be refused by.
+- ~~**The query-side half of `NO_IDENTITY`.**~~ Built. `Frame::add_entity`
+  (`frame.rs:82`) drops the sentinel with the reason this bullet asked for — "an
+  entity set containing the sentinel means *every resource nobody described*,
+  which is not an entity" — and `frame::entities` exposes `resources.key` on
+  `POST /api/v1/entities`, the MCP `list_services` tool and the TUI, so there is
+  now something for it to be refused by. The bullet is kept struck through rather
+  than deleted because the reasoning for the refusal is what section 7.2 is
+  pointing at.
 
 ---
 
@@ -1711,8 +1926,54 @@ GiB of Arrow across 1,652 tables in 137 log blocks, 155 trace blocks and 24
 metric blocks. The ingest rows are separate 30 s runs against a fresh server,
 each the median of three; the query rows are that corpus, read back after a
 restart, and every one of them is a paired A/B against the 0.0.1 binary run
-back to back in the same sitting; the cold-tier table further down is the same
-1,652 tables.
+back to back in the same sitting.
+
+Several bullets below are the exception and say so where they appear, because
+each needs a corpus this one cannot be — a full round-trip through an upload, a
+scan repeated ninety times, or blocks the cold tier has not reached yet:
+
+| corpus | shape | what it is for |
+|---|---|---|
+| the table's own | 8.33 GiB, 1,652 tables, 137 log / 155 trace / 24 metric blocks | every row of the table above |
+| **small** | 137 blocks, 3,599,317,452 bytes (3.352 GiB), 62 logs / 64 traces / 11 metrics | cold tier, block reopens — round-tripping 8.33 GiB through an upload takes long enough that the box moves underneath it |
+| **small, compacted** | those same 137 blocks after the cold tier has finished with them: 718 tables, 440,421,916 bytes, all 137 marked `cold` | the compacted arm of the lazy-open bullet |
+| **plain** | 115 blocks, 611 tables, 2,927,859,966 bytes, 50 logs / 53 traces / 12 metrics, none compacted | the main arm of the lazy-open bullet, which needs attribute tables that are still uncompressed |
+| per-run | built fresh by the script that reads it | restart replay, and the second sitting's 9.6 GiB / 5.01 GiB pair |
+
+The restart-replay corpus is per-run because what it measures is a difference
+across a restart rather than any absolute. All of them are internally paired and
+**none of their numbers may be divided into the table above**.
+
+Four of the five are reproducible from a script in `scripts/measure/`, named in
+the bullet that uses them: `restart-replay.sh`, `offload-cycle.sh`,
+`block-reopens.sh`, `lazy-detail.sh`. **The second sitting's 9.6 GiB / 5.01 GiB
+pair is not.** It was built by hand and there is no script that rebuilds it, so
+that one bullet is reproducible in method and not in corpus. The obstacle is
+worth naming because it is fixable and general: `loadgen`'s payload is
+deterministic — the same arguments produce the same bytes — but its stopping
+condition is `--for <duration>`, so the *volume* a run produces depends on how
+fast the box was. A record-count stopping condition would make a corpus
+described by an exact byte count something a second person can rebuild. See
+[the measurement contract](internals/measurement.md).
+
+The plain one is there for a reason worth stating once: **a corpus is not a
+constant while a server is running on it.** The cold tier compacts blocks that
+have aged past their partition hour from inside the server a harness keeps
+starting, so a long A/B over fresh blocks starts plain and finishes compacted,
+both arms drift together, and the result is a measure of how far through the
+transition each pass landed. That is not hypothetical — it invalidated a table
+this section published, and the withdrawal is under the lazy-open bullet.
+`lazy-detail.sh` now fingerprints the corpus before the run and after every pass
+and refuses to continue if it moved.
+
+There is now a **second sitting**, and naming it is better than folding it in.
+It exists because the checksum cache (section 3.3) landed after the table was
+measured, and it covers the query rows only: two corpora from the same
+generator, both read by this binary and by 04561ed back to back. It does not
+re-measure ingest, footprint or cost per GB, because the write path is
+byte-identical across that change and replacing good numbers with ones taken on
+a busier machine is not an improvement. Where the two sittings disagree the
+disagreement is the finding, and it is written up under the last row.
 
 Six flushers per signal rather than one (section 4) changed the *shape* of that
 corpus as well as the rate that produced it: 137 log blocks of ~204,800 rows
@@ -1728,13 +1989,18 @@ an engine that is fast at whichever one its authors were watching.
 [End-to-end testing section 3](internals/e2e.md#3-the-load-harness) is how to drive
 it and what it teaches.
 
-Read the two query columns carefully. **Neither is a cold-disk number**: 8.33
-GiB fits in this machine's 18 GiB of page cache, so after one pass everything is
-resident and short of `purge` there is no way back. "First" is the first call
-after a process restart — the pages are in RAM but not in this process's address
-space, so it measures establishing 316 blocks' worth of mappings and faulting
-them in. "Steady" is the same call repeated. The gap between them is
-virtual-memory work, not I/O.
+Read the two query columns carefully. "First" is the first call after a process
+restart; "steady" is the same call repeated. The gap between them is
+virtual-memory work — establishing 316 blocks' worth of mappings and faulting
+them in — and for every row that prunes, so is nearly all of the steady figure.
+
+This paragraph used to go on to say that **neither column is a cold-disk
+number**, because 8.33 GiB fits in this machine's 18 GiB of page cache. That is
+arithmetic, not a measurement, and the second sitting shows it does not hold for
+the last row: 18 GiB shared with a VM, Docker and a browser does not keep 8 GiB
+of corpus resident, and the same scan over a corpus that *does* stay resident is
+three times cheaper per row. Treat the pruning rows as warm and the last row as
+partly not.
 
 | Axis | Target | Measured | |
 |---|---|---|---|
@@ -1744,9 +2010,9 @@ virtual-memory work, not I/O.
 | Query: attribute value, absent | ≤ 10 ms | **8.3 ms** first, **2.6 ms** steady, 0 of 137 blocks | ✓ |
 | Query: attribute value, matching | ≤ 10 ms | **4.1 ms** first, **4.5 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
 | Query: unfiltered `limit 100` | ≤ 10 ms | **29.1 ms** first, **4.6 ms** steady, 1 of 137 blocks, 204,800 rows | ✓ |
-| Query: trace by id | ≤ 10 ms | **8.3 ms** first, **4.7 ms** steady, 2 of 155 blocks, 73,728 rows | ✓ |
+| Query: trace by id | ≤ 10 ms | **8.3 ms** first, **4.7 ms** steady, 2 of 155 blocks, 73,728 rows — first sitting; the second measures the checksum cache 1.47× under it | ✓ |
 | Query: metric names | — | **8.9 ms** first, **4.7 ms** steady, 24 of 24 blocks | — |
-| Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows | see below |
+| Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows — first sitting, and the row the second sitting has the most to say about | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.20 B/B** hot, **0.14 B/B** compacted | ✓ |
 | Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.63 MiB** / 117 crates | ✓ |
 
@@ -1766,12 +2032,314 @@ Reading these honestly:
   passes span 6% and 16% — and then falls away to 1,136,941 at 96. That is a new
   shape: before `ingest.shards` (section 4) the curve peaked at four connections
   and declined from there, and 96 returned 734,142. Ten idle cores at the plateau
-  means the ceiling is somewhere other than the engine's arithmetic. This run does not say where, and it
-  cannot: the generator is co-resident and encoding 8192 protobuf records per
-  batch is inside the same loop, so part of the per-batch cost is the harness's.
-  Separating them wants the generator on a second machine, which is the one
-  thing a single-laptop harness cannot do. Until then, treat the aggregate as a
-  floor and the per-core figure as the comparable one.
+  means the ceiling is somewhere other than the engine's arithmetic, and the next
+  bullet names it. Two caveats stay on the aggregate whatever the cause: the
+  generator is co-resident and encoding 8192 protobuf records per batch inside
+  the same loop, so part of the per-batch cost is the harness's, and separating
+  them wants the generator on a second machine, which is the one thing a
+  single-laptop harness cannot do. Treat the aggregate as a floor and the
+  per-core figure as the comparable one.
+- **The plateau is one mutex held across a `write(2)`, and the measurement ships
+  with the binary.** The sweep above cannot see the cause from outside: a
+  closed-loop generator reports `connections × batch / ack latency`, so every
+  hypothesis predicts the same curve, and CPU is flat at 2.23 cores at both ends
+  of it. `mira_core::diag` answers it from inside — two `Instant::now()` pairs
+  and five relaxed atomics per export, under 150 ns against a critical section
+  measured in milliseconds — and prints only when its target is enabled:
+
+  ```sh
+  RUST_LOG=mira=info,mira_core=info,mira::probe=debug mira --data-dir ./data
+  ```
+
+  Three runs, `loadgen --for 20s --batch 8192`, fresh store each, means over the
+  whole run — `scripts/measure/ingest-probe.sh` is the whole sequence, this
+  table and the worker-count A/B in the next bullet:
+
+  | | 4 conns | 32 conns | 96 conns |
+  |---|---|---|---|
+  | records/s | 1,297,149 | 1,917,983 | 1,814,829 |
+  | ack p50 | 8.3 ms | 64.3 ms | 199.9 ms |
+  | `submit.total` | 7.571 ms | 22.117 ms | 26.177 ms |
+  | `submit.admit` | 0.000 ms | 0.002 ms | 0.001 ms |
+  | `wal.encode` | 0.733 ms | 1.545 ms | 1.400 ms |
+  | `wal.lock_wait` | 3.920 ms | 18.152 ms | 22.067 ms |
+  | `wal.held` | 2.915 ms | 2.272 ms | 2.611 ms |
+  | of which `wal.write` | 2.849 ms | 2.042 ms | 2.422 ms |
+  | `runtime.lag`, ticks | 9.7 ms, 418 | 33.9 ms, 238 | 80.2 ms, 192 |
+  | `wal.inflight_max` | 4 | 12 | 12 |
+
+  Read down a column rather than across, for the reason three bullets below.
+  **`wal.lock_wait` is 52% of `submit.total` at four connections and 82% and 84%
+  at thirty-two and ninety-six.** There is one `Wal` behind all three signals and
+  all `ingest.shards` shards; `wal.held` times the append count is 15.2 s, 14.7 s
+  and 18.6 s of a twenty-second run, so **the single mutex is occupied 74% to 93%
+  of the wall clock**, and 90–98% of what it is held for is the three
+  `write_all`s. At 2.2–2.9 ms an append the log serialises at most 345 to 440
+  appends per second, and at ~5,100 records an append that is a hard **1.7 to
+  2.6 M records/s whatever the connection count**. Connections past the plateau
+  add waiters, not appends.
+
+  `wal.inflight_max` is what makes it a runtime failure rather than only a
+  throughput one. `std::sync::Mutex` on aarch64-apple-darwin is the pthread
+  backend, so a contended `lock()` parks the OS thread in the kernel — and a
+  parked tokio worker runs no other task and is not replaced. A high-water mark
+  of exactly 12 on a 12-worker runtime says every worker was inside
+  `append_then` at once. `runtime.lag` is the same fact with nothing borrowed
+  from the client: a task that asks to sleep 50 ms and does no work at all wakes
+  9.7 ms late at four connections, 33.9 at thirty-two and 80.2 at ninety-six.
+  The tick counts beside those — 418, 238 and 192 — are **not** out of a fixed
+  denominator, and an earlier draft of this table said they were out of 400,
+  which is impossible on the face of it since 418 is larger. `RUNTIME_LAG` is a
+  free-running probe spawned at process launch and never reset, so its count is
+  over the whole process lifetime and is not comparable across columns; the load
+  window is 20 s of that. What *is* comparable is the cadence the lag implies:
+  a 50 ms sleep that wakes 9.7, 33.9 and 80.2 ms late completes **16.8, 11.9 and
+  7.7 wake-ups per second** against the 20 it asked for. Ack latency cannot
+  separate "working hard" from "cannot schedule anything". This can, and it says
+  the second.
+- **Each obvious suspect is ruled out by a number rather than an argument.**
+  Admission backpressure: `submit.admit` — `reserve()` plus the `ADMIT_WAIT`
+  park — is a mean of 0.000 to 0.002 ms with a maximum of 6.5 ms at every shape,
+  so the bounded channel is not where the time goes, and `reserve()` is a
+  first-fit `try_reserve` across shards touching atomics only, so shard dispatch
+  goes with it. Park/wake under saturation is real but it is *inside*
+  `wal.lock_wait`, not beside it. And more runtime workers is not the fix, which
+  is the paired A/B worth keeping: 96 connections, same binary, same box, back to
+  back, `TOKIO_WORKER_THREADS` 12 against 48 — **2,229,315 records/s against
+  1,675,695, a 25% loss, `wal.lock_wait` up 6.4x from 16.3 ms to 104.5 ms and
+  `wal.inflight_max` from 12 to 47**, while the total time the mutex was *held*
+  barely moved, 14.98 s against 14.50 s. Four times the workers bought four
+  times the queue and the same serialised section.
+- **What this costs, and what did not land.** The fix is not in this release and
+  the honest reason is that neither candidate can be validated to this section's
+  standard on this box. Group commit — one `writev` of whatever is waiting at the
+  lock, the ack still after the write lands, never a `BufWriter` that acks bytes
+  still in userspace — is the direct answer; one log per signal is the cheap one,
+  three mutexes instead of one, bounded by the signal count rather than the core
+  count. Neither needs coordination state and neither changes the format. What
+  did land is `Wal::sync()` taking its `F_FULLFSYNC` outside the lock rather than
+  inside it: structurally right given the 4,230 µs section 10 already publishes
+  for that call, and **not measured to move any number in the table above**. The
+  sweep does call it — four times a second for the life of the process, so ~80
+  times in a 20 s probe run — but at 4,230 µs on a 250 ms period that is a ~2%
+  duty cycle, which lands on whichever exports are unlucky rather than on a mean
+  taken over hundreds of thousands of them. The half a 20 s run never reaches is
+  truncation, which is the 240th tick.
+- **The box, and a number withdrawn.** This machine is not quiet: an
+  idle-before baseline swung between 6% and 81% busy across consecutive runs,
+  and two runs of the *identical* 96-connection configuration minutes apart
+  returned 1,814,829 and 2,229,315 records/s, a 23% spread. **The 26% fall from
+  32 to 96 connections that the ingest row publishes did not reproduce on the
+  day the diagnosis was measured — the fall was 5%.** The published rates were
+  taken on a quieter day and are left as they were rather than restated from a
+  noisier one, and the diagnosis deliberately rests on ratios taken inside one
+  process during one run, which do not care what the rest of the machine was
+  doing. Reproducing it should move the absolute rates and leave the ratios
+  alone.
+- **`--offload` costs the retention sweep and nothing else.**
+  `scripts/measure/offload-cycle.sh`, one corpus, one box, back to back: 137
+  blocks, 3,599,317,452 bytes (3.352 GiB), three signals (62 logs, 64 traces, 11
+  metrics). The same sweep over the same corpus is **0.868 s and 0.518 s** as the
+  unlink it always was and **14.999 s and 14.844 s** with `--offload file://`, so
+  against the medians the copy is 14.229 s — **241.2 MiB/s**, which is `read` +
+  `write` + `fsync` per file on this volume. `mira offload restore` brings it all
+  back in **12.786 s, 16.642 s and 19.489 s**, a median of 16.642 s =
+  **206.3 MiB/s** but a spread of 176.1 to 268.5 MiB/s across three runs.
+
+  An earlier revision of this bullet read the two directions "agreeing within
+  6%" as a check that neither was doing something clever. It is withdrawn: at
+  n=1 each that agreement was a coincidence of two samples, and the restore
+  samples alone vary by 52%. What the three restores support is weaker and
+  honest — they bracket the upload figure rather than contradict it, and the
+  volume, not the code, is what this section can see. `mira offload list` over
+  all 137 blocks is **0.050 s**, one `readdir` per partition, which is the entire
+  catalogue. A second `restore` copies **0** blocks. Both costs land on the
+  retention `spawn_blocking` thread, so the ingest rows above are unchanged by
+  the flag.
+
+  Compatibility is checked two ways, because a query comparison alone would
+  not catch a silently re-encoded block. The same two queries — page one of the
+  newest logs, and a predicate that prunes nothing so every block is opened —
+  return **byte-identical** responses over the original and the restored corpus.
+  `diff -r` over all 137 restored block directories against the store reports
+  **no difference at all**. A third check — a second, independent upload into a
+  different prefix, compared against the first — would be the one that shows the
+  writer copies bytes rather than re-encoding them
+  reproducibly-but-differently. `offload-cycle.sh` does **not** run it; it uses
+  one prefix, and an earlier draft of this paragraph claimed three checks where
+  the script performs two. The check is also the one that needs measuring least:
+  `offload::copy_file` is `io::copy` over the two descriptors, deliberately not
+  `fs::copy` (which on macOS is `fcopyfile(COPYFILE_ALL)` and would carry the
+  source `mtime` across), so there is no encoder in the path for a re-encode to
+  hide in. One caveat is
+  itself a measured result: an md5 of a whole query response is the wrong
+  instrument and was withdrawn as one here, because two processes over a single
+  unchanged directory differ in `elapsed_us` and nowhere else — that field is
+  normalised before the comparison above, and the fact that it is the *only*
+  unstable field is what makes the comparison worth anything.
+- **A query verifies the tables it reads, and 0.0.3 read tables no query
+  wanted.** The per-table CRC32 shipped in 0.0.3 (section 3.3), so nothing about
+  the format changed here; what changed is that `Block::open` mapped and hashed
+  every attribute level of every block it opened, including blocks a scan was
+  about to reject. Those tables are **42.9% of a logs block** (645,830,556 of
+  1,506,872,204 bytes) and **45.7% of a traces block** (645,882,486 of
+  1,413,774,770) for as long as the block is plain, and 5.5% and 6.3% once the
+  cold tier has been over it — which is a result in its own right and is the
+  last paragraph here.
+
+  `scripts/measure/lazy-detail.sh`, 9 passes × 5 reps per case per build, two
+  binaries alternating inside each pass, `blocks_scanned` printed beside every
+  median and equal to `blocks_total` in every row. The corpus is 115 blocks —
+  50 logs, 53 traces, 12 metrics — 611 tables and 2,927,859,966 bytes, ingested
+  minutes before the run and **none of it compacted**. Three arms, because two
+  changes landed in one release and either would otherwise be credited with the
+  other's work:
+
+  | case | cache alone | split alone | both |
+  |---|---:|---:|---:|
+  | scan-miss-logs, 50/50 blocks, 8,898,000 rows | −18.6% | **−30.8%** | **−43.3%** |
+  | scan-miss-traces, 53/53 blocks, 8,898,000 rows | −23.9% | **−46.8%** | **−62.2%** |
+  | scan-attr (control) | −26.4% | −2.3% | −23.5% |
+  | page-100 (control) | −27.9% | +2.0% | −25.4% |
+
+  "Cache alone" is the verification map against 0.0.3, "split alone" is this
+  binary against the one carrying only the map, "both" is this binary against
+  0.0.3 — end to end, 68,869 → 40,806 µs on the logs scan, 48,425 → 18,625 on
+  traces. The third column is not the sum of the first two and does not have to
+  be, but it is close to their **product**: 0.814 × 0.692 predicts −43.7%
+  against −43.3% measured, 0.761 × 0.532 predicts −59.5% against −62.2%, 0.736
+  × 0.977 predicts −28.1% against −23.5%, 0.721 × 1.020 predicts −26.5% against
+  −25.4%. Two independent multipliers on one read path is what "the two changes
+  stack" (section 3.3) has to mean, and that arithmetic is the check on it.
+
+  The controls are the point of the middle column. `scan-attr` is the *same
+  query shape* as `scan-miss-logs` — same corpus, every block scanned, zero
+  matches — except that its predicate names an attribute, so both builds must
+  read the attribute tables; `page-100` renders a hundred rows, so both builds
+  must read theirs. Neither may move under the split and neither does, but the
+  median alone does not say that: what says it is the **sign** of the nine
+  per-pass deltas. Both treatments are negative in 9 passes of 9 (logs −38.6 to
+  −3.5, traces −59.9 to −42.2); both controls change sign (scan-attr −17.1 to
+  +30.6, page-100 −21.2 to +34.6). A control whose median is small but whose
+  deltas all point one way would be a real effect being called noise, and this
+  is the distinction that catches it.
+
+  The controls do move in the other two columns, by about as much as everything
+  else, and that is the verification map doing exactly what it should: it saves
+  a re-hash on every query that reopens a block, including the queries that read
+  the attribute tables. A caveat that belongs to those two columns and not to
+  the middle one: the harness runs one server per build per pass with two
+  warm-ups per case inside it, so the map is full before the first timed sample.
+  Those are warm-map figures, the upper bound, and a client that reconnects to a
+  fresh server pays the first hash again. The middle column is free of that,
+  because both of its binaries carry the map and both are warmed the same way.
+
+  Traces gains more than logs because of what is left after the map and the
+  hash come out. The traces predicate is over `name`, a dictionary column
+  resolved once and then matched on u16 codes, so nearly all of that query
+  *was* the map and the hash. The logs predicate is a substring scan over a
+  `Utf8` `body` column, which is real work that not-hashing does not remove.
+  The 31% is the floor, not the headline.
+
+  **The table published here before this run was taken while the cold tier was
+  rewriting the corpus underneath it, and it is withdrawn.** It read −25.0% and
+  −43.6% against 0.0.3 over 137 blocks. `compact` rewrites a block ZSTD-encoded
+  once it has aged out of its partition hour, eight blocks per signal per sweep,
+  from inside the server this harness starts fourteen times — so a run that
+  begins on a plain corpus ends on a compacted one, both arms drift upward
+  together across the passes, and a pooled median then reports how far through
+  that transition each pass happened to land. It is why the harness now
+  fingerprints the tables before the run and after every pass and refuses to
+  continue if they moved, why it reports a per-pass paired delta beside the
+  pooled one, and why "none of it compacted" is stated above as a property of
+  the corpus rather than assumed.
+
+  Run against the *same* corpus after the tier has finished with it — 137
+  blocks, 718 tables, 440,421,916 bytes, all 137 marked cold — the split is
+  **−33.5%** and **−56.0%**, controls −13.4% and +2.0% and both changing sign
+  across the nine passes. So the split survives compaction, which is not what
+  the byte shares predict: the attribute tables are **5.5%** of a compacted logs
+  block (11,874,948 of 216,220,380 bytes) and **6.3%** of a traces one. They
+  compress **66.3×** against the root table's **5.14×** — thirteen times better
+  — so on a cold block what the split skips is not mostly bytes to hash, it is
+  an inflate. The 1.11× that compaction costs a warm read, further down this
+  section, is a cost this stops paying on tables nothing asked for.
+- **The per-process verification cache: what it is worth, and the number that
+  nearly kept it out.** The second half of the same idea is to remember that a
+  block was verified so a later open can skip the hash. It is in this release
+  (section 3.3) and the "cache alone" column above prices it: **−18.6% to
+  −27.9%** across the four cases, near-uniform because, unlike the split, it
+  helps every query that reopens a block rather than only the ones that read no
+  attributes. Two other numbers were taken while the answer was still going to
+  be no. Both are kept, because one of them is a lesson in what a measurement is
+  allowed to decide.
+
+  The one that decides nothing first, with what it does not show stated plainly.
+  `scripts/measure/block-reopens.sh` runs 18 representative queries over 126
+  distinct blocks and records **21 block opens in total** — 12 queries open
+  exactly one block, 3 open three, 3 open none. That is a measure of how much
+  block spread a sample of queries has, and it is **not** the quantity a
+  process-scoped cache is priced on: the cache lives for the process, so what
+  decides it is how often a long-lived server reopens the same path across
+  thousands of queries against a hot recent window, and eighteen queries against
+  a denominator of 126 blocks cannot see that. Read as a reopen count it says a
+  cache is pointless. It was very nearly read that way, against a change that
+  then measured a quarter off every case in the table.
+
+  The other is the ceiling, from a throwaway build whose CRC comparison was
+  patched to always pass (built into a scratch target dir and reverted
+  immediately; it is not in the tree and not behind a flag). Against the
+  split-only binary, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
+  scan-miss-traces −29.5% (32,954 → 23,239), scan-attr −26.0% (63,662 →
+  47,085), page-100 −24.1% (3,865 → 2,933). That is verification made free
+  rather than merely cached, so it is more than a cache can reach — a cache
+  still pays the first hash of every file.
+
+  It brackets the measured cache rather than bounding it, and the honest reason
+  is that the two runs share neither corpus nor baseline: −26.4% measured
+  against a −26.0% ceiling is two methods agreeing inside their spread, not a
+  cache beating its own limit. What the pair is good for is that they approach
+  the same quantity from opposite ends and land in the same place — on this
+  shape of corpus the CRC is about a quarter of an open, and a map that rarely
+  misses recovers about a quarter.
+
+  Two caveats survive, because the ceiling is a method and not a constant. It is
+  corpus- and block-shape-dependent: it is the CRC's share of the read path, so
+  a corpus of fewer, larger blocks spends a larger fraction of each open inside
+  the hash and would measure a bigger share from the same method. And "make
+  verification free and re-time it" is the method, whatever mechanism does the
+  making-free — a patched comparison and a pre-warmed verification map are
+  measuring the same quantity, so two such figures taken on two corpora are not
+  in dispute with each other.
+
+  The two objections this bullet raised while the answer was no are both
+  answered in the shipped version rather than argued away. The key must not be
+  the path, because the tier replaces a file under a verified path an hour after
+  it lands: it is keyed on length, mtime and `ino` together behind a settle
+  window, and section 3.3 is the argument for each of the four parts. And the
+  footprint is capped rather than unbounded — `VERIFIED_CAP` at 65,536 entries
+  against ~1,800 tables for the largest corpus here, cleared wholesale rather
+  than evicted, with the LRU named as the upgrade path in the comment that sets
+  it.
+- **A restart replays past the slowest shard, and it is the allowed direction.**
+  `scripts/measure/restart-replay.sh`, three paired runs per binary, one restart
+  each: the rows the corpus gained across the restart were 0.255% (+26,000 of
+  10,188,000), 0% and 0% on this branch and 0%, 1.318% (+130,000 of 9,866,000)
+  and 0% on 0.0.3. Traces gained nothing in any of the six. Both medians are 0%
+  and the largest single excursion is the **baseline's**, so this is not a
+  regression in the change — it is a property of the log, surfaced by measuring
+  for it.
+
+  The mechanism is `Wal::watermark_for`, which returns the oldest unpublished
+  sequence across a signal's shards. One slow shard pins the watermark low, and
+  a boot then replays frames that a published block already covers. The
+  function's own comment says being too low is the allowed direction of error:
+  duplicated rows over lost ones. No loss was observed in any run. It is
+  recorded here because it is a measurable cost of the no-coordination-state
+  rule (there is no committed cursor to reconcile against) and because it
+  invalidates any before/after corpus comparison taken across a restart —
+  `offload-cycle.sh` drains to `replayed=0` before it takes a baseline for
+  exactly this reason.
 - **What changed the shape of the curve was admission, not arithmetic.** The
   first revision shed the moment the queue was full, and at 96 connections that
   read 333,373 records/s with 93% of exports getting a 503 — four cores busy
@@ -1851,21 +2419,89 @@ Reading these honestly:
   for no term at all, 0.485 for a dictionary equality, 1.064 for a resource
   attribute, 2.402 for a record attribute and **5.586** for the most expensive
   shape there is, a UTF-8 `contains`. The *same block through the whole read
-  path* costs **24 to 25 ns/row**. So the scan is at most 22% of what a query
-  pays, and for most predicates under 2%; the other ~20 ns/row is
-  `Block::open` — the `mmap`'s minor faults, the dictionary scan, the two child
-  indexes, and the CRC32 of every table body (section 3.3), which by construction
-  touches every page. The clearest statement of it is that `limit 1` costs
-  24.374 ns/row against the whole block's 25.430: asking for one row and asking
-  for all of them are the same query, because the block had to be opened either
-  way.
+  path* costs **16 to 17 ns/row**. So the scan is a third of what the dearest
+  predicate pays and under 3% of what the cheap ones do; the rest is
+  `Block::open` — the `mmap`'s minor faults, the dictionary scan and the two
+  child indexes. The clearest statement of it is that `limit 1` and the whole
+  block cost the same per row: asking for one row and asking for all of them are
+  the same query, because the block had to be opened either way.
 
-  The arithmetic closes on the last row of the table. A full scan CRCs the
-  4,371 MiB of log blocks, and 4.58 GB in 885 ms is 5.2 GB/s, which is what
-  `crc32fast` does on this machine. **The unpruned scan is integrity-check-bound,
-  not scan-bound** — and that is a tradeoff rather than a bug, because the CRC is
-  why a corrupt block is refused instead of served (section 3.3). What it is not
-  is a vectorisation problem, which is what this section used to imply.
+  The CRC32 of every table body (section 3.3) used to be in that number, re-paid on
+  every open of a file that by construction never changes. It is now verified
+  once per process (section 3.3), and the harness prices the difference rather than
+  inferring it: it publishes the block, times the read path with verification
+  on, backdates the files so the cache accepts them, and times it again. At
+  2,000,000 rows on a 386.1 MiB block, 202 bytes/row, nine paired passes per
+  binary alternating on the same box, the whole-block row is **1.37×** on the
+  binary carrying only the cache and **1.47×** on the one that also has the lazy
+  split — re-verification is 27% and 32% of the read path there, and across the
+  four rows the medians run 1.37× to 1.75×.
+
+  Those two arms are **not separable**, and that is the result rather than a
+  failure of it. Per pass the whole-block row ranges 1.14–1.59× on the one and
+  1.22–2.21× on the other, and the ranges overlap almost entirely. The mechanism
+  is in the harness: every case it times ends in `assert!(hit > 0)`, so every
+  case returns rows, and a block that returns a row has its attributes rendered
+  and therefore its attribute tables read. The split changes which tables an
+  open reads only for a query that reads none of them, and by construction this
+  harness has no such case. The corpus A/B above is where those live.
+
+  The figure this paragraph carried from three passes — median 1.55×, **35–39%**
+  of the read path — sits inside both arms' ranges and is **withdrawn as a
+  median**: three samples of a quantity that moves between 1.14× and 2.21× do
+  not carry two significant figures. Between a quarter and two fifths of a
+  single block's read path is what this harness supports.
+
+  **The arithmetic that used to close this paragraph closed on a coincidence,
+  and it is withdrawn.** It read: a full scan CRCs 4,371 MiB of log blocks, and
+  4.58 GB in 885 ms is 5.2 GB/s, which is what `crc32fast` does here — therefore
+  the unpruned scan is integrity-check-bound. Warm on this machine `crc32fast`
+  is nearer **27 GB/s**, so 5.2 GB/s was never its rate and the agreement was
+  luck. On a corpus that stays resident, removing the redundant CRC outright
+  moves an unpruned scan by about **1.1×** — the 5.01 GiB row of the table below,
+  89.1 ms to 79.8 ms, cache against 0.0.3 with no lazy split in either. Worth
+  having, and not what "integrity-check-bound" promises.
+
+  It is also not a constant, and the corpus A/B at the top of this section is
+  where that shows. The same comparison — the cache alone, against 0.0.3 — is
+  **1.23×** on an unpruned logs scan and **1.31×** on traces over 2.93 GiB of
+  plain blocks, against 1.12× here over 5.01 GiB. The ratio moves with the
+  corpus because the denominator does: the paragraph below the table says an
+  unpruned scan is bound by whether the corpus fits in page cache, and a fixed
+  saving against a growing bound is a shrinking ratio. Quote 1.1× as this
+  corpus's figure, not as the change's.
+
+  Where the cache pays better is the query that opens little and re-opens it
+  often — trace by id over one block of 139,264 rows goes from 3.79 ms to
+  **2.58 ms**, 1.47×, because there the CRC is a large share of a small amount of
+  work. That row is **unchanged by the lazy split**, by the same mechanism as the
+  harness above: a trace lookup returns rows, rows are rendered with their
+  attributes, so both binaries read the same tables. The rows that prune to one
+  block are unchanged by the *cache* too, and have to be: it saves the *second*
+  verification, so a query that opens a table once in a process's life pays
+  exactly what it paid before.
+
+  What the unpruned row is bound by is the thing the *first* column is bound by,
+  which this section named above the table and then did not follow down. The
+  second sitting says so by changing only the corpus size. Both binaries, same
+  predicate, ~187 K rows per block either way, back to back:
+
+  | Corpus | This binary | 04561ed | Per row | Spread within one binary |
+  |---|---|---|---|---|
+  | 9.6 GiB, 168 log blocks, 31,170,560 rows | 847 ms | 981 / 1,992 ms | 27–64 ns | **2.6×** |
+  | 5.01 GiB, 48 log blocks, 9,011,200 rows | **79.8 ms** | 89.1 ms | **8.9 / 9.9 ns** | 1.5× |
+
+  On the 9.6 GiB corpus the two arms are **not separable** — one binary against
+  itself ranged 570 ms to 1,469 ms across five consecutive calls, and the second
+  pre-fix pass landed at twice the first. That is the measurement, not a failure
+  of it: the OS compressor grew by 1.6 GiB during that run, and what was being
+  timed was eviction. On the 5.01 GiB corpus, ten interleaved samples per arm,
+  the medians separate cleanly and the per-row cost is **three times lower on
+  the same binaries**. **An unpruned scan is bound by whether the corpus fits in
+  page cache**, and 18 GiB of RAM on a machine doing anything else does not hold
+  9 GiB of it. The 885 ms in the table is 32.7 ns/row, which is the upper row's
+  regime — so "neither is a cold-disk number", above the table, was a claim
+  about the page cache that the page cache did not honour.
 
   The history is still worth keeping, because it is how the page-fault term was
   found: the last row was once **10.1 s** and did not improve on repetition,
@@ -1942,21 +2578,42 @@ Reading these honestly:
   that term at 0.047 ns/row, so a 204,800-row block spends about 10 µs of the
   4.6 ms it takes. What is left is O(bytes) in the block's *size*, paid at open,
   which also means `target_block_bytes` is **not** the lever it was once written
-  up as. Halving it halves the bytes each block CRCs and doubles the number of
+  up as. Halving it halves the bytes each block maps and hashes on its first
+  open, and doubles the number of
   blocks, so a query that prunes to one block gets faster and a query that prunes
   to none gets nothing. It is not changed here because it only ever helped the
   first kind, the tradeoff runs the other way for compression ratio and directory
   size, and the number to tune it against is a workload nobody has yet. Sharding
   has already moved it in that direction by accident: six sealers per signal make
   a log block 204,800 rows where one made 330,000.
-- **A block cache went from "worth much less than it looks" to the obvious next
-  lever, and the measurement is what turned it round.** It was ruled a small win
-  on the belief that the `open` and the CRC were the small part of a single-block
-  query. They are not: they are ~80% of it, and on the unpruned scan they are
-  effectively all of it. A cache that holds an opened block's validated mapping
-  is the only thing on the section 10 list that attacks the term that actually
-  dominates. What it cannot do is help a first touch, and it trades resident
-  memory for it — which is the axis this section already scores worst.
+- **A block cache was talked into being the obvious next lever twice, in
+  opposite directions, and neither time by a measurement of the cache.** It was
+  first ruled a small win on the belief that `open` and the CRC were the small
+  part of a single-block query. They are not. `scan_cost_per_row` at 2,000,000
+  rows, median of four passes, prices the dearest predicate — `body contains` —
+  at **4.99 ns/row** against a whole read path of **18.23 ns/row** while the
+  checksum is being verified and **11.44 ns/row** once the file has settled, so
+  `open` alone is **56%** of that query and `open` plus the CRC is **73%**. On
+  the cheapest predicate, `no term` at 0.04 ns/row, it is essentially all of it.
+  (This entry said "55%" before, without saying which of the two paths it meant;
+  it was the settled one.) So the entry was rewritten to
+  call the cache the obvious next lever. That does not follow either: "the term
+  a cache would attack dominates" is an argument for attacking the term, not for
+  attacking it with a cache.
+
+  Two changes in this release take that term apart without a cache, and they
+  attack different halves of it. The **lazy attribute-table load** removes opens
+  that should never have happened: the tables a query never reads are never
+  mapped and never hashed, **30.8% off a logs scan and 46.8% off a traces one**
+  measured against the binary that already carries the map — the two figures this
+  entry quoted before, 25% and 44%, are the ones withdrawn earlier in this
+  section for having been taken while the cold tier rewrote the corpus. The
+  **process-scoped verification map** (section 3.3) removes the repeat hashes on
+  the opens that remain, and it holds no mappings and needs no invalidation.
+  Neither pays a resident byte. What a real cache would add on top of both is
+  the `mmap` and the two child indexes, it still cannot help the first open in a
+  process, and it does pay in resident memory — the axis this section already
+  scores worst. It stays on the section 10 list.
 - **Cost per GB is 1.20 B/B while a block is hot and 0.14 once it is
   compacted.** 164.0 bytes on disk per 136.9-byte wire record, and it is the
   steadiest figure in this section: across fifteen benchmark runs it moved
@@ -2034,9 +2691,12 @@ Reading these honestly:
   a resident plain block has nothing to fault while a compressed one still has
   to inflate. Even so the two are within the run-to-run noise of each other,
   which is the useful result: the inflate is real, and it is paid back by having
-  8.4× fewer bytes to touch and CRC32 over 8.4× fewer of them. That second half
-  matters more than it looked when this was written, because the CRC is now
-  measured as the dominant per-block term rather than a small one. Cold — which
+  8.4× fewer bytes to touch and CRC32 over 8.4× fewer of them. The second half
+  of that is worth less than an earlier revision of this paragraph claimed: the
+  CRC is paid once per file per process now (section 3.3), so on a compacted
+  block that is read more than once it is 8.4× fewer bytes of a term that is
+  already amortised to near nothing. The first half is the one that carries the
+  comparison. Cold — which
   is the case that matters, since a block is an hour old before it is compacted —
   the arithmetic runs further the same way, because the `MADV_WILLNEED` hint
   above is then faulting 8.4× fewer pages; an earlier measurement over a smaller
@@ -2197,6 +2857,31 @@ nodes with one down must not quietly return six sevenths of the data and let the
 user draw a conclusion from it. Every response has to name which peers answered,
 and that requirement is why this is not a two-hour feature.
 
+**Recommended: still not built, and not next either.** A stateless proxy in
+front of N replicas with the peer set in static config would close this without
+coordination state *in Mira* — the proxy holds no durable state, so killing and
+restarting it reconciles nothing. Cheap to build. The reason it is not scheduled
+is that nothing has measured a single node's ceiling to be the binding
+constraint for the buyer this design is written for. Section 11 puts ingest at
+1.7–2.6 M records/s on a laptop, and the query finding in the same section is
+that an unpruned scan is bound by whether the corpus fits page cache — which
+fan-out does not change, since each peer still scans its own share off its own
+disk. Building it speculatively means committing to the partial-results contract
+above, the hop flag, and a second deployable, in exchange for a ceiling no
+workload has yet reached.
+
+Hash-based ingest routing is the piece that would make it worth having, and it
+only makes sense alongside the proxy, never on its own. `hash(entity_id) mod N`
+over the 64-bit identity hash section 7.2 already computes would put one
+entity's records on one replica, which is what makes a single peer's answer
+*complete* for that entity rather than a fragment of it — and the same routing
+on a consistent hash ring keeps a scale-out from reshuffling everything.
+Rebalance stays operator-triggered, because an automatic one is a placement
+decision and placement is coordination state (12.4). Routing without fan-out is
+strictly worse than today: it concentrates an entity on one node while queries
+still only see the node they landed on. So the order is fixed — proxy first,
+routing second, both when a workload exceeds one node, and neither before.
+
 ### 12.3 Discovery without membership — still not built
 
 The peer set is a list of addresses, and in Kubernetes it is a headless
@@ -2248,8 +2933,14 @@ mounting ext4 or XFS from two nodes at once corrupts it. Mira has never been run
 on one.
 
 So the supported shape of shared-volume mode is **several processes on one
-host** sharing a local directory: an e2e test covers it, and it is the mode the
-`--node` flag exists for. Across hosts, shared-nothing is the supported shape
+host** sharing a local directory, and it is the mode the `--node` flag exists
+for. It is **not covered by a test**, and that is worth stating plainly: the
+measurement in section 12.6 was a two-process run done by hand, and what is in
+the tree is unit coverage of the *mechanisms* it turned up — a failed publish
+leaving no staging directory, `sweep_staging` filtering by signal and node —
+rather than of two writers racing. Covering it properly means two `mira`
+processes over one `TempDir` and an assertion that no published block mixes two
+sealed sets, which is a test level `docs/internals/testing.md` does not have yet. Across hosts, shared-nothing is the supported shape
 and query fan-out (section 12.2, unbuilt) is the answer to covering the whole dataset.
 A cluster filesystem would work in principle and is not claimed. Object storage
 is a larger question — it forecloses mmap entirely — and is deferred to the
@@ -2258,7 +2949,7 @@ market survey rather than guessed at here.
 ### 12.6 The staging path is the one place two writers can still collide
 
 Everything above rests on writers never touching each other's bytes, and the
-final block name delivers that: `{min_ts}-{max_ts}-{node}-{seq}` is unique per
+final block name delivers that: `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}` is unique per
 writer by construction. The *staging* name was not. It was
 `.tmp/{signal}-{node}-{seq}`, which is unique only as long as the two writers
 disagree about `node` — and `node` is derived from `--node`, which defaults to

@@ -214,7 +214,7 @@ pub(crate) fn correlate(
 /// The service map over a window.
 ///
 /// ```yaml
-/// { "from": "-15m", "to": "now", "max_spans": "50000" }
+/// { "from": "-15m", "to": "now", "max_spans": 50000 }
 /// ```
 ///
 /// `max_spans` bounds the walk rather than the answer: a map is built by
