@@ -9,6 +9,26 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **Every published performance number is a variable.** `measurements.kyaml`
+  holds all 35 of them once, with the 95 sites that quote each one listed
+  beside it, and `make measurements-check` — now part of `ci-drift` — fails the
+  build when a site and the registry disagree. `loadgen` grew `--records N`,
+  which divides the rounds across the connections before the first byte goes
+  out so the same command produces the same corpus on a slower box, and
+  `--emit PATH`, which appends one JSON object per run keyed the way the
+  registry is keyed. `scripts/measure/conn-sweep.sh` runs four connection
+  counts three times each, and `make measurements-ingest RUN=…` takes the
+  median per key across the passes, reports every site that now lies, and with
+  `WRITE=1` updates the values — never the prose, because the sentence around a
+  number is a claim a new number can invalidate. 12 of the 35 are marked
+  `unscripted` rather than quietly presented as reproducible.
+- **[A measurement contract](https://miradb.dev/internals/measurement/)**
+  defining each of the four axes by numerator, denominator and what is inside
+  the measurement, plus the five reasons a competitor's published figure is not
+  the same quantity.
+
 ### Changed
 
 - **A block's checksum is verified once per process, not once per open.** A
@@ -70,6 +90,17 @@ the config keys, the `/mcp` tool set.
   invocation the example's dev-dependencies unify into the normal graph, so the
   release binary carried `tokio/test-util` and tower middleware nothing serves:
   5.99 MiB against 5.63. The shipped size is the declared one again.
+- **vite 8 in the UI build, and the two packages that had to move with it.**
+  `vite` 7.3.6 to 8.3.0 could not install on its own:
+  `@sveltejs/vite-plugin-svelte@6.2.4` peers with `vite ^6.3.0 || ^7.0.0`, so
+  `npm ci` failed with `ERESOLVE` before a test ran. The plugin goes to 7.3.0,
+  which accepts vite 8 and in turn peers with `svelte ^5.46.4`. On the way,
+  `rollupOptions.output.inlineDynamicImports` is deprecated under vite 8 and is
+  now `codeSplitting: false` — the same instruction, and a load-bearing one,
+  because `src/ui.rs` names the built files in a const table and a second chunk
+  would be a 404 rather than a slower page. The bundle is still one `app.js`
+  (78.00 kB), one `app.css` (8.39 kB) and one `index.html`, and the 22 UI tests
+  pass. `taiki-e/install-action` moves 2.87.9 to 2.87.10 in the same release.
 
 ### Removed
 
@@ -78,6 +109,20 @@ the config keys, the `/mcp` tool set.
   figure and two "wait until the data arrives" loops, now `xtask parse-json`,
   `xtask coverage-json` and `scripts/wait-for-signals.sh`. `mkdocs` is a Python
   program and still is; nothing else in the tree needs an interpreter.
+
+### Fixed
+
+- **`make bump` aborted on every invocation, which is to say the release path
+  did not run.** Porting `bumped_changelog` from Python transliterated its
+  pattern character for character, and `(?=^## \[)` is the one character
+  sequence that does not survive the move: Python's `re` has look-ahead, the
+  `regex` crate has none, and `xtask` panics on a pattern it cannot compile. So
+  the first command of the release runbook died before reading a byte of
+  `CHANGELOG.md`. It went unnoticed because 0.0.3 was cut by the Python script
+  that the same release deleted, and nothing called the Rust one until now. The
+  match is lazy up to the next header and consumes it instead of looking at it,
+  and the extraction is a `unreleased_body` function with a test — the thing
+  actually missing, since no test executed this path either.
 
 ## [0.0.3] - 2026-09-12
 
