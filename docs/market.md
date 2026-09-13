@@ -358,11 +358,18 @@ is not a mechanism, and this page published it as one.
 The patch it named is still the right patch, and it has shipped here rather than
 being named again: a published block never changes, so re-hashing it on every
 open is waste, and it is now verified once per file per process. What that is
-worth was measured on both sides of one run instead of inferred — the checksum
-is **35 to 39%** of a single block's read path, a median of **1.55x** there,
-**1.47x** on a trace lookup, and **about 1.1x** on the unpruned scan. Worth
-taking, and nowhere near what "integrity-check-bound" promises, because the
-premise was the coincidence above.
+worth was measured on both sides of one run instead of inferred: on a single
+386.1 MiB block the checksum is **between a quarter and two fifths** of the read
+path, **1.47x** on a trace lookup, and **1.1x to 1.3x** on an unpruned scan
+depending on how much of the corpus the page cache is holding. Worth taking, and
+nowhere near what "integrity-check-bound" promises, because the premise was the
+coincidence above.
+
+An earlier draft of that sentence read "35 to 39%, a median of 1.55x". Nine
+paired passes of the same harness put the whole-block case at 1.37x and 1.47x on
+two binaries whose per-pass values range 1.14x to 2.21x; three samples of a
+quantity that moves that much do not carry two digits, and **the 1.55x median is
+withdrawn** in favour of the range.
 
 The unpruned scan is bound by whether the corpus fits in page cache. A paired
 A/B that changes only the corpus size says so: both binaries, same predicate,
@@ -377,6 +384,22 @@ the corpus that stays resident, on the same binaries. The OS compressor grew by
 1.6 GiB during the large run: what the wide numbers time is eviction. The 885 ms
 at the top of this entry is 32.7 ns/row, which is the first regime — the
 headline is a page-cache result that this page reported as a checksum result.
+
+Which is the sentence that says what to do about it: read fewer bytes. The scan
+in that row has no attribute predicate and emits no rows, so it never looks at an
+attribute table — and opening a block used to map and hash every one of them.
+They are **42.9%** of a plain logs block and **45.7%** of a plain traces block.
+This release opens the root tables alone and the attribute tables on demand, and
+on 2.93 GiB of plain blocks over nine paired passes that is **1.45x on logs and
+1.88x on traces** on top of the checksum cache, or **1.8x and 2.6x** for the two
+together against 0.0.3: 68,869 to 40,806 µs, and 48,425 to 18,625. Two controls
+that must not move — the same scan with the predicate on an attribute instead of
+a field, and an ordinary `limit 100` page — came out at −2.3% and +2.0% and
+changed sign from pass to pass, which is the check that the run measured the
+change rather than the box. On a compacted corpus, where the attribute tables are
+6% of the bytes instead of 43%, it is still 1.5x and 2.3x, because what is being
+skipped there is decompression: those tables compress 66x against the root
+table's 5x.
 
 Where vectorising did pay is everything that filters. An attribute value that
 matches went from 30.2 ms to 4.49 ms, 6.7x; an unfiltered `limit 100` from 24.4
@@ -407,20 +430,25 @@ attribute rows, where the join is about 7% of the query — the other ~93% is
 twenty-two blocks × ten tables of opening them, which is the same finding as the
 paragraph above, reached from the metrics side.
 
-It stays in this section, and the cause named has changed twice. The first entry
-set the path at twenty years of SIMD kernels and called it a programme rather
-than a patch; the second called it re-verification and called it a patch. The
-patch is applied — the guarantee is intact, because verifying once per process
-is not the same as not verifying — and it was worth 1.1x on the row it was
-supposed to fix, because the cause was wrong both times.
+It stays in this section, and the cause named has changed three times. The first
+entry set the path at twenty years of SIMD kernels and called it a programme
+rather than a patch. The second called it re-verification and called it a patch;
+that patch is applied and the guarantee is intact, because verifying once per
+process is not the same as not verifying, but it was worth 1.1x on the row it was
+supposed to fix. The third is the one that moved the row, and it is the dullest
+of the three: the open was reading tables the query never names. Neither of the
+first two would have been found without measuring the third, and none of them
+makes an unpruned scan fast.
 
-The honest version is shorter and has no patch in it. An unpruned scan over a
-corpus larger than the page cache pays for paging, and the two answers Mira has
-are the two it already ships: prune, so the corpus is not the working set, and
-compact, so the working set is 8.4x smaller. Neither helps a query that
-genuinely has to read everything, and nothing here should be read as a promise
-that anything will. Mira's query numbers are a pruning result. That was true
-before the diagnosis changed and it is what this row is.
+The honest version is shorter. A scan over a corpus larger than the page cache
+pays for paging, so the only levers are how much of it you read and whether you
+read it at all, and Mira ships three: prune, so the corpus is not the working
+set; compact, so the working set is 8.4x smaller; and open the tables a query
+names rather than all of them, which is 1.8x to 2.6x on the row above. None of
+the three helps a query that genuinely has to read every byte, and nothing here
+should be read as a promise that anything will. Mira's query numbers are a
+pruning result. That was true before the diagnosis changed twice and it is what
+this row is.
 
 ### Gaps that are what the design costs
 

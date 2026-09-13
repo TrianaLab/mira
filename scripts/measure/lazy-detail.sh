@@ -37,6 +37,10 @@
 #
 #   make release && A=./target/release/mira B=/path/to/0.0.3/mira \
 #     scripts/measure/lazy-detail.sh
+#
+# `ALABEL`/`BLABEL` name the two columns. They default to the pair this was
+# written for, and the defaults are wrong for any other pair -- section 11 reads
+# these labels back as "which binary", so set them when B is not 0.0.3.
 set -e
 A=${A:-./target/release/mira}
 B=${B:-/tmp/mira-0.0.3-target/release/mira}
@@ -47,11 +51,38 @@ GRPC=${GRPC:-127.0.0.1:4336}
 PASSES=${PASSES:-7}
 REPS=${REPS:-5}
 WARM=${WARM:-2}
+ALABEL=${ALABEL:-branch}
+BLABEL=${BLABEL:-0.0.3}
 MISS=zqxjw-no-such-token
 
 [ -d "$CORPUS" ] || { echo "no corpus at $CORPUS"; exit 1; }
-rm -rf "$OUT"
+[ "${REUSE:-0}" = 0 ] && rm -rf "$OUT"
 mkdir -p "$OUT"
+
+# The corpus has to be the same corpus at pass 7 as at pass 1, and on a freshly
+# written one it is not. The cold tier rewrites every block ZSTD-compressed once
+# it has aged out of its partition hour, eight blocks per signal per sweep, and
+# it does that from inside the server this harness keeps starting -- so a run
+# over 137 plain blocks spends its first ten minutes compacting them and its
+# last five reading the result. Both arms drift upward together and the pooled
+# medians are then a measure of how far through the transition each pass landed.
+#
+# There is no knob for it (docs/config.md: no compaction settings, deliberately),
+# so the guard is to refuse rather than to configure: fingerprint the tables,
+# re-check after every pass, and stop the moment the corpus moves. Settle a
+# corpus by leaving a server on it until `cold` markers stop appearing, then run.
+shape() { find "$CORPUS" -name '*.arrow' -exec ls -l {} + | awk '{n++; s+=$5} END{print n, s}'; }
+SHAPE=$(shape)
+COLD=$(find "$CORPUS" -name cold | wc -l | tr -d ' ')
+settled() { # pass
+  s_now=$(shape)
+  [ "$s_now" = "$SHAPE" ] || {
+    echo "!! the corpus changed under pass $1: $SHAPE -> $s_now"
+    echo "!! the cold tier is still compacting. Leave a server on $CORPUS until"
+    echo "!! \`find $CORPUS -name cold | wc -l\` stops climbing, then re-run."
+    exit 1
+  }
+}
 
 CASES="scan-miss-logs scan-miss-traces scan-attr page-100"
 body() { # case
@@ -122,30 +153,56 @@ run() { # tag, binary, pass
   kill $r_pid
   wait $r_pid 2>/dev/null || true
   reclaimed "$OUT/$1-$3.log"
+  settled "$3"
 }
 
-echo "corpus: $CORPUS  $(find "$CORPUS" -mindepth 3 -maxdepth 3 -type d | wc -l | tr -d ' ') blocks  $(du -sh "$CORPUS" | cut -f1)"
+echo "corpus: $CORPUS  $(find "$CORPUS" -mindepth 3 -maxdepth 3 -type d | wc -l | tr -d ' ') blocks  $(echo "$SHAPE" | awk '{printf "%s tables, %s bytes", $1, $2}'), $COLD compacted"
 echo "a: $A"
 echo "b: $B"
 echo "$PASSES passes x $REPS reps, $WARM warm-up per case per pass"
 
-p=1
-while [ "$p" -le "$PASSES" ]; do
-  printf 'pass %s ' "$p"
-  run b "$B" "$p"
-  printf 'b '
-  run a "$A" "$p"
-  echo a
-  p=$((p + 1))
-done
+if [ "${REUSE:-0}" = 0 ]; then
+  p=1
+  while [ "$p" -le "$PASSES" ]; do
+    printf 'pass %s ' "$p"
+    run b "$B" "$p"
+    printf 'b '
+    run a "$A" "$p"
+    echo a
+    p=$((p + 1))
+  done
+else
+  echo "REUSE=1: reporting over the samples already in $OUT"
+fi
 
 echo
-# Median of the first column. `sort -n` rather than an awk sort, because one
-# of the two awks on this box has no arrays of arrays and the bug is silent.
+# Median of the first column of a file. `sort -n` rather than an awk sort,
+# because one of the two awks on this box has no arrays of arrays and the bug is
+# silent.
 med() { sort -n "$1" | awk '{v[NR]=$1} END{h=int(NR/2); print NR%2 ? v[h+1] : (v[h]+v[h+1])/2}'; }
+# The same, over one pass's REPS samples -- the file is in pass order.
+pmed() { # file, pass
+  awk -v p="$2" -v r="$REPS" 'NR > (p-1)*r && NR <= p*r {print $1}' "$1" \
+    | sort -n | awk '{v[NR]=$1} END{h=int(NR/2); print NR%2 ? v[h+1] : (v[h]+v[h+1])/2}'
+}
+# And of a list on stdin.
+smed() { sort -n | awk '{v[NR]=$1} END{h=int(NR/2); print NR%2 ? v[h+1] : (v[h]+v[h+1])/2}'; }
 
+# Two deltas per case, and the paired one is the answer.
+#
+# Pooling all PASSES x REPS samples into one median is only sound if the box is
+# the same at the last pass as at the first, and on a corpus this size it is
+# not: every server maps the whole corpus, the page cache does not hand it back
+# between passes, and all four cases drift upward across a run -- on both
+# binaries at once, which is how you can tell it is the box. The arms alternate
+# inside each pass, b then a, precisely so that the drift can be cancelled: the
+# per-pass delta compares two processes minutes apart under the same pressure,
+# and the median of those PASSES deltas is the figure to read. The pooled
+# median is printed beside it, and when the two disagree it is the pooled one
+# that is measuring the volume -- look at the controls to confirm it.
 want=$((PASSES * REPS))
-printf '%-18s %10s %10s %9s  %s\n' case 0.0.3_us branch_us delta scanned
+printf '%-18s %10s %10s %8s %8s  %s\n' \
+  case "${BLABEL}_us" "${ALABEL}_us" paired pooled scanned
 for c in $CASES; do
   for t in a b; do
     n=$(wc -l < "$OUT/$t.$c" | tr -d ' ')
@@ -153,16 +210,25 @@ for c in $CASES; do
   done
   mb=$(med "$OUT/b.$c")
   ma=$(med "$OUT/a.$c")
+  p=1
+  : > "$OUT/d.$c"
+  while [ "$p" -le "$PASSES" ]; do
+    awk -v a="$(pmed "$OUT/a.$c" "$p")" -v b="$(pmed "$OUT/b.$c" "$p")" \
+      'BEGIN{print 100*(a-b)/b}' >> "$OUT/d.$c"
+    p=$((p + 1))
+  done
   # Every sample of a case reads the same corpus, so the last line speaks for
   # all of them -- and blocks_scanned/blocks_total is the check that it did.
   s=$(tail -1 "$OUT/a.$c")
-  printf '%-18s %10s %10s %8.1f%%  %s of %s blocks, %s rows\n' \
+  printf '%-18s %10s %10s %7.1f%% %7.1f%%  %s of %s blocks, %s rows\n' \
     "$c" "$mb" "$ma" \
+    "$(smed < "$OUT/d.$c")" \
     "$(awk -v a="$ma" -v b="$mb" 'BEGIN{print 100*(a-b)/b}')" \
     "$(echo "$s" | cut -d' ' -f2)" "$(echo "$s" | cut -d' ' -f3)" \
     "$(echo "$s" | cut -d' ' -f4)"
 done
 echo
-echo "0.0.3  = $B"
-echo "branch = $A"
+echo "$BLABEL = $B"
+echo "$ALABEL = $A"
 echo "raw samples in $OUT/{a,b}.<case>, $want per case per build"
+echo "per-pass deltas in $OUT/d.<case>, $PASSES per case"

@@ -304,10 +304,20 @@ That test prints **two** columns per predicate, and the second one is the point
 of it. It publishes the block, times the read path with checksum verification
 on, backdates the files so the process-scoped verification cache accepts them
 (`block.rs`'s `SETTLED`), and times it again — so the checksum's share is a
-column of one run rather than something inferred from a rate. It reads 35–39%
-here, a median of 1.55×. Backdating rather than sleeping is deliberate: the
-default 4,096-row size of this test runs in `make test`, and two seconds of
-waiting does not belong in the normal suite.
+column of one run rather than something inferred from a rate. It reads between a
+quarter and two fifths at 2,000,000 rows. Backdating rather than sleeping is
+deliberate: the default 4,096-row size of this test runs in `make test`, and two
+seconds of waiting does not belong in the normal suite.
+
+**Take more than three passes of it.** The whole-block ratio moves 1.14× to
+2.21× pass to pass on this box; nine paired passes put the median at 1.37× and
+1.47× on two binaries whose ranges overlap almost entirely. A three-pass median
+off that spread is a number with one significant figure wearing two, and section
+11 withdrew one for exactly that reason. Note also what this harness cannot see:
+every case it times asserts `hit > 0`, so every case returns rows, and a query
+that returns rows reads the attribute tables to render them. A change to *which*
+tables an open reads is invisible here by construction —
+`scripts/measure/lazy-detail.sh` is the instrument for that.
 
 The metrics route has the same instrument, per point rather than per row:
 
@@ -356,12 +366,41 @@ quotes:
 | `block-reopens.sh` | how many times one process opens the same block, which is the input to the verification-cache decision |
 | `restart-replay.sh` | how many rows a corpus gains across a restart, on each of two binaries |
 
-Two habits they share are worth stealing. Every one of them greps its server log
-for `nearly full` and aborts if the free-space reclaimer fired, because a
+Three habits they share are worth stealing. Every one of them greps its server
+log for `nearly full` and aborts if the free-space reclaimer fired, because a
 reclaimed corpus is a faster scan and the A/B then reports the volume rather
-than the code. And every one that publishes a median asserts the sample count
+than the code. Every one that publishes a median asserts the sample count
 first: a response body has no trailing newline, so a capture that forgets to
 re-line-break them silently "medians" one value, and only the count catches it.
+And `lazy-detail.sh` fingerprints the corpus — table count and total bytes —
+before the run and after every pass, and stops the moment it moves.
+
+That last one is not defensive programming, it is a bug that shipped. **A corpus
+is not a constant while a server is running on it.** The cold tier compacts
+blocks that have aged out of their partition hour, eight per signal per sweep,
+from inside the server the harness keeps starting — so a run over freshly
+written blocks begins on a plain corpus and ends on a compacted one, both arms
+drift upward together, and the pooled median reports how far through the
+transition each pass landed. It published a table that had to be withdrawn.
+There is no knob to turn it off (`docs/config.md`: no compaction settings,
+deliberately), so the harness refuses instead: leave a server on the corpus
+until `find "$CORPUS" -name cold | wc -l` stops climbing, then run.
+
+Its knobs, since the defaults are only right for the pair it was written for:
+
+| var | what it is for |
+|---|---|
+| `A`, `B` | the two binaries. `B` runs first in every pass |
+| `ALABEL`, `BLABEL` | the column headers. Section 11 reads these back as "which binary", so set them whenever `B` is not 0.0.3 |
+| `CORPUS`, `OUT` | the block directory to measure over, and where the raw samples land |
+| `PASSES`, `REPS`, `WARM` | passes of the pair, timed samples per case per pass, and untimed warm-ups before them |
+| `REUSE=1` | skip the measuring entirely and re-report over the samples already in `OUT` — which is how you get a second statistic out of a run without paying for it twice, and why `OUT` is no longer cleared unconditionally |
+
+It prints two deltas per case and **the paired one is the answer**: the median of
+the per-pass differences, which cancels the drift that every process mapping a
+multi-gigabyte corpus puts on the box. The pooled median over all
+`PASSES × REPS` samples is printed beside it, and when the two disagree it is the
+pooled one that is measuring the volume. Read the two controls to confirm which.
 
 ## 4. telemetrygen
 

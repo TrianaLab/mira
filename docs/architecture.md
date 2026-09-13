@@ -469,7 +469,9 @@ a predicate that names an attribute, because the predicate is evaluated against
 those tables, and a block that produced a row, because rendering a row emits
 its attributes. A block that matches nothing and is asked nothing about
 attributes is never hashed past its root, and on the measured corpus that is
-42.9% of a logs block and 45.7% of a traces block left unread (section 11).
+42.9% of a *plain* logs block and 45.7% of a plain traces block left unread —
+5.5% and 6.3% once the cold tier has compacted it, where the saving is
+decompression rather than bytes (section 11).
 
 None of that weakens the guarantee. What changes is *which* tables a query
 reads; every table it reads is verified in full before a byte of it is
@@ -1866,16 +1868,32 @@ each the median of three; the query rows are that corpus, read back after a
 restart, and every one of them is a paired A/B against the 0.0.1 binary run
 back to back in the same sitting.
 
-Four bullets below are the exception and say so where they appear. The
-cold-tier, lazy-verification and block-reopen figures come from a **second,
-smaller corpus** — 137 blocks, 3,599,317,452 bytes (3.352 GiB), 62 logs / 64
-traces / 11 metrics — because each of them round-trips the whole corpus through
-an upload or a full scan, and doing that to 8.33 GiB takes long enough that the
-box moves underneath it. The restart-replay bullet builds a corpus of its own
-per run, because what it measures is the difference across a restart rather than
-any absolute. All four are internally paired and none of their numbers may be
-divided into the table above. Each is reproducible from a script in
-`scripts/measure/`, named in the bullet.
+Several bullets below are the exception and say so where they appear, because
+each needs a corpus this one cannot be — a full round-trip through an upload, a
+scan repeated ninety times, or blocks the cold tier has not reached yet:
+
+| corpus | shape | what it is for |
+|---|---|---|
+| the table's own | 8.33 GiB, 1,652 tables, 137 log / 155 trace / 24 metric blocks | every row of the table above |
+| **small** | 137 blocks, 3,599,317,452 bytes (3.352 GiB), 62 logs / 64 traces / 11 metrics | cold tier, block reopens — round-tripping 8.33 GiB through an upload takes long enough that the box moves underneath it |
+| **small, compacted** | those same 137 blocks after the cold tier has finished with them: 718 tables, 440,421,916 bytes, all 137 marked `cold` | the compacted arm of the lazy-open bullet |
+| **plain** | 115 blocks, 611 tables, 2,927,859,966 bytes, 50 logs / 53 traces / 12 metrics, none compacted | the main arm of the lazy-open bullet, which needs attribute tables that are still uncompressed |
+| per-run | built fresh by the script that reads it | restart replay, and the second sitting's 9.6 GiB / 5.01 GiB pair |
+
+The restart-replay corpus is per-run because what it measures is a difference
+across a restart rather than any absolute. All of them are internally paired and
+**none of their numbers may be divided into the table above**. Each is
+reproducible from a script in `scripts/measure/`, named in the bullet.
+
+The plain one is there for a reason worth stating once: **a corpus is not a
+constant while a server is running on it.** The cold tier compacts blocks that
+have aged past their partition hour from inside the server a harness keeps
+starting, so a long A/B over fresh blocks starts plain and finishes compacted,
+both arms drift together, and the result is a measure of how far through the
+transition each pass landed. That is not hypothetical — it invalidated a table
+this section published, and the withdrawal is under the lazy-open bullet.
+`lazy-detail.sh` now fingerprints the corpus before the run and after every pass
+and refuses to continue if it moved.
 
 There is now a **second sitting**, and naming it is better than folding it in.
 It exists because the checksum cache (section 3.3) landed after the table was
@@ -2075,45 +2093,100 @@ Reading these honestly:
   wanted.** The per-table CRC32 shipped in 0.0.3 (section 3.3), so nothing about
   the format changed here; what changed is that `Block::open` mapped and hashed
   every attribute level of every block it opened, including blocks a scan was
-  about to reject. Those tables are **42.9% of a logs block** (787,378,052 of
-  1,837,123,124 bytes) and **45.7% of a traces block** (799,601,216 of
-  1,750,266,368) on this corpus. `scripts/measure/lazy-detail.sh` prices the
-  split against the released 0.0.3 binary — two binaries alternating pass by
-  pass over one corpus, medians of 7 × 5 samples, `blocks_scanned` printed beside
-  every median and equal to `blocks_total` in every row. One server process per
-  build per pass, with two warm-ups per case inside it, which is neutral here
-  because neither binary keeps per-process state about a block; it would not be
-  neutral against a build that did:
+  about to reject. Those tables are **42.9% of a logs block** (645,830,556 of
+  1,506,872,204 bytes) and **45.7% of a traces block** (645,882,486 of
+  1,413,774,770) for as long as the block is plain, and 5.5% and 6.3% once the
+  cold tier has been over it — which is a result in its own right and is the
+  last paragraph here.
 
-  | case | 0.0.3 | branch | delta |
+  `scripts/measure/lazy-detail.sh`, 9 passes × 5 reps per case per build, two
+  binaries alternating inside each pass, `blocks_scanned` printed beside every
+  median and equal to `blocks_total` in every row. The corpus is 115 blocks —
+  50 logs, 53 traces, 12 metrics — 611 tables and 2,927,859,966 bytes, ingested
+  minutes before the run and **none of it compacted**. Three arms, because two
+  changes landed in one release and either would otherwise be credited with the
+  other's work:
+
+  | case | cache alone | split alone | both |
   |---|---:|---:|---:|
-  | scan-miss-logs, 62/62 blocks, 10,848,000 rows | 75,158 µs | 56,347 µs | **−25.0%** |
-  | scan-miss-traces, 64/64 blocks, 11,016,000 rows | 57,452 µs | 32,428 µs | **−43.6%** |
-  | scan-attr (control) | 63,009 µs | 60,722 µs | −3.6% |
-  | page-100 (control) | 3,746 µs | 3,833 µs | +2.3% |
+  | scan-miss-logs, 50/50 blocks, 8,898,000 rows | −18.6% | **−30.8%** | **−43.3%** |
+  | scan-miss-traces, 53/53 blocks, 8,898,000 rows | −23.9% | **−46.8%** | **−62.2%** |
+  | scan-attr (control) | −26.4% | −2.3% | −23.5% |
+  | page-100 (control) | −27.9% | +2.0% | −25.4% |
 
-  The two controls are the point of the run. `scan-attr` is the *same query
-  shape* as `scan-miss-logs` — same corpus, every block scanned, zero matches —
-  except that its predicate names an attribute, so both builds must read the
-  attribute tables; `page-100` renders a hundred rows, so both builds must read
-  theirs. Neither may move, and neither does: their sample ranges overlap almost
-  entirely (scan-attr 54,369–82,618 against 53,309–83,014) while
-  scan-miss-traces does not overlap at all (50,268–74,889 against
-  28,126–38,424). A run where the controls had moved with the treatments would
-  have been measuring the box.
+  "Cache alone" is the verification map against 0.0.3, "split alone" is this
+  binary against the one carrying only the map, "both" is this binary against
+  0.0.3 — end to end, 68,869 → 40,806 µs on the logs scan, 48,425 → 18,625 on
+  traces. The third column is not the sum of the first two and does not have to
+  be, but it is close to their **product**: 0.814 × 0.692 predicts −43.7%
+  against −43.3% measured, 0.761 × 0.532 predicts −59.5% against −62.2%, 0.736
+  × 0.977 predicts −28.1% against −23.5%, 0.721 × 1.020 predicts −26.5% against
+  −25.4%. Two independent multipliers on one read path is what "the two changes
+  stack" (section 3.3) has to mean, and that arithmetic is the check on it.
+
+  The controls are the point of the middle column. `scan-attr` is the *same
+  query shape* as `scan-miss-logs` — same corpus, every block scanned, zero
+  matches — except that its predicate names an attribute, so both builds must
+  read the attribute tables; `page-100` renders a hundred rows, so both builds
+  must read theirs. Neither may move under the split and neither does, but the
+  median alone does not say that: what says it is the **sign** of the nine
+  per-pass deltas. Both treatments are negative in 9 passes of 9 (logs −38.6 to
+  −3.5, traces −59.9 to −42.2); both controls change sign (scan-attr −17.1 to
+  +30.6, page-100 −21.2 to +34.6). A control whose median is small but whose
+  deltas all point one way would be a real effect being called noise, and this
+  is the distinction that catches it.
+
+  The controls do move in the other two columns, by about as much as everything
+  else, and that is the verification map doing exactly what it should: it saves
+  a re-hash on every query that reopens a block, including the queries that read
+  the attribute tables. A caveat that belongs to those two columns and not to
+  the middle one: the harness runs one server per build per pass with two
+  warm-ups per case inside it, so the map is full before the first timed sample.
+  Those are warm-map figures, the upper bound, and a client that reconnects to a
+  fresh server pays the first hash again. The middle column is free of that,
+  because both of its binaries carry the map and both are warmed the same way.
 
   Traces gains more than logs because of what is left after the map and the
   hash come out. The traces predicate is over `name`, a dictionary column
   resolved once and then matched on u16 codes, so nearly all of that query
   *was* the map and the hash. The logs predicate is a substring scan over a
   `Utf8` `body` column, which is real work that not-hashing does not remove.
-  The 25% is the floor, not the headline.
-- **The per-process verification cache: measured, and not built.** The second
-  half of the same idea is to remember that a block was verified so a later open
-  can skip the hash. Two numbers were taken before deciding, and only one of
-  them carries the decision.
+  The 31% is the floor, not the headline.
 
-  The weaker one first, with what it does not show stated plainly.
+  **The table published here before this run was taken while the cold tier was
+  rewriting the corpus underneath it, and it is withdrawn.** It read −25.0% and
+  −43.6% against 0.0.3 over 137 blocks. `compact` rewrites a block ZSTD-encoded
+  once it has aged out of its partition hour, eight blocks per signal per sweep,
+  from inside the server this harness starts fourteen times — so a run that
+  begins on a plain corpus ends on a compacted one, both arms drift upward
+  together across the passes, and a pooled median then reports how far through
+  that transition each pass happened to land. It is why the harness now
+  fingerprints the tables before the run and after every pass and refuses to
+  continue if they moved, why it reports a per-pass paired delta beside the
+  pooled one, and why "none of it compacted" is stated above as a property of
+  the corpus rather than assumed.
+
+  Run against the *same* corpus after the tier has finished with it — 137
+  blocks, 718 tables, 440,421,916 bytes, all 137 marked cold — the split is
+  **−33.5%** and **−56.0%**, controls −13.4% and +2.0% and both changing sign
+  across the nine passes. So the split survives compaction, which is not what
+  the byte shares predict: the attribute tables are **5.5%** of a compacted logs
+  block (11,874,948 of 216,220,380 bytes) and **6.3%** of a traces one. They
+  compress **66.3×** against the root table's **5.14×** — thirteen times better
+  — so on a cold block what the split skips is not mostly bytes to hash, it is
+  an inflate. The 1.11× that compaction costs a warm read, further down this
+  section, is a cost this stops paying on tables nothing asked for.
+- **The per-process verification cache: what it is worth, and the number that
+  nearly kept it out.** The second half of the same idea is to remember that a
+  block was verified so a later open can skip the hash. It is in this release
+  (section 3.3) and the "cache alone" column above prices it: **−18.6% to
+  −27.9%** across the four cases, near-uniform because, unlike the split, it
+  helps every query that reopens a block rather than only the ones that read no
+  attributes. Two other numbers were taken while the answer was still going to
+  be no. Both are kept, because one of them is a lesson in what a measurement is
+  allowed to decide.
+
+  The one that decides nothing first, with what it does not show stated plainly.
   `scripts/measure/block-reopens.sh` runs 18 representative queries over 126
   distinct blocks and records **21 block opens in total** — 12 queries open
   exactly one block, 3 open three, 3 open none. That is a measure of how much
@@ -2121,34 +2194,45 @@ Reading these honestly:
   process-scoped cache is priced on: the cache lives for the process, so what
   decides it is how often a long-lived server reopens the same path across
   thousands of queries against a hot recent window, and eighteen queries against
-  a denominator of 126 blocks cannot see that. It is recorded because it is what
-  was measured, not because it settles anything.
+  a denominator of 126 blocks cannot see that. Read as a reopen count it says a
+  cache is pointless. It was very nearly read that way, against a change that
+  then measured a quarter off every case in the table.
 
-  The one that does carry it is the ceiling, from a throwaway build whose CRC
-  comparison was patched to always pass (built into a scratch target dir and
-  reverted immediately; it is not on this branch and not behind a flag). Against
-  the branch, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
+  The other is the ceiling, from a throwaway build whose CRC comparison was
+  patched to always pass (built into a scratch target dir and reverted
+  immediately; it is not in the tree and not behind a flag). Against the
+  split-only binary, 5 × 5 samples: scan-miss-logs −18.0% (58,031 → 47,572 µs),
   scan-miss-traces −29.5% (32,954 → 23,239), scan-attr −26.0% (63,662 →
-  47,085), page-100 −24.1% (3,865 → 2,933). That is what a cache that **never
-  misses** could buy — and the lazy split above already took 25% and 44% with no
-  new state, no new failure mode and no resident memory. **Decision: not yet.**
-  A cache is a map, a key-invalidation rule and a memory-footprint regression on
-  the axis this section scores worst, in exchange for at most 18–30% on the
-  opens that survive the split.
+  47,085), page-100 −24.1% (3,865 → 2,933). That is verification made free
+  rather than merely cached, so it is more than a cache can reach — a cache
+  still pays the first hash of every file.
 
-  Two caveats on that ceiling, because it is the number the decision rests on.
-  It is corpus- and block-shape-dependent: it is the CRC's share of the read
-  path, so a corpus of fewer, larger blocks spends a larger fraction of each
-  open inside the hash and would measure a bigger share from the same method.
-  And "make verification free and re-time it" is the method, whatever mechanism
-  does the making-free — a patched comparison and a pre-warmed verification map
-  are measuring the same quantity, so two such figures taken on two corpora are
-  not in dispute with each other.
+  It brackets the measured cache rather than bounding it, and the honest reason
+  is that the two runs share neither corpus nor baseline: −26.4% measured
+  against a −26.0% ceiling is two methods agreeing inside their spread, not a
+  cache beating its own limit. What the pair is good for is that they approach
+  the same quantity from opposite ends and land in the same place — on this
+  shape of corpus the CRC is about a quarter of an open, and a map that rarely
+  misses recovers about a quarter.
 
-  If it is ever built, the key must not be the path. A compaction can replace a
-  file under a verified path; the key has to come off the open descriptor (`ino`
-  alongside length and mtime) or be invalidated from inside the compaction path,
-  or the cache turns "a bad block is never served" into a stale lookup.
+  Two caveats survive, because the ceiling is a method and not a constant. It is
+  corpus- and block-shape-dependent: it is the CRC's share of the read path, so
+  a corpus of fewer, larger blocks spends a larger fraction of each open inside
+  the hash and would measure a bigger share from the same method. And "make
+  verification free and re-time it" is the method, whatever mechanism does the
+  making-free — a patched comparison and a pre-warmed verification map are
+  measuring the same quantity, so two such figures taken on two corpora are not
+  in dispute with each other.
+
+  The two objections this bullet raised while the answer was no are both
+  answered in the shipped version rather than argued away. The key must not be
+  the path, because the tier replaces a file under a verified path an hour after
+  it lands: it is keyed on length, mtime and `ino` together behind a settle
+  window, and section 3.3 is the argument for each of the four parts. And the
+  footprint is capped rather than unbounded — `VERIFIED_CAP` at 65,536 entries
+  against ~1,800 tables for the largest corpus here, cleared wholesale rather
+  than evicted, with the LRU named as the upgrade path in the comment that sets
+  it.
 - **A restart replays past the slowest shard, and it is the allowed direction.**
   `scripts/measure/restart-replay.sh`, three paired runs per binary, one restart
   each: the rows the corpus gained across the restart were 0.255% (+26,000 of
@@ -2258,10 +2342,27 @@ Reading these honestly:
   every open of a file that by construction never changes. It is now verified
   once per process (section 3.3), and the harness prices the difference rather than
   inferring it: it publishes the block, times the read path with verification
-  on, backdates the files so the cache accepts them, and times it again. Three
-  passes at 2,000,000 rows on a 386.1 MiB block, 202 bytes/row, whole block with
-  no term: **26.5 / 22.5 / 24.6 ns/row** becomes **16.1 / 16.6 / 17.1**. Median
-  1.55×, and re-verification was **35–39%** of the read path.
+  on, backdates the files so the cache accepts them, and times it again. At
+  2,000,000 rows on a 386.1 MiB block, 202 bytes/row, nine paired passes per
+  binary alternating on the same box, the whole-block row is **1.37×** on the
+  binary carrying only the cache and **1.47×** on the one that also has the lazy
+  split — re-verification is 27% and 32% of the read path there, and across the
+  four rows the medians run 1.37× to 1.75×.
+
+  Those two arms are **not separable**, and that is the result rather than a
+  failure of it. Per pass the whole-block row ranges 1.14–1.59× on the one and
+  1.22–2.21× on the other, and the ranges overlap almost entirely. The mechanism
+  is in the harness: every case it times ends in `assert!(hit > 0)`, so every
+  case returns rows, and a block that returns a row has its attributes rendered
+  and therefore its attribute tables read. The split changes which tables an
+  open reads only for a query that reads none of them, and by construction this
+  harness has no such case. The corpus A/B above is where those live.
+
+  The figure this paragraph carried from three passes — median 1.55×, **35–39%**
+  of the read path — sits inside both arms' ranges and is **withdrawn as a
+  median**: three samples of a quantity that moves between 1.14× and 2.21× do
+  not carry two significant figures. Between a quarter and two fifths of a
+  single block's read path is what this harness supports.
 
   **The arithmetic that used to close this paragraph closed on a coincidence,
   and it is withdrawn.** It read: a full scan CRCs 4,371 MiB of log blocks, and
@@ -2269,13 +2370,28 @@ Reading these honestly:
   the unpruned scan is integrity-check-bound. Warm on this machine `crc32fast`
   is nearer **27 GB/s**, so 5.2 GB/s was never its rate and the agreement was
   luck. On a corpus that stays resident, removing the redundant CRC outright
-  moves an unpruned scan by about **1.1×**: worth having, and not what
-  "integrity-check-bound" promises. Where it pays better is the query that opens
-  little and re-opens it often — trace by id over one block of 139,264 rows goes
-  from 3.79 ms to **2.58 ms**, 1.47×, because there the CRC is a large share of
-  a small amount of work. The rows that prune to one block are unchanged, and
-  have to be: the cache saves the *second* verification, so a query that opens a
-  table once in a process's life pays exactly what it paid before.
+  moves an unpruned scan by about **1.1×** — the 5.01 GiB row of the table below,
+  89.1 ms to 79.8 ms, cache against 0.0.3 with no lazy split in either. Worth
+  having, and not what "integrity-check-bound" promises.
+
+  It is also not a constant, and the corpus A/B at the top of this section is
+  where that shows. The same comparison — the cache alone, against 0.0.3 — is
+  **1.23×** on an unpruned logs scan and **1.31×** on traces over 2.93 GiB of
+  plain blocks, against 1.12× here over 5.01 GiB. The ratio moves with the
+  corpus because the denominator does: the paragraph below the table says an
+  unpruned scan is bound by whether the corpus fits in page cache, and a fixed
+  saving against a growing bound is a shrinking ratio. Quote 1.1× as this
+  corpus's figure, not as the change's.
+
+  Where the cache pays better is the query that opens little and re-opens it
+  often — trace by id over one block of 139,264 rows goes from 3.79 ms to
+  **2.58 ms**, 1.47×, because there the CRC is a large share of a small amount of
+  work. That row is **unchanged by the lazy split**, by the same mechanism as the
+  harness above: a trace lookup returns rows, rows are rendered with their
+  attributes, so both binaries read the same tables. The rows that prune to one
+  block are unchanged by the *cache* too, and have to be: it saves the *second*
+  verification, so a query that opens a table once in a process's life pays
+  exactly what it paid before.
 
   What the unpruned row is bound by is the thing the *first* column is bound by,
   which this section named above the table and then did not follow down. The
