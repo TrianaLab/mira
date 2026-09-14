@@ -35,4 +35,4 @@ regex = "1"
 # The same version `mira` pins, because `deny.toml` sets `multiple-versions =
 # "deny"` over the whole lockfile: a tool that drags in a second copy of a
 # parser the product already has is a second parser to audit.
-yaml-rust2 = "0.12.0"
+yaml-rust2 = "0.13.0"
