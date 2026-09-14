@@ -467,6 +467,122 @@ measurements:
         sites: [docs/architecture.md]
 
   # ---------------------------------------------------------------------------
+  # What a log fix is worth. section 11 diagnosed the ingest plateau as one mutex
+  # held across a `write(2)` and named two fixes; these are the numbers that
+  # rejected both. They are ratios rather than rates on purpose — each is taken
+  # inside one sitting with both arms in every pass, so the box's 23% day-to-day
+  # drift cancels instead of being measured. A ratio here without an `agreed`
+  # line in its `measures` is one whose per-pass signs split, which under
+  # docs/internals/measurement.md section 3 means it is recorded as not quotable
+  # rather than quoted.
+  # ---------------------------------------------------------------------------
+
+  - key: wal.ramdisk.records_per_s_ratio.conns32
+    value: 1.096
+    unit: ratio
+    measures: >
+      Records/s with `<data-dir>/.wal` symlinked at an APFS RAM disk, over the
+      same binary logging to the data volume, at thirty-two connections. Median
+      of three per-pass ratios, both arms in every pass, B first; agreed, 3 of 3.
+      This is the *envelope* for any change to the log's critical section rather
+      than a fix: the RAM disk deletes the section instead of shortening it, so
+      no group commit and no log split can be worth more than this.
+    provenance: scripts/measure/wal-volume.sh
+    quoted:
+      - as: "1.096x"
+        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.ramdisk.records_per_s_ratio.conns96
+    value: 1.005
+    unit: ratio
+    measures: >
+      As wal.ramdisk.records_per_s_ratio.conns32, at ninety-six. Signs split, 2
+      of 3, so the median is recorded and deliberately not quoted as an effect —
+      it is quoted as the absence of one.
+    provenance: scripts/measure/wal-volume.sh
+    quoted:
+      - as: "1.005x"
+        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.ramdisk.submit_admit_share
+    value: 92
+    unit: percent
+    measures: >
+      `submit.admit` as a share of `submit.total` in the RAM-disk dump at
+      thirty-two connections — 44.054 ms of 47.910 ms. The same probe reads
+      0.000-0.002 ms in every disk-backed dump in the section 11 table, where it
+      was cited as ruling admission out. With the log's write removed the queue
+      re-forms here, which is what moves the named constraint off the log and on
+      to the flusher.
+    provenance: scripts/measure/wal-volume.sh
+    quoted:
+      - as: "92%"
+        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.split.write_ratio.conns32
+    value: 1.943
+    unit: ratio
+    measures: >
+      Mean `wal.write` with one log per signal over the single-log binary it
+      replaces, at thirty-two connections. Median of nine per-pass ratios across
+      three sittings; agreed, 9 of 9. Three appenders on one volume do not write
+      in the time one did, which is why the split gives back in device time what
+      it takes off the mutex.
+    provenance: scripts/measure/wal-split-ab.sh
+    quoted:
+      - as: "1.94x"
+        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.split.write_ratio.conns96
+    value: 2.394
+    unit: ratio
+    measures: As wal.split.write_ratio.conns32, at ninety-six. Agreed, 9 of 9.
+    provenance: scripts/measure/wal-split-ab.sh
+    quoted:
+      - as: "2.39x"
+        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.split.records_per_s_ratio.conns32
+    value: 1.039
+    unit: ratio
+    measures: >
+      Records/s with one log per signal over the single-log binary, at thirty-two
+      connections. Median of nine per-pass ratios across three sittings minutes
+      apart. **Signs split, 6 of 9, so this is not quotable as a speedup** and is
+      registered to stop it being re-quoted as one — the first sitting alone
+      returned 1.125x on 3 of 3 passes and the other six withdrew it.
+    provenance: scripts/measure/wal-split-ab.sh
+    quoted:
+      - as: "1.039"
+        sites: [docs/architecture.md]
+
+  - key: wal.concurrent_appenders.bandwidth_ratio.two
+    value: 0.98
+    unit: ratio
+    measures: >
+      Aggregate bytes/s from two threads appending 790 KiB frames to two files on
+      the data volume, over one thread doing the same — no Mira code in the loop,
+      so it prices the device rather than the engine. Median of five per-pass
+      ratios; signs split, 2 of 5. The volume absorbs no second appender, which
+      is the mechanism behind wal.split.write_ratio.* and the reason three
+      mutexes buy nothing.
+    provenance: unscripted
+    quoted:
+      - as: "0.98x"
+        sites: [docs/architecture.md, crates/mira-core/src/wal.rs]
+
+  - key: wal.concurrent_appenders.bandwidth_ratio.three
+    value: 0.86
+    unit: ratio
+    measures: >
+      As wal.concurrent_appenders.bandwidth_ratio.two, with three appenders.
+      Signs split, 2 of 5.
+    provenance: unscripted
+    quoted:
+      - as: "0.86x"
+        sites: [docs/architecture.md, crates/mira-core/src/wal.rs]
+
+  # ---------------------------------------------------------------------------
   # The corpus itself. These are the denominators every query row divides by, so
   # they are measurements too.
   # ---------------------------------------------------------------------------

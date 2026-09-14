@@ -1900,7 +1900,9 @@ node is a line the eye learns to skip.
   disable it outright, so performance would depend on whether the sandbox
   allows a syscall. And Mira is not I/O-bound: 190 MiB/s against an NVMe that
   does GB/s, on 1.75 of twelve cores. Revisit when a profile shows syscall
-  overhead above ~5% of ingest CPU, or when the log's group commit measures
+  overhead above ~5% of ingest CPU. The third reason used to name the log's
+  group commit as the trigger; that fix is rejected on the numbers two bullets
+  into the plateau discussion below, so the trigger is now the flusher measuring
   submission-bound rather than device-bound.
 - ~~**The query-side half of `NO_IDENTITY`.**~~ Built. `Frame::add_entity`
   (`frame.rs:82`) drops the sentinel with the reason this bullet asked for — "an
@@ -2110,13 +2112,61 @@ Reading these honestly:
   `wal.inflight_max` from 12 to 47**, while the total time the mutex was *held*
   barely moved, 14.98 s against 14.50 s. Four times the workers bought four
   times the queue and the same serialised section.
-- **What this costs, and what did not land.** The fix is not in this release and
-  the honest reason is that neither candidate can be validated to this section's
-  standard on this box. Group commit — one `writev` of whatever is waiting at the
-  lock, the ack still after the write lands, never a `BufWriter` that acks bytes
-  still in userspace — is the direct answer; one log per signal is the cheap one,
-  three mutexes instead of one, bounded by the signal count rather than the core
-  count. Neither needs coordination state and neither changes the format. What
+- **Both proposed fixes were built or priced, and both are rejected.** The
+  bullets above say where the time goes and they are right. They were then read
+  as saying what the *rate* is, and that does not follow — a queue forms at
+  whatever is slowest to acquire, which need not be what is slowest to finish.
+
+  *One log per signal* was implemented and measured against the binary it
+  replaces: `scripts/measure/wal-split-ab.sh`, nine paired passes at 4/32/96
+  connections across three sittings minutes apart, B before A inside each pass.
+  **records/s signs split at every shape** — medians 0.948, 1.039 and 0.909 with
+  4, 6 and 2 of 9 passes favourable — so no throughput figure from it is
+  quotable, and the 1.125x that the first sitting's thirty-two-connection column
+  reported on 3 of 3 passes is withdrawn by the other six. The mechanism is
+  unambiguous where the rate is not: `wal.lock_wait` does fall, 0.63x at four
+  connections and 0.795x at thirty-two, and `wal.write` takes all of it back at
+  1.94x and 2.39x with **all nine passes agreeing at both shapes**. The reason is
+  the device, and it is measurable with no Mira code in the loop — two concurrent
+  appenders at the measured 790 KiB frame return 0.98x the aggregate bandwidth of
+  one and three return 0.86x, both signs split. Three mutexes are free; a second
+  appender is not. The diff is on the `wal-per-signal` branch, not deleted.
+
+  *Group commit* needs no arm of its own, because the envelope both fixes share
+  was measured directly. `scripts/measure/wal-volume.sh` symlinks `<data-dir>/.wal`
+  at a RAM disk and changes nothing else, which deletes the serialised section
+  rather than shortening it: `wal.write` −89% to 0.245 ms, `wal.held` −83% to
+  0.395 ms, `wal.lock_wait` −93% to 1.245 ms, `wal.inflight_max` off its pin at
+  10 of 12 and `runtime.lag` from 33.9 ms to 2.967 ms. Throughput moves
+  **1.096x at thirty-two connections on 3 of 3 passes, and 1.005x at ninety-six
+  with signs split**. A *perfect* log fix is worth ten percent at one shape and
+  nothing at the other; group commit writes the same bytes down the same fd, so
+  it cannot be worth more than that and is not worth building.
+
+  That run needs the sweep period shortened to truncate inside it — a bounded
+  log is what the four withdrawn RAM-disk figures in that script's header lacked —
+  so it is a one-line build (`ticks % 240` → `ticks % 4` in `wal_maintenance`),
+  the same binary in both arms, and both arms now assert `0 shed` before their
+  number is read.
+- **The constraint behind the log is admission, which is the flusher.** The same
+  RAM-disk dump says where the queue re-forms once the log is free, and it is not
+  where the bullet two up ruled it out. `submit.admit` is 0.000–0.002 ms in every
+  disk-backed dump in the table and was dismissed on exactly that reading; with
+  the log's write removed it is **44.054 ms of a 47.910 ms `submit.total`, 92%**,
+  while `wal.encode`, `wal.lock_wait`, `wal.held` and `wal.write` together come to
+  3.7 ms. Admission blocks when no `Config::queue` slot frees on any shard, so
+  what bounds ingest is the rate at which blocks seal and publish. The log was
+  the louder constraint, not the binding one.
+
+  What is *not* claimed here is why the flusher is slow. Two candidates are open
+  and this measurement does not separate them: its own CPU — Arrow encode plus
+  zstd, against 2.23 of twelve cores busy, which is consistent with a few
+  saturated flushers on an idle box — or the volume it shares with the log, which
+  the concurrent-appender control says is already at its limit with one writer.
+  Separating them is one probe around the seal, not an argument. **What is
+  settled is the envelope: anything spent on the log's mutex is spent inside 10%**,
+  so the next measurement belongs on the flusher and not here.
+- **What did land on the log, which is little.** What
   did land is `Wal::sync()` taking its `F_FULLFSYNC` outside the lock rather than
   inside it: structurally right given the 4,230 µs section 10 already publishes
   for that call, and **not measured to move any number in the table above**. The

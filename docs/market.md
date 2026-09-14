@@ -317,18 +317,34 @@ worker count *exactly* — 12 of 12, 47 of 48 — which is every runtime worker
 parked in the kernel on one lock, and is why ten cores sit idle while ack
 latency climbs. A task that asks to sleep 50 ms and does no work at all returns
 80 ms late at 96 connections against 9.7 ms at four, which is the same finding
-with nothing borrowed from the client. At 2.2–2.9 ms an append the log can
-serialise 345–440 appends/s, so **the ceiling is 1.7 to 2.6 M records/s whatever
-the connection count**; connections past the plateau add waiters, not appends.
-Adding runtime workers makes it worse: 12 against 48 at 96 connections, same
-binary back to back, is 2,229,315 against 1,675,695 records/s with 6.4x the lock
-wait and the same total time under the lock.
+with nothing borrowed from the client. Adding runtime workers makes it worse: 12
+against 48 at 96 connections, same binary back to back, is 2,229,315 against
+1,675,695 records/s with 6.4x the lock wait and the same total time under the
+lock.
 
-That is a diagnosis and not a fix, and the fix is not in this release. Group
-commit — one `writev` of whatever is waiting at the lock, ack still after the
-write lands — or one log per signal would both lift it without coordination
-state and without a format change, and neither is in the tree because neither
-can be validated to this page's standard on the box available. Which is the
+An earlier version of this paragraph went one step further and said that at
+2.2–2.9 ms an append the log serialises 345–440 appends/s, so "the ceiling is 1.7
+to 2.6 M records/s whatever the connection count". **That step is withdrawn.** It
+reads a rate off the largest term in a latency budget, and a queue forms at
+whatever is slowest to *acquire*, which need not be what is slowest to finish.
+Both named fixes were then built or priced and both are rejected. One log per
+signal is implemented and measured — nine paired passes at 4/32/96 connections
+over three sittings, **records/s signs split at every shape**, because
+`wal.lock_wait` falls 0.63–0.795x and `wal.write` takes all of it back at
+1.94x and 2.39x on all nine passes: three mutexes are free, a second appender on one
+volume is not. And the envelope both fixes share was measured directly by putting
+the log on a RAM disk, which deletes the serialised section rather than
+shortening it — `wal.write` −89%, `wal.lock_wait` −93% — for **1.096x at
+thirty-two connections and 1.005x with signs split at ninety-six**. A perfect log
+fix is worth ten percent at one shape and nothing at the other.
+
+What that run also shows is the constraint the log was standing in front of.
+`submit.admit` is 0.000–0.002 ms in every disk-backed dump and was ruled out on
+that reading; with the log free it is 92% of submit time. Admission blocks on a
+flusher queue slot, so ingest is bounded by the rate blocks seal and publish, and
+the log was the louder constraint rather than the binding one. Whether the
+flusher is bound by its own CPU or by the volume it shares with the log is the
+next thing to measure and is not claimed here. Which is the
 second thing to report: two runs of the identical 96-connection configuration
 minutes apart returned 1,814,829 and 2,229,315 records/s, and **the 26% fall
 from 32 to 96 connections that the table above publishes did not reproduce on

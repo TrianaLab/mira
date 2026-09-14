@@ -65,14 +65,44 @@
 //! `wal.lock_wait` by six, because the ceiling is the serialised section rather
 //! than scheduling capacity.
 //!
-//! ponytail: one global log with one mutex, and the ceiling is ~1/2.5 ms ≈ 400
-//! appends/s, or roughly 2.2M records/s at 8,192-record exports. The upgrade
-//! path is group commit — one `writev` for every frame that arrived while the
-//! last write was in flight, with the ack still released after the write, so it
-//! is not the `BufWriter` ruled out above — or one log per signal, which is
-//! three mutexes for free. Neither needs coordination state. Neither is in this
-//! tree, because neither can be validated to section 11's standard on the box
-//! that produced these numbers; see `docs/market.md`.
+//! # …but the serialised section is not the ceiling either
+//!
+//! The paragraph above says where the time goes and it is right. It was then
+//! read as saying what the *rate* is, and that does not follow: a queue forms at
+//! whatever is slowest to acquire, which need not be what is slowest to finish.
+//! Both fixes it proposed were priced before either was believed.
+//!
+//! One log per signal was built, measured against the binary it replaces, and
+//! **rejected**: nine paired passes at 4/32/96 connections across three
+//! sittings, records/s signs split at every shape. It moves `wal.lock_wait` —
+//! 0.63x at four connections, 0.795x at thirty-two — and gives the whole of it
+//! back in `wal.write`, 1.94x and 2.39x at thirty-two and ninety-six with all
+//! nine passes agreeing. The volume does not absorb a second appender: two
+//! concurrent writers at this frame size return 0.98x the aggregate bandwidth of
+//! one and three return 0.86x, measured with no Mira code in the loop. The diff
+//! is kept on the `wal-per-signal` branch rather than deleted.
+//!
+//! Group commit needs no separate arm, because the *envelope* was measured
+//! directly: put the log on a RAM disk, change nothing else, and `wal.write`
+//! falls 89% to 0.245 ms, `wal.held` 83% to 0.395 ms and `wal.lock_wait` 93% to
+//! 1.245 ms — the serialised section effectively deleted — for **1.096x at
+//! thirty-two connections (3 of 3 passes) and 1.005x at ninety-six, signs
+//! split**. A perfect log fix is worth ten percent at one shape and nothing at
+//! the other, and group commit writes the same bytes down the same fd.
+//!
+//! What that run shows instead is where the queue re-forms once the log is free:
+//! `submit.admit`, 0.000–0.002 ms in the disk-backed dumps and ruled out there
+//! on that basis, becomes **44.05 ms of a 47.91 ms `submit.total`, 92%**. Admission
+//! blocks when no flusher queue slot frees, so the constraint behind the log is
+//! the block seal and publish path — the same device, writing Arrow IPC.
+//!
+//! ponytail: one global log with one mutex. The ceiling that matters is not
+//! this file's: `wal.lock_wait` is the largest term in `submit` and still worth
+//! ~10% at most, so the upgrade path here is bytes — the re-encode below is 790
+//! KiB a frame and compressing or eliding it is the only lever with room — and
+//! the upgrade path for *ingest* is the flusher, not the log. Do not re-propose
+//! group commit or a log per signal without a number that contradicts the two
+//! paragraphs above; see `docs/architecture.md` section 11.
 //!
 //! # The frame is the OTLP request, in its canonical protobuf encoding
 //!
