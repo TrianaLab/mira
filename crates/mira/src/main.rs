@@ -37,6 +37,7 @@ mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
              --replica http://HOST:PORT [--replica ...]
 mira offload list    [--config FILE] --offload URI
 mira offload restore [--config FILE] --offload URI [--data-dir PATH]
+mira offload push    [--config FILE] --offload URI [--data-dir PATH]
 mira update  [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
@@ -51,6 +52,12 @@ under the same directory name it had locally — so the store's own listing is
 the catalog and there is nothing else to keep in sync. `mira offload list`
 reads that listing; `mira offload restore` copies every block in it that is not
 already local back into --data-dir, and is safe to re-run.
+
+`mira offload push` is the same copy in the other direction and deletes
+nothing. It is how a volume a scale-down left behind is re-homed: push it, then
+restore it into a node that is still running. Give it a URI of its own —
+`file:///archive/${node}` — so the restore pulls back one node's blocks rather
+than the whole archive.
 
 `mira proxy` is one OTLP and query surface in front of N storage nodes. It
 stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
@@ -121,17 +128,36 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
     Ok(cfg)
 }
 
-/// `mira offload list` and `mira offload restore`.
+/// `mira offload list`, `mira offload restore` and `mira offload push`.
 ///
-/// Both are `readdir` against the store and nothing else. There is no state
-/// here to be stale, no index to rebuild and nothing to reconcile with a
-/// running server: a `restore` into the data directory of a live node is a
-/// block appearing in it, which is the same event as a publish and is already
-/// how the read path learns about anything (section 4).
+/// All three are `readdir` against one side or the other and nothing else.
+/// There is no state here to be stale, no index to rebuild and nothing to
+/// reconcile with a running server: a `restore` into the data directory of a
+/// live node is a block appearing in it, which is the same event as a publish
+/// and is already how the read path learns about anything (section 4).
+///
+/// `push` copies and does not unlink, and that is the design rather than
+/// caution. A node derives two numbers from the blocks it still holds locally,
+/// and emptying the directory walks both backwards: the WAL watermark
+/// ([`mira_core::block::wal_watermarks`]) falls to `0` for any signal left with
+/// no block, so the next boot replays a log that has already been absorbed, and
+/// the block sequence resumes at `max(seq) + 1` over the local scan, so the
+/// node reissues `(node, seq)` pairs that are still alive wherever they were
+/// copied — and `Cursor` is documented as a total order over exactly that pair.
+/// The case this verb exists for is a volume that is about to be deleted, where
+/// freeing space on it buys nothing at all, let alone those two.
+///
+/// ponytail: `push` reads the directory live, so a block being compacted at
+/// that moment — `<table>.arrow.<node>.tmp` renamed over `<table>.arrow` — can
+/// be copied mid-rewrite. It is meant for a volume whose server is stopped,
+/// which is the case it was asked for; holding it against a running one needs
+/// the compaction lock this module deliberately does not have.
 fn offload_cmd(argv: &[String]) -> Result<(), String> {
     let verb = argv.first().map(String::as_str).unwrap_or("");
-    if !matches!(verb, "list" | "restore") {
-        return Err(format!("mira offload takes `list` or `restore`\n\n{USAGE}"));
+    if !matches!(verb, "list" | "restore" | "push") {
+        return Err(format!(
+            "mira offload takes `list`, `restore` or `push`\n\n{USAGE}"
+        ));
     }
     let cfg = load_from(argv[1..].to_vec())?;
     let uri = cfg
@@ -148,7 +174,15 @@ fn offload_cmd(argv: &[String]) -> Result<(), String> {
     }
     let (mut blocks, mut bytes) = (0u64, 0u64);
     for signal in pipeline::SIGNALS {
-        for b in target.list(signal).map_err(|e| e.to_string())? {
+        // The verb chooses which side is the source. Both sides are the same
+        // `scan` over the same names, which is the property section 3.2's
+        // naming scheme exists to have — a store needs no listing code of its
+        // own, and neither does reading one backwards.
+        let source = match verb {
+            "push" => mira_core::block::scan(&cfg.data_dir, signal),
+            _ => target.list(signal),
+        };
+        for b in source.map_err(|e| e.to_string())? {
             let name = b.dir.file_name().unwrap_or_default().to_string_lossy();
             let size = block_bytes(&b.dir);
             blocks += 1;
@@ -159,6 +193,10 @@ fn offload_cmd(argv: &[String]) -> Result<(), String> {
                     .map_err(|e| e.to_string())?
                 {
                     true => "restored",
+                    false => "present",
+                },
+                "push" => match target.push(signal, &b).map_err(|e| e.to_string())? {
+                    true => "pushed",
                     false => "present",
                 },
                 _ => "",
@@ -1253,6 +1291,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `mira offload push` is `restore` read backwards, and it removes nothing.
+    ///
+    /// The unlinking version of this verb is the one that cannot be built, and
+    /// the assertion that the source survives is that argument rather than
+    /// tidiness: a node reads both its WAL watermark and its next block
+    /// sequence off the blocks it still holds, so emptying the directory walks
+    /// both backwards and the next boot replays an absorbed log under reissued
+    /// sequence numbers. Mutation check: make `push` unconditional and the last
+    /// call overwrites an archived block with a volume someone has since
+    /// edited, which is the one direction a backup verb must never go.
+    #[test]
+    fn offload_push_copies_out_of_the_data_dir_and_unlinks_nothing() {
+        let dir = tmp("offload-push");
+        let (store, data) = (dir.join("cold"), dir.join("data"));
+        let uri = format!("file://{}", store.display());
+
+        let name = format!("{:020}-{:020}-{:08x}-{:012}-{:020}", 1_000, 2_000, 7, 1, 0);
+        let local = data.join("logs").join("p=0").join(&name);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("logs.arrow"), b"bytes").unwrap();
+
+        let push = format!("push --offload {uri} --data-dir {}", data.display());
+        offload_cmd(&argv(&push)).unwrap();
+        let remote = store.join("logs").join("p=0").join(&name);
+        assert_eq!(std::fs::read(remote.join("logs.arrow")).unwrap(), b"bytes");
+        assert!(local.exists(), "push copies the block, it does not move it");
+
+        std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
+        offload_cmd(&argv(&push)).unwrap();
+        assert_eq!(
+            std::fs::read(remote.join("logs.arrow")).unwrap(),
+            b"bytes",
+            "a block already in the store is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Flag > file > default, and every flag lands in the field it names.
     ///
     /// This parser is hand-rolled, and the failure it can produce is the quiet
@@ -1886,7 +1961,10 @@ mod tests {
         // Sequence 3 being dropped rather than pinned is the point of that
         // retirement: a frame that will never decode must not hold a watermark,
         // or every frame published behind it is replayed on every boot forever.
-        assert_eq!(mira_core::block::wal_watermarks(&dir, node).unwrap(), [4, 4, 4]);
+        assert_eq!(
+            mira_core::block::wal_watermarks(&dir, node).unwrap(),
+            [4, 4, 4]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

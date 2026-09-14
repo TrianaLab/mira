@@ -975,6 +975,24 @@ retrieval path. No transparent fetch, no cache tier, no partially-local block.
 It is also what keeps section 9's refusal to `mmap` a networked filesystem
 intact: the mapped file is always the local one.
 
+**`mira offload push` is the same copy with the ends swapped, and it unlinks
+nothing.** The retention hook offloads a block because that block was about to
+be deleted; the verb offloads a whole data directory because the *volume* is —
+most often one a scale-in left behind, holding blocks no query can reach any
+more (section 12.4). Push them under a URI of their own, `restore` them into a
+node that is still running, and they are back in a catalogue something reads.
+
+Deleting the local copy afterwards is the obvious next step, and it is wrong.
+A node derives two numbers from the blocks it still holds and neither survives
+an emptied directory: `wal_watermarks` returns `0` for a signal with no block,
+so the next boot replays a log whose frames were absorbed long ago, and the
+block sequence resumes at `max(seq) + 1` over the local scan, so the node
+reissues `(node, seq)` pairs that are still alive wherever they were copied —
+the pair the cursor's total order is built on. Freeing space on a volume that is
+about to be deleted buys nothing, and it does not begin to pay for those. The
+verb copies; deleting the volume is the operator's next step anyway, and it is
+the only unlink in the procedure.
+
 **The copy is a `read`/`write` loop on purpose**, not `fs::copy`. On macOS
 `fs::copy` is `fclonefileat`/`fcopyfile(COPYFILE_ALL)` and *preserves mtime*, so
 a block restored from a two-month-old offload would land with a two-month-old
@@ -3141,6 +3159,13 @@ the state this design refuses.
   is and ages out. **Retention is the rebalancer** — a cluster is evenly loaded
   one retention period after any scale-out, with zero bytes moved. This is a real
   dividend of retention-bounded storage that an unbounded store cannot collect.
+  Scaling *in* collects no such dividend: Kubernetes retains the removed
+  replica's PVC, but nothing reads it, so its blocks are re-homed by hand with
+  `mira offload push` and `mira offload restore` (section 6.1). No lifecycle
+  hook does it for you, and that is a finding rather than a gap — a pod cannot
+  tell a scale-in from a rolling restart, so a hook wired to `preStop` would
+  evacuate every replica on the next image bump. Asking the API server which it
+  was is the membership read this principle refuses.
 - **A replica's identity is its disk.** A StatefulSet with a PVC. On ephemeral
   disk, a rescheduled pod's unexpired data is gone.
 

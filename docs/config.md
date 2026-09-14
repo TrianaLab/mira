@@ -156,11 +156,21 @@ Getting data back is explicit:
 ```sh
 mira offload list    --offload file:///backup/mira
 mira offload restore --offload file:///backup/mira --data-dir ./mira-data
+mira offload push    --offload file:///backup/mira --data-dir ./mira-data
 ```
 
 `restore` copies every block in the listing that is not already local, and is
 safe to re-run — a second run copies nothing. A running server picks restored
 blocks up on its next scan.
+
+`push` is the other direction and **unlinks nothing**: every block in
+`--data-dir` goes to the store, skipping the ones already there. It is no part
+of retention — it is how you empty a volume you are about to delete, usually one
+a scale-in left behind, whose blocks Kubernetes retains and nothing reads. Give
+it a URI of that node's own (`file:///archive/${node}`) so a later `restore`
+pulls back one node's blocks and not the whole archive. Run it against a stopped
+server: it reads the directory live, so a block being compacted at that moment
+can be copied mid-rewrite.
 
 **`file://` is the only scheme**, and it is a path, not a placeholder: a mounted
 bucket (`s3fs`, `gcsfuse`, `rclone mount`), an NFS export, a second disk. A

@@ -22,6 +22,7 @@ mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
              --replica http://HOST:PORT [--replica ...]
 mira offload list    [--config FILE] --offload URI
 mira offload restore [--config FILE] --offload URI [--data-dir PATH]
+mira offload push    [--config FILE] --offload URI [--data-dir PATH]
 mira update  [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
@@ -36,6 +37,12 @@ under the same directory name it had locally — so the store's own listing is
 the catalog and there is nothing else to keep in sync. `mira offload list`
 reads that listing; `mira offload restore` copies every block in it that is not
 already local back into --data-dir, and is safe to re-run.
+
+`mira offload push` is the same copy in the other direction and deletes
+nothing. It is how a volume a scale-down left behind is re-homed: push it, then
+restore it into a node that is still running. Give it a URI of its own —
+`file:///archive/${node}` — so the restore pulls back one node's blocks rather
+than the whole archive.
 
 `mira proxy` is one OTLP and query surface in front of N storage nodes. It
 stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
