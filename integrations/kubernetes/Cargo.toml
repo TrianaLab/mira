@@ -56,3 +56,12 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Both are already in this lockfile — kube depends on them — so naming them here
+# adds no crate to the tree. They exist so `mod tests` can hand `Client::new` a
+# `tower::Service` that records requests instead of a real API server: kube-rs
+# has no envtest, and the alternative is that every function in `controller.rs`
+# that issues an API call stays untested.
+[dev-dependencies]
+http = "1.5.0"
+tower = "0.5.3"

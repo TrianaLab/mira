@@ -1,0 +1,83 @@
+# One-shot generators, aimed at the collector rather than at Mira.
+#
+# Every record therefore makes the full trip — generator to stock collector,
+# stock collector to the operator's proxy Service, proxy to whichever storage
+# replica `hash(resource) % n` picks — before anything asserts on it. The bytes
+# on the wire are not our idea of a span.
+#
+# `--rate 0` is not optional: the default is one item per second per worker, so
+# `--logs 500` without it takes eight minutes and looks like a hang.
+#
+# `restartPolicy: OnFailure` is the readiness wait. The collector's receiver
+# binds a moment after its pod is Ready and both images are distroless — no
+# shell, nowhere to put a retry loop — so a generator that loses the race exits
+# non-zero and the kubelet runs it again.
+#
+# Three `--service` values and not one. The proxy routes on `hash(resource) % n`,
+# so a suite where every generator says `checkout` puts the whole corpus on a
+# single replica and then asserts it can be read back from a single replica —
+# which is the one thing about a tier that would also be true without one. The
+# traces pair stays on `checkout` on purpose; see below.
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: gen-traces }
+spec:
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: gen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["traces", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure",
+                 "--rate", "0", "--traces", "200", "--child-spans", "3",
+                 "--service", "checkout"]
+---
+# A second trace run, because `--status-code` is per-process: 200 ordinary
+# traces and 40 failing ones. A store where every span failed exercises the
+# error path and never the normal one, which is the shape that hides an error
+# filter matching everything.
+apiVersion: batch/v1
+kind: Job
+metadata: { name: gen-errors }
+spec:
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: gen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["traces", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure",
+                 "--rate", "0", "--traces", "40", "--child-spans", "3",
+                 "--service", "checkout", "--status-code", "Error"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: gen-logs }
+spec:
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: gen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["logs", "--otlp-endpoint", "otelcol:4318", "--otlp-insecure",
+                 "--otlp-http", "--rate", "0", "--logs", "500",
+                 "--service", "ingest"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: gen-metrics }
+spec:
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: gen
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["metrics", "--otlp-endpoint", "otelcol:4317", "--otlp-insecure",
+                 "--rate", "0", "--metrics", "300", "--service", "billing"]

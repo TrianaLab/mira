@@ -34,7 +34,9 @@ warn | assert) ;;
 *) usage ;;
 esac
 
-base=http://127.0.0.1:4318
+# `make demo` runs the engine on the default port; the Kind e2e reaches it
+# through a port-forward, which cannot bind 4318 if a demo is already up.
+base=${MIRA_URL:-http://127.0.0.1:4318}
 
 # name | path | request body | the answer that means it is not there yet
 checks=(

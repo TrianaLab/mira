@@ -1,0 +1,45 @@
+# The tier under test, and the cold volume a drain archives into.
+#
+# Two storage replicas, not one, because one replica cannot show the two things
+# this suite exists to check: that the proxy merges results from more than one
+# store, and that `hash(resource) % n` actually spreads resources across them.
+#
+# The thresholds will not fire. The scale decision itself is covered by the
+# request-log tests in `controller.rs`; a threshold that tripped here would make
+# the suite depend on how full a Kind node's disk happens to be, which is the
+# least reproducible input available. What this suite checks about scaling is
+# the *mechanism* — `make operator-e2e` edits `spec.replicas` directly and
+# watches the tier follow.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mira-cold
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: mira.miradb.dev/v1alpha1
+kind: MiraCluster
+metadata:
+  name: tel
+spec:
+  # Overwritten by `make operator-e2e` with the tag it just loaded into Kind.
+  image: mira:e2e
+  replicas: 2
+  maxReplicas: 3
+  storage:
+    size: 1Gi
+  scaling:
+    upWhenFreeBelow: 0.01
+    downWhenFreeAbove: 0.99
+    cooldownSeconds: 1
+  offload: "file:///cold/${node}"
+  # Required alongside `offload`, and the reason is the whole point of this
+  # gate: without it the drain Job writes the archive into its own container,
+  # exits 0, and the operator deletes the volume it believes it archived.
+  coldStorageClaim: mira-cold
+  proxy:
+    replicas: 1

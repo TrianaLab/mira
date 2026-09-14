@@ -96,8 +96,31 @@ pub struct MiraClusterSpec {
     /// still scales *out*, and refuses to scale in — see `Scaling::down`. That
     /// is the safe direction to fail in: the cost of not shrinking is a bill,
     /// and the cost of shrinking without an archive is the data.
+    ///
+    /// `file://` is the only scheme Mira's offload target parses, so on
+    /// Kubernetes this path has to be a mount — hence `coldStorageClaim`, which
+    /// is required alongside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offload: Option<String>,
+
+    /// Name of an existing claim holding the cold store, mounted into the drain
+    /// Job at the first path segment of `offload`.
+    ///
+    /// This field exists because its absence was silent data loss. `offload` is
+    /// a `file://` URL — the only scheme there is — and a drain Job that mounts
+    /// nothing writes the archive into its own container filesystem, exits 0,
+    /// and the operator then deletes the claim it just "archived". The blocks
+    /// are gone and every status field says `Ready`.
+    ///
+    /// So the pair is validated rather than documented: `offload` without this
+    /// is refused, which makes the losing configuration unrepresentable instead
+    /// of merely discouraged.
+    ///
+    /// `ReadWriteMany` if the tier can drain on more than one node. A drain runs
+    /// one at a time, so `ReadWriteOnce` is enough on a single-node cluster and
+    /// will strand the Job anywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_storage_claim: Option<String>,
 
     /// The `mira proxy` tier that fans out across the replicas.
     #[serde(default)]
@@ -273,8 +296,35 @@ impl MiraClusterSpec {
                  adjacent thresholds oscillate, and every cycle copies a replica's blocks"
             ));
         }
+        if let Some(uri) = &self.offload {
+            let Some(root) = cold_mount(uri) else {
+                return Err(format!(
+                    "spec.offload ({uri}) must be a file:// URL with an absolute path; \
+                     it is the only scheme Mira's offload target parses"
+                ));
+            };
+            if self.cold_storage_claim.is_none() {
+                return Err(format!(
+                    "spec.offload is set but spec.coldStorageClaim is not; the drain Job would \
+                     write the archive to {root} inside its own container and the volume would \
+                     be deleted anyway. Name a claim to mount there"
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+/// Where the drain Job has to mount the cold store for `offload` to land on it:
+/// the first path segment of the URL.
+///
+/// `file:///cold/${node}` mounts at `/cold`, and `mira offload push` creates the
+/// per-node directory underneath. Mounting the full path instead would give
+/// every replica its own volume, which is one claim per drain forever.
+pub fn cold_mount(offload: &str) -> Option<String> {
+    let path = offload.strip_prefix("file://")?;
+    let first = path.strip_prefix('/')?.split('/').next()?;
+    (!first.is_empty()).then(|| format!("/{first}"))
 }
 
 #[cfg(test)]
@@ -292,6 +342,7 @@ mod tests {
             },
             scaling: Scaling::default(),
             offload: None,
+            cold_storage_claim: None,
             proxy: Proxy::default(),
         }
     }
@@ -340,5 +391,50 @@ mod tests {
         let mut s = spec();
         s.scaling.up_when_free_below = 15.0;
         assert!(s.validate().unwrap_err().contains("fractions"));
+    }
+
+    /// The one that was silent data loss before this check existed.
+    ///
+    /// `offload` alone is a drain Job that writes the archive into its own
+    /// container, exits 0, and lets the operator delete the volume it thinks it
+    /// archived. There is no error anywhere in that sequence — the phase goes
+    /// `Ready` — so the only place it can be caught is before it starts.
+    #[test]
+    fn an_offload_with_nowhere_to_write_is_refused() {
+        let mut s = spec();
+        s.offload = Some("file:///cold/${node}".into());
+        let e = s.validate().unwrap_err();
+        assert!(e.contains("coldStorageClaim"), "{e}");
+
+        s.cold_storage_claim = Some("mira-cold".into());
+        assert!(s.validate().is_ok());
+    }
+
+    /// `file://` is the only scheme `Target::parse` accepts, so an `s3://` here
+    /// is a drain that fails at the last step with the volume already gone from
+    /// the StatefulSet. Refuse it while it is still a typo.
+    #[test]
+    fn an_offload_that_is_not_a_file_url_is_refused() {
+        for uri in ["s3://bucket/cold", "/cold/${node}", "file://", "file:///"] {
+            let mut s = spec();
+            s.offload = Some(uri.into());
+            s.cold_storage_claim = Some("mira-cold".into());
+            assert!(
+                s.validate().unwrap_err().contains("file://"),
+                "{uri} was allowed"
+            );
+        }
+    }
+
+    /// The mount point is the first segment, not the whole path: `${node}`
+    /// expands per replica, and mounting the expanded path would be one claim
+    /// per drain forever.
+    #[test]
+    fn the_cold_mount_is_the_first_path_segment() {
+        assert_eq!(cold_mount("file:///cold/${node}").as_deref(), Some("/cold"));
+        assert_eq!(cold_mount("file:///archive").as_deref(), Some("/archive"));
+        assert_eq!(cold_mount("file:///a/b/c").as_deref(), Some("/a"));
+        assert_eq!(cold_mount("s3://bucket/x"), None);
+        assert_eq!(cold_mount("file://relative/x"), None);
     }
 }

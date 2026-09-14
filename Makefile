@@ -539,7 +539,7 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 	@# list is what rots, and re-checking get-mira.sh (which `make
 	@# install-script` also does, with more) costs nothing.
 	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
-	shellcheck scripts/*.sh
+	shellcheck scripts/*.sh $(OPERATOR)/e2e/*.sh
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs
@@ -625,6 +625,29 @@ operator-lint: ## Clippy over the operator, warnings are errors
 operator-test: ## The operator's unit tests
 	$(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml --locked
 
+# The operator's own ratchet, separate from the engine's because it is measured
+# over a different manifest — `cargo llvm-cov --workspace` on the root cannot
+# reach a nested workspace, which is why the operator was invisible to
+# COVERAGE_MIN for as long as it existed.
+#
+# 89.07 measured here with the request-log tests in place. It is *not* 99-point-
+# something and cannot be: `main.rs` and `crdgen.rs` are 33 lines of process
+# entry point at 0%, which puts the ceiling at about 98.2 — those two are
+# covered by `make operator-e2e`, and coverage instrumentation does not follow a
+# binary into a container. Floored to 89.0 for the same reason COVERAGE_MIN is
+# floored: a ratchet with no margin fails on a run that measured the same tree.
+OPERATOR_COVERAGE_MIN ?= 89.0
+
+.PHONY: operator-coverage
+operator-coverage: ## Operator line coverage against its ratchet ($(OPERATOR_COVERAGE_MIN)%)
+	$(call need,cargo-llvm-cov)
+	@# Its own target dir: coverage takes the same lock as a normal build, and
+	@# sharing one with the engine's ratchet serialises two legs that have no
+	@# reason to wait for each other.
+	CARGO_TARGET_DIR=target/llvm-cov-operator \
+	  $(CARGO) llvm-cov --manifest-path $(OPERATOR)/Cargo.toml --locked \
+	  --summary-only --show-missing-lines --fail-under-lines $(OPERATOR_COVERAGE_MIN)
+
 .PHONY: operator-crd
 operator-crd: ## Regenerate the CRD the chart ships from the Rust types
 	$(CARGO) run --quiet --manifest-path $(OPERATOR)/Cargo.toml --locked --bin crdgen \
@@ -640,8 +663,21 @@ operator-crd-check: operator-crd ## Fail if the committed CRD is stale
 	@# a drift gate rather than a note in a README.
 	git diff --exit-code -- $(CHART)/crds/miraclusters.yaml
 
+.PHONY: operator-e2e
+operator-e2e: ## The operator against a real cluster: Kind, a stock collector, a drain
+	@# The only end-to-end gate in the tree, and it replaced a compose file that
+	@# ran one Mira behind one collector. Everything that one asserted is
+	@# asserted here — the three signals still make the full trip from a stock
+	@# collector — but through a tier the operator built, so the reconciler, the
+	@# chart, the CRD and the RBAC are all on the path rather than beside it.
+	@#
+	@# It is not in `make check`. It builds two images and a cluster and takes
+	@# minutes; `make ci-operator-e2e` is its own CI leg, and `KEEP=1` leaves the
+	@# cluster up when it fails.
+	$(OPERATOR)/e2e/run.sh
+
 .PHONY: operator
-operator: operator-fmt-check operator-lint operator-test operator-crd-check ## Every operator gate
+operator: operator-fmt-check operator-lint operator-test operator-coverage operator-crd-check ## Every operator gate
 
 # ---------------------------------------------------------------------------
 # Documentation site

@@ -48,6 +48,26 @@ spec:
               run Mira on Kubernetes", and the one that cannot scale, cannot drain and
               cannot be told a ceiling is the wrong default.
             properties:
+              coldStorageClaim:
+                description: |-
+                  Name of an existing claim holding the cold store, mounted into the drain
+                  Job at the first path segment of `offload`.
+
+                  This field exists because its absence was silent data loss. `offload` is
+                  a `file://` URL — the only scheme there is — and a drain Job that mounts
+                  nothing writes the archive into its own container filesystem, exits 0,
+                  and the operator then deletes the claim it just "archived". The blocks
+                  are gone and every status field says `Ready`.
+
+                  So the pair is validated rather than documented: `offload` without this
+                  is refused, which makes the losing configuration unrepresentable instead
+                  of merely discouraged.
+
+                  `ReadWriteMany` if the tier can drain on more than one node. A drain runs
+                  one at a time, so `ReadWriteOnce` is enough on a single-node cluster and
+                  will strand the Job anywhere else.
+                nullable: true
+                type: string
               image:
                 description: |-
                   The Mira image the storage pods and the drain Jobs both run.
@@ -76,6 +96,10 @@ spec:
                   still scales *out*, and refuses to scale in — see `Scaling::down`. That
                   is the safe direction to fail in: the cost of not shrinking is a bill,
                   and the cost of shrinking without an archive is the data.
+
+                  `file://` is the only scheme Mira's offload target parses, so on
+                  Kubernetes this path has to be a mount — hence `coldStorageClaim`, which
+                  is required alongside it.
                 nullable: true
                 type: string
               proxy:

@@ -493,6 +493,156 @@ mod tests {
     use crate::crd::{MiraClusterSpec, MiraClusterStatus, Proxy, Scaling, Storage};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+
+    use http::{Request, Response, StatusCode};
+    use http_body_util::BodyExt;
+    use kube::client::Body;
+    use tower::Service;
+
+    /// A `kube::Client` with a recorder where the API server should be.
+    ///
+    /// kube-rs has no envtest — there is no Rust equivalent of standing up a
+    /// real kube-apiserver and etcd for a test. What it does have is
+    /// [`Client::new`], which takes any `tower::Service`, so the seam is one
+    /// layer lower: instead of asserting on cluster state after a reconcile,
+    /// these tests assert on the exact sequence of HTTP requests the reconcile
+    /// *issued*. For this controller that is the stronger assertion anyway —
+    /// the thing that must not regress is the drain's ordering, and an ordering
+    /// is a property of the request log rather than of the final state.
+    ///
+    /// ponytail: no request matching beyond the path, and every reply is
+    /// canned. Reach for a real control plane the day a test needs the API
+    /// server's own behaviour — defaulting, admission, a conflict on resource
+    /// version — rather than this controller's behaviour.
+    /// `(method, path) -> (status, body)`.
+    type Reply = Arc<dyn Fn(&str, &str) -> (StatusCode, serde_json::Value) + Send + Sync>;
+
+    #[derive(Clone)]
+    struct Fake {
+        calls: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
+        reply: Reply,
+    }
+
+    /// What a Kubernetes 404 actually looks like on the wire. `get_opt` turns
+    /// this into `None`, and it only recognises it by the parsed `Status`.
+    fn not_found() -> serde_json::Value {
+        json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "code": 404, "reason": "NotFound", "message": "not found",
+        })
+    }
+
+    /// Enough of a `MiraCluster` to deserialize, for the replies to
+    /// `patch_status`. Every other kind in this file has all-optional fields,
+    /// so `{"metadata":{}}` is a valid one of those.
+    fn cluster_doc() -> serde_json::Value {
+        json!({
+            "apiVersion": "mira.miradb.dev/v1alpha1",
+            "kind": "MiraCluster",
+            "metadata": {"name": "tel", "namespace": "ns"},
+            "spec": {
+                "image": "m:1", "replicas": 1, "maxReplicas": 5,
+                "storage": {"size": "1Gi"},
+            },
+        })
+    }
+
+    impl Fake {
+        fn new(
+            reply: impl Fn(&str, &str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                reply: Arc::new(reply),
+            }
+        }
+
+        /// The default control plane: every write succeeds, nothing exists yet.
+        fn ok() -> Self {
+            Self::new(|method, path| match (method, path) {
+                ("GET", _) => (StatusCode::NOT_FOUND, not_found()),
+                (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+                _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+            })
+        }
+
+        fn ctx(&self) -> Arc<Ctx> {
+            Arc::new(Ctx {
+                client: Client::new(self.clone(), "ns"),
+            })
+        }
+
+        /// `METHOD /path`, in the order they were issued.
+        fn log(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, p, _)| format!("{m} {p}"))
+                .collect()
+        }
+
+        /// The body of the nth request whose line contains `needle`.
+        fn body(&self, needle: &str) -> serde_json::Value {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(m, p, _)| format!("{m} {p}").contains(needle))
+                .unwrap_or_else(|| panic!("no request matching {needle:?} in {:?}", self.log()))
+                .2
+                .clone()
+        }
+    }
+
+    impl Service<Request<Body>> for Fake {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
+        >;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            let (calls, reply) = (self.calls.clone(), self.reply.clone());
+            Box::pin(async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_owned();
+                let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                let (code, out) = reply(&method, &path);
+                calls.lock().unwrap().push((method, path, body));
+                Ok(Response::builder()
+                    .status(code)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&out).unwrap()))
+                    .unwrap())
+            })
+        }
+    }
+
+    /// A cluster the API-level tests can reconcile: namespaced, with an offload
+    /// target, so the scale-in path is reachable.
+    fn drainable() -> MiraCluster {
+        let mut c = cluster(None, 600);
+        c.meta_mut().namespace = Some("ns".into());
+        // Every object the operator applies carries an owner reference, and
+        // that needs a uid. The API server always assigns one, so only a
+        // hand-built fixture has to remember.
+        c.meta_mut().uid = Some("00000000-0000-0000-0000-000000000000".into());
+        c.spec.offload = Some("file:///cold/${node}".into());
+        // Required alongside `offload` — without it `validate` refuses the spec
+        // and every reconcile below would assert on `Degraded` instead of on
+        // the path it means to cover.
+        c.spec.cold_storage_claim = Some("mira-cold".into());
+        c
+    }
+
     fn cluster(last: Option<&str>, cooldown: i64) -> MiraCluster {
         let mut c = MiraCluster::new(
             "tel",
@@ -509,6 +659,7 @@ mod tests {
                     ..Default::default()
                 },
                 offload: None,
+                cold_storage_claim: None,
                 proxy: Proxy::default(),
             },
         );
@@ -565,5 +716,239 @@ mod tests {
 
         let old = fmt_rfc3339(now_secs() - 4_000);
         assert!(cooling_down(&cluster(Some(&old), 600)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Against an API server, or something shaped like one.
+    //
+    // Everything below drives a real `kube::Client` and asserts the requests it
+    // put on the wire. The reconcile paths these cover are the ones that delete
+    // things.
+    // -----------------------------------------------------------------------
+
+    /// Every object the tier owns, applied, before any scale decision is taken.
+    ///
+    /// The order is not incidental: a tier whose Service is missing is a tier
+    /// whose stats cannot be read, so a reconcile that decided first would
+    /// abstain forever on a cluster it had never finished creating.
+    #[tokio::test]
+    async fn ensure_applies_the_whole_tier_and_the_proxy_with_it() {
+        let f = Fake::ok();
+        let c = drainable();
+        ensure(&f.ctx(), &c, "ns", 3).await.unwrap();
+
+        assert_eq!(
+            f.log(),
+            [
+                "PATCH /api/v1/namespaces/ns/configmaps/tel",
+                "PATCH /api/v1/namespaces/ns/services/tel-headless",
+                "PATCH /apis/apps/v1/namespaces/ns/statefulsets/tel",
+                "PATCH /api/v1/namespaces/ns/configmaps/tel-proxy",
+                "PATCH /api/v1/namespaces/ns/services/tel-proxy",
+                "PATCH /apis/apps/v1/namespaces/ns/deployments/tel-proxy",
+            ]
+        );
+
+        // The count that is applied is the one passed in, not `spec.replicas`.
+        // Re-asserting the spec here would undo every scale-out on the very
+        // next reconcile — a bug that looks like the tier refusing to grow.
+        let set = f.body("statefulsets/tel");
+        assert_eq!(set["spec"]["replicas"], 3);
+    }
+
+    /// `proxy.replicas: 0` is a supported topology, not a degenerate one.
+    #[tokio::test]
+    async fn a_tier_with_no_proxy_applies_only_its_own_three_objects() {
+        let f = Fake::ok();
+        let mut c = drainable();
+        c.spec.proxy.replicas = 0;
+        ensure(&f.ctx(), &c, "ns", 1).await.unwrap();
+
+        assert_eq!(f.log().len(), 3, "{:?}", f.log());
+        assert!(!f.log().iter().any(|l| l.contains("proxy")));
+    }
+
+    /// An unsatisfiable spec is reported and then left alone. It must not reach
+    /// the API server for anything else: a hot loop on an object no reconcile
+    /// can fix is how an operator takes out a control plane.
+    #[tokio::test]
+    async fn an_oscillating_spec_is_reported_and_nothing_else_is_touched() {
+        let f = Fake::ok();
+        let mut c = drainable();
+        c.spec.scaling.up_when_free_below = 0.6;
+        c.spec.scaling.down_when_free_above = 0.2;
+
+        let action = reconcile(Arc::new(c), f.ctx()).await.unwrap();
+
+        assert_eq!(
+            f.log(),
+            ["PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status"]
+        );
+        assert_eq!(f.body("/status")["status"]["phase"], "Degraded");
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+    }
+
+    /// Step 1 before step 2, which is the crash-safety of the whole sequence.
+    ///
+    /// If the process dies between the two, the recorded `draining` ordinal is
+    /// what the next reconcile resumes from. In the other order the StatefulSet
+    /// has already shrunk, nothing records why, and the claim is orphaned with
+    /// no reconcile ever looking at it again.
+    #[tokio::test]
+    async fn a_drain_records_itself_before_it_removes_the_pod() {
+        let f = Fake::ok();
+        let c = drainable();
+        let action = start_drain(&f.ctx(), &c, "ns", 3, Some("0.90".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.log(),
+            [
+                "PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status",
+                "PATCH /apis/apps/v1/namespaces/ns/statefulsets/tel/scale",
+            ],
+            "status must be written before the StatefulSet shrinks"
+        );
+
+        let st = f.body("/status")["status"].clone();
+        assert_eq!(st["phase"], "Draining");
+        assert_eq!(st["draining"], 2);
+        assert_eq!(f.body("/scale")["spec"]["replicas"], 2);
+        assert_eq!(action, Action::requeue(Duration::from_secs(15)));
+    }
+
+    /// A drain in flight owns the next transition. Re-reading stats and
+    /// deciding again from a tier that is mid-shrink is how one decision moves
+    /// two replicas.
+    #[tokio::test]
+    async fn a_reconcile_mid_drain_resumes_it_rather_than_deciding_again() {
+        let f = Fake::ok();
+        let mut c = drainable();
+        c.status = Some(MiraClusterStatus {
+            draining: Some(2),
+            ..Default::default()
+        });
+
+        reconcile(Arc::new(c), f.ctx()).await.unwrap();
+
+        // The drain's own GET is there; no scale, and no status write deciding
+        // anything, because `finish_drain` owns the object now.
+        assert!(f.log().iter().any(|l| l.contains("jobs/tel-drain-2")));
+        assert!(
+            !f.log().iter().any(|l| l.contains("/scale")),
+            "{:?}",
+            f.log()
+        );
+    }
+
+    /// The Job is created against a claim the departing pod may still hold.
+    /// Nothing is deleted on this pass.
+    #[tokio::test]
+    async fn a_drain_with_no_job_yet_creates_one_and_deletes_nothing() {
+        let f = Fake::ok();
+        let c = drainable();
+        let action = finish_drain(&f.ctx(), &c, "ns", 2).await.unwrap();
+
+        assert_eq!(
+            f.log(),
+            [
+                "GET /apis/batch/v1/namespaces/ns/jobs/tel-drain-2",
+                "POST /apis/batch/v1/namespaces/ns/jobs",
+            ]
+        );
+        assert_eq!(action, Action::requeue(Duration::from_secs(15)));
+    }
+
+    /// The one irreversible step, and the only condition under which it may
+    /// run. Until the Job reports `succeeded`, that claim is the last copy of
+    /// those blocks.
+    #[tokio::test]
+    async fn the_claim_is_deleted_only_after_the_archive_succeeds() {
+        let f = Fake::new(|method, path| match (method, path) {
+            ("GET", p) if p.contains("/jobs/") => (
+                StatusCode::OK,
+                json!({"metadata": {"name": "tel-drain-2"}, "status": {"succeeded": 1}}),
+            ),
+            (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+            _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+        });
+        let c = drainable();
+        finish_drain(&f.ctx(), &c, "ns", 2).await.unwrap();
+
+        assert_eq!(
+            f.log(),
+            [
+                "GET /apis/batch/v1/namespaces/ns/jobs/tel-drain-2",
+                "DELETE /api/v1/namespaces/ns/persistentvolumeclaims/data-tel-2",
+                "PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status",
+            ]
+        );
+        let st = f.body("/status")["status"].clone();
+        assert_eq!(st["phase"], "Ready");
+        // Cleared, not left set, or every later reconcile resumes a finished
+        // drain and the tier never scales again.
+        assert!(st["draining"].is_null());
+    }
+
+    /// A failed drain is a bad day, not a data-loss incident: the tier is one
+    /// replica smaller and every block is still on disk. The claim must survive.
+    #[tokio::test]
+    async fn a_failed_drain_keeps_the_volume() {
+        let f = Fake::new(|method, path| match (method, path) {
+            ("GET", p) if p.contains("/jobs/") => (
+                StatusCode::OK,
+                json!({"metadata": {"name": "tel-drain-2"}, "status": {"failed": 1}}),
+            ),
+            (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+            _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+        });
+        let c = drainable();
+        let action = finish_drain(&f.ctx(), &c, "ns", 2).await.unwrap();
+
+        assert!(
+            !f.log().iter().any(|l| l.starts_with("DELETE")),
+            "a failed archive must never delete the claim: {:?}",
+            f.log()
+        );
+        assert_eq!(f.body("/status")["status"]["phase"], "Degraded");
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+    }
+
+    /// A Job still running is neither outcome. Nothing happens but a requeue.
+    #[tokio::test]
+    async fn a_running_drain_job_is_left_to_run() {
+        let f = Fake::new(|method, path| match (method, path) {
+            ("GET", p) if p.contains("/jobs/") => (
+                StatusCode::OK,
+                json!({"metadata": {"name": "tel-drain-2"}, "status": {"active": 1}}),
+            ),
+            _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+        });
+        let action = finish_drain(&f.ctx(), &drainable(), "ns", 2).await.unwrap();
+
+        assert_eq!(
+            f.log(),
+            ["GET /apis/batch/v1/namespaces/ns/jobs/tel-drain-2"]
+        );
+        assert_eq!(action, Action::requeue(Duration::from_secs(10)));
+    }
+
+    /// Unreachable replicas are the state every one of these tests runs in —
+    /// there is no tier behind the fake — and the decision they must produce is
+    /// "do nothing". A controller that read silence as "empty disk" would scale
+    /// a partitioned tier out forever.
+    #[tokio::test]
+    async fn a_tier_that_cannot_be_read_is_held_rather_than_scaled() {
+        let f = Fake::ok();
+        let action = reconcile(Arc::new(drainable()), f.ctx()).await.unwrap();
+
+        assert!(
+            !f.log().iter().any(|l| l.contains("/scale")),
+            "{:?}",
+            f.log()
+        );
+        assert_eq!(f.body("/status")["status"]["phase"], "Ready");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
     }
 }

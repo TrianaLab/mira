@@ -1,0 +1,86 @@
+# The telemetry half of `make operator-e2e`: a stock collector, and the
+# OpenTelemetry project's own generator aimed at it.
+#
+# This is the compose-based `make e2e` that used to live in docs/e2e/, moved
+# into the cluster. The reason it moved rather than being duplicated is that the
+# compose version could only ever prove one thing — that Mira accepts what the
+# stock exporter sends — and this proves that *plus* that the tier the operator
+# built is reachable, routes, and merges. Two e2e suites asserting overlapping
+# halves of one pipeline is one suite too many.
+#
+# The export target is `tel-proxy`, the Service the operator created. Nothing
+# here names a pod, an ordinal or a StatefulSet: if the operator got the
+# topology wrong, the collector simply cannot resolve its exporter.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otelcol
+data:
+  # Byte-for-byte the collector config from the compose scenario, with the
+  # hostname changed. Nothing Mira-specific: the `otlp` exporter out of the box,
+  # pointed at a name.
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+
+    processors:
+      batch: {}
+
+    exporters:
+      # `compression` is unset because the default is already gzip on both, and
+      # that is the point: Mira accepts what the stock exporter sends, on both
+      # transports, without being told.
+      otlp:
+        endpoint: tel-proxy:4317
+        tls: { insecure: true }
+      otlphttp:
+        endpoint: http://tel-proxy:4318
+
+    service:
+      telemetry:
+        logs: { level: info }
+      pipelines:
+        # Traces and metrics over gRPC, logs over HTTP, so one run exercises
+        # both of the proxy's listeners and both of the storage tier's.
+        traces: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+        metrics: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+        logs: { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otelcol
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: otelcol }
+  template:
+    metadata:
+      labels: { app: otelcol }
+    spec:
+      containers:
+        - name: otelcol
+          image: otel/opentelemetry-collector-contrib:0.142.0
+          args: ["--config=/etc/otelcol/config.yaml"]
+          ports:
+            - { containerPort: 4317 }
+            - { containerPort: 4318 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol }
+      volumes:
+        - name: config
+          configMap: { name: otelcol }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otelcol
+spec:
+  selector: { app: otelcol }
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }

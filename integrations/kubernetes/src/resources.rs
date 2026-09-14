@@ -345,6 +345,42 @@ pub fn proxy_deployment(c: &MiraCluster, replicas: i32) -> Deployment {
 /// fights.
 pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
     let name = format!("{}-drain-{}", c.name_any(), ordinal);
+    let pod = format!("{}-{}", c.name_any(), ordinal);
+
+    // `${node}` expanded here, because the engine will not expand it there.
+    // Interpolation is a feature of the config *parser*, and `--offload` on the
+    // command line is stored raw — so the running replica writes its blocks to
+    // `/cold/tel-2/…` via its ConfigMap while this Job would write them to a
+    // directory literally named `${node}`. Both archives exist, only one is the
+    // one a `restore` looks in, and the volume is deleted either way.
+    let offload = &offload.replace("${node}", &pod);
+
+    // The cold store, mounted where the offload URL points. Without it `mira
+    // offload push` writes into the container's own filesystem, exits 0, and
+    // the operator deletes the claim it believes it has archived — so
+    // `validate` refuses the spec that would produce `None` here, and the
+    // `unwrap_or_default` below is the unreachable arm of a check that already
+    // ran rather than a second policy.
+    let cold = crate::crd::cold_mount(offload).zip(c.spec.cold_storage_claim.clone());
+    let (mounts, volumes) = match &cold {
+        Some((at, claim)) => (
+            json!([
+                {"name": "data", "mountPath": "/data"},
+                {"name": "cold", "mountPath": at},
+            ]),
+            json!([
+                {"name": "data", "persistentVolumeClaim": {
+                    "claimName": format!("data-{}-{}", c.name_any(), ordinal)}},
+                {"name": "cold", "persistentVolumeClaim": {"claimName": claim}},
+            ]),
+        ),
+        None => (
+            json!([{"name": "data", "mountPath": "/data"}]),
+            json!([{"name": "data", "persistentVolumeClaim": {
+                "claimName": format!("data-{}-{}", c.name_any(), ordinal)}}]),
+        ),
+    };
+
     serde_json::from_value(json!({
         "metadata": meta(c, name, "drain"),
         "spec": {
@@ -369,15 +405,10 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
                             "--data-dir", "/data",
                             "--offload", offload,
                         ],
-                        "env": [{"name": "POD_NAME", "value": format!("{}-{}", c.name_any(), ordinal)}],
-                        "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+                        "env": [{"name": "POD_NAME", "value": pod}],
+                        "volumeMounts": mounts,
                     }],
-                    "volumes": [{
-                        "name": "data",
-                        "persistentVolumeClaim": {
-                            "claimName": format!("data-{}-{}", c.name_any(), ordinal),
-                        },
-                    }],
+                    "volumes": volumes,
                 },
             },
         },
@@ -404,6 +435,7 @@ mod tests {
                 },
                 scaling: Scaling::default(),
                 offload: Some("file:///cold/${node}".into()),
+                cold_storage_claim: Some("mira-cold".into()),
                 proxy: Proxy::default(),
             },
         );
@@ -527,5 +559,70 @@ mod tests {
         // The verb that must never appear here: `push` copies, and the volume
         // is about to go, so nothing is gained by freeing space on it.
         assert!(!args.iter().any(|a| a.contains("restore")), "{args:?}");
+    }
+
+    /// The other half of the drain, and the one whose absence was silent: the
+    /// archive needs somewhere to land. Without this mount `mira offload push`
+    /// writes `/cold/tel-4` into the container's own filesystem, exits 0, and
+    /// the operator deletes `data-tel-4` believing it is archived.
+    #[test]
+    fn the_drain_job_mounts_the_cold_store_at_the_offload_root() {
+        let pod = drain_job(&cluster(), 4, "file:///cold/${node}")
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        let cold = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "cold")
+            .expect("no cold volume; the archive would go to the container filesystem");
+        assert_eq!(
+            cold.persistent_volume_claim.as_ref().unwrap().claim_name,
+            "mira-cold"
+        );
+
+        let at = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "cold")
+            .expect("cold volume declared but never mounted")
+            .mount_path
+            .clone();
+        // `/cold`, not `/cold/${node}`: the per-replica directory is created by
+        // `offload push` underneath the mount, and mounting the expanded path
+        // would mean one claim per drain forever.
+        assert_eq!(at, "/cold");
+    }
+
+    /// The two halves of the archive have to agree on a path. The replica
+    /// writes through its ConfigMap, where `${node}` is interpolated by the
+    /// config parser; the drain writes through `--offload`, which is not
+    /// parsed as config and so is stored exactly as typed. Left alone, the
+    /// scale-in archive lands in a directory named `${node}` that no restore
+    /// will ever look in — and the claim is deleted all the same.
+    #[test]
+    fn the_drain_writes_where_the_replica_was_writing() {
+        let pod = drain_job(&cluster(), 4, "file:///cold/${node}")
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        let args = pod.containers[0].args.clone().unwrap();
+        assert!(
+            args.contains(&"file:///cold/tel-4".to_string()),
+            "the drain would archive to a literal ${{node}}: {args:?}"
+        );
+        // Same name the config would have resolved `${node}` to, so the two
+        // paths are one path rather than two that happen to match today.
+        let env = pod.containers[0].env.clone().unwrap();
+        assert_eq!(env[0].value.as_deref(), Some("tel-4"));
     }
 }

@@ -1017,6 +1017,7 @@ name = "mira-operator"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "http",
  "http-body-util",
  "hyper-util",
  "k8s-openapi",
@@ -1027,6 +1028,7 @@ dependencies = [
  "serde_yaml_ng",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
