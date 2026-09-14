@@ -74,6 +74,7 @@ jobs:
           enablement: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: docs
       # For the /demo build. `make site` builds the UI a second time with
       # VITE_REPLAY=1, which answers from the committed fixtures instead of

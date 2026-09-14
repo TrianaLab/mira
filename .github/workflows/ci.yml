@@ -94,8 +94,21 @@ jobs:
       # components, and rustup on the runner honours it on the first cargo
       # invocation. One less third-party action in the supply chain, and the
       # toolchain CI uses is the one a contributor gets by cloning.
+      # `env-vars: ImageOS` on every rust-cache in the tree, and it is load-
+      # bearing rather than tidy. The automatic key records `Linux-x64` and not
+      # which Ubuntu that is, so a `target/` built on 24.04 restores cleanly onto
+      # a 22.04 runner and then dies in a build script — `GLIBC_2.39 not found`,
+      # from a cached `getrandom` binary nothing in the job asked to rebuild.
+      # Cargo fingerprints inputs, not the host libc, so it never notices. This
+      # repo pins `image` and `release-dry-run` to 22.04 *because* the glibc
+      # floor is the thing under test, which makes it the repo most likely to
+      # mix the two. `ImageOS` is `ubuntu22`/`ubuntu24` in the runner's
+      # environment and rust-cache hashes it into the key, so the two can no
+      # longer see each other's caches. Empty off GitHub-hosted runners, which
+      # degrades to the old behaviour rather than breaking.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: ${{ matrix.os }}
 
       # Two targets, because formatting, the feature swap and rustdoc are
@@ -115,6 +128,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: msrv
       # `rust-version` in Cargo.toml is a promise to anyone pinned to an older
       # toolchain, and a promise nothing compiles against is a wish. The target
@@ -139,13 +153,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           # Its own cache key and its own lock file. Sharing the engine's key
           # would evict one tree's artifacts on every alternate run.
           key: operator
           workspaces: integrations/kubernetes
-      # fmt, clippy, the unit tests, and the CRD drift gate — the generated
-      # schema has to match the Rust types, because apiextensions silently
-      # prunes any field the schema does not name.
+      # The operator carries its own ratchet, because `cargo llvm-cov
+      # --workspace` on the root manifest cannot reach a nested workspace — so
+      # this leg needs the same tool the `coverage` leg does, for a different
+      # tree and a different floor.
+      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+        with:
+          tool: cargo-llvm-cov
+      # fmt, clippy, the unit tests, the coverage floor, and the CRD drift gate
+      # — the generated schema has to match the Rust types, because
+      # apiextensions silently prunes any field the schema does not name.
       - run: make ci-operator
 
   ui:
@@ -176,6 +198,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: coverage
       - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
         with:
@@ -210,6 +233,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: drift
       # Two halves of one question, and they share a release binary. `drift`
       # checks the crate count, the binary size against the section 11 ceiling,
@@ -252,6 +276,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: image
 
       # The pin and its digest are in ci.mk, alongside the argument for why
@@ -301,6 +326,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           # The operator's workspace: the API-server suite is a `cargo test` on
           # the runner, and it is the only Rust this leg compiles outside Docker.
           key: operator-e2e
@@ -322,6 +348,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: release-dry-run
       - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
         with:
