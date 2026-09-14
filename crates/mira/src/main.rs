@@ -750,7 +750,7 @@ async fn replay(
     let dir = dir.to_path_buf();
     let started = std::time::Instant::now();
     let done = tokio::task::spawn_blocking(move || {
-        let watermarks = mira_core::block::wal_watermarks(&dir)?;
+        let watermarks = mira_core::block::wal_watermarks(&dir, node)?;
         let mut undecodable = 0u64;
         let out = mira_core::wal::Wal::replay(&dir, node, watermarks, |signal, seq, body| {
             let pushed = match signal {
@@ -1886,7 +1886,7 @@ mod tests {
         // Sequence 3 being dropped rather than pinned is the point of that
         // retirement: a frame that will never decode must not hold a watermark,
         // or every frame published behind it is replayed on every boot forever.
-        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [4, 4, 4]);
+        assert_eq!(mira_core::block::wal_watermarks(&dir, node).unwrap(), [4, 4, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

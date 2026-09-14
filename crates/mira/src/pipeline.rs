@@ -955,8 +955,12 @@ async fn wal_sweep(wal: Arc<Wal>, dir: PathBuf, truncating: bool) {
         }
         // The minimum across signals, not each signal's own: one segment holds
         // frames for all three, so it can only go once the last of them has
-        // claimed everything in it.
-        let covered = block::wal_watermarks(&dir)?.into_iter().min().unwrap_or(0);
+        // claimed everything in it. Scoped to this log's own writer, because
+        // what is about to happen to the segments below `covered` is `unlink`.
+        let covered = block::wal_watermarks(&dir, wal.node())?
+            .into_iter()
+            .min()
+            .unwrap_or(0);
         wal.truncate(covered)
     })
     .await;
@@ -1694,7 +1698,7 @@ mod tests {
         let published = block::scan(&dir, "logs").unwrap();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].wal_hi, 1);
-        assert_eq!(block::wal_watermarks(&dir).unwrap(), [1, 0, 0]);
+        assert_eq!(block::wal_watermarks(&dir, node).unwrap(), [1, 0, 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1749,14 +1753,14 @@ mod tests {
 
         drop(tx);
         h.await.unwrap();
-        assert_eq!(block::wal_watermarks(&dir).unwrap(), [2, 0, 0]);
+        assert_eq!(block::wal_watermarks(&dir, node).unwrap(), [2, 0, 0]);
 
         // The second boot: every frame is behind the watermark, so nothing is
         // handed back and the log can be truncated.
         let again = Wal::replay(
             &dir,
             node,
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             |_, _, _| unreachable!("a frame a block already claims must never be replayed again"),
         )
         .unwrap();
@@ -2408,7 +2412,7 @@ mod tests {
         h.await.unwrap();
 
         assert_eq!(
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             [0, 0, 0],
             "a block that was never published claims no sequence"
         );
@@ -2421,7 +2425,7 @@ mod tests {
         let replayed = Wal::replay(
             &dir,
             node,
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             |_, _, _| Ok(()),
         )
         .unwrap();
@@ -2949,7 +2953,7 @@ mod tests {
              still has — this is the assertion `max(seq) + 1` fails"
         );
         assert_eq!(
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             [0, 0, 0],
             "and the reduction over the directory says the same"
         );
@@ -2962,7 +2966,7 @@ mod tests {
         let replayed = Wal::replay(
             &dir,
             node,
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             |_, seq, body| {
                 got.push((seq, body.to_vec()));
                 Ok(())
@@ -2994,7 +2998,7 @@ mod tests {
         let again = Wal::replay(
             &dir,
             node,
-            block::wal_watermarks(&dir).unwrap(),
+            block::wal_watermarks(&dir, node).unwrap(),
             |_, seq, _| unreachable!("frame {seq} is in a block already"),
         )
         .unwrap();

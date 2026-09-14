@@ -2474,9 +2474,9 @@ async fn a_block_seals_on_size_and_on_shutdown_and_neither_is_replayed_afterward
     // The frame is covered now, so the next boot must not touch it. Get this
     // wrong and every restart re-ingests the whole log — silently, as duplicate
     // rows, which is the failure an operator can least detect.
-    let watermarks = mira_core::block::wal_watermarks(&root).unwrap();
-    assert_eq!(watermarks[0], 1, "the block did not claim its frame");
     let node = mira_core::block::node_id("mira");
+    let watermarks = mira_core::block::wal_watermarks(&root, node).unwrap();
+    assert_eq!(watermarks[0], 1, "the block did not claim its frame");
     let mut seen: Vec<u64> = Vec::new();
     let mut sink = |_: mira_core::wal::Signal, seq: u64, _: &[u8]| {
         seen.push(seq);
@@ -2554,7 +2554,10 @@ async fn a_kill_with_the_block_open_loses_no_acknowledged_export_and_duplicates_
     assert_eq!(rows_of(&after), before);
     n.stop().await;
 
-    assert_eq!(mira_core::block::wal_watermarks(&root).unwrap()[0], 3);
+    assert_eq!(
+        mira_core::block::wal_watermarks(&root, mira_core::block::node_id("mira")).unwrap()[0],
+        3
+    );
     let n = restart(&root, true).await;
     let third = query(&n.app, doc).await;
     assert_eq!(
@@ -2667,7 +2670,7 @@ async fn a_torn_wal_tail_costs_only_the_frame_that_was_in_flight() {
     // never existed as far as the next boot is concerned, and the watermark the
     // block claims is the whole log — which here is one frame.
     assert_eq!(
-        mira_core::block::wal_watermarks(&root).unwrap()[0],
+        mira_core::block::wal_watermarks(&root, mira_core::block::node_id("mira")).unwrap()[0],
         1,
         "the recovered block claimed a frame the tear had swallowed"
     );

@@ -335,6 +335,15 @@ pub struct Wal {
 }
 
 impl Wal {
+    /// The writer identity this log's segments are named for.
+    ///
+    /// Recovery needs it to scope [`crate::block::wal_watermarks`] to the blocks
+    /// that absorbed *this* log's sequences — a number from another replica's
+    /// log is not comparable with one of ours. See that function.
+    pub fn node(&self) -> u32 {
+        self.node
+    }
+
     /// Open (or create) the log under `<root>/.wal/`, resuming the sequence
     /// counter past anything already on disk.
     ///

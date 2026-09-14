@@ -655,11 +655,23 @@ pub fn sweep_staging(root: &Path, signal: &str, node: u32) -> Result<usize> {
 ///
 /// A signal with no blocks gets `0` — replay everything the log holds for it,
 /// which is right, because nothing has absorbed any of it.
-pub fn wal_watermarks(root: &Path) -> Result<crate::wal::Watermarks> {
+///
+/// `node` scopes it to one writer's blocks, and that is not an optimisation.
+/// Sequences are per-log: [`crate::wal::Wal`] hands them out from its own
+/// counter, so two replicas sharing a volume (section 12) number their frames
+/// independently and a sequence means nothing outside the log that issued it.
+/// An unscoped maximum therefore hands the quiet replica the busy one's
+/// progress, and both consumers act on it destructively — [`crate::wal::Wal::replay`]
+/// skips every frame below it, and `wal_sweep` unlinks the segments holding
+/// them. The blocks are still filtered by nothing else: `scan` returns the whole
+/// directory because the *read* path wants every replica's blocks, and only
+/// recovery wants one replica's.
+pub fn wal_watermarks(root: &Path, node: u32) -> Result<crate::wal::Watermarks> {
     let mut out = [0u64; 3];
     for signal in crate::wal::Signal::ALL {
         out[signal.index()] = scan(root, signal.as_str())?
             .iter()
+            .filter(|b| b.node == node)
             .map(|b| b.wal_hi)
             .max()
             .unwrap_or(0);
@@ -2158,6 +2170,30 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Two replicas share a volume, and the quiet one must not be handed the
+    /// busy one's progress.
+    ///
+    /// Sequences are per-log, so the busy replica's 1000 says nothing about the
+    /// quiet one's 5. Taking the maximum over both would drop frames 5..1000 on
+    /// the quiet replica's next boot — [`crate::wal::Wal::replay`] skips every
+    /// frame below the watermark — and then unlink the segments holding them,
+    /// because `wal_sweep` truncates to the same number.
+    #[test]
+    fn a_watermark_covers_only_the_replica_that_wrote_the_blocks() {
+        let root = dir("wm-per-node");
+        let busy = node_id("busy");
+        let quiet = node_id("quiet");
+        publish(&root, "logs", busy, 0, 1_000, &sealed(1_000, 2_000)).unwrap();
+        publish(&root, "logs", quiet, 0, 5, &sealed(3_000, 4_000)).unwrap();
+
+        assert_eq!(wal_watermarks(&root, quiet).unwrap()[0], 5);
+        assert_eq!(wal_watermarks(&root, busy).unwrap()[0], 1_000);
+        // A replica with no blocks of its own here replays its whole log, even
+        // standing on a volume full of someone else's.
+        assert_eq!(wal_watermarks(&root, node_id("new")).unwrap()[0], 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A block directory written before the write-ahead log existed has four
     /// fields, not five, and it is still a block. There is no manifest to
     /// migrate and no version to bump, so the only place backward compatibility
@@ -2187,7 +2223,7 @@ mod tests {
     fn the_watermark_is_the_highest_per_signal_not_the_newest() {
         let root = dir("watermark");
         let node = node_id("a");
-        assert_eq!(wal_watermarks(&root).unwrap(), [0, 0, 0]);
+        assert_eq!(wal_watermarks(&root, node).unwrap(), [0, 0, 0]);
 
         // Published second, timestamped first: `scan` puts this one at the
         // front, and its watermark is the low one.
@@ -2196,7 +2232,7 @@ mod tests {
         publish(&root, "traces", node, 0, 3, &sealed(1_000, 2_000)).unwrap();
 
         // Indexed by `wal::Signal`: logs, traces, metrics.
-        assert_eq!(wal_watermarks(&root).unwrap(), [40, 3, 0]);
+        assert_eq!(wal_watermarks(&root, node).unwrap(), [40, 3, 0]);
         let _ = fs::remove_dir_all(&root);
     }
 
