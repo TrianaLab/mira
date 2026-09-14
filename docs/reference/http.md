@@ -76,7 +76,7 @@ Left out, the window is the last `1h` ending now.
 
 Log records or spans matching a filter, newest first.
 
-Accepts `signal`, `from`, `to`, `where`, `limit`, `after`.
+Accepts `signal`, `from`, `to`, `where`, `limit`, `after`, `cursors`.
 
 ```yaml
 {

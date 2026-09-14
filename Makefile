@@ -84,12 +84,21 @@ LOADGEN := target/release/examples/loadgen
 # Most of that race has since been closed at the source: the tests poll for the
 # sweep rather than assume it, and their budget was two seconds, which is not
 # enough on a machine whose cores are all busy — under load three of them failed
-# together. The budget is a minute now and polling makes that free. Whoever
-# raises this next should check whether those five lines have gone quiet on the
-# runner rather than inherit the allowance: the honest floor may now be the
-# figure CI prints, but that has to be read off a green Linux run and not
-# assumed from here.
-COVERAGE_MIN ?= 99.22
+# together. The budget is a minute now and polling makes that free.
+#
+# The rest of it is gone too. Those arms are `pipeline::report_sweep` now with a
+# unit test that drives every one of them, and `serve_with`'s never-fires stop
+# edge — whose `pending()` arm was polled or not depending on what the server
+# was doing at the time — has one as well. Three consecutive runs on this Mac
+# then measured 99.2368 (182 of 23,847) with byte-identical uncovered-line
+# lists, where the same tree before them moved between 180 and 183.
+#
+# So 99.23, which is that figure floored, and not the 99.24 one of those runs
+# printed on the way there. What is left uncovered is stably uncovered rather
+# than flickering, which is the property this gate actually needs; the honest
+# next move is still to read a figure off a green Linux run rather than assume
+# the drift's direction from here.
+COVERAGE_MIN ?= 99.23
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
 # count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor

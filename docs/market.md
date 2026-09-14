@@ -149,16 +149,16 @@ number **up**, so these are the unpacked figures.
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 |---|---|---|---|---|
-| **Mira** | **5.63 MiB** (arm64 macOS) | 1.0x | 117 crates | — |
-| VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.9x | 98 Go packages | yes |
-| VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.8x | — | yes |
-| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 16.7x | 425 modules | yes |
-| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 18.4x | — | yes |
-| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 18.6x | 331 modules | yes |
-| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 24.6x | 407 modules | yes |
-| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 25.6x | 1,171 lock entries | yes |
-| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 27.1x | 462 crates | yes |
-| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 27.3x | — | yes |
+| **Mira** | **5.76 MiB** (arm64 macOS) | 1.0x | 117 crates | — |
+| VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.8x | 98 Go packages | yes |
+| VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.6x | — | yes |
+| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 16.3x | 425 modules | yes |
+| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 17.9x | — | yes |
+| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 18.2x | 331 modules | yes |
+| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 24.0x | 407 modules | yes |
+| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 25.1x | 1,171 lock entries | yes |
+| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 26.5x | 462 crates | yes |
+| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 26.7x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
 The dependency column is directional only: a Go module ships many packages, and
@@ -226,7 +226,7 @@ This table shows what the axis looks like; it is not one Mira wins.
 
 ## Where Mira is ahead
 
-**1. Artifact size, and it is not close.** 5.63 MiB stripped: one binary, three
+**1. Artifact size, and it is not close.** 5.76 MiB stripped: one binary, three
 signals, query API, MCP surface and two UIs. The nearest peer is VictoriaLogs at
 16.26 MiB — 2.9x — and that binary covers logs only; matching Mira's signal
 coverage takes VictoriaLogs plus VictoriaTraces, two processes and 32.44 MiB.
@@ -537,7 +537,8 @@ box for people, so an inverted index would be a second file per block, a term
 dictionary and a posting-list format spent on the reader this engine is not for.
 Losing the row is the correct outcome, not a deferral.
 
-**Horizontal scale.** No cross-replica query fan-out, by design. Quickwit at
+**Horizontal scale.** A storage node answers only from its own blocks, by
+design; the cross-replica merge is a separate process, `mira proxy`. Quickwit at
 Binance reports 1.6 PB a day — 18.5 GB/s — across 2,800 vCPU [^qb], which this
 page rejects below as a *rate* because the denominator is requested vCPU rather
 than observed CPU, and cites here only as evidence that the deployment is that
@@ -546,13 +547,14 @@ behind an L4 balancer and a replication factor of one — a lost disk is lost da
 for that node's share. A scope decision, not a benchmark result, but a buyer
 reads it as a loss and should hear it here rather than discover it.
 
-The hot half cannot be closed. Fan-out needs a replica to know which replicas
-exist and which of them holds what, and that is membership and a shared
-catalogue, which is coordination state — the one thing the stateless principle
-spends everything else to avoid. Winning this row means becoming
-the thing every other row on this page is winning against. The answer is not a
-better implementation, it is a second process in front, and that is the
-operator's choice to make rather than Mira's to ship.
+The hot half cannot be closed *inside the node*. Fan-out from a replica needs
+that replica to know which replicas exist and which of them holds what, and that
+is membership and a shared catalogue, which is coordination state — the one thing
+the stateless principle spends everything else to avoid. Winning this row that
+way means becoming the thing every other row on this page is winning against.
+The answer is not a better implementation, it is a second process in front, and
+Mira now ships one — see below, including the part of the case for it that is
+still not measured.
 
 The cold half is closed, and this release closes it. `--offload <uri>` copies a
 sealed block to an object store immediately before retention unlinks it, under
@@ -569,18 +571,41 @@ arrived. It is deliberately not a tier — reads never consult the store,
 `mira offload restore` is the whole retrieval path, and `file://` is the only
 scheme, which means a mounted bucket rather than a signing library.
 
-A stateless query proxy in front of N replicas — static config, no membership,
-no catalogue, nothing to reconcile after a restart — would close the hot half
-too, and it is **not recommended yet**. Not because it is hard, but because
-nothing has measured a single node's ceiling to be the binding constraint: the
-ingest ceiling above is 1.7–2.6 M records/s on a laptop, and this page's own
-query finding is that an unpruned scan is bound by whether the corpus fits page
-cache, which fan-out does not change. Hash-based ingest routing on the 64-bit
-entity identity hash is the piece that would make fan-out worth having — it is
-what makes one replica's answer *complete* for one entity — and it only makes
-sense alongside the proxy, never before it. Build both when an operator arrives
-with a workload that exceeds one node; the reasoning is in
-[architecture section 12.2](architecture.md#122-query-still-not-built).
+The hot half is now closed mechanically, and the case for it is still not
+measured. `mira proxy` is a stateless merging proxy in front of N replicas —
+static config, no membership, no catalogue, nothing to reconcile after a
+restart — and it is cheaper than the sketch this paragraph used to carry,
+because the keyset cursor Mira already returns is `(ts, node, seq, row)` and is
+therefore *already* a total order across replicas. Merging pages is a sort and a
+cut; paging needs no per-reader position anywhere, so the proxy holds no state
+even in memory. Hash-based ingest routing on the 64-bit entity identity hash
+ships with it, never before it, which is what keeps one replica's answer
+*complete* for one entity. Zero new dependencies: the HTTP client was already in
+the tree for webhooks.
+
+What it costs is measured; what it buys is not. Two replicas and a proxy against
+one node, everything on the same twelve cores, nine paired passes a shape across
+three sittings: ingest through the proxy runs at **0.767x** the single node at
+four connections, every one of nine passes, and the wide unfiltered read costs
+**3.89x** the single node's `elapsed_us`, also nine of nine — the proxy's clock
+starts before the fan-out and stops after the merge, so it carries both
+replicas' reads plus the hop. At thirty-two and ninety-six connections the
+ingest ratio splits sign and is not quotable in either direction[^m5]. None of
+that is a scaling number and it cannot be: on one box there is no second disk,
+no second page cache and no second set of cores for fan-out to buy.
+
+What has **not** changed is the reason this was not recommended. Nothing has
+measured a single node's ceiling to be the binding constraint. The attempt is
+the plateau work above — it rejected both of the log fixes that were supposed to
+raise the ceiling and found the queue re-forming at block seal and publish, on a
+laptop, which is not the same as finding a node saturated at a rate a real
+workload reaches. This page's query finding also stands: an unpruned scan is
+bound by whether the corpus fits page cache, and fan-out does not change that,
+since each replica still scans its own share off its own disk. So read the proxy
+as capacity — more disks, more page cache, more cores — and not as a faster
+answer to the same query. The full reasoning, including what it refuses to merge
+and why, is [architecture section
+12.2](architecture.md#122-query-mira-proxy).
 
 **Cost per GB.** No measured dollar figure, only bytes on disk. Quickwit's $8.4
 per ingested TB per month is structurally unreachable for any engine *serving
@@ -687,7 +712,7 @@ sprint; each one buys something in the tables above.
 | Refused | What the user is told |
 |---|---|
 | **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice.** |
-| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 5.63 MiB. |
+| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 5.76 MiB. |
 | **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
 | **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
 | **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
@@ -712,6 +737,7 @@ argument.
 [^m2]: `cargo run --release -p miradb-core --example tier` over all 1,652 tables of an 8.33 GiB corpus; [Architecture section 11](architecture.md#11-performance-model).
 [^m3]: [Architecture section 11](architecture.md#11-performance-model), the query rows; steady state, server-reported `elapsed_us`.
 [^m4]: `scripts/measure/offload-cycle.sh`; the upload figure is the offload sweep less the plain unlink sweep, medians of two runs each; [Architecture section 11](architecture.md#11-performance-model).
+[^m5]: `scripts/measure/proxy-ab.sh`; medians of nine per-pass ratios, both arms in every pass, B first, with every pass's sign reported; [Architecture section 12.2.5](architecture.md#1225-what-the-hop-costs-on-one-box).
 [^g1]: <https://greptime.com/blogs/2026-03-24-ingestion-protocol-benchmark>
 [^g2]: <https://greptime.com/blogs/2025-03-10-log-benchmark-greptimedb>
 [^oa1]: <https://github.com/open-telemetry/otel-arrow>

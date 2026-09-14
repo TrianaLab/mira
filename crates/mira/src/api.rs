@@ -208,6 +208,7 @@ pub(crate) fn correlate(
             ..Default::default()
         },
         next: None,
+        cursors: Vec::new(),
     })
 }
 
@@ -307,6 +308,13 @@ async fn run(
 /// enjoy. Microseconds because a hot query here is single-digit milliseconds
 /// and "0 ms" is not a measurement.
 pub fn envelope(field: &str, r: &query::Results, elapsed: std::time::Duration) -> String {
+    // Absent rather than null on the last page, so `if (doc.next)` is the whole
+    // of a reader's paging logic.
+    let next = r
+        .next
+        .map(|c| format!(",\"next\":\"{c}\""))
+        .unwrap_or_default();
+    let tail = next + &cursors(&r.cursors);
     format!(
         "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
          \"rows_scanned\":{},\"rows_matched\":{},\"elapsed_us\":{}}}{}}}",
@@ -316,12 +324,31 @@ pub fn envelope(field: &str, r: &query::Results, elapsed: std::time::Duration) -
         r.stats.rows_scanned,
         r.stats.rows_matched,
         elapsed.as_micros(),
-        // Absent rather than null on the last page, so `if (doc.next)` is the
-        // whole of a reader's paging logic.
-        r.next
-            .map(|c| format!(",\"next\":\"{c}\""))
-            .unwrap_or_default()
+        tail
     )
+}
+
+/// `"cursors": ["…", "…"]`, index-aligned with the rows, or nothing at all.
+///
+/// Only a merging reader asks — see `proxy` — so the key is absent on every
+/// other response rather than present and empty: an empty array reads as "this
+/// page has no rows", which is what `rows` is for.
+fn cursors(cs: &[mira_core::query::Cursor]) -> String {
+    if cs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(",\"cursors\":[");
+    for (i, c) in cs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        // All digits, dots and a possible leading `-`; nothing to escape.
+        s.push('"');
+        s.push_str(&c.to_string());
+        s.push('"');
+    }
+    s.push(']');
+    s
 }
 
 fn json_ok(body: String) -> Response {
@@ -338,13 +365,19 @@ fn json_ok(body: String) -> Response {
 /// eventually feed the failure to a JSON parser and report the parse error
 /// instead of the actual problem.
 fn bad_request(msg: &str) -> Response {
+    error(StatusCode::BAD_REQUEST, msg)
+}
+
+/// [`bad_request`] under a status the caller picks, for the proxy — whose
+/// refusals are 501 and 502 and want the same body shape.
+pub(crate) fn error(code: StatusCode, msg: &str) -> Response {
     let mut j = mira_core::json::Json::new();
     j.obj(|j| {
         j.key("error");
         j.str(msg);
     });
     (
-        StatusCode::BAD_REQUEST,
+        code,
         [(header::CONTENT_TYPE, "application/json")],
         j.into_string(),
     )
@@ -394,7 +427,10 @@ pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
 /// [`parse_search`] on an already-parsed document, for callers that received one
 /// nested inside something else — an MCP tool call, say.
 pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
-    known(doc, &["signal", "from", "to", "where", "limit", "after"])?;
+    known(
+        doc,
+        &["signal", "from", "to", "where", "limit", "after", "cursors"],
+    )?;
     let signal = match doc["signal"].as_str() {
         Some(s) => Signal::parse(s).ok_or(format!("unknown signal {s:?}"))?,
         None => Signal::Logs,
@@ -419,7 +455,23 @@ pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
         terms: terms(doc)?,
         limit,
         after,
+        cursors: flag(doc, "cursors")?,
     })
+}
+
+/// A boolean key, absent meaning false.
+///
+/// Both spellings, because KYAML quotes every scalar and JSON does not, and
+/// the same document has to work sent either way (principle 5).
+fn flag(doc: &Yaml, key: &str) -> Result<bool, String> {
+    match &doc[key] {
+        Yaml::BadValue | Yaml::Null => Ok(false),
+        Yaml::Boolean(b) => Ok(*b),
+        y => y
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .ok_or(format!("{key}: expected \"true\" or \"false\"")),
+    }
 }
 
 /// Parse a metrics query document.

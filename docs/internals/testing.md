@@ -67,8 +67,20 @@ run exactly.
 `axum::serve` — with OTLP protobuf in one end and query JSON out the other. It
 is the only test in the tree that would catch a receiver wired to the wrong
 flusher, a block written where the reader does not look, a query that parses but
-never matches, or an acknowledgement returned before the data is findable. The
-only thing it does not exercise is the TCP socket.
+never matches, or an acknowledgement returned before the data is findable.
+Almost everything in it reaches the router through `oneshot`, so the one thing
+it does not exercise is the TCP socket.
+
+Two tests need a real one and say so at the call site. The TUI's client is a
+blocking `std::net::TcpStream` by design, so the only way to assert that it
+parses what the API emits is to make the API emit it over TCP. `mira proxy`
+reaches its replicas over HTTP because in a deployment they are separate
+processes — so the proxy test boots **two** storage nodes, each with its own
+directory and its own `--node` identity, puts each on `127.0.0.1:0`, and drives
+the proxy's router through `oneshot` in front of them. Those nodes are never
+stopped: `axum::serve` holds a router clone for the life of the process, so
+`Node::stop`'s contract — every `Ingest` dropped — has no moment at which it
+could be met, and the test ends with `forget_open_blocks` instead.
 
 **Nothing in it sleeps.** A 200 on `/v1/logs` is a read-your-writes promise, so
 the next query can already see the data; a test that sleeps to make that true is

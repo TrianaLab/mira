@@ -9,6 +9,62 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **`mira proxy`, one OTLP and query surface in front of N storage nodes, and
+  it stores nothing.** The same binary under a subcommand, given a static
+  `--replica http://host:port` list (or `proxy.replicas` in the file), serving
+  the three OTLP endpoints and `/api/v1/query` on one HTTP listener. It needs no
+  session store because the keyset cursor was already global: `(ts, node, seq,
+  row)` where `node` is the block's `node_id` is a total order across every row
+  on every replica, so the merge is a sort and a cut and the next page is exact
+  with nothing remembered per reader. Zero new dependencies — `hyper`,
+  `hyper-util` and `http-body-util` were already in the tree for webhooks. A
+  replica that fails fails the whole query rather than returning the others'
+  rows, and `correlate`, `map`, `metrics/query`, `metrics/names` and `entities`
+  answer **501 naming themselves**: each is built by walking one node's blocks,
+  and a plausible subset with nothing in the response saying so is the failure
+  this design has always refused.
+- **Hash-based ingest routing, shipped alongside the proxy and never before
+  it.** The proxy splits an export resource by resource on `resource_key`, the
+  same 64-bit entity identity the storage layer already joins on, so every
+  record describing one entity lands on one replica whatever batch it arrived
+  in. `NO_IDENTITY` spreads by position instead of piling every unidentified
+  sender onto replica zero. It buys nothing for the merged read; what it buys is
+  that each replica's blocks stay entity-local, which is what the 501s above are
+  waiting on.
+- **`"cursors": "true"` on a search document** returns a `cursors` array beside
+  `rows`, index-aligned and absent otherwise. Beside and not inside, because the
+  rendered row *is* the OTLP record and a reader that did not ask for cursors
+  should not step over one in every object. It is the only thing a storage node
+  grew for the proxy: no hop flag, no peer set, no notion that it is part of
+  one.
+
+### Changed
+
+- **The WAL mutex is not the ingest ceiling, and both of the fixes proposed for
+  it are rejected.** `wal.lock_wait` at 82-84% of submit time reproduces, and
+  `sample(1)` confirms it — 74,650 of 155,615 thread samples in
+  `__psynch_mutexwait`. What does not follow is the rate that was read off it.
+  One log per signal was built and measured (nine paired passes a shape, three
+  sittings): the mutex time comes off and goes straight back on as write time,
+  `wal.write` 1.9x and 2.4x, and throughput signs split at every shape, so no
+  figure is quotable. Group commit is priced rather than built, because the
+  envelope both fixes share is measurable directly — a RAM-disk log deletes the
+  serialised section rather than shortening it and is worth 1.096x at
+  thirty-two connections and nothing at ninety-six. With the log free,
+  `submit.admit` goes from 0.000-0.002 ms to 92% of submit time: **ingest is
+  bounded by the rate blocks seal and publish.** All of it on a laptop, labelled
+  as such.
+
+### Fixed
+
+- **Four RAM-disk figures are withdrawn in place** (0.291x, 0.296x, 0.117x,
+  0.127x). Every one was ENOSPC: truncation fires once a minute, so no 20 s run
+  reclaims a byte, and the faster arm fills the disk *because* it appends faster
+  — the speedup the instrument exists to detect is what guarantees the failure
+  that hides it. Both A/B scripts now assert `0 shed` before a number is read.
+
 ## [0.0.4] - 2026-09-13
 
 ### Added

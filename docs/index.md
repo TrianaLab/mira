@@ -34,7 +34,7 @@ transformation step for a field to fall out of.
 | **Zero-copy reads** | Hot blocks are uncompressed and 64-byte aligned, so a query reads Arrow buffers straight out of the mapping. A test walks every buffer of every column and requires all of them to point inside the `mmap`. |
 | **The filesystem is the manifest** | Blocks are named `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`, so the time index is the directory listing. No catalogue to keep in sync with the data. |
 | **No coordination state** | No Raft, no membership, no external metadata store. Two active replicas share one volume by having different `--node` names. |
-| **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 5.63 MiB stripped, 117 crates, no `protoc` and no node toolchain to build it. |
+| **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 5.76 MiB stripped, 117 crates, no `protoc` and no node toolchain to build it. |
 | **Agents read, not export** | `POST /mcp` is eight tools over that read path. An agent sitting next to the data skips the protocol entirely — `mira mira --data-dir` maps the blocks with no server, no port and no serialisation. |
 
 ## What it is deliberately not

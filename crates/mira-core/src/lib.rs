@@ -845,6 +845,7 @@ mod tests {
             terms,
             limit,
             after: None,
+            cursors: false,
         };
         let attr = |k: &str, v: &str| Term {
             target: Target::Attr(k.into()),
@@ -1038,6 +1039,7 @@ mod tests {
             terms,
             limit,
             after: None,
+            cursors: false,
         };
         let body = |v: &str| Term {
             target: Target::Field("body".into()),
@@ -1145,6 +1147,7 @@ mod tests {
                     terms: vec![],
                     limit,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1286,6 +1289,7 @@ mod tests {
             }],
             limit: 100,
             after: None,
+            cursors: false,
         };
 
         let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -1369,6 +1373,7 @@ mod tests {
                     terms: vec![],
                     limit,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1527,6 +1532,7 @@ mod tests {
             }],
             limit: 10,
             after: None,
+            cursors: false,
         };
         let (f, st) = frame::anchor(&root, &q, &[]).unwrap();
         assert_eq!(f.traces, vec![tid(3)], "one row matched, so one trace");
@@ -1674,6 +1680,7 @@ mod tests {
                     }],
                     limit: 100,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1931,6 +1938,7 @@ mod tests {
                 }],
                 limit: 2_000,
                 after: None,
+                cursors: false,
             },
         )
         .unwrap();
@@ -2000,6 +2008,7 @@ mod tests {
                     }],
                     limit: 2_000,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()

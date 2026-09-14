@@ -1465,28 +1465,45 @@ async fn retention(cfg: Arc<Config>) {
         })
         .await;
         match swept {
-            Ok((results, reclaimed)) => {
-                // `reclaim` has already logged every block it dropped and why.
-                // Only the case where it could not even ask the volume is left,
-                // and it is a warning rather than a stop: a sweep that cannot
-                // read free space still expired by TTL above.
-                if let Err(e) = reclaimed {
-                    tracing::warn!(error = %e, "cannot read free space; retention is TTL-only this sweep");
-                }
-                for (signal, dropped, cold) in results {
-                    match dropped {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(signal, blocks = n, "retention dropped blocks"),
-                        Err(e) => tracing::warn!(signal, error = %e, "retention failed"),
-                    }
-                    match cold {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(signal, blocks = n, "compacted blocks to zstd"),
-                        Err(e) => tracing::warn!(signal, error = %e, "compaction failed"),
-                    }
-                }
-            }
+            Ok((results, reclaimed)) => report_sweep(results, &reclaimed),
             Err(e) => tracing::warn!(error = %e, "retention task panicked"),
+        }
+    }
+}
+
+/// What a finished sweep is worth saying.
+///
+/// Its own function rather than the tail of the loop because a sweep only
+/// happens on a minute's tick over blocks old enough to act on, so under test
+/// these arms run by coincidence or not at all — and a field that is only
+/// evaluated when something is listening is exactly the kind that rots unseen.
+fn report_sweep(
+    results: [(
+        &str,
+        mira_core::error::Result<usize>,
+        mira_core::error::Result<usize>,
+    ); 3],
+    reclaimed: &mira_core::error::Result<Vec<PathBuf>>,
+) {
+    // `reclaim` has already logged every block it dropped and why. Only the
+    // case where it could not even ask the volume is left, and it is a warning
+    // rather than a stop: a sweep that cannot read free space still expired by
+    // TTL above.
+    if let Err(e) = reclaimed {
+        tracing::warn!(error = %e, "cannot read free space; retention is TTL-only this sweep");
+    }
+    for (signal, dropped, cold) in results {
+        // Nothing dropped says nothing: three signals reporting a zero every
+        // minute is the entire log of an idle node.
+        match dropped {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(signal, blocks = n, "retention dropped blocks"),
+            Err(e) => tracing::warn!(signal, error = %e, "retention failed"),
+        }
+        match cold {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(signal, blocks = n, "compacted blocks to zstd"),
+            Err(e) => tracing::warn!(signal, error = %e, "compaction failed"),
         }
     }
 }
@@ -2113,6 +2130,43 @@ mod tests {
             .with_test_writer()
             .finish();
         tracing::subscriber::with_default(sub, f)
+    }
+
+    /// Every arm of the sweep report, driven directly.
+    ///
+    /// What this proves is what `listening` exists for and no more: that each
+    /// arm's fields actually *evaluate*. It does not read the output back —
+    /// there is nothing here worth a capturing writer for. The reason it is a
+    /// test at all is that a real sweep needs a minute's tick and blocks old
+    /// enough to act on, so whether these arms ran during a test run used to be
+    /// a coincidence, and a line covered by coincidence is not covered.
+    #[test]
+    fn a_sweep_reports_what_it_did_and_a_quiet_one_says_nothing() {
+        let bad = || mira_core::error::Error::BadMagic {
+            path: PathBuf::from("/data/logs/0000"),
+        };
+        listening(|| {
+            // Nothing to say, and the volume answered: silent on every arm.
+            report_sweep(
+                [
+                    ("logs", Ok(0), Ok(0)),
+                    ("traces", Ok(0), Ok(0)),
+                    ("metrics", Ok(0), Ok(0)),
+                ],
+                &Ok(Vec::new()),
+            );
+            // One signal expired, one compacted, one failed at both — and the
+            // floor could not be read. A signal failing does not silence the
+            // two beside it, which is the property the loop is built around.
+            report_sweep(
+                [
+                    ("logs", Ok(2), Ok(0)),
+                    ("traces", Ok(0), Ok(1)),
+                    ("metrics", Err(bad()), Err(bad())),
+                ],
+                &Err(bad()),
+            );
+        });
     }
 
     /// Polls `done` for a minute. The sweeps below run on a blocking thread, so

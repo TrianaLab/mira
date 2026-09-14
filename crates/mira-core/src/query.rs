@@ -246,6 +246,14 @@ pub struct Search {
     pub limit: usize,
     /// Start after this row. See [`Cursor`].
     pub after: Option<Cursor>,
+    /// Also return the cursor of every row, not just of the last one.
+    ///
+    /// Off by default because a page has one `next` and that is all a reader
+    /// paging through one node needs. It is on for a reader merging pages from
+    /// several nodes — see `proxy` — which has to know where each row sits in
+    /// the global order to interleave them, and cannot recover that from the
+    /// row itself.
+    pub cursors: bool,
 }
 
 /// Where the previous page stopped.
@@ -278,7 +286,12 @@ impl Cursor {
     /// Descending: newest first, and for rows sharing a nanosecond, the
     /// higher-numbered block and row first. Any total order would do; what
     /// matters is that it is total, so no row can hide in a tie.
-    fn key(&self) -> std::cmp::Reverse<(i64, u32, u64, u32)> {
+    ///
+    /// Public because it is total across *nodes* as well as within one — `node`
+    /// is [`crate::block::node_id`] — which is what lets a merging reader
+    /// interleave pages from several replicas without asking anyone whose row
+    /// comes first. See `proxy`.
+    pub fn key(&self) -> std::cmp::Reverse<(i64, u32, u64, u32)> {
         std::cmp::Reverse((self.ts, self.node, self.seq, self.row))
     }
 }
@@ -358,6 +371,14 @@ pub struct Results {
     /// one — not "ask again and see", which is the ambiguity that makes readers
     /// poll forever.
     pub next: Option<Cursor>,
+    /// One cursor per row in `json`, in the same order, and empty unless
+    /// [`Search::cursors`] asked for them.
+    ///
+    /// Beside the rows rather than inside them. A rendered row is the OTLP
+    /// record and nothing else (principle 3), and a reader that did not ask
+    /// for cursors should not have to step over one in every object to find
+    /// the fields it came for.
+    pub cursors: Vec<Cursor>,
 }
 
 /// The trace id this search pins down exactly, if it pins one down.
@@ -589,6 +610,10 @@ pub fn search_open(root: &Path, q: &Search, open_blocks: &[Arc<Open>]) -> Result
         next: (hits.len() == q.limit)
             .then(|| hits.last().map(|h| cursor(&refs[h.block], h)))
             .flatten(),
+        cursors: match q.cursors {
+            true => hits.iter().map(|h| cursor(&refs[h.block], h)).collect(),
+            false => Vec::new(),
+        },
     })
 }
 
@@ -2242,6 +2267,7 @@ mod tests {
                     terms,
                     limit: 100,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2528,6 +2554,7 @@ mod tests {
                     }],
                     limit: 10,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2684,6 +2711,7 @@ mod tests {
                     terms,
                     limit: 10,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2792,6 +2820,7 @@ mod tests {
                     terms: Vec::new(),
                     limit: 2,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -3040,6 +3069,7 @@ mod tests {
             terms,
             limit: 100,
             after: None,
+            cursors: false,
         };
         let field = |name: &str, op, value| {
             all(vec![Term {

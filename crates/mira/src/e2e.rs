@@ -3240,3 +3240,407 @@ async fn two_evaluations_of_one_window_agree_and_the_transitions_run_both_ways()
     );
     forget_open_blocks();
 }
+
+/// One storage node of a proxied set: its own directory, its own writer
+/// identity, and a real socket.
+///
+/// The socket is the part nothing else in this file needs. Every other test
+/// reaches the router through `oneshot`; the proxy reaches its replicas over
+/// HTTP, by design — they are separate processes in a deployment — so a test of
+/// it has to give them somewhere to listen.
+///
+/// The distinct `node` is not decoration either. It is the field that makes a
+/// [`mira_core::query::Cursor`] total across replicas rather than only within
+/// one, and two nodes sharing an identity is the configuration where the whole
+/// merge argument quietly stops holding.
+async fn replica(name: &str) -> (Router, String) {
+    let root = fresh_dir(name);
+    let id = mira_core::block::node_id(name);
+    let n = restart_with(pipeline::Config {
+        data_dir: root.clone(),
+        node: id,
+        // Long: this test is about the merged read, and a seal partway through
+        // it would only add a way for it to fail for another reason.
+        max_block_age: Duration::from_secs(600),
+        wal: Some(Arc::new(mira_core::wal::Wal::open(&root, id).unwrap())),
+        ..Default::default()
+    })
+    .await;
+    let app = n.app.clone();
+    let addr = serve(n.app.clone()).await;
+    // Never stopped, and it cannot be: `axum::serve` holds a router clone for
+    // the life of the process, so `Node::stop`'s contract — every `Ingest`
+    // dropped — has no moment at which it could be met. Dropping the handles
+    // detaches the flushers rather than aborting them, and
+    // `forget_open_blocks` at the end of the test is what keeps the open-block
+    // gauge honest for the rest of the binary's run.
+    drop(n);
+    (app, addr)
+}
+
+/// A `mira proxy` in front of whatever addresses are handed to it.
+fn proxied(replicas: Vec<String>) -> Router {
+    crate::proxy::router(
+        crate::proxy::Proxy::new(replicas, crate::config::Config::default().max_request_bytes)
+            .expect("at least one replica"),
+    )
+}
+
+/// Two storage nodes, one `mira proxy`, and the claim the proxy is built on.
+///
+/// Three things at once, because they are one mechanism: an export is *split*
+/// across the replicas on entity identity, a read is *merged* back out of them,
+/// and paging that merged read returns every row exactly once in the one order
+/// while the proxy remembers nothing between requests. Any of the three alone
+/// can be made to pass by a proxy that is subtly wrong — one that sends whole
+/// batches to one node, or one that concatenates pages instead of interleaving
+/// them, or one that pages by re-asking and hoping. Together they are the
+/// design.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxy_splits_an_export_across_replicas_and_pages_them_back_as_one_store() {
+    let (a, addr_a) = replica("proxy-a").await;
+    let (b, addr_b) = replica("proxy-b").await;
+    let p = proxied(vec![format!("http://{addr_a}"), format!("http://{addr_b}")]);
+
+    // Eight resources in one export, which is the case the placement rule
+    // exists for: the proxy has to cut a batch up, not pick a node for it. The
+    // same base timestamp for all of them on purpose — every row ties with
+    // seven others on `ts`, so the merge is resolved by the rest of the cursor
+    // and an order that is only total within a node would show up here.
+    const SERVICES: [&str; 8] = [
+        "checkout",
+        "payments",
+        "search",
+        "cart",
+        "auth",
+        "billing",
+        "shipping",
+        "inventory",
+    ];
+    let mut batch = ExportLogsServiceRequest::default();
+    for s in SERVICES {
+        batch
+            .resource_logs
+            .extend(logs_export(s, 1_000, 5).resource_logs);
+    }
+    otlp(&p, "/v1/logs", batch).await;
+
+    // Split, and split by entity: every one of a service's records is on one
+    // node. A proxy that round-robined records would put five rows on two
+    // nodes and pass every other assertion below.
+    let window = r#"{"signal":"logs","from":0,"to":100000"#;
+    let (mut on_a, mut on_b) = (0, 0);
+    for s in SERVICES {
+        let doc =
+            format!(r#"{window},"limit":500,"where":[{{"attr":"service.name","eq":"{s}"}}]}}"#);
+        let here = bodies_of(&rows_of(&query(&a, &doc).await)).len();
+        let there = bodies_of(&rows_of(&query(&b, &doc).await)).len();
+        assert_eq!(
+            (here.min(there), here.max(there)),
+            (0, 5),
+            "{s} was split across both replicas: {here} and {there}"
+        );
+        on_a += here;
+        on_b += there;
+    }
+    assert_eq!(on_a + on_b, 40);
+    assert!(on_a > 0 && on_b > 0, "everything landed on one replica");
+
+    // Merged. The proxy returns both nodes' rows and neither node returns the
+    // other's, which is what makes the next assertion about merging rather
+    // than about replication.
+    let all = query(&p, &format!(r#"{window},"limit":500}}"#)).await;
+    let merged = bodies_of(&rows_of(&all));
+    assert_eq!(merged.len(), 40, "{all}");
+    assert!(!all.contains(r#""next""#), "a short page is the last page");
+    // Summed across the replicas, not one node's share.
+    assert!(all.contains(r#""rows_matched":40"#), "{all}");
+    // Asked for nothing, so given nothing extra: the body a caller sees through
+    // the proxy is the body a single node would have sent.
+    assert!(!all.contains(r#""cursors""#), "{all}");
+
+    // And asked for, they arrive — which is not the same code path as the line
+    // above, because the proxy needs `cursors` on every request it makes and
+    // adding a key a caller already wrote would send the replicas a mapping
+    // with it twice, which is not a document and gets the whole read refused.
+    let with = query(&p, &format!(r#"{window},"limit":500,"cursors":"true"}}"#)).await;
+    let i = with
+        .find(r#""cursors":["#)
+        .unwrap_or_else(|| panic!("{with}"));
+    let list = &with[i + 11..];
+    let cursors: Vec<&str> = list[..list.find(']').expect("unclosed")]
+        .split(',')
+        .collect();
+    assert_eq!(cursors.len(), 40, "{with}");
+    assert_eq!(
+        cursors
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        40,
+        "the merge placed one row twice: {with}"
+    );
+    assert_eq!(bodies_of(&rows_of(&with)), merged, "{with}");
+
+    // Paged, seven at a time, following `next` and nothing else — the proxy is
+    // holding no state between these six requests, so if the cursor does not
+    // carry the whole position this loop repeats or skips rows.
+    let mut pages: Vec<String> = Vec::new();
+    let mut after = String::new();
+    for _ in 0..12 {
+        let body = query(&p, &format!(r#"{window},"limit":7{after}}}"#)).await;
+        pages.extend(bodies_of(&rows_of(&body)));
+        let Some(i) = body.find(r#""next":""#) else {
+            break;
+        };
+        let c = &body[i + 8..];
+        after = format!(r#","after":"{}""#, &c[..c.find('"').unwrap()]);
+    }
+    assert_eq!(pages, merged, "the pages did not reassemble the whole");
+
+    // And the reads it will not pretend to answer say so, by name.
+    let (status, body) = post(&p, "/api/v1/map", "application/json", "{}".into()).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(body.contains("/api/v1/map"), "{body}");
+
+    // An export sent as OTLP/JSON is acknowledged as OTLP/JSON. The proxy
+    // re-encodes every sub-export as protobuf whatever arrived, so the content
+    // type of the *answer* is the one thing on this path that still has to
+    // follow the request, and an exporter that sent JSON will not read `{}`
+    // out of a protobuf frame.
+    let (status, body) = post(
+        &p,
+        "/v1/logs",
+        "application/json",
+        br#"{"resourceLogs":[]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, "{}");
+    let (status, body) = post(&p, "/v1/logs", "application/x-protobuf", vec![0xff, 0xff]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The other two signals, which are the same macro with different type names
+    // and so are not retested in detail — only that they are wired to it, split
+    // on the same identity, and merge back. Two resources apiece: one would land
+    // on one replica and prove nothing about the split.
+    use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use mira_proto::metrics::v1::metric::Data;
+    use mira_proto::metrics::v1::number_data_point::Value as NumValue;
+    use mira_proto::metrics::v1::{Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics};
+
+    otlp(
+        &p,
+        "/v1/traces",
+        ExportTraceServiceRequest {
+            resource_spans: SERVICES
+                .iter()
+                .map(|s| ResourceSpans {
+                    resource: Some(Resource {
+                        attributes: vec![kv("service.name", s)],
+                        ..Default::default()
+                    }),
+                    scope_spans: vec![ScopeSpans {
+                        spans: vec![Span {
+                            trace_id: vec![0xab; 16].into(),
+                            span_id: vec![0xcd; 8].into(),
+                            name: format!("GET /{s}"),
+                            start_time_unix_nano: 1_000,
+                            end_time_unix_nano: 1_500,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+        },
+    )
+    .await;
+    otlp(
+        &p,
+        "/v1/metrics",
+        ExportMetricsServiceRequest {
+            resource_metrics: SERVICES
+                .iter()
+                .map(|s| ResourceMetrics {
+                    resource: Some(Resource {
+                        attributes: vec![kv("service.name", s)],
+                        ..Default::default()
+                    }),
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics: vec![Metric {
+                            name: "http.server.requests".into(),
+                            data: Some(Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: 1_000,
+                                    value: Some(NumValue::AsInt(1)),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+        },
+    )
+    .await;
+
+    let doc = r#"{"signal":"traces","from":0,"to":100000,"limit":500}"#;
+    let both = query(&p, doc).await;
+    assert!(both.contains(r#""rows_matched":8"#), "{both}");
+    // Neither replica holds all eight, so the count above came from the merge
+    // and not from one node that happened to take the whole export.
+    for r in [&a, &b] {
+        let one = query(r, doc).await;
+        assert!(
+            (1..8).any(|k| one.contains(&format!(r#""rows_matched":{k}"#))),
+            "one replica answered the whole export: {one}"
+        );
+    }
+
+    // A metric read does not merge and the proxy says so rather than guessing,
+    // so the split of that export is checked on the replicas themselves.
+    let point = br#"{"name":"http.server.requests","from":0,"to":100000}"#.to_vec();
+    let (status, body) = post(
+        &p,
+        "/api/v1/metrics/query",
+        "application/json",
+        point.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    let mut seen = 0;
+    for r in [&a, &b] {
+        let (status, one) = post(
+            r,
+            "/api/v1/metrics/query",
+            "application/json",
+            point.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        let here = SERVICES
+            .iter()
+            .filter(|s| one.contains(&format!(r#""service.name":"{s}""#)))
+            .count();
+        assert!(
+            here > 0 && here < 8,
+            "one replica holds {here} series: {one}"
+        );
+        seen += here;
+    }
+    assert_eq!(seen, 8, "the metric export did not arrive whole");
+
+    forget_open_blocks();
+}
+
+/// A replica that answers everything with one status and one body.
+///
+/// Enough to drive every failure path below: they are about what a replica
+/// *said*, never about what it holds.
+async fn stub(status: StatusCode, body: &'static str) -> String {
+    let addr = serve(Router::new().fallback(move || async move { (status, body) })).await;
+    format!("http://{addr}")
+}
+
+/// What the proxy does when a replica will not cooperate.
+///
+/// None of this is reachable from the test above, and it is the half that rots:
+/// a merge that quietly dropped an unreachable replica, or an ingest that
+/// reported one node's transient 503 as a permanent 400, would pass every
+/// assertion there while losing data here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_that_will_not_answer_fails_the_request_instead_of_shortening_it() {
+    // Port 1 needs privileges nothing in a test has, so nothing is listening on
+    // it and the connect is refused rather than timing out.
+    const DEAD: &str = "http://127.0.0.1:1";
+    let doc = r#"{"signal":"logs","limit":5}"#;
+
+    // Unreachable: a 502 that names the replica, not a page missing its rows.
+    let p = proxied(vec![DEAD.into()]);
+    let (status, body) = post(&p, "/api/v1/query", "application/json", doc.into()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("127.0.0.1:1"), "{body}");
+
+    // Reachable and refusing: the replica's own words come back inside the 502,
+    // because "a replica said no" and "the proxy could not reach it" are
+    // different things to be paged for.
+    let p = proxied(vec![stub(StatusCode::BAD_REQUEST, "signal: nope").await]);
+    let (status, body) = post(&p, "/api/v1/query", "application/json", doc.into()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        body.contains("HTTP 400") && body.contains("signal: nope"),
+        "{body}"
+    );
+
+    // Answering 200 with something this proxy cannot place. Also a 502: the
+    // caller asked for rows in one order and there is no honest way to give
+    // them some of them in another.
+    let p = proxied(vec![stub(StatusCode::OK, r#"{"rows":[]}"#).await]);
+    let (status, body) = post(&p, "/api/v1/query", "application/json", doc.into()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+    // Answering 200 with bytes that are not text at all. A page is read as a
+    // string before it is read as a document, so this is a different line from
+    // the one above, and the one that would be a panic if it were an `unwrap`.
+    let addr = serve(Router::new().fallback(|| async { vec![0x80u8, 0xff] })).await;
+    let p = proxied(vec![format!("http://{addr}")]);
+    let (status, body) = post(&p, "/api/v1/query", "application/json", doc.into()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+    // Documents the proxy refuses before any replica is troubled, all 400:
+    // unparseable, parseable but not a search, and one that turns off the
+    // cursors the merge is built on.
+    let p = proxied(vec![DEAD.into()]);
+    for bad in [
+        "{",
+        r#"{"signal":"nope"}"#,
+        r#"{"cursors":"false","limit":5}"#,
+    ] {
+        let (status, body) = post(&p, "/api/v1/query", "application/json", bad.into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} gave {body}");
+    }
+
+    // Ingest, where a partial failure is the whole export's failure. Eight
+    // services so both replicas get a sub-export — the same eight the test above
+    // proves are split across two slots.
+    let mut batch = ExportLogsServiceRequest::default();
+    for s in [
+        "checkout",
+        "payments",
+        "search",
+        "cart",
+        "auth",
+        "billing",
+        "shipping",
+        "inventory",
+    ] {
+        batch
+            .resource_logs
+            .extend(logs_export(s, 1_000, 1).resource_logs);
+    }
+    let body = batch.encode_to_vec();
+
+    // Both unreachable: 503, which is the code that tells an OTLP exporter to
+    // keep the batch and come back.
+    let p = proxied(vec![DEAD.into(), DEAD.into()]);
+    let (status, why) = post(&p, "/v1/logs", "application/x-protobuf", body.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{why}");
+
+    // One unreachable and one refusing: still 503. The retryable failure has to
+    // win, or a transient overload on one node is reported as a permanent error
+    // and the exporter drops a batch the other node would have taken.
+    let p = proxied(vec![DEAD.into(), stub(StatusCode::BAD_REQUEST, "no").await]);
+    let (status, why) = post(&p, "/v1/logs", "application/x-protobuf", body.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{why}");
+
+    // And a refusal that is nobody's transient problem is passed straight
+    // through, because retrying it would never work.
+    let p = proxied(vec![stub(StatusCode::BAD_REQUEST, "no").await]);
+    let (status, why) = post(&p, "/v1/logs", "application/x-protobuf", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+}

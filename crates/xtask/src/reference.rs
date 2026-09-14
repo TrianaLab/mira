@@ -267,7 +267,15 @@ const SIGNAL_SCHEMA: [(&str, &str); 2] = [("logs", "LOGS"), ("traces", "SPANS")]
 /// `e2e.rs` is the in-process end-to-end suite, not a surface. The statuses in
 /// it are the ones it asserts on, and listing them here would document the
 /// tests.
-const NOT_A_SURFACE: [&str; 1] = ["e2e.rs"];
+///
+/// `proxy.rs` is a second *implementation* of paths this table already has, not
+/// a second set of paths: `mira proxy` answers `/api/v1/query` and the three
+/// OTLP endpoints with the same request and response documents a node does,
+/// which is the property that makes it droppable in front of one. Scraping it
+/// would give every one of those routes two rows with two summaries. What is
+/// specific to that mode — which reads it refuses, and why — is
+/// `docs/architecture.md` section 12 and `mira proxy --help`.
+const NOT_A_SURFACE: [&str; 2] = ["e2e.rs", "proxy.rs"];
 
 /// Routes are grouped the way a reader meets them, not the way the files happen
 /// to sort. The port is part of the answer: everything below is on `listen.http`
@@ -298,6 +306,9 @@ fn routes(f: &mut Failures) -> BTreeMap<String, (String, String, String)> {
     let mut found = BTreeMap::new();
     for path in glob(&format!("{SRC}/*.rs")) {
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        if NOT_A_SURFACE.contains(&name.as_str()) {
+            continue;
+        }
         let stem = name.trim_end_matches(".rs").to_string();
         let text = read_or_exit(&path);
         let lines: Vec<&str> = text.split('\n').collect();
@@ -813,7 +824,7 @@ fn http_page(f: &mut Failures) -> String {
 const PARSED: [(&str, &str); 2] = [("positive", "count"), ("whole", "count")];
 
 /// How a Rust type reads to an operator writing KYAML.
-const TYPES: [(&str, &str); 8] = [
+const TYPES: [(&str, &str); 9] = [
     ("String", "string"),
     ("SocketAddr", "host:port"),
     ("PathBuf", "path"),
@@ -825,6 +836,11 @@ const TYPES: [(&str, &str); 8] = [
     ("Duration", "duration"),
     ("usize", "size"),
     ("bool", "boolean"),
+    // Written as one comma-separated scalar, not as a YAML sequence: every
+    // value in this file is a quoted string and `check_keys` refuses a list at
+    // every path (`config.rs`). The word says so rather than making an
+    // operator find that out from an error.
+    ("Vec<String>", "uri,uri,…"),
 ];
 
 /// A Rust default expression as the operator would write it in KYAML.
@@ -869,7 +885,7 @@ fn humanize(expr: &str) -> String {
             _ => (n << shift).to_string(),
         };
     }
-    if expr == "None" {
+    if expr == "None" || expr == "Vec::new()" {
         return "unset".into();
     }
     expr.to_string()

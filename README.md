@@ -31,7 +31,7 @@ is the only state there is.
 | **4.7 ms** | every span of one trace, out of 27.1M spans on disk |
 | **7 µs** | the durable log append inside an acknowledgement |
 | **0.14** | bytes on disk per byte on the wire, once compacted |
-| **5.63 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
+| **5.76 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 Apple M3 Pro, one process, reproducible with the load harness in this
 repository. What each number measures — the numerator, the denominator, and what
@@ -83,8 +83,10 @@ a cosign signature and a SLSA provenance attestation.
 ## Scope
 
 Mira is pre-1.0 and says so. Ingestion is allocation-lean rather than zero-copy
-(*queries* are zero-copy); there is no cross-replica query fan-out; there is no
-entity predicate and no block cache. The full list, with the reasoning, is
+(*queries* are zero-copy); a storage node answers only from its own blocks, and
+the cross-replica merge lives in `mira proxy` rather than in the node, which
+merges record search and refuses correlate, map, metrics and entities; there is
+no entity predicate and no block cache. The full list, with the reasoning, is
 [architecture section 0.1](docs/architecture.md#01-what-is-not-true-yet).
 
 ## Contributing

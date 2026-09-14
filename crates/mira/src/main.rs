@@ -8,6 +8,7 @@ mod e2e;
 mod json;
 mod mcp;
 mod pipeline;
+mod proxy;
 mod receiver;
 mod telemetry;
 mod term;
@@ -32,6 +33,8 @@ const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http AD
      [--alerts FILE] [--version]
 
 mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
+             --replica http://HOST:PORT [--replica ...]
 mira offload list    [--config FILE] --offload URI
 mira offload restore [--config FILE] --offload URI [--data-dir PATH]
 mira update  [--version VERSION] [--dry-run]
@@ -48,6 +51,12 @@ under the same directory name it had locally — so the store's own listing is
 the catalog and there is nothing else to keep in sync. `mira offload list`
 reads that listing; `mira offload restore` copies every block in it that is not
 already local back into --data-dir, and is safe to re-run.
+
+`mira proxy` is one OTLP and query surface in front of N storage nodes. It
+stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
+is answered by merging every replica's page on the cursor order. The reads it
+cannot merge — correlate, map, metrics and entities — answer 501 naming
+themselves rather than returning one node's share of the answer.
 
 `mira update` replaces this binary with the latest GitHub release, using the
 same installer as the curl one-liner at https://miradb.dev/install/.";
@@ -94,6 +103,11 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
             "--shards" => cfg.shards = config::whole(&value()?)?,
             "--telemetry-interval" => cfg.telemetry_interval = config::duration(&value()?)?,
             "--alerts" => cfg.alerts = Some(PathBuf::from(value()?)),
+            // Repeatable, unlike every other flag here, because the value is a
+            // list and `--replica a --replica b` is what a process manager's
+            // args array already looks like. The file form is one
+            // comma-separated string; see `config::replicas`.
+            "--replica" => cfg.replicas.extend(config::replicas(&value()?)?),
             // These two take no value, unlike every other flag here. They are
             // the settings whose file form has to be able to say `false` — to
             // turn off what an inherited config turned on — and whose flag form
@@ -340,10 +354,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // file, a collector, or an agent wrapped in escape codes.
         .with_ansi(std::io::stdout().is_terminal())
         .init();
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(serve())
+        .build()?;
+    // After the subscriber and inside the runtime, unlike the three above: the
+    // proxy is a server and wants both, it just has no storage under it.
+    match argv.first().is_some_and(|a| a == "proxy") {
+        true => rt.block_on(proxy_cmd(argv[1..].to_vec())),
+        false => rt.block_on(serve()),
+    }
+}
+
+/// `mira proxy`: the HTTP surface of [`proxy`] and nothing else.
+///
+/// No data directory, no flusher, no gRPC listener. gRPC is left off rather
+/// than proxied because splitting an export by entity means decoding it, and a
+/// tonic service that decodes in order to re-encode to three HTTP clients is a
+/// second transport to keep in step for a hop that is inside one deployment.
+/// Point collectors at 4318; see `docs/architecture.md` section 12.
+async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let p = proxy::Proxy::new(cfg.replicas.clone(), cfg.max_request_bytes)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("{e}\n\n{USAGE}").into() })?;
+    let socket = tokio::net::TcpListener::bind(cfg.http).await?;
+    let addr = socket.local_addr()?;
+    tracing::info!(
+        http = %addr,
+        replicas = %cfg.replicas.join(" "),
+        max_request_bytes = cfg.max_request_bytes,
+        "mira proxy listening"
+    );
+    axum::serve(socket, proxy::router(p))
+        .with_graceful_shutdown(shutdown())
+        .await?;
+    Ok(())
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
@@ -357,6 +401,17 @@ async fn serve_with(
     cfg: Config,
     stop_signal: impl std::future::Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A setting only the other mode reads is a setting that does nothing, and
+    // doing nothing in silence is what `config::check_keys` exists to prevent.
+    // The likely typo is `mira --replica ...` for `mira proxy --replica ...`,
+    // which would otherwise start a storage node that looks like a proxy.
+    if !cfg.replicas.is_empty() {
+        return Err(format!(
+            "--replica / proxy.replicas is read by `mira proxy`; this is a storage node\n\n{USAGE}"
+        )
+        .into());
+    }
+
     // First, because a rules file that does not parse is a deployment that
     // believes it is being paged and is not. Nothing has been created, bound or
     // mapped at this point, so the failure is a message and an exit rather than
@@ -1085,6 +1140,24 @@ mod tests {
         if !immediately {
             std::future::pending::<()>().await;
         }
+    }
+
+    /// The edge that never fires is still pending once something polls it.
+    ///
+    /// Less circular than it looks. Three tests below hand `serve_with` this
+    /// future to prove the server *keeps* serving, and every one of them would
+    /// pass for the wrong reason if it resolved. And `serve_with` only polls
+    /// its stop edge when it has nothing else to do, so whether that arm runs
+    /// inside any given test run is otherwise a race against the request the
+    /// test is making — which is a line of coverage that moves on its own.
+    #[tokio::test]
+    async fn the_stop_edge_fires_when_it_is_told_to_and_never_otherwise() {
+        let zero = std::time::Duration::ZERO;
+        let never = tokio::time::timeout(zero, stop_edge(false));
+        assert!(never.await.is_err(), "the never-stop edge stopped");
+        tokio::time::timeout(zero, stop_edge(true))
+            .await
+            .expect("the immediate edge did not fire");
     }
 
     /// The probe tasks wake up and write into the statics the diagnosis reads.

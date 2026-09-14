@@ -1,7 +1,7 @@
 # Configuration
 
 **For:** whoever runs the process. <!-- BEGIN GENERATED: count -->
-13
+14
 <!-- END GENERATED: count -->
 keys. Three of them reach the engine rather than describing where it runs, and
 none of them tunes it: `ingest.queue` buys burst room with memory,
@@ -36,6 +36,7 @@ so `{ "cluster": {} }` is `unknown key "cluster"`.
 | [`telemetry.self`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.self_telemetry) | `--self-telemetry` | boolean | `false` | Store this node's own telemetry in this node, as ordinary metrics. |
 | [`telemetry.interval`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.telemetry_interval) | `--telemetry-interval` | duration | `15s` | How often `Config::self_telemetry` samples this node's counters. |
 | [`alerts.rules`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.alerts) | `--alerts` | path | `unset` | A KYAML file of alerting rules (`crate::alert`), or none. |
+| [`proxy.replicas`](https://miradb.dev/api/mira/config/struct.Config.html#structfield.replicas) | `--replica` | uri,uri,… | `unset` | The storage nodes `mira proxy` sits in front of, and nothing else reads. |
 <!-- END GENERATED: keys -->
 
 **Durations** are `500ms`, `30s`, `5m`, `2h`, `7d`; a bare number is seconds.
@@ -466,10 +467,26 @@ volumeClaimTemplates:                           # StatefulSet.spec
       resources: { requests: { storage: 100Gi } }
 ```
 
-Ingest goes through one Service — any replica accepts any export. **A query does
-not**: there is no fan-out, so a replica answers only from its own blocks.
-Address a specific pod (a headless Service gives you `mira-0.mira`), or run one
-replica.
+Ingest goes through one Service — any replica accepts any export. **A query
+addressed at a replica does not**: a storage node never fans out, so it answers
+only from its own blocks. Address a specific pod (a headless Service gives you
+`mira-0.mira`), run one replica, or put `mira proxy` in front:
+
+```yaml
+{
+  "proxy": {
+    "replicas": "http://mira-0.mira:4318,http://mira-1.mira:4318",
+  },
+}
+```
+
+That is a second Deployment of the same image running `mira proxy`, and it is
+stateless — no PVC, any number of them behind one Service. It merges
+`/api/v1/query` across every replica and splits OTLP exports between them by
+entity, so ingest can point at it too; the reads it cannot merge answer 501
+naming themselves. The list is static, so adding a replica is an edit and a
+rolling restart of the proxy. See [architecture section
+12.2](architecture.md#122-query-mira-proxy).
 
 Several pods sharing one `/data` is the topology the `node_id` exists for, and
 the only one where any replica answers for all of them — but it is not

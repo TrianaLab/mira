@@ -499,6 +499,7 @@ pub fn map(
         json: j.into_string(),
         stats,
         next: None,
+        cursors: Vec::new(),
     })
 }
 
@@ -558,6 +559,7 @@ pub fn entities(
         json: j.into_string(),
         stats,
         next: None,
+        cursors: Vec::new(),
     })
 }
 
@@ -859,6 +861,7 @@ mod tests {
             terms: Vec::new(),
             limit: 10,
             after: None,
+            cursors: false,
         };
         let (f, _) = anchor(&root, &q, &[]).unwrap();
         assert_eq!(f.traces, vec![[1u8; 16]], "one trace in the window");

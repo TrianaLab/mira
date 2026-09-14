@@ -16,9 +16,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use prost::Message;
 
 use mira_proto::collector::logs::v1::ExportLogsServiceRequest;
+use mira_proto::collector::metrics::v1::ExportMetricsServiceRequest;
+use mira_proto::collector::trace::v1::ExportTraceServiceRequest;
 use mira_proto::common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value};
 use mira_proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use mira_proto::metrics::v1::metric::Data;
+use mira_proto::metrics::v1::number_data_point::Value as NumValue;
+use mira_proto::metrics::v1::{Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics};
 use mira_proto::resource::v1::Resource;
+use mira_proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 const MIRA: &str = env!("CARGO_BIN_EXE_mira");
 
@@ -89,65 +95,23 @@ fn a_sigterm_stops_the_server_with_the_data_on_disk() {
     let dir = std::env::temp_dir().join(format!("mira-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let mut child = Command::new(MIRA)
-        .args([
-            "--grpc",
-            "127.0.0.1:0",
-            "--http",
-            "127.0.0.1:0",
-            "--data-dir",
-        ])
-        .arg(&dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    // Drained on a thread: a child that fills the pipe while this side is
-    // waiting on it is a deadlock, not a slow test.
-    let log = Arc::new(Mutex::new(String::new()));
-    for stream in [
-        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
-        Box::new(child.stderr.take().unwrap()),
-    ] {
-        let sink = log.clone();
-        std::thread::spawn(move || {
-            let mut stream = stream;
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    return;
-                }
-                sink.lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        });
-    }
-    let logged = |marker: &str| {
-        (0..600).any(|_| {
-            if log.lock().unwrap().contains(marker) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-            false
-        })
-    };
+    let (mut child, log) = spawn_logged(&[
+        "--grpc",
+        "127.0.0.1:0",
+        "--http",
+        "127.0.0.1:0",
+        "--data-dir",
+        dir.to_str().unwrap(),
+    ]);
+    let logged = |marker: &str| logged(&log, marker);
 
     // Port 0 means the kernel picked it, and the only place it is written down
     // is the line the server logs on the way up — which is also the point of
     // logging it.
     let up = logged("mira listening");
-    let port = up.then(|| log.lock().unwrap().clone()).and_then(|l| {
-        let tail = l.split("http=127.0.0.1:").nth(1)?.to_owned();
-        tail.chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse::<u16>()
-            .ok()
-    });
+    let port = up.then(|| port_of(&log)).flatten();
 
-    let posted = port.map(|p| post(p, "/v1/logs", &one_log().encode_to_vec()));
+    let posted = port.map(|p| post(p, "/v1/logs", PROTOBUF, &one_log().encode_to_vec()));
     // SIGTERM rather than `child.kill`, which is SIGKILL and proves nothing.
     // SAFETY: `kill` dereferences nothing, so the only hazard is signalling the
     // wrong process. `child` has not been waited on yet — `child.wait()` is
@@ -178,6 +142,180 @@ fn a_sigterm_stops_the_server_with_the_data_on_disk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `mira proxy` as an operator starts it: a second process of the same binary,
+/// no data directory under it, and the storage node behind it reached over a
+/// real socket.
+///
+/// The merge itself is level 3 — the proxy's router in-process, in `e2e.rs`.
+/// What only a subprocess can say is that the *subcommand* is wired: that it
+/// parses its own flags, refuses an empty replica list before binding anything,
+/// comes up on the port it was given, and that the storage node refuses the
+/// same key so a missing `proxy` word cannot start half a deployment.
+#[test]
+fn the_proxy_subcommand_serves_the_node_behind_it_and_the_node_refuses_to_be_one() {
+    // The likely typo, and the reason `proxy.replicas` is checked on both sides:
+    // a storage node that quietly ignored it would look like a running proxy.
+    let (code, out, err) = mira(&["--replica", "http://127.0.0.1:4318"]);
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(err.contains("is read by `mira proxy`"), "{err:?}");
+
+    // And a proxy with nothing to proxy fails before it binds, with the usage,
+    // rather than serving 502s to whoever finds it.
+    let (code, _, err) = mira(&["proxy", "--http", "127.0.0.1:0"]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("--replica"), "{err:?}");
+
+    // A flag the config layer rejects, which is a different refusal from the
+    // one above: that one is the proxy saying it has no replicas, this one is
+    // the shared parser, and `mira proxy` has to carry its errors out too
+    // rather than start on a default the operator did not ask for.
+    let (code, _, err) = mira(&["proxy", "--http", "not-an-address"]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("--http: invalid socket address"), "{err:?}");
+
+    let dir = std::env::temp_dir().join(format!("mira-cli-proxy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut node, nlog) = spawn_logged(&[
+        "--grpc",
+        "127.0.0.1:0",
+        "--http",
+        "127.0.0.1:0",
+        "--data-dir",
+        dir.to_str().unwrap(),
+    ]);
+    let replica = logged(&nlog, "mira listening")
+        .then(|| port_of(&nlog))
+        .flatten()
+        .map(|p| format!("http://127.0.0.1:{p}"));
+
+    let (mut px, plog) = spawn_logged(&[
+        "proxy",
+        "--http",
+        "127.0.0.1:0",
+        "--replica",
+        replica.as_deref().unwrap_or("http://127.0.0.1:1"),
+    ]);
+    let up = logged(&plog, "mira proxy listening");
+    let port = up.then(|| port_of(&plog)).flatten();
+
+    // Through the proxy both ways: the export it splits and re-encodes, and the
+    // read it fans out and merges — over one replica, which is the arithmetic
+    // that has to work before two do.
+    let exported = port.map(|p| post(p, "/v1/logs", PROTOBUF, &one_log().encode_to_vec()));
+    let read = port.map(|p| {
+        post(
+            p,
+            "/api/v1/query",
+            "application/json",
+            br#"{"signal":"logs","limit":5}"#,
+        )
+    });
+    // The other two OTLP routes are one macro with different type names, so
+    // they are not retested in detail — only that the subcommand actually
+    // mounted them. A missing route is a 404 an exporter retries forever.
+    let others: Vec<String> = port
+        .map(|p| {
+            vec![
+                post(p, "/v1/traces", PROTOBUF, &one_span().encode_to_vec()),
+                post(p, "/v1/metrics", PROTOBUF, &one_point().encode_to_vec()),
+            ]
+        })
+        .unwrap_or_default();
+
+    for c in [&node, &px] {
+        // SAFETY: as in the SIGTERM test above — neither child has been waited
+        // on, so neither pid can have been recycled.
+        unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+    }
+    let (pstatus, nstatus) = (px.wait().unwrap(), node.wait().unwrap());
+
+    let (ntail, ptail) = (nlog.lock().unwrap().clone(), plog.lock().unwrap().clone());
+    assert!(replica.is_some(), "the replica never came up:\n{ntail}");
+    assert!(up, "the proxy never came up:\n{ptail}");
+    // It says what it is in front of, because the list is static config and the
+    // log line is the only place a running proxy states it.
+    assert!(ptail.contains("replicas=http://127.0.0.1:"), "{ptail}");
+    assert!(
+        exported
+            .as_deref()
+            .is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+        "export rejected: {exported:?}\n{ptail}"
+    );
+    assert!(
+        read.as_deref().is_some_and(|r| r.contains("\"hello\"")),
+        "the row did not come back through the proxy: {read:?}\n{ptail}"
+    );
+    assert_eq!(others.len(), 2, "{ptail}");
+    for r in &others {
+        assert!(
+            r.starts_with("HTTP/1.1 200"),
+            "export rejected: {r}\n{ptail}"
+        );
+    }
+    assert!(pstatus.success(), "the proxy exited {pstatus}:\n{ptail}");
+    assert!(nstatus.success(), "the node exited {nstatus}:\n{ntail}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A child of this binary with both its streams drained into one buffer.
+///
+/// On a thread, because a child that fills the pipe while this side is waiting
+/// on it is a deadlock and not a slow test.
+fn spawn_logged(args: &[&str]) -> (std::process::Child, Arc<Mutex<String>>) {
+    let mut child = Command::new(MIRA)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let log = Arc::new(Mutex::new(String::new()));
+    for stream in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let sink = log.clone();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    (child, log)
+}
+
+/// Up to thirty seconds for a marker to show up in a child's output.
+fn logged(log: &Arc<Mutex<String>>, marker: &str) -> bool {
+    (0..600).any(|_| {
+        if log.lock().unwrap().contains(marker) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        false
+    })
+}
+
+/// The port out of a `http=127.0.0.1:NNNN` line.
+fn port_of(log: &Arc<Mutex<String>>) -> Option<u16> {
+    let tail = log
+        .lock()
+        .unwrap()
+        .split("http=127.0.0.1:")
+        .nth(1)?
+        .to_owned();
+    tail.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn first(dir: &PathBuf) -> PathBuf {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{dir:?}: {e}"))
@@ -190,14 +328,16 @@ fn first(dir: &PathBuf) -> PathBuf {
         .unwrap_or_else(|| panic!("{dir:?} is empty"))
 }
 
+const PROTOBUF: &str = "application/x-protobuf";
+
 /// OTLP/HTTP is a plain POST of protobuf, so this is a plain socket. A client
 /// crate for four lines of HTTP/1.1 would be a dependency the README has to
 /// account for.
-fn post(port: u16, path: &str, body: &[u8]) -> String {
+fn post(port: u16, path: &str, content_type: &str, body: &[u8]) -> String {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         s,
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-protobuf\r\n\
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
@@ -211,21 +351,10 @@ fn post(port: u16, path: &str, body: &[u8]) -> String {
 }
 
 fn one_log() -> ExportLogsServiceRequest {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let now = nanos();
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![KeyValue {
-                    key: "service.name".into(),
-                    value: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue("mira.cli".into())),
-                    }),
-                }],
-                ..Default::default()
-            }),
+            resource: Some(named("mira.cli")),
             scope_logs: vec![ScopeLogs {
                 scope: Some(InstrumentationScope {
                     name: "mira.cli".into(),
@@ -244,5 +373,72 @@ fn one_log() -> ExportLogsServiceRequest {
             }],
             ..Default::default()
         }],
+    }
+}
+
+/// The smallest span and the smallest point that are still worth storing —
+/// enough for the proxy to have a resource entry to place and a replica to
+/// have a row to write, and nothing beyond that, because what they are here to
+/// prove is that the route exists.
+fn one_span() -> ExportTraceServiceRequest {
+    let now = nanos();
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(named("mira.cli")),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![0xab; 16].into(),
+                    span_id: vec![0xcd; 8].into(),
+                    name: "cli".into(),
+                    start_time_unix_nano: now,
+                    end_time_unix_nano: now + 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn one_point() -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(named("mira.cli")),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "cli.requests".into(),
+                    data: Some(Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: nanos(),
+                            value: Some(NumValue::AsInt(1)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+fn named(service: &str) -> Resource {
+    Resource {
+        attributes: vec![KeyValue {
+            key: "service.name".into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(service.into())),
+            }),
+        }],
+        ..Default::default()
     }
 }

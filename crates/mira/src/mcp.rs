@@ -273,6 +273,7 @@ fn trace_search(args: &Yaml) -> Result<Search, String> {
         // past what any waterfall can show, and an agent handed "here is a
         // third of a trace, ask again" will reason about the third.
         after: None,
+        cursors: false,
     })
 }
 

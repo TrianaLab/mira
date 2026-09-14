@@ -108,12 +108,16 @@ missing, why, and what to do instead today.
   `otelarrowreceiver`/`exporter` in collector-contrib. OTLP on 4317/4318 is the
   universal path, and the OTAP receiver is a second listener over a storage
   layout that is already shaped for it.
-- **No cross-replica query fan-out.** A query reads the block directory it was
-  pointed at and nothing scatters it: two replicas sharing a volume both answer
-  for all of it, two replicas with a volume each answer for half. There is no
-  peer list to configure, which is the point (principle 4) and also the
-  limitation. Section 12.2 has the shape it would take if it were built, and
-  section 12.4 is honest about what that would and would not buy.
+- ~~**No cross-replica query fan-out.**~~ Built, in a second process rather
+  than in the storage node: `mira proxy` (section 12.2) merges `/api/v1/query`
+  across a static list of replicas and routes OTLP exports between them by
+  entity. A storage node still reads only the block directory it was pointed at
+  and still has no peer list — that is the part principle 4 is protecting, and
+  the proxy holds nothing durable either. What is *not* built is peer-to-peer
+  broadcast between nodes, and the reads the proxy refuses to merge rather than
+  approximate (correlate, map, metrics, entities) still have to be addressed at
+  a replica. Section 12.2.4 is honest about the remaining gap, which is that
+  nothing has measured the single-node ceiling this closes.
 - **No entity *predicate*.** The entity key each block stores — the identity
   that survives an attribute changing mid-rollout, section 7.2 — is now read:
   `/api/v1/entities` lists what a window holds and `correlate`'s `peers` returns
@@ -172,7 +176,7 @@ it is measured.
   `ingest.wal` is a *promise*, not a speed: on means an ack survives SIGKILL at a
   p99 in the microseconds, off means it survives power loss at a p99 of 2.6 s,
   and nothing the engine can measure says which one a deployment wants. The
-  boundary is structural, not documentary. It is also closed — thirteen keys, and
+  boundary is structural, not documentary. It is also closed — fourteen keys, and
   an unknown one is a startup error naming it — because the alternative is what
   `cluster.peers` was (section 12.2): a key read by nothing that still looks like a
   setting in effect.
@@ -200,7 +204,7 @@ The concrete mechanism is in section 3.2 — the filesystem is the manifest. Thi
 rules out DataFusion *from the default build*: it would give SQL for free at a
 cost of 47 direct dependencies and a ~1.5M SLoC transitive tree. The binary cost
 was estimated here at 68–92 MB and that was too pessimistic — built at Mira's
-release profile it is **50.0 MiB and 271 crates**, against 5.63 MiB and 117. An
+release profile it is **50.0 MiB and 271 crates**, against 5.76 MiB and 117. An
 order of magnitude is still an order of magnitude, so it is out of the binary
 everyone downloads. There is no `--features sql` in the tree: `crates/mira`
 declares `default = []` and `webhook-tls`, and nothing else. The feature is the
@@ -209,7 +213,7 @@ default — and section 10 keeps it on the not-built list until someone asks. Wh
 DataFusion does not do, either way, is displace the hand-rolled ~2,000 LOC fast path, because a
 4.5 ms point lookup that already prunes to one block of 137 has nothing to gain
 from a planner. With traces, metrics, query, MCP and both UIs in it, the default
-build is **5.63 MiB stripped, 117 crates** — the scale the design is defending.
+build is **5.76 MiB stripped, 117 crates** — the scale the design is defending.
 
 **KYAML-first, everywhere.** Every text format Mira reads or writes — the config
 file, dashboard definitions, saved queries, MCP examples, anything added later —
@@ -2016,7 +2020,7 @@ partly not.
 | Query: metric names | — | **8.9 ms** first, **4.7 ms** steady, 24 of 24 blocks | — |
 | Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows — first sitting, and the row the second sitting has the most to say about | see below |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.20 B/B** hot, **0.14 B/B** compacted | ✓ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.63 MiB** / 117 crates | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **5.76 MiB** / 117 crates | ✓ |
 
 Reading these honestly:
 
@@ -2848,12 +2852,15 @@ The requirement: N replicas, all active, scaling horizontally, with no hard
 coordination. This is principle 4 — "stateless means no coordination state" —
 cashed out as a deployment topology.
 
-**Shared-nothing ingest, scatter-gather query, discovery borrowed from the
-platform.** Ingest (section 12.1) is built, and so is the shared-volume topology of
-section 12.5, which answers the same requirement with no fan-out at all. The
-scatter-gather half — section 12.2 and section 12.3 — is design; the config key it used to name
-is deleted, and the reasoning below says why that is the honest state rather than
-a regression.
+**Shared-nothing ingest, a stateless merging proxy for reads, discovery
+borrowed from the platform.** Ingest (section 12.1) was coordination-free
+already, and the shared-volume topology of section 12.5 answers the same
+requirement with no fan-out at all. The fan-out half is now built too:
+`mira proxy` (section 12.2), shipping with the hash-based ingest routing that
+section 12.2 used to say must never arrive without it. What is still not built
+is peer-to-peer broadcast *between storage nodes*, and section 12.2.4 says why
+the proxy replaced that design rather than preceding it — along with the part
+of this that is not yet earned, which is the evidence that any of it is needed.
 
 ### 12.1 Ingest
 
@@ -2875,71 +2882,243 @@ Two things had to change to make concurrent writers safe, and both are in:
 - Retention tolerates a losing race on `remove_dir_all` (section 6). Two replicas
   expiring the same block is not a conflict.
 
-### 12.2 Query — still not built
+### 12.2 Query — `mira proxy`
 
-A query is answered from the blocks the replica it arrived at can see: every
-writer's, on a shared volume (section 12.5); one writer's, shared-nothing. There is no
-fan-out, and `cluster.peers` — which named the peer set in the config file — is
-deleted rather than left in place, because it was parsed, logged and read by
+A storage node answers from the blocks it can see: every writer's, on a shared
+volume (section 12.5); its own, shared-nothing. It does not fan out and it has
+no peer set — `cluster.peers`, which once named one in the config file, was
+deleted rather than left in place because it was parsed, logged and read by
 nothing. An unread key is worse than a missing one: it is a setting an operator
-configures, sees accepted, and believes is in effect, and it sent them to point a
-headless Service at a feature that did not exist.
+configures, sees accepted, and believes is in effect, and it sent them to point
+a headless Service at a feature that did not exist.
 
-The design, for when it lands: a query arriving at any replica is broadcast to
-the peer set, executed locally on each, and merged. **The frame algebra of section 7.3
-is what makes this work**: a frame is a small value, so broadcasting it is free,
-and merging two nodes' results is a set union.
+The fan-out lives in a **second process that stores nothing**. `mira proxy` is
+the same binary under a subcommand, given a static list of replica addresses
+(`--replica http://host:port`, or `proxy.replicas` in the file), serving the
+OTLP endpoints and `/api/v1/query` on one HTTP listener and no gRPC one. It is
+`crates/mira/src/proxy.rs`, roughly six hundred lines, and it cost **zero new
+dependencies**: `hyper`, `hyper-util` and `http-body-util` were already direct
+dependencies of the binary for the webhook dispatcher.
 
-The reason it is a set union — rather than a distributed join — is the entity
-identity of section 7.2, and this is the load-bearing connection between the two
-requirements. Block-local ids never leave a node; they are meaningless off-box.
-The only identifiers that cross the wire are the globally stable ones:
-`resources.key`, `trace_id`, `span_id`, timestamps. Had entity identity stayed
-"equality of the resource attribute set", cross-node correlation would have
-needed a cluster-wide resource dictionary — which is coordination state, and the
-principle forbids it. One decision paid for both features.
+#### 12.2.1 Why it can hold no state — the cursor was already global
 
-Fan-out uses the same query API as an external client, with a hop flag so a peer
-does not re-broadcast.
+Paging is what usually forces a coordinator on a fan-out read. N nodes each
+answer "the newest hundred", the merger cuts to a hundred, and the rows it did
+not emit are now *somewhere* — so for the second page it has to remember, per
+reader, how far into each node's stream it had got. That per-reader position is
+coordination state, it has to survive the proxy restarting, and it is the reason
+scatter-gather usually comes with a session store attached.
 
-**Partial results must be reported, never hidden.** A scatter-gather over seven
-nodes with one down must not quietly return six sevenths of the data and let the
-user draw a conclusion from it. Every response has to name which peers answered,
-and that requirement is why this is not a two-hour feature.
+Mira does not need one, and the reason predates this feature. The keyset cursor
+of section 8 is `(ts, node, seq, row)` where `node` is `block::node_id` — so the
+sort key is **already total across every row on every replica**, not merely
+within one. Nothing was added to make that true; keyset
+paging needed a key intrinsic to the record rather than to the query, the node
+id was in it because block names have to be unique per writer (section 3.2), and
+that is the whole of it.
 
-**Recommended: still not built, and not next either.** A stateless proxy in
-front of N replicas with the peer set in static config would close this without
-coordination state *in Mira* — the proxy holds no durable state, so killing and
-restarting it reconciles nothing. Cheap to build. The reason it is not scheduled
-is that nothing has measured a single node's ceiling to be the binding
-constraint for the buyer this design is written for. Section 11 puts ingest at
-1.7–2.6 M records/s on a laptop, and the query finding in the same section is
-that an unpruned scan is bound by whether the corpus fits page cache — which
-fan-out does not change, since each peer still scans its own share off its own
-disk. Building it speculatively means committing to the partial-results contract
-above, the hop flag, and a second deployable, in exchange for a ceiling no
-workload has yet reached.
+So the protocol is: broadcast the caller's document, with the same `after`, to
+every replica; each returns the newest `limit` rows strictly behind that cursor
+out of its own blocks; sort the union on the cursor order; cut to `limit`; hand
+back the cursor of the last row emitted. Every row no replica emitted sorts
+strictly after that cursor *on every replica*, so the next page is exact — no
+duplicate, no gap — and by the time the response is written the proxy has
+forgotten the reader exists. Principle 4 is satisfied by construction rather
+than by care, which is the only way it survives a maintainer who has not read
+this section.
 
-Hash-based ingest routing is the piece that would make it worth having, and it
-only makes sense alongside the proxy, never on its own. `hash(entity_id) mod N`
-over the 64-bit identity hash section 7.2 already computes would put one
-entity's records on one replica, which is what makes a single peer's answer
-*complete* for that entity rather than a fragment of it — and the same routing
-on a consistent hash ring keeps a scale-out from reshuffling everything.
-Rebalance stays operator-triggered, because an automatic one is a placement
-decision and placement is coordination state (12.4). Routing without fan-out is
-strictly worse than today: it concentrates an entity on one node while queries
-still only see the node they landed on. So the order is fixed — proxy first,
-routing second, both when a workload exceeds one node, and neither before.
+Two details of the merge are load-bearing:
 
-### 12.3 Discovery without membership — still not built
+- **`next` is set by either side.** A replica that reported its own `next`
+  means that node is holding more; the merged set exceeding `limit` means the
+  cut is holding more. Only checking the second misses the case where N short
+  pages fit under `limit`, and the reader stops pages early believing it is
+  done.
+- **A read that cannot be complete is an error.** One replica timing out fails
+  the whole query rather than returning the others' rows. The alternative is the
+  scatter-gather failure this document has always refused: six sevenths of the
+  data, with nothing in the response saying so. The old design answered that
+  with a per-response list of which peers replied; all-or-nothing is the same
+  guarantee with nothing to render, nothing to parse, and no way for a caller to
+  ignore it.
 
-The peer set is a list of addresses, and in Kubernetes it is a headless
-Service: DNS already enumerates every replica, and the platform already keeps
-that current. Mira stores nothing about the cluster. There is no gossip, no
+#### 12.2.2 What the node had to grow, and what it did not
+
+One thing, and it is smaller than it sounds. A rendered row is an OTLP record
+and carries no cursor, so a merger holding two nodes' rows could not tell which
+came first. The node now accepts `"cursors": "true"` on a search document and
+returns a `"cursors"` array beside `"rows"`, index-aligned, absent otherwise.
+
+Beside the rows and not inside them, because of principle 3: the rendered row
+*is* the OTLP record, and a reader that did not ask for cursors should not have
+to step over one in every object to find the fields it came for. Absent rather
+than empty for the same reason `next` is absent on the last page — an empty
+array is a value a client has to interpret.
+
+The proxy adds that key textually rather than by re-serialising the document
+through a KYAML writer. A round trip would normalise the `where` terms, which is
+exactly the part of a caller's document most likely to have a spelling this file
+has not thought of. It then parses the result back and **refuses the request**
+if the flag did not take, because a document that reached the replicas without
+it would come back without cursors and the merge would silently fall back to
+whatever order the replicas answered in.
+
+What the node did *not* grow is a hop flag, a peer-aware code path, or any
+notion that it is part of a set. A replica behind a proxy is byte-for-byte the
+binary that runs alone.
+
+#### 12.2.3 What it refuses, and the routing that keeps the door open
+
+The proxy serves `/api/v1/query` and the three OTLP endpoints. `correlate`,
+`map`, `metrics/query`, `metrics/names` and `entities` answer **501 naming the
+path** and telling the caller to query a replica directly.
+
+They are refused rather than approximated because each is built by walking one
+node's blocks — a trace assembled from the spans that are local, a service map
+from the edges that are local. Merging those is not "sort and cut": two nodes
+each holding half a trace produce two partial frames and there is no cursor to
+interleave them on. A plausible subset is the failure mode section 7.2 refuses
+to hash for, and it is worse here, because nothing in the response would say it
+was partial. 501 and not 404: a 404 reads as "old build" and sends whoever hit
+it looking at versions.
+
+**Hash-based ingest routing is what holds that door open, and it ships here
+because this is the only release it is allowed to ship in.** The proxy splits
+an export resource by resource on `resource_key` — the same 64-bit entity
+identity of section 7.2, the one the storage layer already joins on — so every
+record describing one entity lands on one replica whatever batch it arrived in.
+`NO_IDENTITY` is spread by position instead: a resource with no identifying
+attribute has no entity to keep together, and hashing it to a fixed slot would
+pile every unidentified sender in a deployment onto replica zero.
+
+That placement buys nothing for the merged read above, which fans out
+regardless. What it buys is that each replica's blocks stay entity-local — the
+`_entity` block filter keeps its selectivity, and "everything this pod emitted"
+stays a question one node can answer *completely* rather than a fragment of.
+That is the property the 501 is waiting on: a future `entities` or `correlate`
+on the proxy is a routed call to the one node that has the whole answer, not a
+merge. Routing without fan-out would have been strictly worse than no routing,
+which is why the ordering constraint was there.
+
+Modulo and not a consistent hash ring, marked `ponytail:` at the line. The
+replica list is static, so the only event that remaps keys is an operator
+editing it and restarting — and at that point the blocks already written do not
+move either way, because **retention is the rebalancer** (section 12.4).
+Consistent hashing buys a smaller remap for a rebalance this design does not
+have.
+
+A partial ingest failure is a 503 for the whole export, so the exporter retries
+the batch and re-delivers the sub-exports that did land. That is at-least-once,
+which is what OTLP already is end to end; making it exactly-once needs an
+idempotency key and a seen-set on the node, which is per-sender coordination
+state for a duplicate section 12.4 already says the system tolerates.
+
+#### 12.2.4 What this replaced, and what it has not earned
+
+The design this section used to hold was peer-to-peer: a query arriving at any
+replica is broadcast to its peers, executed locally, merged, with a hop flag so
+a peer does not re-broadcast and a per-response list of which peers answered.
+The proxy is strictly less machinery for the same result — no peer set in the
+storage node, no hop flag, no partial-results rendering, and the one process
+that does hold a list of addresses holds nothing durable, so killing and
+restarting it reconciles nothing. The set-union argument that made the old
+design work is untouched and is why this one works too: block-local ids never
+leave a node, and the only identifiers that cross the wire are the globally
+stable ones — `resources.key`, `trace_id`, `span_id`, timestamps. Had entity
+identity stayed "equality of the resource attribute set", any cross-node read
+would have needed a cluster-wide resource dictionary, which is coordination
+state. One decision in section 7.2 paid for the merge, the routing, and the
+correlation this still refuses.
+
+**What has not been earned is the case for building it.** The previous version
+of this section said the proxy was cheap and still should not be built, because
+nothing had measured a single node's ceiling to be the binding constraint. That
+measurement was then attempted — it is the plateau work in section 11 — and it
+did not deliver the confirmation. It established the opposite of the premise
+everyone was working from: the log's mutex is not the ceiling, both proposed
+fixes are rejected, and once the log is free the queue re-forms at block seal
+and publish. Nothing in it says a *node* is saturated at a rate a real workload
+reaches, and it was taken on a laptop rather than on production-representative
+hardware.
+
+So the honest status is: the mechanism is built, tested and free of new
+dependencies, its *cost* is measured in 12.2.5, and the argument that it is
+*needed* rests on an instruction to build it rather than on a number. The two
+objections the old text raised have both been answered by the design — the
+partial-results contract became all-or-nothing, and the second deployable is a
+subcommand of the same binary — but "no workload has reached the ceiling" is not
+one of them, and it still stands. Section 11's query finding also still stands:
+an unpruned scan is bound by whether the corpus fits page cache, and fan-out
+does not change that, since each replica still scans its own share off its own
+disk. What fan-out buys is capacity — more disks, more page cache, more cores —
+not a faster answer to the same query.
+
+#### 12.2.5 What the hop costs, on one box
+
+`scripts/measure/proxy-ab.sh`. Arm A is one node with the generator pointed
+straight at it, the shape every number in section 11 was taken in. Arm B is two
+replicas and a proxy, with the generator pointed at the proxy. Same binary in
+both arms — the proxy is a subcommand, so there is no preserved-binary dance and
+no version skew. Both arms send `--records`, not `--for`, so the bytes and the
+corpus the read leg then scans are identical. Paired and alternating, B first,
+nine passes a shape across three sittings minutes apart, median of the per-pass
+ratios; two asserted controls, `0 shed` and the paged read returning no row
+twice, the second counted on the cursor because it is unique by construction.
+
+Read the ratios as a cost and never as scaling. Arm B runs three servers and the
+generator on the same twelve cores, on one disk, so both arms contend for the
+same everything and arm B pays an extra process to do it. The one question this
+box can answer is what the extra hop costs; what a second machine would buy is
+not on it.
+
+| Shape | Ingest B/A | Read B/A |
+|---|---|---|
+| 4 connections | **0.767x**, 0 of 9 | **3.89x**, 9 of 9 |
+| 32 connections | 0.973, 3 of 9 — split | **2.76x**, 9 of 9 |
+| 96 connections | 1.044, 5 of 9 — split | 3.882, 8 of 9 — split |
+
+Two things reproduce. **The proxy costs ingest at four connections** — every one
+of nine passes, spread 0.666 to 0.939 — and it is the shape where that should be
+true: there is no concurrency to hide the extra hop, the per-record
+`resource_key` and the re-encode behind. **The wide unfiltered read is several
+times slower through the proxy** at four and thirty-two connections, unanimously,
+and the proxy's `elapsed_us` is why: it starts before the fan-out and stops after
+the merge, so it contains both replicas' entire reads plus the hop. A node's own
+number measures one node's read; the proxy's measures the slowest replica.
+
+Everything else is noise and is registered as noise. Ingest at thirty-two and at
+ninety-six connections split 3 of 9 and 5 of 9 — at the shapes where the node is
+already saturated the extra process is lost in the variance, in both directions.
+The read at ninety-six split 8 of 9, on a pass that returned 0.620 and another
+that returned 40.684; that is three servers and a generator on one laptop, not
+the merge. All six figures are in `measurements.kyaml` including the three that
+did not reproduce, for the reason section 11 gives: an unregistered median is one
+somebody re-quotes next quarter.
+
+None of this is the Phase 1 question and none of it answers it. It prices the
+mechanism on hardware where fan-out cannot pay, which is the only hardware
+available. 12.2.4 still stands.
+
+### 12.3 Discovery without membership
+
+The replica set is a list of addresses given to the proxy at startup and never
+revisited. Mira stores nothing about the cluster. There is no gossip, no
 heartbeat, no join/leave protocol and no split brain — not because they are
-solved but because there is no membership to be wrong about. A peer that does not
-answer is a peer whose data is absent from this answer, and the answer says so.
+solved but because there is no membership to be wrong about.
+
+In Kubernetes the list is the pods of a StatefulSet, which have stable DNS names
+by construction, so it is a literal list in the proxy's config. A headless
+Service resolving to all of them is the *other* half — it is how an OTLP
+exporter reaches the proxy, or reaches the nodes directly when no proxy is
+deployed — but it is not how the proxy finds its replicas, because a DNS answer
+that changes underneath a running process is exactly the membership event this
+design has nothing to do about. Adding a replica is a config change and a
+restart of the proxy, which is a rolling restart of a stateless process.
+
+A replica that does not answer fails the query it was part of (section 12.2.1).
+There is no liveness tracking and no ejection: that would be membership, and a
+proxy that remembered which nodes it had given up on would be holding exactly
+the state this design refuses.
 
 ### 12.4 What scales, and what this deliberately does not buy
 
@@ -2947,7 +3126,7 @@ answer is a peer whose data is absent from this answer, and the answer says so.
 |---|---|
 | Ingest throughput | Linear. Nodes are independent. |
 | Storage capacity | Linear. |
-| Query capacity | Linear; every replica answers independently. On a shared volume that answer covers the whole dataset, shared-nothing it covers that replica's share until section 12.2 lands — at which point latency for one query becomes the slowest peer. |
+| Query capacity | Linear; every replica answers independently. Direct to a node, that answer covers the whole dataset on a shared volume and that node's share shared-nothing. Through `mira proxy` it covers all of them, and one query's latency becomes the slowest replica's. |
 
 - **No replication.** A lost disk is lost data for that node's share. The answer
   is client-side fan-out — an OTel Collector can export to two Mira replicas —
@@ -2991,7 +3170,7 @@ leaving no staging directory, `sweep_staging` filtering by signal and node —
 rather than of two writers racing. Covering it properly means two `mira`
 processes over one `TempDir` and an assertion that no published block mixes two
 sealed sets, which is a test level `docs/internals/testing.md` does not have yet. Across hosts, shared-nothing is the supported shape
-and query fan-out (section 12.2, unbuilt) is the answer to covering the whole dataset.
+and `mira proxy` (section 12.2) is the answer to covering the whole dataset.
 A cluster filesystem would work in principle and is not claimed. Object storage
 is a larger question — it forecloses mmap entirely — and is deferred to the
 market survey rather than guessed at here.
