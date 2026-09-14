@@ -62,7 +62,8 @@ of both UIs, from data you generated a minute earlier.
 
 ```sh
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
-helm install mira oci://ghcr.io/trianalab/charts/mira
+helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
+  --namespace mira-system --create-namespace   # then: kubectl apply a MiraCluster
 ```
 
 Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.4` pins the

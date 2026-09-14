@@ -1,0 +1,46 @@
+mira-operator {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+It is watching for MiraCluster resources and has created nothing yet. Create one:
+
+  kubectl apply -f - <<'EOF'
+  apiVersion: mira.miradb.dev/v1alpha1
+  kind: MiraCluster
+  metadata:
+    name: telemetry
+    namespace: {{ .Release.Namespace }}
+  spec:
+    image: ghcr.io/trianalab/mira:{{ .Chart.AppVersion }}
+    replicas: 1
+    maxReplicas: 5
+    storage:
+      size: 50Gi
+    # Required before the operator will ever scale *in*. Without it the tier
+    # only grows: removing a replica means deleting a volume holding blocks no
+    # other replica has, and nothing replicates or rebalances.
+    offload: "file:///cold/${node}"
+  EOF
+
+Then:
+
+  kubectl get miracluster -n {{ .Release.Namespace }} -w
+
+  NAME        REPLICAS   FREE   PHASE   AGE
+  telemetry   1          0.94   Ready   30s
+
+Send OTLP to the proxy, which fans out across every replica and merges the
+answers:
+
+  telemetry-proxy.{{ .Release.Namespace }}.svc:4318
+
+{{- if not .Values.rbac.create }}
+
+WARNING: rbac.create is false. The operator will start and then 403 on its first
+reconcile unless a ClusterRole and binding already exist for service account
+{{ include "mira-operator.serviceAccountName" . }}.
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+
+WARNING: replicaCount is {{ .Values.replicaCount }}. There is no leader election, so every
+replica reconciles every MiraCluster and each one decides to scale independently
+— one scale decision would move several replicas. Set replicaCount: 1.
+{{- end }}

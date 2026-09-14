@@ -1,0 +1,181 @@
+suite: rbac
+templates:
+  - templates/rbac.yaml
+release:
+  name: mira-operator
+  namespace: mira-system
+tests:
+  # The `status` subresource is its own RBAC resource. Without the rule, every
+  # status write is a 403 and the operator reconciles forever while `kubectl get
+  # miracluster` shows an empty PHASE — the failure looks like "the operator is
+  # doing nothing" rather than like a permissions error.
+  - it: grants the status subresource, not just the resource
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: rules[1].resources[0]
+          value: miraclusters/status
+      - contains:
+          path: rules[1].verbs
+          content: patch
+
+  # The tier is only ever resized through the scale subresource. A ClusterRole
+  # that omits it makes every scaling decision a silent 403.
+  - it: grants statefulsets/scale
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules[4].resources
+          content: statefulsets/scale
+      - contains:
+          path: rules[4].verbs
+          content: patch
+
+  # The blast-radius assertion. `delete` is the one irreversible verb here, and
+  # it must reach exactly two kinds: the claim a drained replica leaves behind
+  # and the Job that drained it. A `delete` that reached statefulsets, pods or
+  # deployments would let a controller bug remove a running tier rather than
+  # scale it.
+  - it: can delete only claims and jobs
+    documentIndex: 0
+    asserts:
+      - notContains:
+          path: rules[3].verbs
+          content: delete
+      - notContains:
+          path: rules[4].verbs
+          content: delete
+      - notContains:
+          path: rules[5].verbs
+          content: delete
+      - notContains:
+          path: rules[6].verbs
+          content: delete
+      - equal:
+          path: rules[7].resources[0]
+          value: persistentvolumeclaims
+      - contains:
+          path: rules[7].verbs
+          content: delete
+      - equal:
+          path: rules[8].resources[0]
+          value: jobs
+      - contains:
+          path: rules[8].verbs
+          content: delete
+
+  # The assertions above name the rules that matter; this one freezes the rest.
+  # A wildcard, an extra verb or a new apiGroup would make every one of them
+  # vacuous while still passing, so the whole list is snapshotted and any drift
+  # has to be reviewed as a diff rather than arriving unnoticed.
+  - it: grants exactly this list and nothing more
+    documentIndex: 0
+    asserts:
+      - matchSnapshot:
+          path: rules
+
+  - it: is a ClusterRole when no namespaces are listed
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: ClusterRole
+
+  - it: binds that ClusterRole and nothing else
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: ClusterRoleBinding
+      - equal:
+          path: roleRef.name
+          value: mira-operator
+      - equal:
+          path: subjects[0].namespace
+          value: mira-system
+
+  # Namespaced mode: one Role and one RoleBinding per listed namespace, and no
+  # cluster-scoped grant at all.
+  - it: becomes one Role and one RoleBinding per listed namespace
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    asserts:
+      - hasDocuments:
+          count: 4
+
+  - it: puts the first Role in the first listed namespace
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: metadata.namespace
+          value: alpha
+
+  - it: puts the second Role in the second listed namespace
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    documentIndex: 2
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: metadata.namespace
+          value: beta
+
+  # The point of scoping: no cluster-wide grant survives it.
+  - it: grants nothing cluster-wide when scoped
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    asserts:
+      - notMatchRegexRaw:
+          pattern: 'kind: Cluster'
+
+  # Both branches include the same `mira-operator.rules` template, and this is
+  # what keeps them from drifting: the namespaced Role must grant exactly what
+  # the ClusterRole does, or scoping the operator silently removes a permission.
+  - it: grants the same rules in namespaced mode
+    set:
+      rbac:
+        namespaces: [alpha]
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: rules[1].resources[0]
+          value: miraclusters/status
+      - contains:
+          path: rules[4].resources
+          content: statefulsets/scale
+      - equal:
+          path: rules[7].resources[0]
+          value: persistentvolumeclaims
+
+  # The binding has to point at the operator's own namespace even when the Role
+  # lives in another one; a ServiceAccount reference is not namespace-relative.
+  - it: binds the operator's service account across namespaces
+    set:
+      rbac:
+        namespaces: [alpha]
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: alpha
+      - equal:
+          path: subjects[0].namespace
+          value: mira-system
+      - equal:
+          path: subjects[0].name
+          value: mira-operator
+
+  - it: renders nothing when rbac.create is false
+    set:
+      rbac:
+        create: false
+    asserts:
+      - hasDocuments:
+          count: 0

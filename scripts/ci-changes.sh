@@ -21,7 +21,7 @@ if [ -z "${base}" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
   # no origin/main locally. Unknown means "everything", never "nothing": a
   # filter that fails open costs CI minutes, one that fails closed ships bugs.
   echo "base ref '${base}' unusable — running every leg" >&2
-  code=true; docs=true; ui=true; image=true; chart=true
+  code=true; docs=true; ui=true; image=true; chart=true; operator=true
 else
   files=$(git diff --name-only "${base}" HEAD)
   echo "changed files:" >&2
@@ -51,9 +51,17 @@ else
   # exactly the change that introduces the advisory this leg exists to catch.
   image=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|\.dockerignore\$|Makefile\$)${W}")
   chart=$(m "^charts/${W}")
+  # The operator is a second Cargo workspace with a second Cargo.lock, so an
+  # engine-only diff has nothing for it to recompile. `Makefile$` is here for
+  # the same reason it is in `code` and `image`: the leg is `make operator`, so
+  # an edit to those targets changes what the job asserts. `charts/mira-operator`
+  # is here too — the CRD drift gate lives in this leg and diffs a file under
+  # that directory, so a hand-edit there has to be caught by the gate that
+  # regenerates it rather than only by `helm lint`.
+  operator=$(m "^(integrations/kubernetes/|charts/mira-operator/|Makefile\$)${W}")
 fi
 
-out=$(printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\n' \
-  "${code}" "${docs}" "${ui}" "${image}" "${chart}")
+out=$(printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\noperator=%s\n' \
+  "${code}" "${docs}" "${ui}" "${image}" "${chart}" "${operator}")
 printf '%s\n' "${out}"
 [ -z "${GITHUB_OUTPUT:-}" ] || printf '%s\n' "${out}" >> "${GITHUB_OUTPUT}"

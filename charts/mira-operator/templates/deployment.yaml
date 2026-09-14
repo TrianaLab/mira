@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mira-operator.fullname" . }}
+  labels:
+    {{- include "mira-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # `Recreate`, not the default rolling update. There is no leader election, so
+  # the overlap a rolling update creates is two controllers reconciling the same
+  # MiraCluster — and both would read the same `free_fraction`, both decide to
+  # scale, and the tier would move two replicas for one decision. A moment of
+  # no controller is safe; Mira keeps serving either way.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mira-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "mira-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mira-operator.serviceAccountName" . }}
+      # The one place in this repo where a service-account token is genuinely
+      # required. The engine's StatefulSet turns it off by default and the
+      # reasoning holds: a Mira pod that can read the API server is a Mira pod
+      # that could read membership, which is the thing principle 4 refuses. The
+      # operator is the process that is *allowed* to, and it is a different pod.
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

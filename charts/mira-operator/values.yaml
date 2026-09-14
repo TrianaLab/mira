@@ -1,0 +1,82 @@
+# Default values for mira-operator.
+
+image:
+  # -- Operator image repository.
+  repository: ghcr.io/trianalab/mira-operator
+  # -- Pull policy.
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag. Defaults to the chart's appVersion.
+  tag: ""
+
+# -- Image pull secrets for a private registry.
+imagePullSecrets: []
+# -- Overrides the chart name in resource names.
+nameOverride: ""
+# -- Overrides the full generated resource name.
+fullnameOverride: ""
+
+# -- Replicas. One, and raising it does nothing useful: there is no leader
+# election in the tree (kube-rs has never shipped one — kube-rs/kube#485, open
+# since 2021), so two controllers would both reconcile every MiraCluster and
+# both decide to scale it. The Deployment's `Recreate` strategy below is the
+# other half of that: a rolling update would briefly run two.
+replicaCount: 1
+
+rbac:
+  # -- Create the ClusterRole and binding the operator needs.
+  create: true
+  # -- Restrict the operator to a list of namespaces by creating a Role in each
+  # instead of one ClusterRole. Empty means cluster-wide.
+  namespaces: []
+
+serviceAccount:
+  # -- Create a ServiceAccount.
+  create: true
+  # -- Annotations for the ServiceAccount (IRSA, Workload Identity).
+  annotations: {}
+  # -- Name to use. Generated from the fullname when empty.
+  name: ""
+
+# -- Log filter, in `tracing-subscriber` `EnvFilter` syntax. `kube=warn` keeps
+# the client's per-request lines out of a log that should be one line per
+# decision.
+logLevel: "info,kube=warn"
+
+# -- Pod annotations.
+podAnnotations: {}
+# -- Pod labels.
+podLabels: {}
+
+# -- Pod-level security context. The operator writes nothing and needs no
+# identity beyond its token.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Resource requests and limits. The controller is idle between reconciles;
+# the ceiling exists to make it evictable rather than because it is reached.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+# -- Node selector.
+nodeSelector: {}
+# -- Tolerations.
+tolerations: []
+# -- Affinity.
+affinity: {}

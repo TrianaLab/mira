@@ -161,7 +161,10 @@ to the new Sigstore bundle, and a verifier on the default looks in a place the
 signature is not and reports a signed artefact as unsigned. We sign in the legacy
 format because that is the one Artifact Hub's indexer reads.
 
-The Helm chart is signed the same way, at `ghcr.io/trianalab/charts/mira`.
+The operator image and the Helm chart are signed the same way, at
+`ghcr.io/trianalab/mira-operator` and `ghcr.io/trianalab/charts/mira-operator`.
+They are on their own version line, so the tag is the operator's, not the
+engine's.
 
 Tarballs: check the sums, then check the provenance. The sums prove the bytes are
 the bytes; the attestation proves which workflow run, from which commit, produced

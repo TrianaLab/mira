@@ -4,19 +4,100 @@
 `.github/workflows/release.yml`. If you want to *install* Mira rather than
 publish it, you want [Install](../install.md).
 
-## One binary, one chart, one number
+## One binary, one number
 
-Mira publishes four coordinates and they all carry the same version string:
+Mira publishes three coordinates and they all carry the same version string:
 
 | Coordinate | Where |
 |---|---|
 | Tarballs, SBOM, `SHA256SUMS` | GitHub Release assets on the `vX.Y.Z` tag |
 | Multi-arch image | `ghcr.io/trianalab/mira:X.Y.Z` (and `:latest`) |
-| Helm chart | `ghcr.io/trianalab/charts/mira:X.Y.Z` |
 | Three crates | `miradb`, `miradb-core`, `miradb-proto` on crates.io |
 
-One number across all four, so there is nothing to compute: bumping is an edit
+One number across all three, so there is nothing to compute: bumping is an edit
 to `Cargo.toml` and a `make drift` run.
+
+No chart is on that list, and that is a change rather than an omission. There
+used to be a `charts/mira` stamped from the workspace version; it was removed
+when the operator landed, because two charts is two answers to "how do I run
+Mira on Kubernetes" and the one that cannot scale, cannot drain and cannot be
+told a ceiling is the wrong default. The only chart Mira publishes now is the
+operator's, and it is on the next table.
+
+### And two that do not
+
+The operator is a separate program in a separate workspace, and it publishes two
+more coordinates on a **version of its own**:
+
+| Coordinate | Where | Version from |
+|---|---|---|
+| Multi-arch image | `ghcr.io/trianalab/mira-operator:A.B.C` (no `:latest`) | `charts/mira-operator/Chart.yaml` |
+| Helm chart | `ghcr.io/trianalab/charts/mira-operator:A.B.C` | the same file |
+
+They are built and pushed by the same `release.yml`, on the same tag, and that is
+the only thing they share with the four above. Three consequences follow, and
+none of them is optional:
+
+**The operator does not take the engine's number.** A controller at `0.3.1` and
+an engine at `0.3.1` would be a claim that they move together, and they do not:
+`spec.image` in a `MiraCluster` names whatever engine tag you want, including an
+older one, which is the entire point of a controller that upgrades a tier. A
+shared number would turn "which operator supports which engine" into a question
+whose answer looks obvious and is wrong. `make bump` therefore does **not**
+touch `charts/mira-operator/Chart.yaml`, and `make drift` does not check it.
+
+**Its publishers skip rather than fail.** This is the exact inverse of the rule
+in [Two irreversible facts](#two-irreversible-facts), and it is deliberate. The
+engine's publishers refuse an existing coordinate because a tag that already
+exists means something went wrong. The operator's already exist on almost every
+release — its number only moves when *it* changes — so `operator-image` and
+`operator-chart` each ask the registry first and exit with a `::notice::` if the
+coordinate is there. Applying the engine's rule here would make every engine
+release red.
+
+**So `verify-release` checks them unconditionally.** A publisher that skipped and
+a publisher that broke look identical from the outside, which is what makes the
+paragraph above dangerous on its own. The terminal job therefore resolves both
+operator coordinates by digest, cosign-verifies both against the
+`release.yml@refs/tags/` identity, and asserts that `helm template` on the
+published chart names the published image tag — every run, including the runs
+where neither was pushed.
+
+There is no `:latest` on the operator image. The chart pins a digestless tag it
+gets from its own `appVersion`, and a floating tag on a controller that holds a
+cluster's scaling logic is a silent in-place upgrade nobody asked for.
+
+The ceiling on all of this: **the operator cannot ship a fix without an engine
+release**, because there is no second tag to hang one on. The upgrade path is a
+`mira-operator/vA.B.C` tag and a second `push: tags:` filter beside the existing
+one, on the first day that costs somebody something.
+
+### Why not changesets
+
+[pacto](https://pacto.run) uses [changesets](https://github.com/changesets/changesets)
+for exactly this shape — several artefacts, versions that move independently —
+and it was the obvious thing to reach for here. It was not adopted, and the
+reason is worth recording so the question does not get re-opened for free.
+
+Changesets' product is the **Version Packages PR**: contributors drop a markdown
+file saying "this is a patch to the operator", a bot accumulates them, and
+merging its PR performs the bumps and writes the changelog. That is a real
+feature and Mira is not currently using any part of it — the bump is `make bump`
+and the changelog is prose a human writes, on purpose, because
+[the notes are the point](#cutting-a-release).
+
+What adopting it *today* would cost is a `package.json` at the root declaring an
+npm workspace, a `.changeset/config.json` with a fixed group, and one
+`package.json` per publishable unit whose only content is a version string that
+`Chart.yaml` already holds — three files restating one number, plus a gate to
+keep them agreeing, plus node on the release path. That is the machinery with
+none of the benefit.
+
+The trigger to revisit is a **third** independently-versioned artefact, or the
+first outside contributor who has to be told by hand which version line their
+change belongs to. Two artefacts and one maintainer is below the line where the
+bot pays for itself; `charts/mira-operator/Chart.yaml` is the source of truth
+until then, and `operator-meta` reads it with `sed`.
 
 The crates are `miradb-*` because `mira` on crates.io is an unrelated crate
 from 2024. Only the registry knows those names: the dependency keys, the `use`
@@ -121,14 +202,24 @@ silently skips is caught at PR time rather than discovered in a green run that
 published nothing.
 
 ```
-meta ──> build (×4 targets) ──┬─> package ──────────┐
-                              └─> image ──> chart ──┴─> release ──> crates ──> verify-release
+meta ──> build (×4 targets) ──┬─> package ──┐
+                              └─> image ────┴─> release ──> crates ──┐
+                                                                     │
+meta ──> operator-meta ──> operator-build (×2) ──> operator-image ──┐│
+                                                    operator-chart <┘│
+                                                              └──────┴─> verify-release
 ```
 
-`chart` is downstream of `image`, not a sibling of it: the chart advertises an
-image coordinate, and publishing a chart that points at an image which failed to
-push is the one ordering mistake that produces a green run and a broken
-`helm install`.
+Two chains, one terminal job. They share `meta` and nothing else — no operator
+job blocks an engine job or the other way round, so a broken operator build does
+not stop the engine from releasing, and `verify-release` is where that is
+noticed rather than papered over.
+
+`operator-chart` is downstream of `operator-image` rather than a sibling of it:
+the chart advertises an image coordinate, and publishing a chart that points at
+an image which failed to push is the one ordering mistake that produces a green
+run and a broken `helm install`. That is the only reason — the two jobs have no
+artefact to pass.
 
 **`meta`** computes `version`, `publish` and `prerelease` once. Deriving them
 per job is how a release ends up tagged `v0.2.0` with a binary that prints
@@ -152,11 +243,6 @@ no QEMU. It refuses an existing coordinate *before* pushing, because
 `gh release create` would only refuse the duplicate after `:latest` had already
 moved.
 
-**`chart`** passes `--version/--app-version "$VERSION"` to `helm package`, which
-overrides `Chart.yaml` without editing the tree. It also pushes a
-`:artifacthub.io` OCI artifact — the repository-ownership proof Artifact Hub
-looks for.
-
 **`release`** calls `gh release create`. `gh` is preinstalled on the runner and
 does exactly this, so there is no third-party release action holding a write
 token.
@@ -169,6 +255,44 @@ but a crates.io version is consumed on upload and `cargo yank` only hides it.
 It needs a `CARGO_REGISTRY_TOKEN` secret, and fails with a message naming it if
 it is missing — everything else has already published by then, so the fix is to
 re-run the job, not to bump.
+
+**`operator-meta`** reads the three version fields out of
+`charts/mira-operator/Chart.yaml` — `version`, `appVersion` and the tag in the
+`artifacthub.io/images` annotation — and **fails if any disagrees**. The chart
+installs a Deployment whose image tag defaults to `appVersion`, so a chart at
+`0.2.0` carrying `appVersion: 0.1.0` ships a controller one version behind the
+CRD schema it was installed with. The annotation is worse in a quieter way:
+nothing renders it, so a stale one is Artifact Hub scanning the previous
+image for CVEs and reporting them on this release's page. They are published as
+one unit; they have to say one number.
+
+**`operator-build`** is two native runners, `ubuntu-22.04` and
+`ubuntu-22.04-arm`, pushing by digest — not one buildx pass over
+`linux/amd64,linux/arm64`. `image` can do that because it copies prebuilt
+binaries and never runs a command in the build; the operator's Dockerfile
+*compiles*, so the same trick would emulate a 160-crate Rust build under QEMU.
+A matrix job cannot write per-leg `outputs` (last writer wins), so each leg
+uploads its digest as an artifact named after its arch, and `operator-image`
+joins them with `docker buildx imagetools create` — which writes an index over
+manifests already in the registry, uploading nothing.
+
+A dry run still builds both architectures, with `outputs: type=cacheonly`. The
+half of this that can be wrong is the compile.
+
+**`operator-image`** and **`operator-chart`** each begin with a `free` step that
+asks the registry whether the coordinate exists and **skips the rest of the job**
+if it does. See [And two that do not](#and-two-that-do-not) for why that is the
+opposite of every other publisher here, and why `verify-release` then has to
+check both coordinates on every run.
+
+`operator-chart` passes **no** `--version`/`--app-version` to `helm package`.
+The chart it replaced took them from the command line, because the authority
+there was `Cargo.toml` and `Chart.yaml` was a copy; here the numbers in
+`Chart.yaml` *are* the release, and `operator-meta` has already asserted they
+agree. It is also where the `:artifacthub.io` OCI artifact is pushed — the
+repository-ownership proof Artifact Hub looks for — and that push is
+deliberately *outside* the skip: the tag is mutable, one repository has one
+proof, and re-pushing identical bytes is free.
 
 **`verify-release`** throws away every artifact and output the run produced,
 checks out nothing, re-downloads what a stranger would download, and verifies it
@@ -184,13 +308,17 @@ workflow can change that — visibility is a setting on the package, not a field
 in a manifest, and there is no API for it.
 
 So v0.0.1 published an image and a chart that nobody could pull. `docker run
-ghcr.io/trianalab/mira` and `helm install oci://ghcr.io/trianalab/charts/mira` —
-the two lines the README hands a reader — answered `DENIED`, Artifact Hub's
-first tracking pass failed with the same error, and the run was green, because
-every step that touched the registry had logged in first.
+ghcr.io/trianalab/mira` and the chart install beside it — the two lines the
+README hands a reader — answered `DENIED`, Artifact Hub's first tracking pass
+failed with the same error, and the run was green, because every step that
+touched the registry had logged in first.
+
+The operator's first release walks into the same trap twice more, on
+`mira-operator` and on `charts/mira-operator`, and neither package exists yet as
+this is written.
 
 `verify-release` now asks for an anonymous pull token before it authenticates,
-for both coordinates, and fails the release if either is refused. That failure
+for all three coordinates, and fails the release if any is refused. That failure
 is not a broken release: the bytes are published and correct, and the fix is the
 package's own settings page rather than a version bump. It is the only check
 here whose remedy is a click.
@@ -208,9 +336,10 @@ index Cargo itself resolves against, not the API — for all three names.
 | CycloneDX SBOM | `SHA256SUMS` | — | via `SHA256SUMS` |
 | `SHA256SUMS` itself | — | — | yes, directly |
 | Image (`mira:X.Y.Z`) | digest | yes, over the digest | yes, pushed to the registry |
-| Chart (`charts/mira:X.Y.Z`) | digest | yes, over the digest | — |
-| `:artifacthub.io` metadata | — | — | — |
 | crates (`miradb*`) | registry `.crate` checksum | — | — |
+| Image (`mira-operator:A.B.C`) | digest | yes, over the digest | yes, pushed to the registry |
+| Chart (`charts/mira-operator:A.B.C`) | digest | yes, over the digest | — |
+| `:artifacthub.io` metadata | — | — | — |
 
 **Everything signed is signed over its digest, never over a tag.** A tag is a
 mutable pointer; a signature over one says nothing about the bytes that came
@@ -222,28 +351,35 @@ referrer. That is not a preference — Artifact Hub does not read referrers, and
 unverifiable badge on the page people land on is worse than an old-format
 signature.
 
-`verify-release` re-runs `gh attestation verify` and both `cosign verify` calls
-with the certificate identity pinned to `release.yml@refs/tags/`, so a signature
-raised by any other workflow, or on any other ref, fails the release.
+`verify-release` re-runs `gh attestation verify` and all three `cosign verify`
+calls with the certificate identity pinned to `release.yml@refs/tags/`, so a
+signature raised by any other workflow, or on any other ref, fails the release.
+The operator's two are verified against the *same* identity as the engine's,
+because they are raised by the same workflow on the same tag — a separate
+operator tag, the upgrade path named above, would move that subject and is
+therefore not a change to make quietly.
 
 ## Where the version lives
 
 `Cargo.toml`'s `[workspace.package] version` is the source; everything below
 restates it, and the right-hand column is what stops it rotting.
+`charts/mira-operator/Chart.yaml` is deliberately **not** in this table — it is
+its own source, for [the reasons above](#and-two-that-do-not), and `make bump`
+leaving it alone is the behaviour rather than an omission. The gate on it is
+`operator-meta`, at release time, not `make drift`.
 
 | Site | Written by | Gate |
 |---|---|---|
 | `Cargo.toml` `[workspace.package]` | `make bump` | the source |
 | `Cargo.toml` `miradb-core` / `miradb-proto` path-dep pins | `make bump` | `make drift` |
-| `charts/mira/Chart.yaml` — `version`, `appVersion`, the scanned image tag | `make bump` | `make drift` |
-| `charts/mira/tests/statefulset_test.yaml` | `make bump` | `make drift`, and the chart suite |
-| `docs/install.md` — `--version v`, `V=`, `helm install --version`, the chart coordinate | `make bump` | `make drift` |
+| `docs/install.md` — `--version v`, `V=`, the `spec.image` in the MiraCluster | `make bump` | `make drift` |
 | `README.md` — `--version v` | `make bump` | `make drift` |
 | `SECURITY.md` — the supported-versions line | `make bump` | `make drift` |
 | `.github/ISSUE_TEMPLATE/bug_report.yml` — the `mira X.Y.Z` placeholder | `make bump` | `make drift` |
+| `charts/mira-operator/README.md.gotmpl` — the `spec.image` in the MiraCluster | `make bump` | `make drift` |
 | `CHANGELOG.md` — the heading and the link definitions | `make bump` | **none** (prose) |
 | `Cargo.lock` | `cargo update --workspace` | `--locked` fails the build |
-| `charts/mira/README.md` | `helm-docs` | `make helm-docs-check` |
+| `charts/mira-operator/README.md` | `make bump`, then `helm-docs` over it | `make helm-docs-check`, `make drift` |
 
 `make bump TO=X.Y.Z` writes every row above and then regenerates the last two,
 so step 1 is one command and `make drift` is how you check it did. The middle
@@ -281,12 +417,17 @@ re-checked.
 This is survivable because nothing reaches `main` un-gated, and because the
 `tag` job `needs: [required, security-required]` — so the commit a tag names is
 by construction the commit both gates just passed on, rather than a commit
-somebody believed was green. That also closes what used to be the residual hole
-here, a tag cut from a *stale* `main` commit: `helm package
---version/--app-version` overrides two of `Chart.yaml`'s three version fields
-but not the `artifacthub.io/images` annotation, so a stale tag could ship a
-chart advertising an image tag that is not the one being released. A hand-pushed
-tag can still do that, and is still the only way to.
+somebody believed was green.
+
+The residual hole is a hand-pushed tag, which is the one way to reach
+`release.yml` from a commit no gate has seen. It used to be wider: the engine's
+chart took its `version`/`appVersion` from `helm package` on the command line
+but left the `artifacthub.io/images` annotation alone, so a stale tag shipped a
+chart advertising an image that was not the one being released. That chart is
+gone, and the operator's does not have the hole — its three version fields all
+come from the tree rather than the command line, and `operator-meta` refuses to
+run if any disagrees with the other two. `verify-release` then `helm template`s
+the *published* chart and asserts the image tag it renders is the published one.
 
 ## Rehearsal, and what only the tag can run
 
@@ -300,6 +441,18 @@ Both have passed.
 `publish=false` skips every network-publishing step, so `cosign sign`,
 `helm push`, the `Digest:` scrape off `helm push`'s stderr and the Artifact Hub
 `oras push` were all executing for the first time on v0.0.1. All four worked.
+
+The operator's four jobs are in the weakest position of anything here, and it is
+worth being explicit rather than discovering it on a tag. `operator-build`
+compiles both architectures on a dry run, so the Dockerfile is rehearsed.
+`operator-meta` runs unconditionally, so the version assertion is rehearsed.
+`operator-image` and `operator-chart` are gated on `publish`, so the `free`
+check, `imagetools create`, both `cosign sign` calls and the `helm push` digest
+scrape have **never executed** — and unlike the engine's equivalents, they have
+no `release-dry-run` leg on pull requests either, because `ci.yml`'s rehearsal
+covers `make dist` and `make publish-dry` and neither touches this tree. The
+first tag after this lands is their first run. `verify-release` is what will say
+so.
 
 The `crates` job and the anonymous-pull check both ran for the first time on
 v0.0.2, which is also the first release whose `make publish` actually uploaded.

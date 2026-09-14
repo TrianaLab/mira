@@ -3,18 +3,23 @@ name: release
 # Mira is a single binary, so the release artifacts *are* the product's front
 # door. The whole file therefore has one rule: nothing is published until every
 # platform has built. The matrix produces tarballs, one job checksums and
-# attests them, one job turns the same bytes into a multi-arch image, one
-# packages the chart, and only then does the GitHub Release appear — followed by
-# `verify-release`, which re-downloads what was actually published and checks
-# it, because a release job that reports green having published nothing is a
-# failure mode both this project and its neighbours have shipped.
+# attests them, one job turns the same bytes into a multi-arch image, and only
+# then does the GitHub Release appear — followed by `verify-release`, which
+# re-downloads what was actually published and checks it, because a release job
+# that reports green having published nothing is a failure mode both this
+# project and its neighbours have shipped.
+#
+# The operator is a second train on the same tag, with its own version, its own
+# image and the only Helm chart Mira publishes. It shares `meta` and nothing
+# else; see its section header below for why its publishers *skip* where the
+# engine's refuse.
 #
 # Two invariants, both fail-closed and both learned the expensive way:
 #
-#   * A published coordinate is immutable. Every publisher asks the registry
-#     whether the coordinate already exists and refuses rather than overwriting
-#     it, so a re-run of a released tag is a red run and not a silent swap of
-#     bytes somebody already verified against SHA256SUMS.
+#   * A published coordinate is immutable. Every engine publisher asks the
+#     registry whether the coordinate already exists and refuses rather than
+#     overwriting it, so a re-run of a released tag is a red run and not a
+#     silent swap of bytes somebody already verified against SHA256SUMS.
 #   * Everything published is signed over its *digest*, never over a tag. A tag
 #     is a mutable pointer; a signature over one says nothing about the bytes
 #     that came back.
@@ -55,12 +60,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/trianalab/mira
-  # The chart lives beside the image, not under it. `helm push` appends the
+  # Charts live beside the images, not under them. `helm push` appends the
   # chart name to whatever repository it is given, so this is the parent and
-  # every coordinate below is `${CHARTS}/mira` — nesting charts inside the
+  # the coordinate below is `${CHARTS}/mira-operator` — nesting charts inside an
   # image repository would make `ghcr.io/trianalab/mira` a directory and a
   # manifest at once, which is legal and confusing in equal measure.
   CHARTS: ghcr.io/trianalab/charts
+  # A sibling coordinate, not a tag on `mira`. The operator is a different
+  # program with a different entrypoint and a different permission model, and
+  # publishing it as `ghcr.io/trianalab/mira:0.1.0-operator` would put two
+  # unrelated things in one package's tag list where a `:latest` reader cannot
+  # tell them apart.
+  OPERATOR_IMAGE: ghcr.io/trianalab/mira-operator
 
 jobs:
   # Everything downstream keys off these three strings, so they are computed
@@ -371,9 +382,9 @@ jobs:
           # defaults to writing a Sigstore bundle into the OCI referrers API,
           # which is the better artifact and which Artifact Hub's indexer does
           # not read. It reads the legacy `sha256-<digest>.sig` tag cosign has
-          # written since 2021, and the chart job below has the same
-          # requirement, so the image uses the same format for one story rather
-          # than two.
+          # written since 2021, and the operator chart below has the same
+          # requirement, so every signature this workflow raises uses the same
+          # format for one story rather than two.
           #
           # ponytail: both flags are deprecated in cosign v3 — `--help` hides
           # them and the deprecation text says the new format "will be the only
@@ -388,30 +399,90 @@ jobs:
             --use-signing-config=false \
             "${IMAGE}@${DIGEST}"
 
-  # The chart is a second OCI artifact in the same registry, with the same two
-  # rules: refuse an existing coordinate, sign the digest. `needs: image`
-  # because a chart whose appVersion names an image that failed to push is a
-  # chart that installs a CrashLoopBackOff.
-  chart:
-    name: chart
-    needs: [meta, image]
+  # ---------------------------------------------------------------------------
+  # The operator: a second product, on a second version line
+  # ---------------------------------------------------------------------------
+  #
+  # It rides the engine's tag but does not take the engine's version. The two
+  # are not released together in any meaningful sense: the operator is a
+  # controller for a Mira tier and works across a range of engine versions, so
+  # tying its number to `v0.0.5` would claim a correspondence that does not
+  # exist and force a version bump on it every time the engine ships.
+  #
+  # So: `charts/mira-operator/Chart.yaml` is the version, and the jobs below are
+  # idempotent. If that number is already published they skip rather than fail —
+  # which is the opposite of the rule the engine's publishers follow, and the
+  # difference is deliberate. For the engine, an existing coordinate means the
+  # tag was cut twice and something is wrong. For the operator it is the normal
+  # case: most engine releases do not change it.
+  #
+  # ponytail: the ceiling is that the operator cannot ship a fix without an
+  # engine release, because there is no second tag to hang one on. The upgrade
+  # path is a `mira-operator/vX.Y.Z` tag and a `push: tags:` filter beside the
+  # existing one, on the day that costs somebody something. docs/internals/releases.md
+  # has the argument, including why changesets is not that upgrade path yet.
+  operator-meta:
+    name: operator-meta
+    needs: meta
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        run: |
+          set -euo pipefail
+          chart=charts/mira-operator/Chart.yaml
+          version=$(sed -n 's/^version: *//p' "${chart}" | head -1)
+          app=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' "${chart}" | head -1)
+          # The chart installs a Deployment whose image tag defaults to
+          # appVersion, so a chart at 0.2.0 carrying appVersion 0.1.0 ships a
+          # controller one version behind the schema its own CRD declares. They
+          # are published as one unit; they have to say one number.
+          if [ "${version}" != "${app}" ]; then
+            echo "::error::${chart} has version ${version} but appVersion ${app}; the chart and the image it installs are published together and must agree"
+            exit 1
+          fi
+          [ -n "${version}" ] || { echo "::error::no version in ${chart}"; exit 1; }
+          # And the third number in that file: `artifacthub.io/images` is a
+          # literal, not a template, and nothing renders it — so a stale one is
+          # Artifact Hub scanning last release's image for CVEs and reporting
+          # them against this one. Only `verify-release`'s `helm template` check
+          # covers the *rendered* tag; this covers the annotation.
+          ann=$(sed -n 's|^ *image: ghcr.io/trianalab/mira-operator:||p' "${chart}" | head -1)
+          if [ "${ann}" != "${version}" ]; then
+            echo "::error::${chart}'s artifacthub.io/images annotation names ${ann:-nothing}, not ${version}"
+            exit 1
+          fi
+          echo "version=${version}" | tee -a "$GITHUB_OUTPUT"
+
+  # Two native runners rather than one with QEMU, for the reason the `build`
+  # matrix gives: the operator's Dockerfile *compiles*, so a cross-platform
+  # buildx pass would emulate a 160-crate build. The arm64 label is free on
+  # public repositories.
+  #
+  # Each leg pushes an unnamed manifest by digest and hands the digest on as a
+  # file; `operator-image` joins them into the index. Matrix jobs cannot use
+  # `outputs:` for this — every leg writes the same key and the last one wins.
+  operator-build:
+    name: operator-build (${{ matrix.arch }})
+    needs: [meta, operator-meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-22.04
+          - arch: arm64
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       packages: write
-      id-token: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
-        with:
-          # The same pin ci.yml uses. They have to move together.
-          version: v3.22.0
-
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: needs.meta.outputs.publish == 'true'
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: needs.meta.outputs.publish == 'true'
@@ -420,68 +491,207 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Packaged on a dry run too, and only the push is gated — a `helm package`
-      # that has never run until a tag is exactly the class of failure this
-      # workflow's dry run exists to remove.
-      - env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          # --version and --app-version both from the tag: the chart ships the
-          # binary it was cut with, and `meta` has already proved the tag and
-          # Cargo.toml agree. Passing them here rather than editing Chart.yaml
-          # keeps the working tree clean, which is what makes it safe for the
-          # dry run to do the identical thing.
-          mkdir -p chart-dist
-          helm package charts/mira \
-            --version "${VERSION}" \
-            --app-version "${VERSION}" \
-            --destination chart-dist
-          ls -l chart-dist
+      # A dry run builds and throws the result away. It still compiles both
+      # architectures, which is the half of this that can actually be wrong.
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          # The repository root: Cargo.lock, the nested workspace and the
+          # Dockerfile are three different directories.
+          context: .
+          file: integrations/kubernetes/Dockerfile
+          build-args: |
+            VERSION=${{ needs.operator-meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: >-
+            ${{ needs.meta.outputs.publish == 'true'
+                && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.OPERATOR_IMAGE)
+                || 'type=cacheonly' }}
+          provenance: false
 
-      - name: refuse to overwrite a published chart
-        if: needs.meta.outputs.publish == 'true'
+      - if: needs.meta.outputs.publish == 'true'
         env:
-          VERSION: ${{ needs.meta.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          if helm show chart "oci://${CHARTS}/mira" --version "${VERSION}" >/dev/null 2>&1; then
-            echo "::error::${CHARTS}/mira:${VERSION} is already published — refusing to overwrite an immutable chart version."
-            exit 1
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.meta.outputs.publish == 'true'
+        with:
+          name: operator-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  operator-image:
+    name: operator-image
+    needs: [meta, operator-meta, operator-build]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.join.outputs.digest }}
+      published: ${{ steps.free.outputs.free }}
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Skip, not fail. See the section header: an operator version that is
+      # already published is the normal outcome of an engine release that did
+      # not touch it.
+      - id: free
+        env:
+          VERSION: ${{ needs.operator-meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${OPERATOR_IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::notice::${OPERATOR_IMAGE}:${VERSION} is already published — this release does not change the operator."
+            echo "free=false" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "free=true" | tee -a "$GITHUB_OUTPUT"
           fi
-          echo "${CHARTS}/mira:${VERSION} is free"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.free.outputs.free == 'true'
+        with:
+          pattern: operator-digest-*
+          merge-multiple: true
+          path: digests
+
+      # `imagetools create` writes the index over manifests that are already in
+      # the registry, so nothing is re-uploaded and nothing is emulated.
+      - id: join
+        if: steps.free.outputs.free == 'true'
+        env:
+          VERSION: ${{ needs.operator-meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          refs=$(cd digests && printf "${OPERATOR_IMAGE}@sha256:%s " *)
+          echo "joining: ${refs}"
+          # No `:latest`. The engine moves it because `docker run
+          # ghcr.io/trianalab/mira` is in the README; nothing installs the
+          # operator by anything but a chart, and a floating tag on a controller
+          # with a CRD is how a cluster ends up running a binary that does not
+          # match the schema it was installed with.
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "${OPERATOR_IMAGE}:${VERSION}" ${refs}
+          digest=$(docker buildx imagetools inspect "${OPERATOR_IMAGE}:${VERSION}" \
+            --format '{{ .Manifest.Digest }}')
+          [ -n "${digest}" ] || { echo "::error::no digest for the joined index"; exit 1; }
+          echo "digest=${digest}" | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: steps.free.outputs.free == 'true'
+        with:
+          subject-name: ${{ env.OPERATOR_IMAGE }}
+          subject-digest: ${{ steps.join.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: steps.free.outputs.free == 'true'
+
+      - name: sign the operator image
+        if: steps.free.outputs.free == 'true'
+        env:
+          DIGEST: ${{ steps.join.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # The same two deprecated flags and the same reason as the engine's
+          # image: Artifact Hub reads the legacy `.sig` tag, not the referrers
+          # API, and this image is what the chart's Artifact Hub entry points at.
+          cosign sign --yes \
+            --new-bundle-format=false \
+            --use-signing-config=false \
+            "${OPERATOR_IMAGE}@${DIGEST}"
+
+  # The only chart Mira publishes. `helm push` appends the chart name to the
+  # repository it is given, so this lands at ${CHARTS}/mira-operator with no
+  # extra configuration — which is why ${CHARTS} is a parent coordinate rather
+  # than the chart's own, and why `charts/mira` being removed cost nothing here.
+  operator-chart:
+    name: operator-chart
+    needs: [meta, operator-meta, operator-image]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      published: ${{ steps.free.outputs.free }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: free
+        env:
+          VERSION: ${{ needs.operator-meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if helm show chart "oci://${CHARTS}/mira-operator" --version "${VERSION}" >/dev/null 2>&1; then
+            echo "::notice::${CHARTS}/mira-operator:${VERSION} is already published."
+            echo "free=false" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "free=true" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      # No --version or --app-version override, unlike the engine's chart: the
+      # numbers in Chart.yaml *are* the release, and `operator-meta` already
+      # proved the two agree. Passing them here would let a tag quietly restamp
+      # a chart whose CRD says something else.
+      - if: steps.free.outputs.free == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p operator-chart-dist
+          helm package charts/mira-operator --destination operator-chart-dist
+          ls -l operator-chart-dist
 
       - id: push
-        if: needs.meta.outputs.publish == 'true'
+        if: steps.free.outputs.free == 'true'
         env:
-          VERSION: ${{ needs.meta.outputs.version }}
+          VERSION: ${{ needs.operator-meta.outputs.version }}
         run: |
           set -euo pipefail
-          # helm push prints `Digest: sha256:…` on stderr and nothing useful on
-          # stdout, so the digest has to be scraped. It is worth scraping: it is
-          # what gets signed, and signing `:${VERSION}` instead would leave the
-          # same tag-is-mutable hole the image job avoids.
-          helm push "chart-dist/mira-${VERSION}.tgz" "oci://${CHARTS}" 2>&1 | tee push.log
+          helm push "operator-chart-dist/mira-operator-${VERSION}.tgz" "oci://${CHARTS}" 2>&1 | tee push.log
           digest=$(sed -n 's/^Digest: //p' push.log | tail -1)
           [ -n "${digest}" ] || { echo "::error::helm push printed no digest"; exit 1; }
           echo "digest=${digest}" | tee -a "$GITHUB_OUTPUT"
 
-      - name: sign the chart
-        if: needs.meta.outputs.publish == 'true'
+      - name: sign the operator chart
+        if: steps.free.outputs.free == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          # Same two flags and the same reason as the image: Artifact Hub reads
-          # the legacy `.sig` tag, not the referrers API, and an unsigned-looking
-          # chart is the one thing the badge does not forgive.
           cosign sign --yes \
             --new-bundle-format=false \
             --use-signing-config=false \
-            "${CHARTS}/mira@${DIGEST}"
+            "${CHARTS}/mira-operator@${DIGEST}"
 
       - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        if: needs.meta.outputs.publish == 'true'
 
       # The ownership handshake. An OCI repository has no `index.yaml` to carry
       # `artifacthub-repo.yml` beside, so Artifact Hub looks for it under a
@@ -490,24 +700,35 @@ jobs:
       # the repository unverified — so all three are copied from Artifact Hub's
       # docs verbatim and none of them is ours to pick.
       #
-      # Pushed on every release rather than once, because the tag is mutable and
-      # a repository that loses it loses the badge. Idempotent by construction:
-      # the same bytes produce the same digest.
+      # Deliberately *not* behind `steps.free`: the two above are, because a
+      # published chart version is immutable, but this tag is mutable and a
+      # repository that loses it loses the badge. Idempotent by construction —
+      # the same bytes produce the same digest — so pushing it on a release that
+      # changed no operator code is free and skipping it is not.
+      #
+      # It moved here from the `chart` job when `charts/mira` was removed. The
+      # `repositoryID` in the file did not change: an Artifact Hub repository is
+      # a registration with a URL field, so this is a control-panel edit rather
+      # than a second registration. Until that edit is made the badge points at
+      # a repository with nothing in it.
       - name: publish the Artifact Hub repository metadata
-        if: needs.meta.outputs.publish == 'true'
         run: |
           set -euo pipefail
-          oras push "${CHARTS}/mira:artifacthub.io" \
+          oras push "${CHARTS}/mira-operator:artifacthub.io" \
             --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
             artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
 
   # Created last, on purpose. The GitHub Release is the only coordinate a human
-  # reads as "this shipped", so it must not exist until the image and the chart
-  # already do — the other order produces release notes pointing at a pull that
-  # 404s.
+  # reads as "this shipped", so it must not exist until the image already does —
+  # the other order produces release notes pointing at a pull that 404s.
+  #
+  # Not `needs: operator-chart`. The operator is a separate release train (see
+  # the section header above) and a controller that failed to build must not
+  # hold back an engine release that is otherwise complete. `verify-release`
+  # covers both, which is where a half-shipped run gets caught.
   release:
     name: release
-    needs: [meta, package, image, chart]
+    needs: [meta, package, image]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -612,7 +833,7 @@ jobs:
   # whose inputs are not this workflow's own state — which is the entire point.
   verify-release:
     name: verify-release
-    needs: [meta, image, chart, release, crates]
+    needs: [meta, image, release, crates, operator-meta, operator-build, operator-image, operator-chart]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -646,6 +867,7 @@ jobs:
       - name: a stranger can pull the image and the chart
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          OPERATOR_VERSION: ${{ needs.operator-meta.outputs.version }}
         run: |
           set -euo pipefail
           anon() {
@@ -662,7 +884,8 @@ jobs:
           }
           rc=0
           for target in "${IMAGE#ghcr.io/}:${VERSION}" \
-                        "${CHARTS#ghcr.io/}/mira:${VERSION}"; do
+                        "${OPERATOR_IMAGE#ghcr.io/}:${OPERATOR_VERSION}" \
+                        "${CHARTS#ghcr.io/}/mira-operator:${OPERATOR_VERSION}"; do
             if anon "${target%:*}" "${target##*:}"; then
               echo "anonymous pull of ghcr.io/${target} ok"
             else
@@ -737,27 +960,6 @@ jobs:
             "${IMAGE}@${DIGEST}" > /dev/null
           echo "image ${IMAGE}@${DIGEST} verified"
 
-      - name: the chart is pullable and its digest is signed
-        env:
-          DIGEST: ${{ needs.chart.outputs.digest }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          # `helm show chart` is the round trip a user makes: it pulls the
-          # manifest anonymously and parses it. It also proves the appVersion
-          # that was stamped is the one that came back.
-          helm show chart "oci://${CHARTS}/mira" --version "${VERSION}"
-          # --new-bundle-format=false for the same reason as the image above:
-          # the chart is signed in the legacy format Artifact Hub indexes, so a
-          # verifier on cosign's default looks in the wrong place.
-          cosign verify \
-            --new-bundle-format=false \
-            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp="^https://github\.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
-            "${CHARTS}/mira@${DIGEST}" > /dev/null
-          echo "chart ${CHARTS}/mira@${DIGEST} verified"
-
       - name: all three crates are on crates.io at this version
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -783,6 +985,40 @@ jobs:
           done
           exit "${rc}"
 
+      # The operator's two coordinates, checked the same way and on the same
+      # terms. Unconditional, not `if: published == 'true'`: the question here
+      # is whether a stranger can install the version the chart declares, and
+      # that has to hold on the releases that republished nothing just as much
+      # as on the one that first pushed it. A skipped publisher and a broken one
+      # look identical from the outside, which is the gap this job exists for.
+      - name: the operator image and chart are pullable and signed
+        env:
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.operator-meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm show chart "oci://${CHARTS}/mira-operator" --version "${VERSION}"
+          # The digest as the registry serves it now, not the one this run
+          # produced: on a release that skipped the operator there is no output
+          # to read, and the published bytes are the only thing worth checking.
+          for coord in "${OPERATOR_IMAGE}:${VERSION}" "${CHARTS}/mira-operator:${VERSION}"; do
+            digest=$(docker buildx imagetools inspect "${coord}" --format '{{ .Manifest.Digest }}')
+            [ -n "${digest}" ] || { echo "::error::${coord} has no manifest"; exit 1; }
+            cosign verify \
+              --new-bundle-format=false \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+              --certificate-identity-regexp="^https://github\.com/${REPO}/\.github/workflows/release\.yml@refs/tags/" \
+              "${coord%:*}@${digest}" > /dev/null
+            echo "${coord%:*}@${digest} verified"
+          done
+          # The chart's default image tag is its appVersion, so this is the
+          # assertion that an install of the chart pulls a manifest that exists.
+          # A chart published against an image that never pushed is a
+          # CrashLoopBackOff nothing else in this run would notice.
+          helm template probe "oci://${CHARTS}/mira-operator" --version "${VERSION}" \
+            | grep -q "image: ${OPERATOR_IMAGE}:${VERSION}"
+          echo "the published chart installs the published image"
+
       - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: the Artifact Hub ownership metadata came back
@@ -798,21 +1034,21 @@ jobs:
           # because this job deliberately has no checkout: everything it looks
           # at comes back off the wire. `cargo run -p xtask -- drift` is what holds
           # the ID to the right one; this holds the push to having happened.
-          oras pull "${CHARTS}/mira:artifacthub.io" --output pulled
+          oras pull "${CHARTS}/mira-operator:artifacthub.io" --output pulled
           grep -Eq '^repositoryID: [0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' \
             pulled/artifacthub-repo.yml
-          echo "${CHARTS}/mira:artifacthub.io carries an owner proof"
+          echo "${CHARTS}/mira-operator:artifacthub.io carries an owner proof"
 
       - run: |
           set -euo pipefail
           {
             echo '### Verified after publication'
             echo
-            echo '- the image and the chart are pullable with no credentials'
+            echo '- both images and the chart are pullable with no credentials'
             echo '- SHA256SUMS matches every asset attached to the release'
             echo '- SLSA provenance resolves for the linux x86_64 tarball'
             echo '- the image digest carries a cosign signature from this workflow'
-            echo '- the chart pulls and its digest carries the same signature'
             echo '- all three crates resolve out of the crates.io sparse index'
+            echo '- the operator image and chart pull, verify, and agree on a tag'
             echo '- the Artifact Hub ownership metadata round-trips'
           } >> "$GITHUB_STEP_SUMMARY"

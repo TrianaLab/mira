@@ -50,6 +50,7 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       image: ${{ steps.filter.outputs.image }}
       chart: ${{ steps.filter.outputs.chart }}
+      operator: ${{ steps.filter.outputs.operator }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -119,6 +120,33 @@ jobs:
       # toolchain, and a promise nothing compiles against is a wish. The target
       # reads the floor out of Cargo.toml, installs exactly it, and builds.
       - run: make ci-msrv
+
+  # `integrations/kubernetes/` is a second Cargo workspace, so `rust` above
+  # cannot reach it: `--workspace` in the root manifest does not enumerate it,
+  # and that is deliberate — kube-rs would move the crate count the README
+  # publishes, raise the MSRV floor and fail `cargo deny`'s duplicate and
+  # licence rules. The separation is in the Makefile's "The operator" section.
+  #
+  # One runner, not the three `rust` uses. The operator has no memory-mapped
+  # on-disk format and no cfg-gated arms; it is API calls and arithmetic, and
+  # "works on x86_64" is a statement about all of it.
+  operator:
+    name: operator
+    needs: changes
+    if: needs.changes.outputs.operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Its own cache key and its own lock file. Sharing the engine's key
+          # would evict one tree's artifacts on every alternate run.
+          key: operator
+          workspaces: integrations/kubernetes
+      # fmt, clippy, the unit tests, and the CRD drift gate — the generated
+      # schema has to match the Rust types, because apiextensions silently
+      # prunes any field the schema does not name.
+      - run: make ci-operator
 
   ui:
     name: ui
@@ -363,7 +391,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [changes, rust, msrv, ui, coverage, supply-chain, drift, docs, e2e, release-dry-run, helm, meta]
+    needs: [changes, rust, msrv, operator, ui, coverage, supply-chain, drift, docs, e2e, release-dry-run, helm, meta]
     runs-on: ubuntu-latest
     steps:
       - name: Every leg green or deliberately skipped

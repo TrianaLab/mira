@@ -3160,12 +3160,13 @@ the state this design refuses.
   one retention period after any scale-out, with zero bytes moved. This is a real
   dividend of retention-bounded storage that an unbounded store cannot collect.
   Scaling *in* collects no such dividend: Kubernetes retains the removed
-  replica's PVC, but nothing reads it, so its blocks are re-homed by hand with
+  replica's PVC, but nothing reads it, so its blocks have to be re-homed with
   `mira offload push` and `mira offload restore` (section 6.1). No lifecycle
   hook does it for you, and that is a finding rather than a gap — a pod cannot
   tell a scale-in from a rolling restart, so a hook wired to `preStop` would
   evacuate every replica on the next image bump. Asking the API server which it
-  was is the membership read this principle refuses.
+  was is the membership read this principle refuses *inside Mira*; section 12.7
+  is what happens when something outside Mira asks instead.
 - **A replica's identity is its disk.** A StatefulSet with a PVC. On ephemeral
   disk, a rescheduled pod's unexpired data is gone.
 
@@ -3242,6 +3243,94 @@ filesystem, every path a writer creates is part of the coordination-free
 argument, not just the ones that survive the write.** Principle 4 buys freedom
 from coordination *state*; it does not buy freedom from thinking about
 concurrency.
+
+### 12.7 The coordinator lives outside the binary
+
+**Built**: `integrations/kubernetes`, a second Cargo workspace producing a
+second binary, `mira-operator`, and a `MiraCluster` CRD. It is the only chart
+Mira publishes; the one that installed a StatefulSet directly was removed with
+it, because two charts is two answers to "how do I run Mira on Kubernetes" and
+the one that cannot scale, cannot drain and cannot be told a ceiling is the
+wrong default.
+
+Everything above says a Mira tier is resized by hand. Section 12.4's scale-in
+paragraph is the reason: the sequencing a safe scale-in needs — drain first,
+then remove the volume — is not something a pod can decide about itself, and
+section 12.3 refuses to let it ask. That argument is correct and it is about
+*Mira*. It says nothing about whether something else may hold the decision.
+
+**Why not an HPA.** Mira has no metric that moves when it needs another replica.
+Section 11 measures 2.23 of twelve cores at 1,537,875 records/s, so a CPU-target
+HPA reads single-digit utilisation at saturation and a memory-target one reads
+page cache, which is the `mmap` working as designed. The quantity that runs out
+is **disk**, and an HPA has never been able to scale a StatefulSet on its own
+volumes filling. So the trigger is `free_fraction` from `/api/v1/stats` — the
+number section 9's `statfs` already computes — and something has to read it.
+
+**Why this does not violate principle 4.** The principle constrains Mira: no
+Raft, no membership, no external metadata store, the block directory is the
+manifest. A controller is not Mira, and the test of that is what happens when
+the controller is deleted. Every Mira pod keeps ingesting, keeps serving and
+keeps its blocks readable, because none of them ever asked it anything. Only the
+scaling stops. That is the line between a coordinator and coordination state,
+and it is the same delegation the engine already makes to the platform for pod
+identity and volume lifecycle, moved up one level — Kubernetes already knows the
+membership, and reading it from the API server is not a consensus protocol.
+
+**It owns the whole topology**, rather than autoscaling a StatefulSet somebody
+else installed. A controller that only writes `spec.replicas` on an object Helm
+owns loses the value on the next `helm upgrade`, which reasserts the count from
+the chart: the scale-out silently unwinds, and on the way down it unwinds
+*after* the drain has copied the blocks out. One writer for the field that
+matters.
+
+**The two thresholds are asymmetric on purpose.** Out when the *fullest* replica
+drops below `upWhenFreeBelow`; in when *every* replica is above
+`downWhenFreeAbove`. Not the mean either time — `route` sends a resource to
+`hash(resource) % n` (section 12.1) and resources are not the same size, so a
+mean of 0.4 across ten replicas is compatible with one at 0.02, and it is the
+one at 0.02 that stops accepting writes. A replica that is unreachable, or that
+answers `null` for `free_fraction` because it could not `statfs` its own volume,
+means *neither* decision: read as 0 it says scale out, read as 1 it says delete
+a volume. The two thresholds must also not meet, and a spec where they do is
+refused as `Degraded` rather than acted on — adjacent thresholds oscillate, and
+every cycle of that loop moves one replica's whole dataset through `offload
+push`.
+
+**A scale-in is section 12.4's manual procedure, sequenced.** `status.draining`
+is written *first*, so a controller that restarts mid-sequence resumes instead
+of orphaning a volume; the StatefulSet scales down and the pod goes while the
+claim stays; a Job runs `mira offload push` against the released claim — which
+is why the pod has to go first, since the claim is `ReadWriteOnce` and a Job
+cannot attach it while the pod holds it; and only on success is the claim
+deleted. A failed drain stops before that last step, phase `Degraded`, one
+replica smaller and every block still on disk. `spec.offload` is required before
+the tier will ever shrink, and unset it simply never does: the cost of not
+shrinking is a bill, the cost of shrinking without an archive is the data.
+
+It does **not** re-home the blocks afterwards. That is 12.4's "no rebalancing,
+ever" rather than an omission, and the same `ReadWriteOnce` constraint that
+forced the order above forbids the reverse — a restore has to mount a
+*surviving* replica's volume, which its running pod holds. Automating it would
+mean taking a healthy replica down in order to grow it.
+
+**ponytail:** there is no leader election, so `replicaCount` is bounded to
+exactly 1 by the chart's schema and the Deployment strategy is `Recreate`.
+kube-rs has never shipped one ([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485),
+open since 2021); two controllers would both reconcile every `MiraCluster` and
+both act on the same reading, moving two replicas for one decision. A moment
+with no controller is safe, because Mira keeps serving either way. The upgrade
+path is a `Lease`-based election, on the day a single-replica controller is the
+thing that hurts.
+
+The other ceiling is the CRD itself. `apiextensions` **prunes** a field the CRD
+does not declare rather than rejecting it, so a cluster holding a stale schema
+loses those fields silently, with no error anywhere. The CRD is therefore
+generated from the Rust types by `crdgen` and `make operator-crd-check` fails
+the build when the checked-in copy disagrees — and because Helm installs `crds/`
+once and never upgrades it, a chart upgrade that changes the schema needs the
+CRD applied by hand first. [Install](install.md#kubernetes) says so in the place
+someone will read it.
 
 ---
 

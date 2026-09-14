@@ -1,0 +1,531 @@
+//! The objects the operator owns, built from a `MiraCluster`.
+//!
+//! Written as `json!` literals deserialised into the k8s-openapi types rather
+//! than as struct initialisers. The structs are ~40 `Option` fields deep for a
+//! pod spec and the initialiser form buries the eight fields that matter under
+//! ~200 `..Default::default()` lines, which is how a chart-shaped object stops
+//! being reviewable against the chart it has to match.
+//!
+//! The cost of that choice is real and worth naming: k8s-openapi's types ignore
+//! unknown fields, so a typo'd key deserialises cleanly and vanishes. The
+//! `json!` blocks below are therefore paired with round-trip tests over exactly
+//! the fields whose loss would be silent in the cluster rather than loud —
+//! `volumeClaimTemplates`, the readiness probe, the data mount. A typo in one
+//! of those is a tier that comes up and then loses its blocks on restart.
+
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
+use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use kube::api::ObjectMeta;
+use kube::{Resource, ResourceExt};
+use serde_json::json;
+
+use crate::crd::MiraCluster;
+
+/// Ports, named once. The engine hardcodes them in the chart too.
+pub const GRPC: i32 = 4317;
+pub const HTTP: i32 = 4318;
+
+/// `app.kubernetes.io` labels, and the selector subset of them.
+///
+/// Split because a StatefulSet's `spec.selector` is immutable after creation.
+/// Putting the version in the selector — the mistake the full label set invites
+/// — makes the first image bump an un-upgradeable object that has to be deleted
+/// by hand, taking its PVCs' owner references with it.
+pub fn selector(c: &MiraCluster) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("app.kubernetes.io/name".into(), "mira".into()),
+        ("app.kubernetes.io/instance".into(), c.name_any()),
+    ])
+}
+
+fn labels(c: &MiraCluster, component: &str) -> BTreeMap<String, String> {
+    let mut l = selector(c);
+    l.insert("app.kubernetes.io/component".into(), component.into());
+    l.insert(
+        "app.kubernetes.io/managed-by".into(),
+        "mira-operator".into(),
+    );
+    l
+}
+
+fn proxy_selector(c: &MiraCluster) -> BTreeMap<String, String> {
+    let mut l = selector(c);
+    l.insert("app.kubernetes.io/component".into(), "proxy".into());
+    l
+}
+
+/// Owned-by metadata, so deleting the `MiraCluster` collects everything.
+///
+/// Every object below carries it. Without it, deleting a cluster leaves a
+/// StatefulSet running and a proxy serving from it, and the only trace of why
+/// is a name that happens to match.
+fn meta(c: &MiraCluster, name: String, component: &str) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name),
+        namespace: c.namespace(),
+        labels: Some(labels(c, component)),
+        owner_references: Some(vec![c.controller_owner_ref(&()).expect("cluster is named")]),
+        ..Default::default()
+    }
+}
+
+pub fn headless_name(c: &MiraCluster) -> String {
+    format!("{}-headless", c.name_any())
+}
+pub fn proxy_name(c: &MiraCluster) -> String {
+    format!("{}-proxy", c.name_any())
+}
+
+/// Stable DNS for one storage replica.
+///
+/// This is the address the proxy is given and the address the operator reads
+/// stats from. It is a *pod* DNS name off the headless Service rather than the
+/// Service itself, because both callers need to reach one specific replica —
+/// the whole point of the proxy is that it talks to each one in turn, and a
+/// load-balanced name would make "replica 3's free space" unanswerable.
+pub fn replica_host(c: &MiraCluster, ordinal: i32) -> String {
+    format!(
+        "{}-{}.{}.{}.svc",
+        c.name_any(),
+        ordinal,
+        headless_name(c),
+        c.namespace().unwrap_or_else(|| "default".into())
+    )
+}
+
+/// The storage node config, as the KYAML the engine parses.
+///
+/// `${env:POD_NAME}` and not the ordinal: the node name is hashed into the
+/// block directory name so replicas sharing a volume cannot collide, and it has
+/// to survive a reschedule. The downward API is the only thing that promises
+/// that — `HOSTNAME` is set by the container runtime, not by Kubernetes.
+fn node_config(c: &MiraCluster) -> String {
+    let offload = c
+        .spec
+        .offload
+        .as_ref()
+        .map(|o| format!("    \"offload\": {},\n", json!(o)))
+        .unwrap_or_default();
+    format!(
+        r#"{{
+  "node": "${{env:POD_NAME}}",
+  "listen": {{
+    "grpc": "0.0.0.0:{GRPC}",
+    "http": "0.0.0.0:{HTTP}",
+  }},
+  "storage": {{
+    "dir": "/data",
+{offload}  }},
+}}
+"#
+    )
+}
+
+pub fn config_map(c: &MiraCluster) -> ConfigMap {
+    ConfigMap {
+        metadata: meta(c, c.name_any(), "storage"),
+        data: Some(BTreeMap::from([("mira.yaml".into(), node_config(c))])),
+        ..Default::default()
+    }
+}
+
+/// The proxy's config: the replica list, and nothing else it could disagree
+/// with the storage nodes about.
+///
+/// Regenerated on every reconcile from the *current* replica count, which is
+/// what makes a scale event reach the proxy at all. The engine reads this list
+/// once at boot and `route`'s `% n` is computed against it, so the Deployment
+/// below hashes this config into a pod annotation — a replica count that
+/// changed without restarting the proxy is a proxy fanning out to a pod that no
+/// longer exists, or missing one that does.
+fn proxy_config(c: &MiraCluster, replicas: i32) -> String {
+    let list = (0..replicas)
+        .map(|i| format!("http://{}:{HTTP}", replica_host(c, i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"{{
+  "listen": {{
+    "http": "0.0.0.0:{HTTP}",
+  }},
+  "proxy": {{
+    "replicas": {},
+  }},
+}}
+"#,
+        json!(list)
+    )
+}
+
+pub fn proxy_config_map(c: &MiraCluster, replicas: i32) -> ConfigMap {
+    ConfigMap {
+        metadata: meta(c, proxy_name(c), "proxy"),
+        data: Some(BTreeMap::from([(
+            "mira.yaml".into(),
+            proxy_config(c, replicas),
+        )])),
+        ..Default::default()
+    }
+}
+
+/// A cheap, stable hash of the config, for the restart annotation.
+///
+/// Not a cryptographic digest and it does not need to be: the only requirement
+/// is that a changed replica list changes the string, so the Deployment's pod
+/// template changes and Kubernetes rolls it. Pulling in a sha2 crate to restart
+/// a pod would be a dependency bought with nothing.
+fn config_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+pub fn headless_service(c: &MiraCluster) -> Service {
+    serde_json::from_value(json!({
+        "metadata": meta(c, headless_name(c), "storage"),
+        "spec": {
+            "clusterIP": "None",
+            // So a pod gets DNS before it is Ready. The operator reads stats
+            // from these names, and a replica that is starting up is exactly
+            // the one whose name has to resolve so the read can fail honestly
+            // as Unreachable rather than as NXDOMAIN.
+            "publishNotReadyAddresses": true,
+            "selector": selector(c),
+            "ports": [
+                {"name": "otlp-grpc", "port": GRPC, "targetPort": GRPC, "protocol": "TCP"},
+                {"name": "otlp-http", "port": HTTP, "targetPort": HTTP, "protocol": "TCP"},
+            ],
+        },
+    }))
+    .expect("headless service is well-formed")
+}
+
+pub fn proxy_service(c: &MiraCluster) -> Service {
+    serde_json::from_value(json!({
+        "metadata": meta(c, proxy_name(c), "proxy"),
+        "spec": {
+            "type": "ClusterIP",
+            "selector": proxy_selector(c),
+            "ports": [
+                {"name": "otlp-http", "port": HTTP, "targetPort": HTTP, "protocol": "TCP"},
+            ],
+        },
+    }))
+    .expect("proxy service is well-formed")
+}
+
+pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
+    let mut pod_labels = selector(c);
+    pod_labels.insert("app.kubernetes.io/component".into(), "storage".into());
+
+    serde_json::from_value(json!({
+        "metadata": meta(c, c.name_any(), "storage"),
+        "spec": {
+            "replicas": replicas,
+            "serviceName": headless_name(c),
+            // Nothing joins, nothing votes and nothing waits for a peer, so
+            // ordered startup would only make an N-replica rollout N WAL
+            // replays long.
+            "podManagementPolicy": "Parallel",
+            "selector": {"matchLabels": selector(c)},
+            "template": {
+                "metadata": {
+                    "labels": pod_labels,
+                    "annotations": {"mira.miradb.dev/config": config_hash(&node_config(c))},
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "mira",
+                        "image": c.spec.image,
+                        "args": ["--config", "/etc/mira/mira.yaml"],
+                        "env": [{
+                            "name": "POD_NAME",
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                        }],
+                        "ports": [
+                            {"name": "otlp-grpc", "containerPort": GRPC},
+                            {"name": "otlp-http", "containerPort": HTTP},
+                        ],
+                        // `/readyz` and not `/health` for readiness: the engine
+                        // separates them, and the proxy must not be sent to a
+                        // replica that is still replaying its WAL.
+                        "readinessProbe": {
+                            "httpGet": {"path": "/readyz", "port": HTTP},
+                            "periodSeconds": 5,
+                        },
+                        "livenessProbe": {
+                            "httpGet": {"path": "/health", "port": HTTP},
+                            "periodSeconds": 10,
+                        },
+                        "volumeMounts": [
+                            {"name": "data", "mountPath": "/data"},
+                            {"name": "config", "mountPath": "/etc/mira"},
+                        ],
+                    }],
+                    "volumes": [{
+                        "name": "config",
+                        "configMap": {"name": c.name_any()},
+                    }],
+                },
+            },
+            // One RWO volume per replica. Mira mmaps its blocks and refuses to
+            // start on a network filesystem, which rules out the single shared
+            // RWX claim a Deployment would need — and ordinal identity is the
+            // honest model anyway, because nothing replicates and nothing
+            // rebalances, so replica 2's blocks are replica 2's.
+            "volumeClaimTemplates": [{
+                "metadata": {"name": "data"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": c.spec.storage.size}},
+                    "storageClassName": c.spec.storage.class_name,
+                },
+            }],
+        },
+    }))
+    .expect("statefulset is well-formed")
+}
+
+pub fn proxy_deployment(c: &MiraCluster, replicas: i32) -> Deployment {
+    let cfg = proxy_config(c, replicas);
+    serde_json::from_value(json!({
+        "metadata": meta(c, proxy_name(c), "proxy"),
+        "spec": {
+            "replicas": c.spec.proxy.replicas,
+            "selector": {"matchLabels": proxy_selector(c)},
+            "template": {
+                "metadata": {
+                    "labels": proxy_selector(c),
+                    // The line that makes a scale event reach the proxy. The
+                    // engine reads the replica list once at boot, so a rewritten
+                    // ConfigMap alone changes nothing until something restarts
+                    // the pods; this annotation is that something.
+                    "annotations": {"mira.miradb.dev/config": config_hash(&cfg)},
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "proxy",
+                        "image": c.spec.image,
+                        "args": ["proxy", "--config", "/etc/mira/mira.yaml"],
+                        "ports": [{"name": "otlp-http", "containerPort": HTTP}],
+                        "readinessProbe": {
+                            "httpGet": {"path": "/readyz", "port": HTTP},
+                            "periodSeconds": 5,
+                        },
+                        "volumeMounts": [{"name": "config", "mountPath": "/etc/mira"}],
+                    }],
+                    "volumes": [{
+                        "name": "config",
+                        "configMap": {"name": proxy_name(c)},
+                    }],
+                },
+            },
+        },
+    }))
+    .expect("proxy deployment is well-formed")
+}
+
+/// The Job that copies a replica's blocks out before its volume is deleted.
+///
+/// `mira offload push` and not a `preStop` hook, which is what the first design
+/// of this reached for and had to drop: a pod cannot tell a scale-in from a
+/// rolling restart, so a hook on `preStop` would evacuate every replica on the
+/// next image bump. A Job created by the controller happens exactly when the
+/// controller decided to shrink and at no other time.
+///
+/// It mounts the *existing* PVC by name. That is the whole trick — the StatefulSet
+/// has already been scaled down, the pod is gone, and the claim outlives it,
+/// which is the default `retentionPolicy` behaviour this relies on rather than
+/// fights.
+pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
+    let name = format!("{}-drain-{}", c.name_any(), ordinal);
+    serde_json::from_value(json!({
+        "metadata": meta(c, name, "drain"),
+        "spec": {
+            // A drain that fails is not retried into a different shape — it
+            // fails, the phase goes Degraded and the volume is still there.
+            // Retrying forever would hide a full archive behind a Job that
+            // looks busy.
+            "backoffLimit": 3,
+            "template": {
+                "metadata": {"labels": labels(c, "drain")},
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "drain",
+                        "image": c.spec.image,
+                        // `push` copies and unlinks nothing. The volume it runs
+                        // against is about to be deleted, so freeing space on
+                        // it buys nothing, and an emptied directory walks two
+                        // derived numbers backwards — see architecture.md 6.1.
+                        "args": [
+                            "offload", "push",
+                            "--data-dir", "/data",
+                            "--offload", offload,
+                        ],
+                        "env": [{"name": "POD_NAME", "value": format!("{}-{}", c.name_any(), ordinal)}],
+                        "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+                    }],
+                    "volumes": [{
+                        "name": "data",
+                        "persistentVolumeClaim": {
+                            "claimName": format!("data-{}-{}", c.name_any(), ordinal),
+                        },
+                    }],
+                },
+            },
+        },
+    }))
+    .expect("drain job is well-formed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crd::{MiraClusterSpec, Proxy, Scaling, Storage};
+    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+    fn cluster() -> MiraCluster {
+        let mut c = MiraCluster::new(
+            "tel",
+            MiraClusterSpec {
+                image: "ghcr.io/trianalab/mira:0.0.4".into(),
+                replicas: 1,
+                max_replicas: 10,
+                storage: Storage {
+                    size: Quantity("10Gi".into()),
+                    class_name: Some("fast".into()),
+                },
+                scaling: Scaling::default(),
+                offload: Some("file:///cold/${node}".into()),
+                proxy: Proxy::default(),
+            },
+        );
+        c.metadata.namespace = Some("obs".into());
+        c.metadata.uid = Some("uid-1".into());
+        c
+    }
+
+    /// The fields whose loss would be *silent*. `json!` into a type that
+    /// ignores unknown keys means a typo deserialises to `None` and the object
+    /// applies cleanly — a StatefulSet with no `volumeClaimTemplates` starts
+    /// fine and loses every block on the first reschedule.
+    #[test]
+    fn the_statefulset_keeps_the_fields_a_typo_would_drop() {
+        let s = stateful_set(&cluster(), 3);
+        let spec = s.spec.expect("spec");
+        assert_eq!(spec.replicas, Some(3));
+        assert_eq!(spec.service_name.as_deref(), Some("tel-headless"));
+
+        let vct = spec.volume_claim_templates.expect("volumeClaimTemplates");
+        assert_eq!(vct.len(), 1);
+        let claim = vct[0].spec.as_ref().expect("claim spec");
+        assert_eq!(
+            claim.access_modes.as_deref(),
+            Some(&["ReadWriteOnce".to_string()][..])
+        );
+        assert_eq!(claim.storage_class_name.as_deref(), Some("fast"));
+
+        let pod = spec.template.spec.expect("pod spec");
+        let ctr = &pod.containers[0];
+        assert_eq!(ctr.image.as_deref(), Some("ghcr.io/trianalab/mira:0.0.4"));
+        // The mount, and the probe that decides whether the proxy is sent here.
+        let mounts = ctr.volume_mounts.as_ref().expect("mounts");
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.mount_path == "/data" && m.name == "data")
+        );
+        let probe = ctr.readiness_probe.as_ref().expect("readinessProbe");
+        assert_eq!(
+            probe.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/readyz")
+        );
+    }
+
+    /// Every object the operator creates has to be garbage-collected with the
+    /// cluster, or deleting a `MiraCluster` leaves a proxy serving traffic.
+    #[test]
+    fn every_object_is_owned_by_the_cluster() {
+        let c = cluster();
+        let owners = [
+            stateful_set(&c, 1).metadata.owner_references,
+            proxy_deployment(&c, 1).metadata.owner_references,
+            headless_service(&c).metadata.owner_references,
+            proxy_service(&c).metadata.owner_references,
+            config_map(&c).metadata.owner_references,
+            proxy_config_map(&c, 1).metadata.owner_references,
+            drain_job(&c, 2, "file:///cold").metadata.owner_references,
+        ];
+        for o in owners {
+            let o = o.expect("ownerReferences");
+            assert_eq!(o[0].uid, "uid-1");
+            assert_eq!(o[0].controller, Some(true));
+        }
+    }
+
+    /// The selector must not carry anything that changes on an upgrade. A
+    /// StatefulSet's `spec.selector` is immutable, so a version label in it
+    /// makes the first image bump require deleting the object by hand.
+    #[test]
+    fn the_selector_is_immutable_across_an_image_bump() {
+        let mut a = cluster();
+        let before = selector(&a);
+        a.spec.image = "ghcr.io/trianalab/mira:9.9.9".into();
+        assert_eq!(before, selector(&a));
+        assert!(!before.contains_key("app.kubernetes.io/version"));
+    }
+
+    /// The replica list is what a scale event actually changes, and the proxy
+    /// reads it once at boot — so the pod annotation has to move with it or the
+    /// scale never reaches the read tier.
+    #[test]
+    fn growing_the_tier_rewrites_the_proxy_list_and_rolls_it() {
+        let c = cluster();
+        let (two, three) = (proxy_config(&c, 2), proxy_config(&c, 3));
+        assert!(two.contains("tel-0.tel-headless.obs.svc") && two.contains("tel-1."));
+        assert!(!two.contains("tel-2."), "a two-replica list named a third");
+        assert!(three.contains("tel-2."));
+
+        let roll = |n| {
+            proxy_deployment(&c, n)
+                .spec
+                .unwrap()
+                .template
+                .metadata
+                .unwrap()
+                .annotations
+                .unwrap()["mira.miradb.dev/config"]
+                .clone()
+        };
+        assert_ne!(roll(2), roll(3), "the proxy would not restart on a scale");
+    }
+
+    /// The drain has to mount the volume of the replica being removed. An
+    /// off-by-one here archives the wrong replica and then deletes the one that
+    /// was never copied.
+    #[test]
+    fn the_drain_job_mounts_the_departing_replicas_claim() {
+        let j = drain_job(&cluster(), 4, "file:///cold/${node}");
+        let pod = j.spec.unwrap().template.spec.unwrap();
+        let claim = pod.volumes.unwrap()[0]
+            .persistent_volume_claim
+            .as_ref()
+            .unwrap()
+            .claim_name
+            .clone();
+        assert_eq!(claim, "data-tel-4");
+
+        let args = pod.containers[0].args.clone().unwrap();
+        assert!(args.contains(&"push".to_string()), "{args:?}");
+        // The verb that must never appear here: `push` copies, and the volume
+        // is about to go, so nothing is gained by freeing space on it.
+        assert!(!args.iter().any(|a| a.contains("restore")), "{args:?}");
+    }
+}

@@ -129,6 +129,14 @@ ci-release-dry-run: dist publish-dry ## The `release-dry-run` leg
 .PHONY: ci-helm
 ci-helm: chart ## The `helm` leg
 
+# Its own leg rather than part of `ci-rust`, because it is its own workspace:
+# `--workspace` in the root manifest cannot reach it, the cache key is a
+# different Cargo.lock, and a diff that touches only the engine has no reason to
+# compile 160 crates of kube-rs. The path filter in scripts/ci-changes.sh is
+# what makes that true in practice.
+.PHONY: ci-operator
+ci-operator: operator ## The `operator` leg
+
 # Not part of `ci`, and the only target in either file that *writes* to the
 # repository. It is here rather than in the Makefile because it is not a gate:
 # nothing about it is reproducible on a laptop, and running it by accident
@@ -151,7 +159,7 @@ ci-tag: ## Tag a merged version bump, so merging is the whole release
 # honest answer: they are the legs a laptop cannot reproduce, and knowing which
 # ones those are is worth more than an aggregate that quietly skips them.
 .PHONY: ci
-ci: ci-meta ci-rust ci-ui ci-supply-chain ci-docs ci-helm ci-coverage ci-drift ci-msrv ci-release-dry-run ci-image ci-e2e ## Every leg a pull request runs, on this host
+ci: ci-meta ci-rust ci-ui ci-supply-chain ci-docs ci-operator ci-helm ci-coverage ci-drift ci-msrv ci-release-dry-run ci-image ci-e2e ## Every leg a pull request runs, on this host
 	@echo
 	@echo "every CI leg passed."
 

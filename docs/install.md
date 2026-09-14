@@ -161,25 +161,60 @@ Neither touches the block directory, so a slow disk does not fail a probe.
 
 ## Kubernetes
 
-The chart is [`charts/mira`](reference/chart.md) in the repository, published to
-the same registry as the image, as an OCI artifact:
+There is one chart, [`charts/mira-operator`](reference/chart.md), and it installs
+a **controller** rather than Mira. Published to the same registry as the image,
+as an OCI artifact:
 
 ```sh
-helm install mira oci://ghcr.io/trianalab/charts/mira \
-  --version 0.0.4 --namespace observability --create-namespace
+helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
+  --version 0.1.0 --namespace mira-system --create-namespace
 ```
 
-That is a StatefulSet of one, a PVC, a ServiceAccount, and two Services — a
-ClusterIP one carrying both ports and the StatefulSet's governing headless one,
-which publishes not-ready addresses so a pod whose volume has filled is still
-reachable by name, which is when someone needs it. No
-operator, no sidecar, no CRDs and nothing to elect: Mira holds no coordination
-state, so the chart has nothing to coordinate. Configuration is the same KYAML
-document as everywhere else, rendered into a ConfigMap — the `config.*` values
-are [Configuration](config.md)'s keys, camelCased per Helm convention
-(`ingest.max_request_bytes` is `config.ingest.maxRequestBytes`), and how much
-CPU, memory and disk to give it is [that page's sizing
-table](config.md#sizing), every row anchored to a measured point.
+That is a Deployment of exactly one, a ServiceAccount, a ClusterRole with no
+wildcards, and the `MiraCluster` CRD. It is not the thing that stores anything.
+The tier comes next, and it is a document:
+
+```yaml
+apiVersion: mira.miradb.dev/v1alpha1
+kind: MiraCluster
+metadata:
+  name: telemetry
+  namespace: observability
+spec:
+  image: ghcr.io/trianalab/mira:0.0.4
+  replicas: 1          # floor
+  maxReplicas: 5       # ceiling; there is no "unbounded"
+  storage: { size: 50Gi, className: gp3 }
+  offload: "file:///cold/${node}"
+  proxy: { replicas: 2 }
+```
+
+`kubectl apply` that and the operator builds what the old chart made you size by
+hand — a StatefulSet, a PVC per replica, the governing headless Service which
+publishes not-ready addresses so a pod whose volume has filled is still
+reachable by name, and a `mira proxy` Deployment with a ClusterIP Service in
+front of it. The ConfigMap each of them mounts is the same KYAML document as
+everywhere else, but the operator writes it rather than you: the node's is
+`node`, `listen`, `storage.dir` and `storage.offload`, and the proxy's is the
+replica list, regenerated on every reconcile so a scale event reaches the proxy
+at all. How much CPU, memory and disk to give a replica is [Configuration's
+sizing table](config.md#sizing), every row anchored to a measured point.
+
+!!! note "A chart that installed a StatefulSet used to exist"
+
+    It was removed rather than kept beside this one. Two charts is two answers
+    to "how do I run Mira on Kubernetes", and the one that cannot scale, cannot
+    drain and cannot be told a ceiling is the wrong answer to ship as the
+    default. Three things it could do have **no `MiraCluster` equivalent yet**:
+    an Ingress, a ServiceAccount per tier, and arbitrary `config.*` keys. Write
+    the Ingress yourself against the proxy Service; the tier's pods run as
+    `default`, and the config is whatever the operator generates, until the CRD
+    grows fields for them.
+
+The controller does not make Mira stateful. Principle 4 says *Mira* holds no
+coordination state, and the test is what happens when you delete the operator's
+Deployment: every Mira pod keeps ingesting, keeps serving and keeps its blocks
+readable, because none of them ever asked it anything. Only the scaling stops.
 
 The chart is signed, but not the same way the binaries are — it carries a cosign
 signature over its digest and no SLSA provenance, where the tarballs carry
@@ -192,21 +227,29 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira:0.0.4
+  ghcr.io/trianalab/charts/mira-operator:0.1.0
 ```
 
-The [chart reference](reference/chart.md) has every value, why it defaults where
-it does, and the argument for a StatefulSet.
-It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira),
+The [chart reference](reference/chart.md) has every value, how a scale-in is
+sequenced, and why there is no leader election.
+It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira-operator),
 which renders that README, the signature above and the image's current CVE
-report against the same coordinate. Every value the chart itself owns — all of
-`config.*`, `image`, `service`, `ingress`, `persistence`, `serviceAccount` — is
-covered by a `values.schema.json` that is closed at each of those levels, so
-`helm install` rejects a typo'd key before the cluster sees it, the same rule
-Mira's own config file follows. The Kubernetes pass-throughs
-(`resources`, `securityContext`, `podSecurityContext`, `nodeSelector`,
-`tolerations`, `affinity`, `extraEnv`) stay open on purpose: the API server owns
-those schemas, and a copy here would go stale against it.
+report against the same coordinate. Every value the chart itself owns — `image`,
+`rbac`, `serviceAccount`, `replicaCount`, `logLevel` — is covered by a
+`values.schema.json` that is closed at each of those levels, so `helm install`
+rejects a typo'd key before the cluster sees it, the same rule Mira's own config
+file follows. The Kubernetes pass-throughs (`resources`, `securityContext`,
+`podSecurityContext`, `nodeSelector`, `tolerations`, `affinity`) stay open on
+purpose: the API server owns those schemas, and a copy here would go stale
+against it.
+
+The `MiraCluster` fields get the same treatment one level up, and there the
+stakes are higher: the API server **prunes** a field the CRD does not name
+rather than rejecting it, so a stale CRD is silent data loss with no error. That
+is why the CRD is generated from the Rust types and `make operator-crd-check`
+fails the build when the two disagree — and why a chart upgrade that changes the
+schema needs the CRD applied by hand first, since Helm installs `crds/` once and
+never upgrades it.
 
 ## Where it will refuse to start
 
@@ -216,10 +259,12 @@ names the filesystem it found and says what to point `--data-dir` at instead.
 FUSE is a warning rather than a refusal, because the magic number cannot tell
 `gcsfuse` from a local one.
 
-That rules out an RWX PVC on Kubernetes — which is why the chart's
-`persistence.accessMode` offers only the two ReadWriteOnce modes, and why its
-`persistence.storageClass` should name a block-backed class.
-[Configuration](config.md) has the topology that works instead.
+That rules out an RWX PVC on Kubernetes — which is why the operator's volume
+claim template is hard-coded to `ReadWriteOnce` with no field to change it, and
+why `spec.storage.className` should name a block-backed class.
+[Configuration](config.md) has the topology that works instead. The same
+constraint is what forces the order of a scale-in: the drain Job cannot attach
+the claim until the pod holding it is gone.
 
 ## Check it runs
 

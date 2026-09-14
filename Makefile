@@ -509,9 +509,9 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 	@# that just went green, which is how a bump ends up taking three pushes.
 	@test -n "$(TO)" || { \
 		echo "usage: make bump TO=X.Y.Z" >&2; \
-		echo "  writes Cargo.toml, Chart.yaml, the chart test, README.md," >&2; \
-		echo "  SECURITY.md, docs/install.md, the issue template, CHANGELOG.md" >&2; \
-		echo "  then regenerates Cargo.lock and charts/mira/README.md" >&2; \
+		echo "  writes Cargo.toml, README.md, SECURITY.md, docs/install.md," >&2; \
+		echo "  the issue template, CHANGELOG.md and the MiraCluster examples," >&2; \
+		echo "  then regenerates Cargo.lock and the operator chart's README" >&2; \
 		exit 1; }
 	$(XTASK) drift --bump $(TO)
 	$(CARGO) update --workspace --quiet
@@ -588,6 +588,62 @@ msrv: ## Compile with exactly the declared MSRV ($(MSRV))
 	$(CARGO) +$(MSRV) check --workspace --all-targets --locked
 
 # ---------------------------------------------------------------------------
+# The operator
+# ---------------------------------------------------------------------------
+#
+# `integrations/kubernetes/` is a second Cargo workspace, and everything in this
+# section exists because of that one fact. It is not a member of the root one,
+# so `--workspace` above never sees it and none of the gates above apply to it.
+#
+# That is the point rather than a gap. The operator needs kube-rs, which is 160
+# crates against the engine's 120, wants a newer MSRV than the engine declares,
+# and brings duplicate versions and licences that `deny.toml` refuses. Inside
+# the root workspace it would move the crate count the README publishes, break
+# `make msrv`, fail `cargo deny`, and dilute a coverage ratchet with no margin.
+# Outside it, the engine's numbers stay statements about the engine — which is
+# the same reason pacto keeps its Kubernetes integration behind a second
+# `go.mod`.
+#
+# What it costs is this section: the gates the operator does get have to be
+# written out a second time, pointed at the other manifest.
+
+OPERATOR := integrations/kubernetes
+
+.PHONY: operator-fmt
+operator-fmt: ## Format the operator's sources in place
+	$(CARGO) fmt --manifest-path $(OPERATOR)/Cargo.toml --all
+
+.PHONY: operator-fmt-check
+operator-fmt-check: ## Fail if the operator is unformatted
+	$(CARGO) fmt --manifest-path $(OPERATOR)/Cargo.toml --all --check
+
+.PHONY: operator-lint
+operator-lint: ## Clippy over the operator, warnings are errors
+	$(CARGO) clippy --manifest-path $(OPERATOR)/Cargo.toml --all-targets --locked -- -D warnings
+
+.PHONY: operator-test
+operator-test: ## The operator's unit tests
+	$(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml --locked
+
+.PHONY: operator-crd
+operator-crd: ## Regenerate the CRD the chart ships from the Rust types
+	$(CARGO) run --quiet --manifest-path $(OPERATOR)/Cargo.toml --locked --bin crdgen \
+	  > $(CHART)/crds/miraclusters.yaml
+
+.PHONY: operator-crd-check
+operator-crd-check: operator-crd ## Fail if the committed CRD is stale
+	@# The CRD is generated from `#[derive(CustomResource)]`, so a field added to
+	@# the Rust struct and not regenerated here is a field the API server
+	@# *rejects* — apiextensions prunes anything the schema does not name, so the
+	@# value silently disappears between `kubectl apply` and the reconciler
+	@# reading it. That failure has no error message anywhere, which is why it is
+	@# a drift gate rather than a note in a README.
+	git diff --exit-code -- $(CHART)/crds/miraclusters.yaml
+
+.PHONY: operator
+operator: operator-fmt-check operator-lint operator-test operator-crd-check ## Every operator gate
+
+# ---------------------------------------------------------------------------
 # Documentation site
 # ---------------------------------------------------------------------------
 
@@ -659,10 +715,19 @@ site: docs doc ui-demo ## The published site: the docs, rustdoc at /api, the UI 
 # The Helm chart
 # ---------------------------------------------------------------------------
 #
-# One chart, one workload, and the same rule as everywhere else here: CI calls
-# these targets and adds nothing of its own.
+# One chart, and it installs the operator. There used to be a second one that
+# installed a StatefulSet directly, and it was removed rather than kept beside
+# this: two charts is two answers to "how do I run Mira on Kubernetes", and the
+# one that cannot scale, cannot drain and cannot be told a ceiling is the wrong
+# answer to ship as the default. A tier is a `MiraCluster` now.
+#
+# `CHART` stays a variable rather than being inlined, because the gates below
+# differ in what they can iterate: lint, the unit suites and the schema parse
+# are shape-independent, but `helm template`'s permutations are a specific
+# chart's own values — and `--set` on a key a chart does not define is silently
+# accepted, so a shared flag list would render happily while testing nothing.
 
-CHART := charts/mira
+CHART := charts/mira-operator
 
 # The plugin is pinned because an unpinned test runner is a test suite that
 # changes meaning on someone else's machine.
@@ -683,19 +748,14 @@ helm-template: ## Render the chart across the permutations that change its shape
 	$(call need_bin,helm,brew install helm   (see https://helm.sh/docs/intro/install/))
 	@# Not golden files — helm-unittest below asserts the *claims*, and a golden
 	@# file asserts whitespace. This gate answers the other question: does every
-	@# combination that adds or removes a resource still render at all? Each
-	@# line below is one axis: no PVC, a named class, an Ingress, no account,
-	@# several replicas, the durability switch, self-telemetry, and the rules.
-	helm template mira $(CHART) --debug >/dev/null
-	helm template mira $(CHART) --set persistence.enabled=false >/dev/null
-	helm template mira $(CHART) --set persistence.storageClass=gp3 --set persistence.size=100Gi >/dev/null
-	helm template mira $(CHART) --set ingress.enabled=true >/dev/null
-	helm template mira $(CHART) --set serviceAccount.create=false >/dev/null
-	helm template mira $(CHART) --set replicaCount=3 --set service.type=LoadBalancer >/dev/null
-	helm template mira $(CHART) --set config.ingest.wal=false --set config.storage.retention=720h >/dev/null
-	helm template mira $(CHART) --set config.telemetry.self=true --set config.ingest.queue=1024 >/dev/null
-	helm template mira $(CHART) --values $(CHART)/ci/alerting-values.yaml >/dev/null
-	helm template mira $(CHART) --values $(CHART)/ci/ephemeral-values.yaml >/dev/null
+	@# combination that adds or removes a resource still render at all? The
+	@# axes: the default cluster-wide install, the scoped one where the
+	@# ClusterRole becomes a Role per namespace, and the two opt-outs that leave
+	@# the controller with no permissions and no account of its own.
+	helm template mira-operator $(CHART) --debug >/dev/null
+	helm template mira-operator $(CHART) --set 'rbac.namespaces={alpha,beta}' >/dev/null
+	helm template mira-operator $(CHART) --set rbac.create=false >/dev/null
+	helm template mira-operator $(CHART) --set serviceAccount.create=false --set serviceAccount.name=existing >/dev/null
 
 .PHONY: helm-unittest
 helm-unittest: ## The chart's own test suites
@@ -709,21 +769,26 @@ helm-unittest: ## The chart's own test suites
 .PHONY: helm-schema
 helm-schema: ## values.schema.json parses, admits the defaults, and refuses a typo
 	$(call need_bin,helm,brew install helm   (see https://helm.sh/docs/intro/install/))
-	$(XTASK) parse-json $(CHART)/values.schema.json
+	@$(XTASK) parse-json $(CHART)/values.schema.json
 	@# Helm validates values against the schema on every template and install,
 	@# so `helm-template` above already proves the shipped defaults satisfy it.
 	@# What that cannot prove is that the schema *refuses* anything: a schema
 	@# with a typo'd key name, or one helm never loaded, passes that test
-	@# perfectly. So assert the refusals — a closed object, an enum, a minimum,
-	@# an access mode Mira cannot use, and one of Mira's own value grammars.
-	@for bad in persistenc.enabled=true \
-	            service.type=Bogus \
+	@# perfectly. So assert the refusals — a bound, an enum, an empty list, an
+	@# empty string, and a plain typo in a key name.
+	@#
+	@# `replicaCount=2` is the one that matters: there is no leader election in
+	@# the tree, so a second controller is a second independent scaling decision
+	@# on the same tier. The schema is what stops it, and this is what proves
+	@# the schema is loaded at all.
+	@for bad in replicaCount=2 \
 	            replicaCount=0 \
-	            persistence.accessMode=ReadWriteMany \
-	            config.storage.retention=1week \
-	            config.ingest.queue=0; do \
-		if helm template mira $(CHART) --set "$$bad" >/dev/null 2>&1; then \
-			echo "error: values.schema.json accepted --set $$bad."; \
+	            image.pullPolicy=Sometimes \
+	            rbac.namespaces={} \
+	            logLevel= \
+	            rbac.craete=true; do \
+		if helm template mira-operator $(CHART) --set "$$bad" >/dev/null 2>&1; then \
+			echo "error: $(CHART)/values.schema.json accepted --set $$bad."; \
 			echo "  the schema is the only thing between a typo'd value and a"; \
 			echo "  cluster that installs happily with the default instead."; \
 			exit 1; \
@@ -750,7 +815,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 

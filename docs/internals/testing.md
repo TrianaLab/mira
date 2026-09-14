@@ -5,9 +5,11 @@ whether a PR has enough of them. For *reproducing the published numbers* against
 a live binary, see [End-to-end testing](e2e.md) — that page is a transcript, this
 one is the map.
 
-Mira has 354 cargo tests — 337 across the eight levels below, plus 17 in
-`xtask` that test the gates rather than the engine — 22 UI tests and 36 chart
-tests, and every one of them runs from a `make` target that CI also calls. There is no CI-only test step. If
+Mira has 385 cargo tests — 359 across the eight levels below, plus 26 in
+`xtask` that test the gates rather than the engine — 22 UI tests and 20 chart
+tests, with 18 more cargo tests in the operator's
+[second workspace](#the-operator-in-a-workspace-of-its-own). Every one of them
+runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
 second toolchain, a Docker daemon, a Trivy database, minutes rather than
@@ -22,13 +24,13 @@ the least agreement in the industry, so it does not appear here.
 
 | # | Level | Count | Lives in | Runs from |
 |---|---|---|---|---|
-| 1 | Unit, in-source | 138 core + 162 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 139 core + 180 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
-| 3 | In-process end-to-end | 34 | `crates/mira/src/e2e.rs` | `make test` |
-| 4 | Subprocess CLI | 2 | `crates/mira/tests/cli.rs` | `make test` |
+| 3 | In-process end-to-end | 36 | `crates/mira/src/e2e.rs` | `make test` |
+| 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
-| 7 | Chart rendering | 36 in 5 suites | `charts/mira/tests/*_test.yaml` | `make helm-unittest` |
+| 7 | Chart rendering | 20 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
 | 8 | Live, over real sockets | asserted, not counted | `docs/e2e/compose.yaml` | `make e2e` |
 
 Levels 1–5 are one `cargo test --workspace`. That is deliberate: the loop a
@@ -99,9 +101,13 @@ test can be.
 `main`, `run`, `load` and `shutdown` are reachable only by exec'ing the binary:
 a unit test inside the bin crate never calls its own `main`, `-h` and `-V` end
 the process rather than returning a value, and a signal handler needs a process
-to signal. Two tests, argv in and exit code out, with a SIGTERM in the middle.
-Coverage still counts them — the child inherits `LLVM_PROFILE_FILE` and writes a
-profraw that gets merged.
+to signal. Three tests, argv in and exit code out, with a SIGTERM in the middle.
+The third is here for the same reason: `mira proxy` and `mira run` are two modes
+of one binary that must refuse each other's flags, and it then puts a real proxy
+in front of a real node — two processes, which is the one thing level 3's
+`oneshot` harness cannot be. Coverage still
+counts them — the child inherits `LLVM_PROFILE_FILE` and writes a profraw that
+gets merged.
 
 ### 5. The generator's own invariants
 
@@ -125,16 +131,35 @@ binary and a fix that is not in `dist` is a fix nobody gets.
 
 ### 7. The chart, rendered
 
-`helm-unittest` over five suites, one per template. It asserts the rendering
-decisions that are cheap to break and invisible until something is deployed:
-that the image tag defaults to the chart's `appVersion`, that the headless
-Service stays on the container ports however the public Service's move, that a
-config change rolls the pods, that SIGTERM gets long enough to seal the open
-blocks, and that alert rules are refused on more than one replica. Four
-more chart gates sit beside it — `helm-lint`, `helm-template` across the
-permutations that change the chart's shape, `helm-schema` (the defaults are
-admitted and a typo is refused), and `helm-docs-check`. `make chart` is all
-five.
+`helm-unittest` over two suites, and there is only one chart to run them
+against: `charts/mira-operator`. The chart that installed a StatefulSet
+directly was removed — a tier is a `MiraCluster` now — and with it went five
+suites and 36 tests, which is why the count in this page's opening line went
+*down* in the release that added an operator. What the two that remain assert
+are the rendering decisions that are cheap to break and invisible until
+something is deployed: that the image tag defaults to the chart's `appVersion`,
+that `replicaCount` cannot be raised past one, that `rbac.namespaces` turns one
+`ClusterRole` into a `Role` per namespace, and that the rule list is exactly the
+rule list. Four more chart gates sit beside it — `helm-lint`, `helm-template`
+across the permutations that change the chart's shape, `helm-schema` (the
+defaults are admitted and six bad values are refused), and `helm-docs-check`.
+`make chart` is all five.
+
+The `rbac` suite is the one worth copying, because the first version of it was
+**vacuous**. It asserted the absence of a wildcard with `notMatchRegexRaw`,
+which reads the rendered document as text — and a mutation that injected
+`verbs: ["*"]` into `templates/rbac.yaml` passed all thirteen tests.
+A permissions test that cannot fail on over-permission is worse than none: it is
+a green check beside a `cluster-admin`. It now ends in `matchSnapshot: path:
+rules`, so the assertion is the whole rule list rather than a pattern somebody
+guessed, and the same mutation fails it. If you add a template with a security
+property, mutate the template and watch the suite go red before you believe it.
+
+The way to check any assertion here is to break the thing it claims to protect.
+helm-unittest 1.0.3 in particular will accept assertions it does not implement:
+an assertion-level `documentIndex` is silently ignored (it has to be at test
+level), and `containsDocument` requires *every* document to match rather than
+any. Both fail open.
 
 ### 8. Live, over real sockets
 
@@ -144,6 +169,46 @@ with a network, a container runtime and someone else's binary in it, which is
 exactly why it is the last one and why it does not run on every PR — see
 [End-to-end testing](e2e.md) for the manual version, with `loadgen`,
 `telemetrygen` and the numbers.
+
+## The operator, in a workspace of its own
+
+`integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
+so `cargo test --workspace` in the root cannot reach it and `make test` does not
+try. `make operator` is its whole gate — fmt, clippy, 18 tests and the CRD drift
+check — and `ci-operator` is its own CI leg, skipped entirely by
+`scripts/ci-changes.sh` on a diff that does not touch it.
+
+The separation is not about testing. kube-rs declares Rust 1.89 against the
+engine's 1.85 floor, brings ~160 crates and a TLS stack through a `deny.toml`
+that sets `multiple-versions = "deny"`, and the README's crate count is a
+published product property. A nested workspace keeps all of that pinned to the
+engine while this tree resolves whatever the Kubernetes API needs;
+`integrations/kubernetes/Cargo.toml` opens with the argument.
+
+Its 18 tests are level 1 in shape — in-source, private state — and they are
+almost all about **arithmetic that decides to delete a volume**. A controller's
+own behaviour needs an API server, so a test of `reconcile` would be level 8 in
+cost for level 1 in value; the design instead keeps every decision in a pure
+function and tests that. `stats::decide` takes a slice of readings and returns
+`Up`/`Down`/`Hold`, so "one full replica outvotes nine empty ones" and "an
+unreachable replica stops every decision" are unit tests rather than a cluster.
+`resources::*` build the objects and the tests assert the fields a typo drops
+silently — the owner reference, the immutable selector, the claim the drain Job
+mounts. `crd::*` assert the validations that refuse a spec whose thresholds
+would oscillate.
+
+`main.rs` reaches the modules through the library rather than re-declaring them
+with `mod`. A bin that redeclares a `[lib]`'s modules compiles the crate twice
+and runs every test twice under two target names, which is also how you end up
+reporting 36.
+
+**`operator-crd-check` is the gate that matters most here** and it is not a
+test. `make operator-crd` regenerates `charts/mira-operator/crds/miraclusters.yaml`
+from the Rust types and `git diff --exit-code`s it, because the API server
+*prunes* any field its stored schema does not name. A struct field added without
+regenerating does not error — the value is silently dropped on the way in, and
+the controller reads the default. That is the one failure mode in this tree with
+no symptom.
 
 ## Gates that test the repository, not the code
 
@@ -164,11 +229,13 @@ tests do. Each exists because something got through.
 | `drift` | The README's crate count or binary size no longer matching the tree that builds |
 | `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
 | `install-script` | The published one-liner no longer parsing, linting or running |
+| `operator-crd-check` | A `MiraCluster` field the shipped CRD does not name, which the API server would prune rather than reject |
 | `docs` | A dead link, a dead anchor, a page outside the nav, or a route with a capital letter in it |
 
 Listed in `make check`'s own order, which is the order they fail fastest. It
 runs `test`, `chart` and `coverage` alongside these — the levels above and the
-ratchet below — and leaves out the four `make ci` picks up: `msrv` refuses a
+ratchet below — plus `operator`, which is that row and the second workspace's
+own fmt, clippy and tests. It leaves out the four `make ci` picks up: `msrv` refuses a
 construct newer than the declared minimum Rust, `scan-image` a fixable HIGH or
 CRITICAL in the release image, `dist` a Linux binary that will not start on the
 glibc the README promises (through `glibc-floor`), and `e2e` is level 8.
@@ -213,7 +280,11 @@ is not — so `make ci` runs the whole pipeline on one host and a red leg is
 reproducible with one command.
 
 `ci.yml` computes a `changes` matrix first and every job is conditional on it,
-so a docs-only PR does not build the workspace. Two aggregate jobs — `required`
+so a docs-only PR does not build the workspace, and an engine-only PR does not
+compile 160 crates of kube-rs for the `operator` leg. `scripts/ci-changes.sh`
+holds those filters and **fails open**: an unusable base ref runs every leg,
+because a filter that guesses wrong in that direction costs runner minutes and
+one that guesses wrong in the other ships the bug. Two aggregate jobs — `required`
 and `security-required` — sit downstream of everything and are the contexts the
 branch ruleset requires; `xtask ci` enforces that no job can escape their
 `needs` closure, which is how a silently-skipped gate is caught statically at
@@ -246,3 +317,7 @@ Work down; stop at the first level that can fail for the reason you care about.
 A bug fix arrives with the test that would have caught it, at the level where it
 would have caught it. A fix at level 3 for a bug that a level 1 assertion would
 have caught is a test that will not be maintained.
+
+Changing the operator is a different tree and a different question: there is no
+level 3 there, so the answer is "make the decision a pure function and test that"
+— see [above](#the-operator-in-a-workspace-of-its-own).

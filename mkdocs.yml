@@ -167,9 +167,11 @@ nav:
   - Reference:
       - CLI: reference/cli.md
       - HTTP API: reference/http.md
-      # A symlink to charts/mira/README.md, which helm-docs generates and
-      # `helm-docs-check` diffs — so the values table on the site is the one the
-      # chart ships, not a second copy of it that goes stale.
+      # A symlink to charts/mira-operator/README.md, which helm-docs generates
+      # and `helm-docs-check` diffs — so the values table on the site is the one
+      # the chart ships, not a second copy of it that goes stale. The path stays
+      # `reference/chart.md` after the engine chart was removed, because
+      # miradb.dev/reference/chart/ is linked from the README and elsewhere.
       - Helm chart: reference/chart.md
       - Rust API: https://miradb.dev/api/
   - Understand:

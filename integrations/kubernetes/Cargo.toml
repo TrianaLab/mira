@@ -1,0 +1,58 @@
+# The operator is its own workspace, not a member of the root one, and the
+# reason is the root's gates rather than taste. `make msrv` runs
+# `cargo +1.85 check --workspace`; kube-rs declares 1.89. `deny.toml` sets
+# `multiple-versions = "deny"` and a licence allow-list that is "exactly what
+# the tree contains today"; the Kubernetes client tree is ~200 crates with a
+# TLS stack and would rewrite both. The coverage ratchet is at 99.23 with no
+# margin, and the crate count in the README is a published product property.
+#
+# None of those are things the operator should be allowed to move, because the
+# operator is not Mira — it is the coordinator that lets Mira stay stateless
+# (principle 4). A nested workspace keeps every one of them pinned to the
+# engine while this tree resolves whatever the Kubernetes API needs. It is the
+# same split pacto makes with a second `go.mod` under `integrations/`.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "mira-operator"
+version = "0.0.0"
+edition = "2024"
+# kube 4.x floor. Deliberately not the engine's 1.85: a user compiling Mira is
+# not compiling this.
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/trianalab/mira"
+publish = false
+
+[lib]
+name = "mira_operator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mira-operator"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/crdgen.rs"
+
+[dependencies]
+futures = "0.3.34"
+http-body-util = "0.1.5"
+# No direct `hyper`. `stats.rs` talks to it only through `hyper-util`'s legacy
+# client, and `client-legacy` already turns on the `hyper/client` and
+# `hyper/http1` features it needs — a second entry here naming the same features
+# is a line `cargo machete` correctly calls unused.
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "tokio", "http1"] }
+k8s-openapi = { version = "0.28.0", default-features = false, features = ["latest", "schemars"] }
+kube = { version = "4.2.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "ring"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
