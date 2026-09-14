@@ -2,7 +2,13 @@
 
 ![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.1.0](https://img.shields.io/badge/AppVersion-0.1.0-informational?style=flat-square)
 
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira-operator)
+<!--
+Links to the repository listing, not to /packages/helm/mira/mira-operator —
+that page 404s until the first release publishes this chart. The repository
+slug stays `mira` (only its display name changed), so both URLs here are
+stable across the rename.
+-->
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/search?repo=mira)
 
 The controller that scales a Mira tier on free disk, and drains a replica's blocks to cold storage before its volume is deleted. Install it, then apply a MiraCluster.
 

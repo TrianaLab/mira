@@ -2,7 +2,13 @@
 
 {{ template "chart.badgesSection" . }}
 
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/helm/mira/mira-operator)
+<!--
+Links to the repository listing, not to /packages/helm/mira/mira-operator —
+that page 404s until the first release publishes this chart. The repository
+slug stays `mira` (only its display name changed), so both URLs here are
+stable across the rename.
+-->
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/search?repo=mira)
 
 {{ template "chart.description" . }}
 
