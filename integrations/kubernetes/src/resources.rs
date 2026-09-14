@@ -102,13 +102,28 @@ pub fn replica_host(c: &MiraCluster, ordinal: i32) -> String {
 /// block directory name so replicas sharing a volume cannot collide, and it has
 /// to survive a reschedule. The downward API is the only thing that promises
 /// that — `HOSTNAME` is set by the container runtime, not by Kubernetes.
-fn node_config(c: &MiraCluster) -> String {
-    let offload = c
-        .spec
-        .offload
-        .as_ref()
-        .map(|o| format!("    \"offload\": {},\n", json!(o)))
-        .unwrap_or_default();
+///
+/// **`spec.offload` is deliberately not here**, and putting it here is the
+/// third time this shape of bug has been written in this file. `storage.offload`
+/// on a *running* node is a retention setting: `expire_with` copies each
+/// expiring block to the target and then unlinks the local one, so the target
+/// has to be a mount. The replicas mount `data` and `config` and nothing else,
+/// which would make `/cold/tel-0` the container's own writable layer — blocks
+/// leaving the claim for a directory that dies with the pod, with the same
+/// `Ready` status and the same silent loss that `coldStorageClaim` exists to
+/// make unrepresentable, just moved from the drain Job to the replica.
+///
+/// It is not an oversight in the mounts either: every replica would have to
+/// hold the cold claim at once, which makes `ReadWriteMany` mandatory for any
+/// tier of more than one pod on more than one node. So `spec.offload` means
+/// what the CRD says it means — where a drain archives to, passed to the Job on
+/// its command line — and nothing else reads it.
+///
+/// ponytail: no retention tiering to cold storage from a live replica. The
+/// upgrade path is a separate `spec.coldTiering` that mounts the claim into the
+/// StatefulSet and documents the RWX requirement, not a second meaning for this
+/// field.
+fn node_config() -> String {
     format!(
         r#"{{
   "node": "${{env:POD_NAME}}",
@@ -118,7 +133,7 @@ fn node_config(c: &MiraCluster) -> String {
   }},
   "storage": {{
     "dir": "/data",
-{offload}  }},
+  }},
 }}
 "#
     )
@@ -127,7 +142,7 @@ fn node_config(c: &MiraCluster) -> String {
 pub fn config_map(c: &MiraCluster) -> ConfigMap {
     ConfigMap {
         metadata: meta(c, c.name_any(), "storage"),
-        data: Some(BTreeMap::from([("mira.yaml".into(), node_config(c))])),
+        data: Some(BTreeMap::from([("mira.yaml".into(), node_config())])),
         ..Default::default()
     }
 }
@@ -237,7 +252,7 @@ pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
             "template": {
                 "metadata": {
                     "labels": pod_labels,
-                    "annotations": {"mira.miradb.dev/config": config_hash(&node_config(c))},
+                    "annotations": {"mira.miradb.dev/config": config_hash(&node_config())},
                 },
                 "spec": {
                     "containers": [{
@@ -349,10 +364,10 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
 
     // `${node}` expanded here, because the engine will not expand it there.
     // Interpolation is a feature of the config *parser*, and `--offload` on the
-    // command line is stored raw — so the running replica writes its blocks to
-    // `/cold/tel-2/…` via its ConfigMap while this Job would write them to a
-    // directory literally named `${node}`. Both archives exist, only one is the
-    // one a `restore` looks in, and the volume is deleted either way.
+    // command line is stored raw — so a Job handed the spec's string verbatim
+    // writes the archive into a directory literally named `${node}`, one level
+    // under the mount, and `mira offload restore` looks for `/cold/tel-2`. The
+    // Job exits 0 either way and the claim is deleted either way.
     let offload = &offload.replace("${node}", &pod);
 
     // The cold store, mounted where the offload URL points. Without it `mira
@@ -601,14 +616,33 @@ mod tests {
         assert_eq!(at, "/cold");
     }
 
-    /// The two halves of the archive have to agree on a path. The replica
-    /// writes through its ConfigMap, where `${node}` is interpolated by the
-    /// config parser; the drain writes through `--offload`, which is not
-    /// parsed as config and so is stored exactly as typed. Left alone, the
-    /// scale-in archive lands in a directory named `${node}` that no restore
-    /// will ever look in — and the claim is deleted all the same.
+    /// `spec.offload` must never reach a running replica's config.
+    ///
+    /// On a node, `storage.offload` is a *retention* setting: the sweep copies
+    /// each expiring block to the target and then unlinks the local one. The
+    /// replicas mount `data` and `config`, so the target would be the
+    /// container's writable layer — blocks off the claim and into a directory
+    /// that dies with the pod, phase still `Ready`. It is the exact loss
+    /// `coldStorageClaim` was added to make unrepresentable, one object over.
     #[test]
-    fn the_drain_writes_where_the_replica_was_writing() {
+    fn the_replica_config_never_names_the_cold_store() {
+        // `cluster()` sets `offload`, so this fails if the field is ever piped
+        // back through rather than only reaching `drain_job`.
+        let cfg = config_map(&cluster()).data.unwrap()["mira.yaml"].clone();
+        assert!(
+            !cfg.contains("offload") && !cfg.contains("/cold"),
+            "the replica would archive to an unmounted path and unlink the \
+             original: {cfg}"
+        );
+    }
+
+    /// The drain has to archive where a `restore` will look. It writes through
+    /// `--offload`, which is not parsed as config and so is stored exactly as
+    /// typed — `${node}` included. Left alone, the scale-in archive lands in a
+    /// directory literally named `${node}` that nothing will ever read, and the
+    /// claim is deleted all the same.
+    #[test]
+    fn the_drain_writes_where_a_restore_will_look() {
         let pod = drain_job(&cluster(), 4, "file:///cold/${node}")
             .spec
             .unwrap()
@@ -620,8 +654,9 @@ mod tests {
             args.contains(&"file:///cold/tel-4".to_string()),
             "the drain would archive to a literal ${{node}}: {args:?}"
         );
-        // Same name the config would have resolved `${node}` to, so the two
-        // paths are one path rather than two that happen to match today.
+        // Same `POD_NAME` the replica ran under. The node name is hashed into
+        // the block directory's name, so a drain under any other name walks a
+        // directory it does not recognise and pushes nothing.
         let env = pod.containers[0].env.clone().unwrap();
         assert_eq!(env[0].value.as_deref(), Some("tel-4"));
     }

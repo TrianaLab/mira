@@ -129,7 +129,7 @@ ci-helm: chart ## The `helm` leg
 # Its own leg rather than part of `ci-rust`, because it is its own workspace:
 # `--workspace` in the root manifest cannot reach it, the cache key is a
 # different Cargo.lock, and a diff that touches only the engine has no reason to
-# compile 160 crates of kube-rs. The path filter in scripts/ci-changes.sh is
+# compile 220 crates of kube-rs. The path filter in scripts/ci-changes.sh is
 # what makes that true in practice.
 .PHONY: ci-operator
 ci-operator: operator ## The `operator` leg

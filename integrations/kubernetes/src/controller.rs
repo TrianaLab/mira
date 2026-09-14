@@ -386,6 +386,20 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
             c,
             json!({
                 "replicas": ordinal,
+                // `draining` repeated, for the same server-side-apply reason as
+                // `replicas` above and with a far worse failure than a wrong
+                // printer column. This field is what routes the next reconcile
+                // back into this function; omit it and SSA deletes it, the next
+                // pass takes the decision path instead, and it is free to start
+                // draining the *next* replica down while this one's claim and
+                // its failed Job are still sitting there. Degraded has to stay
+                // degraded — the way out is to fix the cause and delete the
+                // Job, which makes the next pass build a new one and retry.
+                "draining": ordinal,
+                // Carried, not re-stamped. `now()` here would push the cooldown
+                // forward on every 300s requeue and turn "when the tier last
+                // changed size" into "when the operator last noticed this".
+                "lastScaled": c.status.as_ref().and_then(|s| s.last_scaled.clone()),
                 "phase": "Degraded",
                 "message": format!(
                     "drain of replica {ordinal} failed; its volume was kept. \
@@ -955,7 +969,14 @@ mod tests {
             "a failed archive must never delete the claim or the evidence: {:?}",
             f.log()
         );
-        assert_eq!(f.body("/status")["status"]["phase"], "Degraded");
+        let st = &f.body("/status")["status"];
+        assert_eq!(st["phase"], "Degraded");
+        // The one that matters. `draining` is what sends the next reconcile
+        // back here rather than to the decision path, and this patch is an
+        // apply: a key it does not name is a key the server deletes. Without
+        // this line a failed drain un-wedges itself, and the pass after it can
+        // pick the next replica down while this one's claim is still orphaned.
+        assert_eq!(st["draining"], 2);
         assert_eq!(action, Action::requeue(Duration::from_secs(300)));
     }
 

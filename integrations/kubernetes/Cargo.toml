@@ -2,7 +2,7 @@
 # reason is the root's gates rather than taste. `make msrv` runs
 # `cargo +1.85 check --workspace`; kube-rs declares 1.89. `deny.toml` sets
 # `multiple-versions = "deny"` and a licence allow-list that is "exactly what
-# the tree contains today"; the Kubernetes client tree is ~200 crates with a
+# the tree contains today"; the Kubernetes client tree is ~220 crates with a
 # TLS stack and would rewrite both. The coverage ratchet is at 99.23 with no
 # margin, and the crate count in the README is a published product property.
 #

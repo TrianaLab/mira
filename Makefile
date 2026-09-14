@@ -630,7 +630,7 @@ operator-test: ## The operator's unit tests
 # reach a nested workspace, which is why the operator was invisible to
 # COVERAGE_MIN for as long as it existed.
 #
-# 89.07 measured here with the request-log tests in place. It is *not* 99-point-
+# 89.56 measured here with the request-log tests in place. It is *not* 99-point-
 # something and cannot be: `main.rs` and `crdgen.rs` are 33 lines of process
 # entry point at 0%, which puts the ceiling at about 98.2 — those two are
 # covered by `make operator-e2e`, and coverage instrumentation does not follow a
