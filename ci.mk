@@ -22,8 +22,8 @@
 #
 # `make check` is still what to run before you push: it is the subset that
 # needs no second toolchain, no docker daemon and no several minutes. `make ci`
-# is that plus msrv, the image scan, e2e and the release rehearsal — the four
-# the Makefile header says CI adds.
+# is that plus msrv, the image scan, the Kind end-to-end suite and the release
+# rehearsal — the four the Makefile header says CI adds.
 #
 # `release.yml` is deliberately not dispatched this way, and the line is the
 # same one: the parts of it that *build* something already call `make` —
@@ -120,9 +120,6 @@ ci-docs: docs install-script ## The `docs` leg
 .PHONY: ci-image
 ci-image: scan-image ## The `image` leg
 
-.PHONY: ci-e2e
-ci-e2e: e2e ## The `e2e` leg
-
 .PHONY: ci-release-dry-run
 ci-release-dry-run: dist publish-dry ## The `release-dry-run` leg
 
@@ -136,6 +133,16 @@ ci-helm: chart ## The `helm` leg
 # what makes that true in practice.
 .PHONY: ci-operator
 ci-operator: operator ## The `operator` leg
+
+# The only end-to-end gate in the tree, and its own leg because it is the only
+# one that builds a Kubernetes cluster. It replaced `ci-e2e`, which stood up one
+# Mira behind one collector with docker compose: the three signals still make
+# the full trip from a stock collector here, but through a tier the operator
+# built, so the reconciler, the chart, the CRD and the RBAC are on that path
+# instead of beside it. Running both would have asserted the OTLP surface twice
+# and the operator once.
+.PHONY: ci-operator-e2e
+ci-operator-e2e: operator-e2e ## The `operator-e2e` leg
 
 # Not part of `ci`, and the only target in either file that *writes* to the
 # repository. It is here rather than in the Makefile because it is not a gate:
@@ -154,12 +161,14 @@ ci-tag: ## Tag a merged version bump, so merging is the whole release
 # line and ci.yml's job list can be read against each other. Ordered
 # fastest-failing first, like `check`.
 #
-# On a Mac `ci-e2e` refuses with a message saying so — it needs a Linux binary
-# in a Linux container — and `ci-image` needs a docker daemon. That is the
-# honest answer: they are the legs a laptop cannot reproduce, and knowing which
-# ones those are is worth more than an aggregate that quietly skips them.
+# `ci-image` needs a docker daemon and `ci-operator-e2e` needs docker plus kind,
+# kubectl and helm. That is the honest answer: they are the legs a laptop may not
+# have the tools for, and knowing which ones those are is worth more than an
+# aggregate that quietly skips them. Unlike the compose e2e this replaced,
+# `ci-operator-e2e` does run on a Mac — it compiles the engine inside the image
+# rather than copying a host binary into it.
 .PHONY: ci
-ci: ci-meta ci-rust ci-ui ci-supply-chain ci-docs ci-operator ci-helm ci-coverage ci-drift ci-msrv ci-release-dry-run ci-image ci-e2e ## Every leg a pull request runs, on this host
+ci: ci-meta ci-rust ci-ui ci-supply-chain ci-docs ci-operator ci-helm ci-coverage ci-drift ci-msrv ci-release-dry-run ci-image ci-operator-e2e ## Every leg a pull request runs, on this host
 	@echo
 	@echo "every CI leg passed."
 
@@ -181,6 +190,12 @@ TRIVY_VERSION        := 0.74.0
 TRIVY_INSTALL_SHA256 := e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
 ACTIONLINT_VERSION   := 1.7.12
 ACTIONLINT_SHA256    := 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+# The Kubernetes version the end-to-end suite runs against comes from kind's
+# default node image for this release, so bumping this bumps both. That is the
+# intent: the pair is what upstream tested together, and choosing them
+# separately is how a cluster that only exists here comes about.
+KIND_VERSION         := 0.31.0
+KIND_SHA256          := eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
 
 .PHONY: ci-tool-trivy
 ci-tool-trivy: ## Install the pinned trivy (CI; locally use your own)
@@ -211,6 +226,21 @@ ci-tool-actionlint: ## Install the pinned actionlint (CI; locally use your own)
 	tar -xzf actionlint.tgz actionlint
 	sudo install actionlint /usr/local/bin/actionlint
 	rm actionlint actionlint.tgz
+
+.PHONY: ci-tool-kind
+ci-tool-kind: ## Install the pinned kind (CI; locally use your own)
+	@# Not helm/kind-action, for the argument spelled out above ci-tool-trivy: an
+	@# action runs with the job's token, and this one would be running with it
+	@# around a cluster whose whole purpose is to accept arbitrary manifests.
+	@# kind publishes no checksums file, so the digest here is of the binary
+	@# itself — re-pin with:
+	@#   curl -fsSL .../kind-linux-amd64 | sha256sum
+	curl -fsSLo kind \
+	  "https://github.com/kubernetes-sigs/kind/releases/download/v$(KIND_VERSION)/kind-linux-amd64"
+	echo "$(KIND_SHA256)  kind" | $(SHA256) -c -
+	sudo install kind /usr/local/bin/kind
+	rm kind
+	kind version
 
 .PHONY: ci-tool-chart
 ci-tool-chart: ## Install the pinned chart tooling (CI; locally use your own)

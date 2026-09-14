@@ -3302,11 +3302,41 @@ is written *first*, so a controller that restarts mid-sequence resumes instead
 of orphaning a volume; the StatefulSet scales down and the pod goes while the
 claim stays; a Job runs `mira offload push` against the released claim — which
 is why the pod has to go first, since the claim is `ReadWriteOnce` and a Job
-cannot attach it while the pod holds it; and only on success is the claim
-deleted. A failed drain stops before that last step, phase `Degraded`, one
-replica smaller and every block still on disk. `spec.offload` is required before
-the tier will ever shrink, and unset it simply never does: the cost of not
-shrinking is a bill, the cost of shrinking without an archive is the data.
+cannot attach it while the pod holds it; only on success is the claim deleted;
+and then the Job is, which is what lets the claim's deletion finish. A failed
+drain stops before those last two steps, phase `Degraded`, one replica smaller
+and every block still on disk. `spec.offload` is required before the tier will
+ever shrink, and unset it simply never does: the cost of not shrinking is a
+bill, the cost of shrinking without an archive is the data.
+
+Three details in that sequence were each their own way of deleting a volume and
+reporting success. `spec.offload` is a `file://` URL, the only scheme
+`Target::parse` accepts, so on Kubernetes the archive is a mount — and a drain
+Job with nothing mounted at it writes the archive into its own container
+filesystem, exits 0, and the claim is deleted anyway. `spec.coldStorageClaim` is
+therefore validated as *required* alongside `offload` rather than documented
+beside it, which makes the losing configuration unrepresentable. And the Job's
+`--offload` argument has `${node}` expanded by the operator before it is passed,
+because the engine will not expand it there: interpolation is a feature of the
+config *parser* (section 9), and a value given on the command line is stored
+raw. Un-expanded, the replica archived to `/cold/tel-2` through its ConfigMap
+while the Job archived to a directory literally named `${node}` — two archives,
+one of them the one a `restore` looks in, and the volume deleted either way. The
+Kind end-to-end suite asserts the blocks are under `/cold/tel-2` before it will
+call a scale-in a pass, because every other observable in the sequence is
+identical when the archive is empty.
+
+The third is why the Job is deleted at all, and it is not tidying up.
+`kubernetes.io/pvc-protection` holds a claim alive while any scheduled pod still
+references it, and a *completed* pod counts — a Job's pod is not removed when
+the Job finishes, and nothing else removes the Job. So the claim deleted in the
+step before went to `Terminating` and stayed there for ever, with the operator
+logging "volume released" and the PV still on the bill. The deletion is
+`Background`, because orphaning the pod would orphan precisely the object
+holding the finalizer, and it comes *after* the status patch rather than before:
+the Job is how a reconcile interrupted mid-drain knows where it got to, so
+clearing `status.draining` first is what stops a crash in the gap from building
+a second drain Job against a claim that is already going away.
 
 It does **not** re-home the blocks afterwards. That is 12.4's "no rebalancing,
 ever" rather than an omission, and the same `ReadWriteOnce` constraint that

@@ -5,10 +5,11 @@ whether a PR has enough of them. For *reproducing the published numbers* against
 a live binary, see [End-to-end testing](e2e.md) — that page is a transcript, this
 one is the map.
 
-Mira has 385 cargo tests — 359 across the eight levels below, plus 26 in
-`xtask` that test the gates rather than the engine — 22 UI tests and 20 chart
-tests, with 18 more cargo tests in the operator's
-[second workspace](#the-operator-in-a-workspace-of-its-own). Every one of them
+Mira has 386 cargo tests — 360 across levels 1–5 below, plus 26 in `xtask` that
+test the gates rather than the engine — 22 UI tests and 20 chart tests, and 37
+more cargo tests in the operator's
+[second workspace](#the-operator-in-a-workspace-of-its-own), which is where
+levels 8 and 9 live as well. Every one of them
 runs from a `make` target that CI also calls. There is no CI-only test step. If
 `make check` is green on your machine, the only things left that can turn CI red
 are the four gates that need something a pre-push check should not assume (a
@@ -18,7 +19,7 @@ seconds) — and `make ci` runs those too, on this host. Both are described in
 
 ## The levels
 
-Eight of them, and the ordering is by how much of the real system each one
+Nine of them, and the ordering is by how much of the real system each one
 holds, not by how they are usually named. "Integration test" is the label with
 the least agreement in the industry, so it does not appear here.
 
@@ -26,12 +27,13 @@ the least agreement in the industry, so it does not appear here.
 |---|---|---|---|---|
 | 1 | Unit, in-source | 139 core + 180 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
-| 3 | In-process end-to-end | 36 | `crates/mira/src/e2e.rs` | `make test` |
+| 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
 | 7 | Chart rendering | 20 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
-| 8 | Live, over real sockets | asserted, not counted | `docs/e2e/compose.yaml` | `make e2e` |
+| 8 | Against a real API server | 4 | `integrations/kubernetes/tests/apiserver.rs` | `make operator-apiserver` |
+| 9 | Live, on a real cluster | asserted, not counted | `integrations/kubernetes/e2e/run.sh` | `make operator-e2e` |
 
 Levels 1–5 are one `cargo test --workspace`. That is deliberate: the loop a
 contributor stays in has to be one command and a few seconds, or it stops being
@@ -161,22 +163,58 @@ an assertion-level `documentIndex` is silently ignored (it has to be at test
 level), and `containsDocument` requires *every* document to match rather than
 any. Both fail open.
 
-### 8. Live, over real sockets
+### 8. Against a real API server
 
-`make e2e` stands up a stock OpenTelemetry Collector in front of a real Mira
-container and asserts all three signals made the full trip. It is the only level
-with a network, a container runtime and someone else's binary in it, which is
-exactly why it is the last one and why it does not run on every PR — see
-[End-to-end testing](e2e.md) for the manual version, with `loadgen`,
-`telemetrygen` and the numbers.
+`make operator-apiserver` runs `integrations/kubernetes/tests/apiserver.rs`
+against whatever cluster the current kubeconfig context points at, and returns
+immediately unless `MIRA_OPERATOR_APISERVER` is set — so `make operator` stays a
+gate a laptop with no cluster can pass.
+
+kube-rs has no `envtest`. Go operators get a real `kube-apiserver` and `etcd`
+pair downloaded and started by `controller-runtime`; no Rust crate does that, so
+"a real API server" here means one you already have. `make operator-e2e` runs
+this leg first, against the Kind cluster it just created, because these are the
+failures a fake client cannot see:
+
+- **apiextensions prunes.** A field the CRD's schema does not describe is
+  dropped on write, with no error anywhere — a stale CRD is silent data loss.
+  One test writes every field of the spec and compares the object it reads back
+  whole. The fixture spells out every field rather than using
+  `..Default::default()`, so adding a spec field breaks the build here.
+- **Server-side apply and ownership.** The field manager, the owner reference's
+  uid and kind, `clusterIP: None` surviving on the headless Service.
+- **Write loops.** Two reconciles, and `resourceVersion` and `generation` must
+  not move on the second. A fake client cannot fail this because nothing in it
+  increments a resourceVersion.
+- **The status subresource.** An unsatisfiable spec has to land on `.status`
+  rather than in a log line, and build nothing.
+
+### 9. Live, on a real cluster
+
+`make operator-e2e` builds a Kind cluster, installs the chart as published,
+and asserts five things end to end — including that the tier keeps serving after
+the operator is uninstalled, which is the claim principle 4 rests on. It is the
+only level with a network, a container runtime, a Kubernetes API and someone
+else's binary in it, which is exactly why it is last and why it is its own CI
+leg. [End-to-end testing](e2e.md) section 6 is the map of what it asserts and
+how to debug one; sections 2–5 and 7 there are the manual versions, with
+`loadgen`, `telemetrygen` and the OpenTelemetry Demo.
+
+It replaced a docker compose file that stood one Mira up behind one stock
+collector. The three signals still make the full trip from a stock collector,
+but through a tier the operator built — so the reconciler, the chart, the CRD
+and the RBAC are on that path rather than beside it, and there is one end-to-end
+suite rather than two asserting the OTLP surface twice.
 
 ## The operator, in a workspace of its own
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it and `make test` does not
-try. `make operator` is its whole gate — fmt, clippy, 18 tests and the CRD drift
-check — and `ci-operator` is its own CI leg, skipped entirely by
-`scripts/ci-changes.sh` on a diff that does not touch it.
+try. `make operator` is its whole gate — fmt, clippy, 33 tests, a coverage floor and
+the CRD drift check — and `ci-operator` is its own CI leg, skipped entirely by
+`scripts/ci-changes.sh` on a diff that does not touch it. The two levels that
+need a cluster, 8 and 9, are deliberately *not* in it: `make operator` has to
+pass on a laptop with no kubeconfig.
 
 The separation is not about testing. kube-rs declares Rust 1.89 against the
 engine's 1.85 floor, brings ~160 crates and a TLS stack through a `deny.toml`
@@ -185,11 +223,11 @@ published product property. A nested workspace keeps all of that pinned to the
 engine while this tree resolves whatever the Kubernetes API needs;
 `integrations/kubernetes/Cargo.toml` opens with the argument.
 
-Its 18 tests are level 1 in shape — in-source, private state — and they are
-almost all about **arithmetic that decides to delete a volume**. A controller's
-own behaviour needs an API server, so a test of `reconcile` would be level 8 in
-cost for level 1 in value; the design instead keeps every decision in a pure
-function and tests that. `stats::decide` takes a slice of readings and returns
+Its 33 in-workspace tests are level 1 in shape — in-source, private state — and
+they are almost all about **arithmetic that decides to delete a volume**. A
+controller's own behaviour needs an API server, which is level 8 in cost, so the
+design keeps every decision in a pure function and tests that here; level 8 is
+then reserved for the four things only a real server can answer. `stats::decide` takes a slice of readings and returns
 `Up`/`Down`/`Hold`, so "one full replica outvotes nine empty ones" and "an
 unreachable replica stops every decision" are unit tests rather than a cluster.
 `resources::*` build the objects and the tests assert the fields a typo drops
@@ -291,10 +329,11 @@ branch ruleset requires; `xtask ci` enforces that no job can escape their
 PR time rather than noticed later.
 
 The four gates that `make check` leaves to `make ci` are `msrv`, `scan-image`,
-`e2e` and `dist` (as `release-dry-run`, which runs the real tarball, SBOM and
-checksum targets on every code PR). Two of them a Mac cannot run at all —
-`ci-e2e` needs a Linux binary in a Linux container, `ci-image` needs a Docker
-daemon — and they say so rather than passing quietly.
+`operator-e2e` and `dist` (as `release-dry-run`, which runs the real tarball,
+SBOM and checksum targets on every code PR). Two of them need tools a laptop may
+not have — `ci-image` a Docker daemon and a Trivy database, `ci-operator-e2e`
+Docker plus `kind`, `kubectl` and `helm` — and they say so rather than passing
+quietly.
 
 ## Choosing a home for a new test
 
@@ -310,9 +349,11 @@ Work down; stop at the first level that can fail for the reason you care about.
    mistake, which most of them are.
 4. **Does it need a process — argv, an exit code, a signal?** `cli.rs`, and
    expect it to be slower than everything above it.
-5. **Does it need a socket, a container, or someone else's binary?** `make e2e`,
-   and consider whether the thing you are testing is really Mira's behaviour or
-   the Collector's.
+5. **Does it need a socket, a container, or someone else's binary?** The Kind
+   e2e, and consider whether the thing you are testing is really Mira's
+   behaviour or the Collector's. If it is really about what the API server does
+   to an object — pruning, ownership, a write loop — it is level 8, which is
+   cheaper and fails in seconds.
 
 A bug fix arrives with the test that would have caught it, at the level where it
 would have caught it. A fix at level 3 for a bug that a level 1 assertion would

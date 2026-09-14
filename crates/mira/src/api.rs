@@ -351,7 +351,7 @@ fn cursors(cs: &[mira_core::query::Cursor]) -> String {
     s
 }
 
-fn json_ok(body: String) -> Response {
+pub(crate) fn json_ok(body: String) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],

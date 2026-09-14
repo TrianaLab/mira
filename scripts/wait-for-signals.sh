@@ -12,9 +12,17 @@
 #
 #   wait-for-signals.sh 60 warn      `make demo`. A slow laptop is not a bug, so
 #                                    a timeout prints a warning and exits 0.
-#   wait-for-signals.sh 240 assert   `make e2e`. The client on the wire there is
-#                                    the stock collector, so a timeout is a
+#   wait-for-signals.sh 240 assert   the Kind e2e. The client on the wire there
+#                                    is the stock collector, so a timeout is a
 #                                    failed gate.
+#
+# A trailing list of signal names narrows it. One caller needs that: the e2e
+# asks a `mira proxy`, and metrics are the one signal a proxy cannot answer —
+# `/api/v1/metrics/names` walks one node's blocks and there is no cursor to
+# merge two nodes' answers on, so it is a documented 501, not a slow block. The
+# e2e asks the replicas for that leg instead. Retrying a 501 for four minutes
+# and then reporting "metrics never arrived" would be a lie about a working
+# tier.
 #
 # curl rather than a language runtime: this is three HTTP requests in a loop,
 # and the alternative was the only reason two of Mira's gates needed Python.
@@ -22,13 +30,14 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: wait-for-signals.sh <seconds> <warn|assert>" >&2
+	echo "usage: wait-for-signals.sh <seconds> <warn|assert> [signal...]" >&2
 	exit 2
 }
 
-[ $# -eq 2 ] || usage
+[ $# -ge 2 ] || usage
 timeout=$1
 mode=$2
+shift 2
 case "$mode" in
 warn | assert) ;;
 *) usage ;;
@@ -44,6 +53,18 @@ checks=(
 	'logs|/api/v1/query|{"signal":"logs","from":"-24h","to":"now","limit":1}|"rows":[]'
 	'metrics|/api/v1/metrics/names|{}|"names":[]'
 )
+
+# Named signals only, if any were named. Unknown names are a typo in a caller,
+# not a signal that is missing, so they stop the run rather than time out.
+if [ $# -gt 0 ]; then
+	want=()
+	for n in "$@"; do
+		hit=$(printf '%s\n' "${checks[@]}" | grep "^$n|" || true)
+		[ -n "$hit" ] || { echo "error: no such signal '$n'" >&2; exit 2; }
+		want+=("$hit")
+	done
+	checks=("${want[@]}")
+fi
 
 # Every second for the gate, three times a second for the demo: the demo is
 # somebody watching a terminal, and four extra requests are cheaper than four
@@ -70,7 +91,7 @@ while [ -n "$left" ] && [ "$SECONDS" -lt "$timeout" ]; do
 done
 
 if [ -z "$left" ]; then
-	[ "$mode" = warn ] || echo "e2e: all three signals made the full trip"
+	[ "$mode" = warn ] || echo "e2e: every signal asked for made the full trip"
 	exit 0
 fi
 

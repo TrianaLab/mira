@@ -91,6 +91,7 @@ spec:
     downWhenFreeAbove: 0.60
     cooldownSeconds: 600
   offload: "file:///cold/${node}"
+  coldStorageClaim: mira-cold
   proxy:
     replicas: 2
 ```
@@ -120,6 +121,13 @@ reports `Degraded` rather than acting on it.
 `spec.offload` is **required** before the operator will ever shrink a tier, and
 unset it simply never does. The cost of not shrinking is a bill; the cost of
 shrinking without an archive is the data.
+
+It never travels alone. `file://` is the only scheme Mira's offload target
+parses, so the archive is a mount and `spec.coldStorageClaim` names the claim to
+put there — an existing `ReadWriteMany` claim, or `ReadWriteOnce` on a
+single-node cluster. Without it the drain Job writes the archive inside its own
+container, exits 0, and the claim is deleted anyway, so the operator refuses the
+pair rather than documenting it.
 
 1. `status.draining` is written **first**, so a controller that restarts
    mid-sequence resumes instead of orphaning a volume.

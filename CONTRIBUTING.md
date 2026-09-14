@@ -74,11 +74,12 @@ make ci-changes  # which legs your diff against origin/main would run
 ```
 
 `make ci` is `make check` plus the four it leaves out — `ci-msrv` (a second
-toolchain), `ci-image` (a Docker daemon and a Trivy database), `ci-e2e` and
-`ci-release-dry-run` (minutes, not seconds). Two of those a Mac cannot do at
-all: `ci-e2e` needs a Linux binary in a Linux container and says so rather than
-pretending, and `ci-image` needs a daemon. Those two are the honest gap, and
-knowing which they are beats an aggregate that quietly skips them.
+toolchain), `ci-image` (a Docker daemon and a Trivy database),
+`ci-operator-e2e` (Docker, `kind`, `kubectl`, `helm`, and about fifteen minutes
+building a Kubernetes cluster) and `ci-release-dry-run` (minutes, not seconds).
+Those are the legs a laptop may not have the tools for, and they say so rather
+than passing quietly — knowing which they are beats an aggregate that skips
+them without saying.
 
 The split between the two files is not "CI things live over here". The Makefile
 holds the **gates** — what "correct" means, which has to mean the same thing on

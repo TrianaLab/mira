@@ -62,7 +62,7 @@ into that file. `make ci` runs every leg here, `make ci-<leg>` runs one, and
 leg grouping, the path filter and pinned runner tool versions go in `ci.mk`.
 
 The contributor-facing internals live under `docs/internals/`:
-[testing.md](docs/internals/testing.md) is the map of the eight test levels and
+[testing.md](docs/internals/testing.md) is the map of the nine test levels and
 which one a new test belongs at, [e2e.md](docs/internals/e2e.md) is end-to-end
 testing against a live instance with synthetic data, and
 [releases.md](docs/internals/releases.md) is how a release is cut and what is

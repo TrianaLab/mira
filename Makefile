@@ -663,6 +663,20 @@ operator-crd-check: operator-crd ## Fail if the committed CRD is stale
 	@# a drift gate rather than a note in a README.
 	git diff --exit-code -- $(CHART)/crds/miraclusters.yaml
 
+# The envtest-shaped hole. `controller-runtime` hands Go operators a real
+# `kube-apiserver` and `etcd` pair on a temp port; kube-rs has no equivalent and
+# no crate offers one, so the cluster has to come from outside and the suite has
+# to be opt-in — `cargo test` is the first command a contributor runs and it
+# cannot start needing a kubeconfig.
+#
+# Opt-in by environment variable rather than by `#[ignore]`: an ignored test
+# that cannot reach a cluster *passes* when someone runs `--ignored` on a laptop
+# with the wrong context, and this suite's job is to fail loudly about a cluster.
+.PHONY: operator-apiserver
+operator-apiserver: ## Reconcile against the current kube context (needs a cluster)
+	MIRA_OPERATOR_APISERVER=1 $(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml \
+	  --locked --test apiserver -- --test-threads=4
+
 .PHONY: operator-e2e
 operator-e2e: ## The operator against a real cluster: Kind, a stock collector, a drain
 	@# The only end-to-end gate in the tree, and it replaced a compose file that
@@ -1017,11 +1031,10 @@ publish: ## Publish all three crates to crates.io. Irreversible.
 # [workspace.dependencies] block says why.
 
 # ---------------------------------------------------------------------------
-# The image, and the two gates over it
+# The image, and the gate over it
 # ---------------------------------------------------------------------------
 
 SCAN_IMAGE  ?= local/mira:scan
-E2E_COMPOSE := docs/e2e/compose.yaml
 # Docker's spelling of the architecture, which is not uname's. The Dockerfile's
 # prebuilt stage copies dist/linux/$$TARGETARCH/mira.
 DOCKER_ARCH  = $(if $(filter aarch64 arm64,$(shell uname -m)),arm64,amd64)
@@ -1049,45 +1062,6 @@ scan-image: dist-image ## Trivy over the release image; a fixable HIGH/CRITICAL 
 	@# switched off. HIGH,CRITICAL because the distroless base carries a
 	@# permanent tail of MEDIUM glibc findings that would drown the signal.
 	trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress $(SCAN_IMAGE)
-
-.PHONY: e2e
-e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, asserted
-	@# dist-image copies the host binary in, so on macOS the image builds happily
-	@# around a Mach-O that Linux cannot exec — and the symptom is 240 seconds of
-	@# silence followed by "the pipeline is broken", which it is not. Say so now.
-	@head -c 4 "$(DIST_BIN)" | grep -q ELF || { \
-		echo "error: $(DIST_BIN) is not a Linux binary, so the container cannot start it."; \
-		echo "  this gate runs on Linux (ci.yml's e2e leg). Locally, use \`make demo\`."; \
-		exit 1; }
-	@# The scenario docs/internals/e2e.md section 6 documents, run as a gate. The
-	@# --build-arg makes compose reuse the layers dist-image just built instead
-	@# of compiling a second time inside the Dockerfile; everything else about
-	@# the stack is exactly what a reader of that section types.
-	docker compose -f $(E2E_COMPOSE) build --build-arg BIN=prebuilt mira
-	@# The assertion at the end is the same three questions `make demo` waits on,
-	@# asked as a gate rather than as a warning. This is the only test in the
-	@# tree where the client on the wire is not ours — the stock collector gzips
-	@# by default, batches on its own schedule, and drops a batch permanently
-	@# rather than retry if the server answers UNIMPLEMENTED — so a timeout here
-	@# is a failure. Four minutes is generous on purpose: the runner pulls two
-	@# images, starts a collector, runs four one-shot generators and waits for a
-	@# block to seal. Slow is fine; never is what this is looking for.
-	@#
-	@# Every service, not `mira otelcol`, and `ps -a` before the logs. The two
-	@# things the narrow version could not show are the two that matter when
-	@# this fails: which containers are still up (a name that stops resolving is
-	@# a container that exited, not a network fault), and whether the generators
-	@# ever reached the collector. `--tail 100` is per container, and the one
-	@# line that explains the whole run is usually the container's first, so the
-	@# dead one gets its log in full.
-	@trap 'rc=$$?; [ $$rc -eq 0 ] || { \
-	         echo "--- containers"; docker compose -f $(E2E_COMPOSE) ps -a; \
-	         echo "--- mira"; docker compose -f $(E2E_COMPOSE) logs --no-color mira; \
-	         echo "--- everything else"; docker compose -f $(E2E_COMPOSE) logs --no-color --tail 100; }; \
-	       docker compose -f $(E2E_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; \
-	       exit $$rc' EXIT; \
-	docker compose -f $(E2E_COMPOSE) up -d; \
-	scripts/wait-for-signals.sh 240 assert
 
 # ---------------------------------------------------------------------------
 # The pipeline

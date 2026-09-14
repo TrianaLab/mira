@@ -15,8 +15,8 @@
 #   B  a stock OpenTelemetry Collector can export into that tier and all three
 #      signals come back out of the proxy
 #   C  the tier follows `spec.replicas` up
-#   D  and down, through the four-step drain: Draining, Job, archive, and only
-#      then the claim
+#   D  and down, through the five-step drain: Draining, Job, archive, the claim,
+#      and then the Job again — a completed pod pins the claim it mounted
 #   E  deleting the operator does not stop the tier serving
 #
 # E is the assertion the architecture rests on. Principle 4 says Mira holds no
@@ -37,6 +37,23 @@ HTTP=4318
 # is a failure fifteen minutes into a run that had nothing wrong with it.
 PORT=${PORT:-14318}
 
+# A kubeconfig of this run's own, and the reason is not tidiness. Every kubectl
+# below names a namespace and no context, so they follow whatever the *current*
+# context is — and that is a global the rest of the machine can move. It moved
+# during a run: a phase-D wait timed out on `<empty>` and the diagnostics came
+# back "the server doesn't have a resource type miracluster", because by then
+# `kubectl` was talking to a production GKE cluster. A suite that deletes
+# volumes must not be able to point itself at somebody's cluster, and
+# `kubectl config use-context` — which this used to do — is the same bug in
+# reverse: it silently repoints the operator's shell at Kind.
+#
+# `kind` writes here, `kubectl` and `helm` read here, and kube-rs reads
+# `KUBECONFIG` too, so `make operator-apiserver` below is pinned by the same
+# line.
+KUBECONFIG=$(mktemp -t mira-e2e-kubeconfig.XXXXXX)
+export KUBECONFIG
+
+pf=
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: $1 is not installed." >&2; exit 1; }; }
 for t in docker kind kubectl helm; do need "$t"; done
@@ -44,25 +61,33 @@ for t in docker kind kubectl helm; do need "$t"; done
 # Diagnostics before teardown, and only on failure. The two things that explain
 # a failed run are what the operator logged and what the objects look like; a
 # cluster deleted before either is read is a re-run.
-dump() {
-	rc=$?
-	[ "$rc" -eq 0 ] && return 0
-	say "FAILED (exit $rc) — state follows"
+dump() { # <exit-code>
+	say "FAILED (exit $1) — state follows"
 	kubectl -n "$NS" get miracluster,statefulset,deployment,pod,pvc,job -o wide 2>&1 || true
 	kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>&1 | tail -30 || true
 	echo "--- operator log"
 	kubectl -n mira-system logs deploy/mira-operator --tail=100 2>&1 || true
-	return "$rc"
 }
+# The exit code has to be read into a local on the *first* line and passed
+# around by hand from there. `$?` is whatever the previous command set, so a
+# helper that reads it itself reads the status of the `trap -` above it — which
+# is how a run that failed in phase A printed no diagnostics and exited 0.
 cleanup() {
-	rc=$?
+	local rc=$?
 	trap - EXIT
-	dump || rc=$?
+	proxy_down
+	[ "$rc" -eq 0 ] || dump "$rc"
 	if [ -n "$KEEP" ]; then
-		echo "KEEP set; cluster '$CLUSTER' left running. Delete it with: kind delete cluster --name $CLUSTER"
+		# The run's kubeconfig is a temp file that goes with it, so the
+		# first line is how the context reaches the shell you are in.
+		echo "KEEP set; cluster '$CLUSTER' left running. Reach it with:"
+		echo "  kind export kubeconfig --name $CLUSTER"
+		echo "  kubectl --context kind-$CLUSTER -n $NS get miracluster,sts,po,pvc"
+		echo "  kind delete cluster --name $CLUSTER"
 	else
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
+	rm -f "$KUBECONFIG"
 	exit "$rc"
 }
 trap cleanup EXIT
@@ -71,13 +96,16 @@ trap cleanup EXIT
 # wait` cannot do this: it waits on conditions, and "the StatefulSet reports 3
 # ready replicas" and "the phase field says Draining" are neither.
 until_eq() { # <seconds> <expr> <want> <resource...>
-	local deadline=$(( SECONDS + $1 )) want=$3 expr=$2 got=; shift 3
+	# `secs` is kept because the message below is printed after the `shift`,
+	# and `$1` by then is the first resource — which is how a phase-D timeout
+	# reported itself "after statefulset/tels".
+	local secs=$1 deadline=$(( SECONDS + $1 )) want=$3 expr=$2 got=; shift 3
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		got=$(kubectl -n "$NS" get "$@" -o jsonpath="$expr" 2>/dev/null || true)
 		[ "$got" = "$want" ] && return 0
 		sleep 2
 	done
-	echo "error: $* $expr was '${got:-<empty>}', wanted '$want' after ${1}s" >&2
+	echo "error: $* $expr was '${got:-<empty>}', wanted '$want' after ${secs}s" >&2
 	return 1
 }
 
@@ -94,22 +122,18 @@ until_ok() { # <seconds> <message> <command>
 	return 1
 }
 
-# Port-forward the proxy. The forward joins the EXIT trap while it is up, so a
-# failure in the middle of a check does not leave a kubectl behind holding the
-# port against the next run.
-pf=
+# Port-forward the proxy. `cleanup` kills whatever `$pf` names, so a failure in
+# the middle of a check does not leave a kubectl behind holding the port against
+# the next run.
 proxy_up() {
 	kubectl -n "$NS" port-forward svc/tel-proxy "$PORT:$HTTP" >/dev/null 2>&1 &
 	pf=$!
-	trap 'proxy_down; cleanup' EXIT
 	until_ok 60 "the proxy never answered on the forwarded port" \
 		"curl -fs -o /dev/null http://127.0.0.1:$PORT/health"
 }
 proxy_down() {
-	[ -n "$pf" ] && kill "$pf" 2>/dev/null
+	if [ -n "$pf" ]; then kill "$pf" 2>/dev/null || true; fi
 	pf=
-	trap cleanup EXIT
-	return 0
 }
 
 # One query document, posted the way the CLI and the MCP tool post it, asserted
@@ -125,7 +149,19 @@ say "cluster"
 # ---------------------------------------------------------------------------
 kind get clusters 2>/dev/null | grep -qx "$CLUSTER" \
 	|| kind create cluster --name "$CLUSTER" --config "$here/kind.yaml" --wait 120s
-kubectl config use-context "kind-$CLUSTER" >/dev/null
+# Writes the context into this run's own kubeconfig. Needed even right after a
+# create, because `--name` on an existing cluster skips the create entirely.
+kind export kubeconfig --name "$CLUSTER" >/dev/null
+
+# ---------------------------------------------------------------------------
+say "reconcile against the API server"
+# ---------------------------------------------------------------------------
+# Here and not at the end, because these need the cluster and nothing else. A
+# CRD the API server prunes a field out of, or a StatefulSet it returns 422 for,
+# fails thirty seconds in rather than after two container builds — and those are
+# the failures most likely to be waiting, since they are the ones a fake client
+# cannot see.
+make operator-apiserver
 
 # ---------------------------------------------------------------------------
 say "images"
@@ -179,13 +215,67 @@ done
 # Through the proxy, which is the only address the collector was given. A row
 # here means the whole path worked: generator, stock collector, proxy, `route`,
 # a storage replica, a sealed block, and the query coming back merged.
+#
+# Traces and logs only, because those are what a proxy can answer. Metrics are
+# below, and asked of the replicas.
 proxy_up
-MIRA_URL="http://127.0.0.1:$PORT" scripts/wait-for-signals.sh 240 assert
+MIRA_URL="http://127.0.0.1:$PORT" scripts/wait-for-signals.sh 240 assert traces logs
 proxy_down
 
+# The third signal, asked of the replicas rather than of the proxy, because
+# `/api/v1/metrics/names` is a documented 501 there: it is built by walking one
+# node's blocks and there is no cursor to merge two nodes' answers on. Papering
+# over that with a proxy round trip would test a merge the product does not
+# claim; asking both replicas tests what it does claim, which is that the
+# export landed somewhere in the tier.
+#
+# In-cluster rather than through another port-forward, because the routing hash
+# is free to put `billing` on either replica and nothing here may depend on
+# which — a forward to one pod would be a coin flip.
+metrics_check() { # <replica...>
+	kubectl -n "$NS" delete pod metrics-check --ignore-not-found >/dev/null
+	sed "s|REPLICAS|$*|" <<-'YAML' | kubectl -n "$NS" apply -f -
+		apiVersion: v1
+		kind: Pod
+		metadata:
+		  name: metrics-check
+		spec:
+		  restartPolicy: Never
+		  containers:
+		    - name: check
+		      image: busybox:1.37
+		      command: ["sh", "-c"]
+		      args:
+		        - |
+		          i=0
+		          while [ $i -lt 90 ]; do
+		            for r in REPLICAS; do
+		              url="http://$r.tel-headless:4318/api/v1/metrics/names"
+		              out=$(wget -q -O - --post-data='{}' \
+		                --header='content-type: application/yaml' "$url") || continue
+		              case "$out" in
+		                *'"names":[]'*) ;;
+		                *) echo "$r answered: $out"; exit 0 ;;
+		              esac
+		            done
+		            i=$((i + 1)); sleep 2
+		          done
+		          echo "no replica has a metric name; the metrics export never landed"
+		          exit 1
+	YAML
+	kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/metrics-check --timeout=240s \
+		|| { kubectl -n "$NS" logs metrics-check || true; echo "error: metrics never reached a replica" >&2; exit 1; }
+	kubectl -n "$NS" logs metrics-check
+}
+metrics_check tel-0 tel-1
+
 # ---------------------------------------------------------------------------
-say "C — the tier follows spec.replicas up"
+say "C — the tier follows the floor up"
 # ---------------------------------------------------------------------------
+# Raising `spec.replicas` grows the tier with no threshold involved: the floor
+# is applied before the scale decision is even read, because a floor that is not
+# met is not a floor. Coming back down is not the mirror of this and phase D
+# says why.
 kubectl -n "$NS" patch miracluster tel --type merge -p '{"spec":{"replicas":3}}'
 until_eq 300 '{.status.readyReplicas}' 3 statefulset/tel
 # The proxy's config is regenerated from the live count and its pod template is
@@ -235,14 +325,33 @@ echo "ok: a row held by one replica came back through the proxy"
 # ---------------------------------------------------------------------------
 say "D — and down, through the drain"
 # ---------------------------------------------------------------------------
+# Lowering the floor does not shrink the tier; it lets the tier shrink. The
+# drain archives a volume and then deletes it, so the operator waits for the
+# replicas to agree the data fits without that volume before it starts one, and
+# the manifest's `downWhenFreeAbove: 0.002` is what makes that agreement
+# unconditional here rather than a reading off a Kind node's disk. The first
+# version of this phase patched the floor and waited five minutes for a scale-in
+# the operator had no reason to perform.
 kubectl -n "$NS" patch miracluster tel --type merge -p '{"spec":{"replicas":2}}'
 until_eq 300 '{.status.readyReplicas}' 2 statefulset/tel
 # The claim outlives the pod, gets archived, and only then goes. Waiting on the
 # phase rather than on the Job because the Job is deleted with the cluster and
 # the phase is the operator's own account of what it did.
 until_eq 300 '{.status.phase}' Ready miracluster/tel
-kubectl -n "$NS" get pvc data-tel-2 >/dev/null 2>&1 \
-	&& { echo "error: the drained replica's claim is still there" >&2; exit 1; }
+# Waited for rather than asserted once. The operator issues the delete and then
+# writes `Ready`, but a claim with a pod that mounted it still on the node sits
+# in `Terminating` behind its `pvc-protection` finalizer for a few seconds after
+# that — long enough that a single `get` right on the phase edge fails against a
+# drain that worked perfectly.
+# shellcheck disable=SC2016  # re-evaluated each round by until_ok
+until_ok 120 "the drained replica's claim is still there" \
+	'! kubectl -n "$NS" get pvc data-tel-2'
+
+# The operator's own account of the tier, which is not the StatefulSet's. Both
+# status patches in a drain are server-side applies by one field manager, so a
+# key the second one leaves out is a key the first one loses: this read 0 beside
+# two running pods until `finish_drain` repeated the count.
+until_eq 60 '{.status.replicas}' 2 miracluster/tel
 
 # The archive itself. Everything above this line passes just as happily when
 # the drain Job wrote nothing at all: the claim is deleted either way, the
@@ -287,8 +396,9 @@ say "E — deleting the operator does not stop the tier"
 # wrong.
 helm uninstall mira-operator --namespace mira-system --wait
 proxy_up
-MIRA_URL="http://127.0.0.1:$PORT" scripts/wait-for-signals.sh 120 assert
+MIRA_URL="http://127.0.0.1:$PORT" scripts/wait-for-signals.sh 120 assert traces logs
 proxy_down
+metrics_check tel-0 tel-1
 echo "ok: the tier still ingests and serves with no controller in the cluster"
 
 say "all five passed"

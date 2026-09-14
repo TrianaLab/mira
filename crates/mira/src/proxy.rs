@@ -56,7 +56,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 
@@ -98,6 +98,19 @@ impl Proxy {
 pub fn router(p: Proxy) -> Router {
     let max = p.max_request_bytes;
     Router::new()
+        // The probes. Without them a proxy pod never becomes Ready, its Service
+        // never gets an endpoint, and the whole tier is unreachable behind a
+        // container that is running perfectly — which is what a 404 on
+        // `/readyz` cost the first Kubernetes end-to-end run.
+        //
+        // Both a constant 200, unlike the storage node's, and the difference is
+        // the point. A node's readiness asks "can I make an export durable",
+        // which has a real answer because it owns a disk. This owns nothing: it
+        // is ready the moment it is listening. Gating it on the replicas would
+        // be strictly worse — one replica restarting would deregister the only
+        // address the exporters have and take the tier down to protect it.
+        .route("/health", get(up))
+        .route("/readyz", get(up))
         .route("/api/v1/query", post(query_handler))
         .route("/v1/logs", post(logs_handler))
         .route("/v1/traces", post(traces_handler))
@@ -111,6 +124,16 @@ pub fn router(p: Proxy) -> Router {
         .route("/api/v1/entities", post(unmergeable))
         .layer(axum::extract::DefaultBodyLimit::max(max))
         .with_state(p)
+}
+
+/// Liveness and readiness, which for a stateless fan-out are the same answer.
+async fn up() -> Response {
+    let mut j = mira_core::json::Json::new();
+    j.obj(|j| {
+        j.key("status");
+        j.str("ok");
+    });
+    api::json_ok(j.into_string())
 }
 
 async fn unmergeable(uri: axum::http::Uri) -> Response {

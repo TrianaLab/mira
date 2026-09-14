@@ -3289,6 +3289,28 @@ fn proxied(replicas: Vec<String>) -> Router {
     )
 }
 
+/// The probes, which are the difference between a proxy that works and a proxy
+/// that is never sent anything.
+///
+/// The chart gives the proxy Deployment the same `/health` and `/readyz` the
+/// storage node has, and until the routes existed both 404'd: the pod stayed
+/// 0/1 for ever, the Service kept no endpoints, and the whole tier was
+/// unreachable behind a container that was answering every query it was asked.
+/// Nothing in the merge tests can see that, because they bypass the socket.
+///
+/// Both answer without a replica configured being reachable — the list here
+/// points at a port nothing is listening on — because that is the contract:
+/// this readiness says "I am listening", not "the tier is healthy".
+#[tokio::test]
+async fn a_proxy_answers_the_probes_kubernetes_gates_its_endpoints_on() {
+    let p = proxied(vec!["http://127.0.0.1:1".into()]);
+    for path in ["/health", "/readyz"] {
+        let (status, body, _) = get(&p, path, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(String::from_utf8(body).unwrap(), r#"{"status":"ok"}"#);
+    }
+}
+
 /// Two storage nodes, one `mira proxy`, and the claim the proxy is built on.
 ///
 /// Three things at once, because they are one mechanism: an export is *split*

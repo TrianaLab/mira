@@ -4,12 +4,24 @@
 # this suite exists to check: that the proxy merges results from more than one
 # store, and that `hash(resource) % n` actually spreads resources across them.
 #
-# The thresholds will not fire. The scale decision itself is covered by the
-# request-log tests in `controller.rs`; a threshold that tripped here would make
-# the suite depend on how full a Kind node's disk happens to be, which is the
-# least reproducible input available. What this suite checks about scaling is
-# the *mechanism* — `make operator-e2e` edits `spec.replicas` directly and
-# watches the tier follow.
+# The thresholds below are set so that `Down` is the standing verdict, and that
+# needs explaining, because the obvious setting is the opposite.
+#
+# `spec.replicas` is a *floor*, not a desired count, and the two directions are
+# not symmetric. Raising it grows the tier immediately — a floor that is not met
+# is not a floor. Lowering it only *permits* a shrink: the drain archives a
+# volume and then deletes it, so the operator will not start one until the
+# replicas themselves say the data fits without that volume. So "patch
+# spec.replicas down and watch it follow" is not a thing the product does, and a
+# suite that asserted it would be asserting a bug.
+#
+# Which leaves the real reading as an input to a gate, and the least
+# reproducible one available — how full a Kind node's disk happens to be. The
+# way out is not to avoid the threshold but to put it somewhere a disk cannot
+# reach: `downWhenFreeAbove: 0.002` is true of any node this suite could run on
+# at all. `Down` is then constant, the scale decision stops being an input, and
+# what phase D actually tests is the mechanism underneath it — floor, drain,
+# archive, claim, in that order.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -33,8 +45,8 @@ spec:
   storage:
     size: 1Gi
   scaling:
-    upWhenFreeBelow: 0.01
-    downWhenFreeAbove: 0.99
+    upWhenFreeBelow: 0.001
+    downWhenFreeAbove: 0.002
     cooldownSeconds: 1
   offload: "file:///cold/${node}"
   # Required alongside `offload`, and the reason is the whole point of this

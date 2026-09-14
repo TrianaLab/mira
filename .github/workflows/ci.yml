@@ -243,7 +243,7 @@ jobs:
     name: image
     needs: changes
     if: needs.changes.outputs.image == 'true'
-    # Same pin as `e2e` and `release-dry-run`: `make scan-image` goes through
+    # Same pin as `release-dry-run`: `make scan-image` goes through
     # `dist-image`, which puts this runner's binary in the image and asserts its
     # glibc floor. Scanning an image built from a binary that could not ship is
     # scanning something else.
@@ -264,30 +264,50 @@ jobs:
       # place a broken base image showed up was a tag.
       - run: make ci-image
 
-  e2e:
-    name: e2e
+  # The only end-to-end gate, and it replaced one. The compose leg that used to
+  # live here put a stock collector in front of one Mira container and asserted
+  # three signals came back. That is still asserted — same collector, same
+  # generator, same three questions — but through a tier the operator builds
+  # from a MiraCluster, so the reconciler, the CRD, the chart and its RBAC are
+  # on the path rather than beside it. Keeping both would have tested the OTLP
+  # surface twice and the operator once.
+  #
+  # It is also where the API-server suite runs: `run.sh` calls
+  # `make operator-apiserver` as soon as the cluster is up and before it builds
+  # anything, because a pruned CRD field or a StatefulSet the API server refuses
+  # should fail in thirty seconds, not after two image builds.
+  operator-e2e:
+    name: operator-e2e
     needs: changes
-    # Docs are in the trigger set because docs/e2e/ *is* the scenario: the
-    # compose file and the collector config live there, so editing them has to
-    # re-run the thing they describe.
-    if: needs.changes.outputs.image == 'true' || needs.changes.outputs.docs == 'true'
-    # ubuntu-22.04, the same pin and the same reason as release.yml's two linux
-    # legs: this is the only job in the tree that *runs* the release binary
-    # inside the release image, so building it against a glibc newer than the
-    # distroless base makes it the only job that can catch that — and building
-    # it on `ubuntu-latest` made it the job that caused it instead.
-    runs-on: ubuntu-22.04
+    # `code` as well as `operator`, because the engine image is half of what
+    # this runs — and `docs`, because docs/internals/e2e.md documents it.
+    if: >-
+      needs.changes.outputs.operator == 'true' ||
+      needs.changes.outputs.code == 'true' ||
+      needs.changes.outputs.image == 'true' ||
+      needs.changes.outputs.docs == 'true'
+    # ubuntu-latest, unlike the compose leg this replaced. That one pinned
+    # 22.04 because it ran a *release* binary — built by `make build` on the
+    # runner — inside the distroless image, which made it the one job that could
+    # catch a glibc floor regression. This one compiles the engine inside the
+    # Dockerfile against its own pinned base, so the runner's glibc never
+    # touches the artefact and the pin would only be pinning the build host.
+    # `make ci-image` still covers the floor, on 22.04, where it belongs.
+    runs-on: ubuntu-latest
+    # Two container builds, a cluster, a collector and a drain. The default 360
+    # would hide a hang as a six-hour job.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: e2e
-      # docs/internals/e2e.md has described this scenario since before CI could
-      # run it: a real binary in a container, a stock OpenTelemetry Collector in
-      # front of it, the OpenTelemetry project's own generator on the wire, and
-      # then the query API asked whether the data arrived. Every other test in
-      # the tree uses a client we wrote.
-      - run: make ci-e2e
+          # The operator's workspace: the API-server suite is a `cargo test` on
+          # the runner, and it is the only Rust this leg compiles outside Docker.
+          key: operator-e2e
+          workspaces: integrations/kubernetes
+      # kubectl and helm are on the runner image; kind is not.
+      - run: make ci-tool-kind
+      - run: make ci-operator-e2e
 
   release-dry-run:
     name: release-dry-run
@@ -391,7 +411,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [changes, rust, msrv, operator, ui, coverage, supply-chain, drift, docs, e2e, release-dry-run, helm, meta]
+    needs: [changes, rust, msrv, operator, operator-e2e, ui, coverage, supply-chain, drift, docs, release-dry-run, helm, meta]
     runs-on: ubuntu-latest
     steps:
       - name: Every leg green or deliberately skipped

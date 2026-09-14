@@ -18,11 +18,20 @@
 //!    works at all.
 //! 3. Run `mira offload push` as a Job against the released claim.
 //! 4. Only on success, delete the claim.
+//! 5. Then delete the Job, which is what actually lets step 4 finish.
 //!
 //! Every step before 4 is reversible, and step 4 is gated on the archive
 //! existing. A failed drain leaves the claim in place and the phase `Degraded`:
 //! the tier is one replica smaller and the blocks are still on disk, which is a
 //! bad day rather than a data-loss incident.
+//!
+//! Step 5 is not tidying up. `kubernetes.io/pvc-protection` keeps a claim alive
+//! while any scheduled pod still references it, and a *completed* pod counts:
+//! the Job's pod is not deleted when the Job finishes, so the claim deleted in
+//! step 4 sits in `Terminating` for as long as the Job exists, which is for
+//! ever. The operator would log "volume released" over a volume still on the
+//! bill. Only on success, so a failed drain keeps the Job its own status message
+//! tells an operator to go and read.
 //!
 //! # What a drain does not do
 //!
@@ -41,7 +50,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Service};
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::Controller;
 use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
@@ -334,10 +343,18 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
             warn!(%ns, %claim, "archive complete but claim not deleted: {e}");
         }
         info!(%ns, ordinal, "drain complete, volume released");
+        // `replicas` is repeated rather than left to carry over, and this is the
+        // one place server-side apply bites. A field this manager owned and then
+        // omits is *removed*, not kept — so a patch that says only "Ready" also
+        // silently unsets the count `start_drain` wrote, and the printer column
+        // reads 0 on a tier that is running `ordinal` pods. Nothing reconciles
+        // off it, which is exactly why it went unnoticed: the only consumer is
+        // whoever is watching the scale-in happen.
         status(
             ctx,
             c,
             json!({
+                "replicas": ordinal,
                 "phase": "Ready",
                 "draining": null,
                 "lastScaled": now(),
@@ -345,6 +362,18 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
             }),
         )
         .await?;
+
+        // Last, and after the status patch rather than before it. The Job is
+        // how a reconcile interrupted mid-drain knows where it got to, so it
+        // may only go once `draining` is cleared — delete it first and a crash
+        // in between leaves a cluster that is still draining, with no Job, and
+        // the next pass builds a second one against a claim that is already
+        // going away. Background propagation because the pod is the point:
+        // deleting a Job without it orphans exactly the object holding the
+        // claim's finalizer.
+        if let Err(e) = jobs.delete(&job_name, &DeleteParams::background()).await {
+            warn!(%ns, %job_name, "drain job not deleted; its pod pins the claim: {e}");
+        }
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
@@ -356,6 +385,7 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
             ctx,
             c,
             json!({
+                "replicas": ordinal,
                 "phase": "Degraded",
                 "message": format!(
                     "drain of replica {ordinal} failed; its volume was kept. \
@@ -876,12 +906,18 @@ mod tests {
         let c = drainable();
         finish_drain(&f.ctx(), &c, "ns", 2).await.unwrap();
 
+        // The Job goes last, after the status patch. A completed pod holds the
+        // claim's `pvc-protection` finalizer, so the DELETE two lines up does
+        // not finish until this one runs; and it runs after the patch so that a
+        // crash in the gap leaves a resumable drain rather than a cleared one
+        // with no Job to resume from.
         assert_eq!(
             f.log(),
             [
                 "GET /apis/batch/v1/namespaces/ns/jobs/tel-drain-2",
                 "DELETE /api/v1/namespaces/ns/persistentvolumeclaims/data-tel-2",
                 "PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status",
+                "DELETE /apis/batch/v1/namespaces/ns/jobs/tel-drain-2",
             ]
         );
         let st = f.body("/status")["status"].clone();
@@ -889,6 +925,11 @@ mod tests {
         // Cleared, not left set, or every later reconcile resumes a finished
         // drain and the tier never scales again.
         assert!(st["draining"].is_null());
+        // Repeated, not carried over. This patch is a server-side apply by the
+        // same manager that wrote the count in `start_drain`, so a key left out
+        // here is a key deleted there — the Kind suite caught `REPLICAS 0`
+        // beside two running pods.
+        assert_eq!(st["replicas"], 2);
     }
 
     /// A failed drain is a bad day, not a data-loss incident: the tier is one
@@ -906,9 +947,12 @@ mod tests {
         let c = drainable();
         let action = finish_drain(&f.ctx(), &c, "ns", 2).await.unwrap();
 
+        // Nothing at all is deleted, and the Job least of all: its pod holds
+        // the log of why the archive failed, and the status message sends an
+        // operator to read it.
         assert!(
             !f.log().iter().any(|l| l.starts_with("DELETE")),
-            "a failed archive must never delete the claim: {:?}",
+            "a failed archive must never delete the claim or the evidence: {:?}",
             f.log()
         );
         assert_eq!(f.body("/status")["status"]["phase"], "Degraded");

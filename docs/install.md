@@ -186,8 +186,17 @@ spec:
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage: { size: 50Gi, className: gp3 }
   offload: "file:///cold/${node}"
+  coldStorageClaim: mira-cold   # must already exist; see below
   proxy: { replicas: 2 }
 ```
+
+`offload` and `coldStorageClaim` are a pair, and the operator refuses a spec
+with one and not the other. `file://` is the only scheme Mira's offload target
+parses, so on Kubernetes the archive is a *mount*: a drain Job with no claim
+mounted at `/cold` writes the archive into its own container filesystem, exits
+0, and the operator then deletes the volume it believes it archived. Refusing
+the spec makes that unrepresentable rather than merely discouraged. Both are
+optional together — a tier with neither still scales out, and never in.
 
 `kubectl apply` that and the operator builds what the old chart made you size by
 hand — a StatefulSet, a PVC per replica, the governing headless Service which

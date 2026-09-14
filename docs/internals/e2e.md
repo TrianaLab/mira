@@ -470,8 +470,8 @@ pass exercises both receivers.
 
 ## 5. Reading it back
 
-**`localhost` can answer from the wrong Mira.** If either compose stack below is
-up, Docker has published `*:4318` on IPv6 and macOS resolves `localhost` to
+**`localhost` can answer from the wrong Mira.** If the demo stack in section 7
+is up, Docker has published `*:4318` on IPv6 and macOS resolves `localhost` to
 `::1` first — so every command here reaches the *container* rather than the
 binary section 2 started, and answers with a `stats` object that is valid,
 plausible and about someone else's store. The tell is `blocks_total`: a store
@@ -567,70 +567,86 @@ list and exits. The layout unit tests pass even when content is being *lost* —
 `Row` clips at `max` rather than overflowing — so a layout change is not
 verified until you have looked at it.
 
-## 6. A stock Collector in front
-
-The only test where the client is not ours. The stock exporter gzips by default
-on both transports, batches on its own schedule, and drops a batch permanently
-rather than retry if the server answers `UNIMPLEMENTED`.
+## 6. A tier the operator built, on a real cluster
 
 ```sh
-docker compose -f docs/e2e/compose.yaml up -d --build
+make operator-e2e
 ```
 
-That one command is the whole test. Six containers on one network: Mira
-(`4317`/`4318` published), `otel/opentelemetry-collector-contrib`
-(`14317`/`14318` published), and four one-shot `telemetrygen` runs aimed at the
-collector. The generators are in the compose file on purpose — without them
-`up -d` brings up two idle containers and proves nothing.
+One command, about fifteen minutes, and it needs `docker`, `kind`, `kubectl` and
+`helm`. It is the only gate in the tree that stands anything up, and it is also
+the only test where the client is not ours — the exporter on the wire is a stock
+`otel/opentelemetry-collector-contrib`, which gzips by default on both
+transports, batches on its own schedule, and drops a batch permanently rather
+than retry if the server answers `UNIMPLEMENTED`.
 
-The collector config is [`docs/e2e/otelcol.yaml`](../e2e/otelcol.yaml): the `otlp`
-and `otlphttp` exporters out of the box, pointed at a hostname. There is no
-Mira-specific component.
+It replaced a docker compose file that put that same collector in front of one
+Mira container. Everything that one asserted is asserted here, through a tier
+the operator built, so there is one end-to-end suite rather than two.
 
-Give it a few seconds and ask Mira, on its own port, for what the collector sent:
+`integrations/kubernetes/e2e/run.sh`
+is the whole thing. In order:
+
+| | |
+|---|---|
+| | `kind create cluster`, then `make operator-apiserver` — the API-server tests first, because a CRD the server prunes a field out of fails in thirty seconds rather than after two image builds |
+| | `docker build` the engine and the operator, `kind load`, and `helm install` the chart **as published** — a broken template or a missing RBAC rule fails here rather than in somebody's cluster |
+| A | a `MiraCluster` becomes a running tier: StatefulSet 2/2, proxy 1/1, and four objects the CR never named |
+| B | `integrations/kubernetes/e2e/telemetry.yaml` — the collector, config byte-for-byte from the compose scenario — plus four one-shot `telemetrygen` Jobs, and all three signals come back |
+| C | `spec.replicas: 3`, and a row written straight at `tel-2` comes back *through the proxy* |
+| D | `spec.replicas: 2`, and the drained replica's blocks are on the cold volume before its claim is deleted |
+| E | `helm uninstall` the operator, and the tier still ingests and serves |
+
+E is the assertion the architecture rests on. Principle 4 says Mira holds no
+coordination state, and the whole defence of shipping a controller is that a
+controller is not Mira. That is a testable claim, so it is tested.
+
+Five things about the setup that are not obvious:
+
+- **The generators use three different services.** Ingest routes on
+  `hash(resource) % n`, so one `--service` for all four puts the entire corpus
+  on one replica — C's merge assertion then passes against a proxy that is only
+  forwarding, and D archives an empty volume. C's fifth generator goes straight
+  at `tel-2.tel-headless:4317` for the same reason: a row that provably lives on
+  exactly one replica is the only honest test of a merge.
+- **Metrics are asked of the replicas, not of the proxy.**
+  `/api/v1/metrics/names` is built by walking one node's blocks and there is no
+  cursor to merge two nodes' answers on, so a proxy answers `501` and says so.
+  `scripts/wait-for-signals.sh 240 assert traces logs` covers the two a proxy
+  can merge; an in-cluster Pod asks both replicas for the third.
+- **The scale thresholds are set so `Down` always wins**, which is the opposite
+  of what it looks like it should be. `spec.replicas` is a floor: raising it
+  grows the tier outright, lowering it only *permits* a shrink, because a drain
+  archives a volume and then deletes it and the operator wants the replicas to
+  agree the data fits first. So D cannot patch the floor and wait — it has to
+  make that agreement unconditional, and `downWhenFreeAbove: 0.002` is true on
+  any node this suite could run on at all. The scale decision itself belongs to
+  the request-log tests; what D tests is floor, drain, archive, claim, in order.
+- **Both images are built inside Docker**, not copied in from the host. A
+  Mach-O binary in a Linux image fails four minutes later as silence.
+- **The forward is on `14318`.** `make demo` binds `4318`, and a port-forward
+  that cannot bind is a failure fifteen minutes into a run that had nothing
+  wrong with it.
+
+Debugging one:
 
 ```sh
-curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
-  -d '{"signal":"traces","limit":1}'
-curl -s -X POST localhost:4318/api/v1/metrics/names -H 'content-type: application/json' -d '{}'
+KEEP=1 make operator-e2e        # leave the cluster up on failure
+kind export kubeconfig --name mira-operator-e2e     # the run's own is a temp file
+kubectl --context kind-mira-operator-e2e -n mira-e2e get miracluster,sts,po,pvc
+kubectl --context kind-mira-operator-e2e -n mira-system logs deploy/mira-operator
+kind delete cluster --name mira-operator-e2e
 ```
 
-```sh
-docker compose -f docs/e2e/compose.yaml ps -a             # the generators should be Exited (0)
-docker compose -f docs/e2e/compose.yaml logs -f mira otelcol
-docker compose -f docs/e2e/compose.yaml down -v           # -v drops the data volume
-```
+The run exports `KUBECONFIG` to a temp file of its own and never calls
+`kubectl config use-context`, so it can neither be redirected by the machine's
+current context nor leave your shell pointed at Kind. It is not tidiness: a
+context that moved mid-run once had a suite that deletes volumes talking to a
+GKE cluster.
 
-`restart: on-failure` on the generators *is* the readiness wait: `depends_on`
-waits for the container to start, not for the receiver to bind, and both images
-are distroless, so there is nowhere to put a retry loop. A generator that loses
-the race exits non-zero and Docker runs it again. A first `ps -a` showing a
-restart is the design working.
-
-For different shapes, run telemetrygen from the host against the collector's
-published ports — same flags, `14317`/`14318` instead of the in-network
-`otelcol:4317`:
-
-```sh
-telemetrygen traces --otlp-endpoint 127.0.0.1:14317 --otlp-insecure --rate 0 \
-  --traces 200 --child-spans 3 --service checkout --status-code Error
-```
-
-Two things about the setup that cost an hour to learn:
-
-- **Mira has to be in the container too.** Collector-in-Docker against
-  Mira-on-the-host does not work on Docker Desktop for Mac:
-  `host.docker.internal` resolves to an IPv6 ULA that is not routable from the
-  container, and the bridge gateway is not either.
-- **The data volume is named, not a bind mount.** Mira `mmap`s its blocks, and a
-  Docker Desktop bind mount is FUSE, where an I/O hiccup arrives as `SIGBUS`
-  rather than as an error. Mira warns about a FUSE data directory at startup
-  rather than refusing, because the filesystem magic number cannot tell a local
-  FUSE mount from gcsfuse.
-
-The collector will log `"otlp" alias is deprecated; use "otlp_grpc" instead`.
-That is about the exporter's own name in recent contrib builds, not about
-anything Mira did. The old names are kept because they work on every version.
+On failure the script prints the objects, the last thirty events and the
+operator's last hundred log lines before it deletes anything — a cluster torn
+down before either is read is a re-run.
 
 ## 7. The OpenTelemetry Demo
 
@@ -689,7 +705,7 @@ docker compose -f /tmp/otel-demo/compose.yaml -f docs/e2e/demo/compose.mira.yaml
 ## 8. Cleanup
 
 ```sh
-docker compose -f docs/e2e/compose.yaml down -v
+kind delete cluster --name mira-operator-e2e
 make demo-clean
 rm -rf /tmp/mira-dev
 ```
