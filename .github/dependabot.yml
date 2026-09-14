@@ -1,8 +1,8 @@
 version: 2
 
-# Five ecosystems, because the repo has five: the Rust workspace, the workflows,
-# the Svelte UI under crates/mira/ui, the pinned MkDocs requirements under
-# docs/, and the Dockerfile's base images. Everything is grouped, because an
+# Six ecosystems, because the repo has six: the Rust workspace, the workflows,
+# the Svelte UI under crates/mira/ui, `@changesets/cli` at the root, the pinned
+# MkDocs requirements under docs/, and the Dockerfile's base images. Everything is grouped, because an
 # ungrouped weekly run on a tree this size opens a dozen PRs nobody reads, and a
 # dependency bot that gets ignored is worse than none — it trains you to ignore
 # the one that matters.
@@ -81,6 +81,24 @@ updates:
         update-types:
           - minor
           - patch
+
+  # The release machinery's one dependency: @changesets/cli, at the root. It is
+  # not a build dependency of anything Mira ships — no JavaScript from this
+  # lockfile reaches the binary — but it is on the path that writes version
+  # numbers, so it ages like everything else on the release path. One PR, and
+  # the Version PR it opens next is the test.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: ci
+    groups:
+      changesets:
+        patterns:
+          - "*"
 
   # The docs site's pinned requirements. One PR a week for the whole set — a
   # docs build either passes or it does not, and bisecting which mkdocs plugin

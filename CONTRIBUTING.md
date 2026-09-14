@@ -25,8 +25,9 @@ the tree.
 
 Rust **1.85** or newer — that is the `rust-version` in `Cargo.toml`, and CI
 holds it. A working `cc` for `zstd-sys`, which vendors its own source. No
-`protoc`: the OTLP protos are compiled by `protox` in a build script. No Node,
-unless you are changing the UI.
+`protoc`: the OTLP protos are compiled by `protox` in a build script. Node only
+if you are changing the UI, or running `make changeset` — and that one writes
+five lines of markdown you can equally well write by hand.
 
 `cargo` may not be on `PATH` in a non-login shell:
 
@@ -185,13 +186,27 @@ have an answer, and finding that out after the work is the expensive order.
 
 ## Releases
 
-[Release architecture](https://miradb.dev/internals/releases/) is the procedure
-and the reasoning: one version number across four coordinates, what a tag triggers,
-what is signed, and the two facts that cannot be undone once a coordinate is
-published. Read it before changing `.github/workflows/release.yml`.
+There are two version lines: the engine and the operator. They move
+independently, on purpose, and your PR says which one it moves:
 
-A version bump is an ordinary PR like any other. It is not something you do on
-`main`, and it is not something a tag does for you.
+```sh
+make changeset
+```
+
+That writes a file under `.changeset/`. `make ci-changeset` fails a pull request
+that changes shipped code without one; docs, tests and CI-only changes are
+exempt. If the change is to the engine, add the notes under `## [Unreleased]` in
+`CHANGELOG.md` too — the release publishes that section verbatim.
+
+Nothing else is yours to do. Merging your PR does not release; a bot opens a
+**`chore: version packages`** PR that accumulates changesets, and merging *that*
+is the release.
+
+[Release architecture](https://miradb.dev/internals/releases/) is the procedure
+and the reasoning: two version lines across five coordinates, what a tag
+triggers, what is signed, and the two facts that cannot be undone once a
+coordinate is published. Read it before changing
+`.github/workflows/release.yml`.
 
 ## Licence
 

@@ -68,6 +68,11 @@ ci-section-text: ## No section sign in the TITLE and BODY environment variables
 	printf '%s' "$${TITLE:-}" | sh scripts/check-section-sign.sh --text "pr title"
 	printf '%s' "$${BODY:-}"  | sh scripts/check-section-sign.sh --text "pr body"
 
+# The third of the same kind: a gate that reads the pull request's range rather
+# than the tree, so it takes its input as a variable and is not in `ci` below.
+.PHONY: ci-changeset
+ci-changeset: changeset-check ## The `changeset` leg: this diff declares its version line
+
 .PHONY: ci-rust
 ci-rust: fmt-check lint features test doc ## The `rust` leg, on the primary runner
 

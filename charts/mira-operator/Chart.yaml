@@ -6,9 +6,15 @@ type: application
 # operator is a separate binary with a separate dependency tree and a separate
 # release cadence — a controller bug fix should not require a Mira release, and
 # a Mira release should not require republishing a controller that did not
-# change. This number is the operator's source of truth: `operator-meta` in
-# release.yml reads it, `make drift` deliberately does not, and `make bump`
-# must leave it alone.
+# change. `make bump` still must leave this alone: that target moves the
+# *engine*, and the two numbers must never learn to move together.
+#
+# This number is now written by `make version`, from an `"@mira/operator"`
+# changeset, and checked by `make drift` through `operator_sites()` in
+# crates/xtask/src/release.rs — along with `appVersion` and the Artifact Hub
+# image annotation below, which are the same number twice more and had no local
+# gate at all until then. `operator-meta` in release.yml still reads it; it is
+# just no longer the first thing that does.
 version: 0.1.0
 appVersion: "0.1.0"
 # `apiextensions.k8s.io/v1` CRDs and server-side apply are both far older, but

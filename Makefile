@@ -520,6 +520,54 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 	@echo "Now: \`make drift\` to verify, then a PR. Merging it cuts $(TO) —"
 	@echo "there is no tag to remember. See docs/internals/releases.md."
 
+# ---------------------------------------------------------------------------
+# Changesets: the declaration, the gate on it, and the writer it drives
+# ---------------------------------------------------------------------------
+#
+# `make bump TO=X.Y.Z` above is still the whole bump and still works offline.
+# What changesets adds is *who chooses X.Y.Z*: a contributor says "this is a
+# patch to the operator" in a five-line file, a bot accumulates them, and
+# `make version` applies the arithmetic. Both paths share one writer —
+# `xtask drift --bump` for the engine, `xtask release apply` for the operator,
+# and the same two tables `make drift` reads — so there is no second way for a
+# version to end up wrong.
+
+.PHONY: changeset
+changeset: ## Declare which version line this change moves
+	@# The only Node on a contributor's path, and it is optional: the file
+	@# this writes is five lines of markdown and .changeset/README.md has the
+	@# shape.
+	npm ci
+	npx changeset add
+
+.PHONY: changeset-check
+changeset-check: ## Every diff that ships something declares its version line (BASE=<ref>)
+	@# Not in `check`. It reads a pull request's range, and on main that range
+	@# is empty, so a laptop has nothing to run it against — the same reason
+	@# `ci-section-range` is not in `ci-meta`. The fail-open behaviour and the
+	@# reasoning are in the script.
+	sh scripts/changeset-check.sh $(BASE)
+
+.PHONY: version
+version: ## Apply the pending changesets (this is what the bot runs)
+	@# Three steps and a hand-off. `changeset version` computes the arithmetic
+	@# and writes the two stubs under release/units/; `release apply` copies
+	@# those two numbers into the ~20 places Mira actually states a version,
+	@# through the same tables `make drift` checks; then the generated files.
+	@#
+	@# Both Cargo.locks, because the two workspaces are separate: the root one
+	@# carries the three miradb-* entries and integrations/kubernetes/Cargo.lock
+	@# carries mira-operator. A `--locked` build against a stale one fails at
+	@# release time, which is the wrong place to find out.
+	npm ci
+	npx changeset version
+	$(XTASK) release apply
+	$(CARGO) update --workspace --quiet
+	$(CARGO) update --workspace --quiet --manifest-path $(OPERATOR)/Cargo.toml
+	$(MAKE) --no-print-directory helm-docs
+	@echo
+	@echo "Now: \`make drift\` to verify. Merging this cuts the release."
+
 .PHONY: workflows
 workflows: ## Lint the workflows, and check every CI job can block a merge
 	@# actionlint is the syntax and shellcheck pass; `xtask ci` is the

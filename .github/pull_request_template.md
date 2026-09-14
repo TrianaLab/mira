@@ -25,6 +25,8 @@ the command you ran:
 
 ## Checklist
 
+- [ ] A changeset says which version line this moves — `make changeset`, or a
+      file under `.changeset/`. Not needed for docs, tests or CI.
 - [ ] `make check` is green locally.
 - [ ] Tests cover the new behaviour — or, for a fix, the test fails without it.
 - [ ] Coverage went up, or held. If the ratchet moved, it moved **up**.

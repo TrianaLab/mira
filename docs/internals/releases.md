@@ -14,8 +14,9 @@ Mira publishes three coordinates and they all carry the same version string:
 | Multi-arch image | `ghcr.io/trianalab/mira:X.Y.Z` (and `:latest`) |
 | Three crates | `miradb`, `miradb-core`, `miradb-proto` on crates.io |
 
-One number across all three, so there is nothing to compute: bumping is an edit
-to `Cargo.toml` and a `make drift` run.
+One number across all three, so there is nothing to compute at release time: by
+the time the tag exists the number was decided on a pull request, written into
+`Cargo.toml` by a bot and checked by `make drift`.
 
 No chart is on that list, and that is a change rather than an omission. There
 used to be a `charts/mira` stamped from the workspace version; it was removed
@@ -44,7 +45,9 @@ an engine at `0.3.1` would be a claim that they move together, and they do not:
 older one, which is the entire point of a controller that upgrades a tier. A
 shared number would turn "which operator supports which engine" into a question
 whose answer looks obvious and is wrong. `make bump` therefore does **not**
-touch `charts/mira-operator/Chart.yaml`, and `make drift` does not check it.
+touch `charts/mira-operator/Chart.yaml`. `make drift` *does* check it — against a
+source of its own, in a table of its own — and until recently did not, which is
+the subject of the next section.
 
 **Its publishers skip rather than fail.** This is the exact inverse of the rule
 in [Two irreversible facts](#two-irreversible-facts), and it is deliberate. The
@@ -72,32 +75,62 @@ release**, because there is no second tag to hang one on. The upgrade path is a
 `mira-operator/vA.B.C` tag and a second `push: tags:` filter beside the existing
 one, on the first day that costs somebody something.
 
-### Why not changesets
+### Why changesets, in the end
 
 [pacto](https://pacto.run) uses [changesets](https://github.com/changesets/changesets)
-for exactly this shape — several artefacts, versions that move independently —
-and it was the obvious thing to reach for here. It was not adopted, and the
-reason is worth recording so the question does not get re-opened for free.
+for exactly this shape — several artefacts, versions that move independently. It
+was rejected here once, on a recorded argument, and then adopted. Both halves are
+worth keeping: the argument was not wrong when it was made, and what changed is
+not what anybody expected to change.
 
-Changesets' product is the **Version Packages PR**: contributors drop a markdown
-file saying "this is a patch to the operator", a bot accumulates them, and
-merging its PR performs the bumps and writes the changelog. That is a real
-feature and Mira is not currently using any part of it — the bump is `make bump`
-and the changelog is prose a human writes, on purpose, because
-[the notes are the point](#cutting-a-release).
-
-What adopting it *today* would cost is a `package.json` at the root declaring an
-npm workspace, a `.changeset/config.json` with a fixed group, and one
+The argument was that changesets' product is the **Version Packages PR** —
+contributors drop a markdown file saying "this is a patch to the operator", a bot
+accumulates them, and merging its PR performs the bumps — and that the price of
+that was a `package.json` at the root, a `.changeset/config.json`, and one
 `package.json` per publishable unit whose only content is a version string that
-`Chart.yaml` already holds — three files restating one number, plus a gate to
-keep them agreeing, plus node on the release path. That is the machinery with
-none of the benefit.
+`Chart.yaml` already held. Three files restating one number, plus a gate to keep
+them agreeing, plus Node on the release path. The stated trigger to revisit was a
+*third* independently-versioned artefact, or the first outside contributor who
+had to be told by hand which line their change belonged to.
 
-The trigger to revisit is a **third** independently-versioned artefact, or the
-first outside contributor who has to be told by hand which version line their
-change belongs to. Two artefacts and one maintainer is below the line where the
-bot pays for itself; `charts/mira-operator/Chart.yaml` is the source of truth
-until then, and `operator-meta` reads it with `sed`.
+Neither of those happened. What happened is that the second line was examined
+closely enough to write the section above, and it turned out
+`charts/mira-operator/Chart.yaml` had **no local gate at all**. Three version
+fields in one file, hand-edited, cross-checked only by `operator-meta` — which
+runs after the tag, on the wrong side of the merge. `docs/install.md` had two
+copy-pasteable operator commands nobody checked either, and
+`integrations/kubernetes/Cargo.toml` sat at `0.0.0`, which `mira-operator
+--version` was printing to anybody debugging a cluster.
+
+So the cost accounting was inverted. The objection counted the gate as part of
+the price of adopting changesets; the gate was the thing that was missing, and it
+was needed whether or not a bot ever wrote a version number. Once
+`operator_sites()` exists in `crates/xtask/src/release.rs` — the same table shape
+as `version_sites()`, read forwards to check and backwards to write — the
+remaining delta is two stub `package.json` files and one workflow. That is a
+small price for the part nobody had solved by hand: **which of the two lines does
+this change move, decided on the pull request that makes it, by the person who
+knows.** `make bump TO=` could never answer that. It takes the answer as an
+argument.
+
+What was adopted is narrow, and the boundary is deliberate:
+
+- **The arithmetic and the Version PR.** `changeset version` reads the files
+  under `.changeset/` and writes the two stubs under `release/units/`. That is
+  the whole of what the npm tooling does.
+- **Nothing else.** `xtask release apply` copies those two numbers into the
+  twenty-odd sites; `changelog: false` in the config, because the changelog is
+  prose a human writes for exactly the reason in
+  [Cutting a release](#cutting-a-release); `private: true` on both units and no
+  `publish-script`, because nothing here goes to npm and the real artefacts are
+  published by `release.yml` off the tag under an OIDC identity the Version PR
+  job does not have.
+
+`crates/mira/ui` is **not** an npm workspace member, and that is load-bearing:
+npm reroutes an install run from inside a member up to the root, and `make ui`'s
+`git diff --exit-code dist` stops being reproducible the moment the UI's
+lockfile is resolved against a different tree. The root `package.json` declares
+`release/units/*` and nothing else.
 
 The crates are `miradb-*` because `mira` on crates.io is an unrelated crate
 from 2024. Only the registry knows those names: the dependency keys, the `use`
@@ -106,24 +139,41 @@ paths, the `[lib] name`s and the installed binary are all still `mira`.
 
 ## Cutting a release
 
-1. **Write the changelog section first**, under `## [Unreleased]` in
-   `CHANGELOG.md`. This is not optional decoration: the release job extracts
-   that section verbatim as the Release notes, and an empty one degrades to
-   `--generate-notes`. Mira does not use Conventional Commits, so generated
-   notes are a list of imperative prose subjects — worse than what you would
-   have written. Step 2 refuses if you skip this.
-2. **Bump the version.**
+There is no release PR to open. A release is the accumulation of ordinary PRs,
+each of which said what it moved.
+
+1. **On the change itself, declare the line.**
    ```sh
-   make bump TO=X.Y.Z && make drift
+   make changeset
    ```
-   `Cargo.toml`'s `[workspace.package] version` is the source of truth and
-   everything else restates it; `bump` writes all of them and promotes the
-   changelog section you just wrote, `drift` checks it. The full list, and what
-   guards each one, is under
-   [Where the version lives](#where-the-version-lives).
-3. **Open a normal PR, and merge it when it is green.** That is the release.
-4. **Watch `verify-release`.** It is the terminal job and the only one whose
+   It asks which of `@mira/engine` and `@mira/operator` this touches and whether
+   it is major, minor or patch, and writes five lines of markdown under
+   `.changeset/`. Commit that with the change. `make ci-changeset` runs on the
+   pull request and fails if a diff that touches shipped code has none; docs,
+   tests and CI-only diffs are exempt, and so is a hand-written bump.
+2. **If it is an engine change, write the changelog section**, under
+   `## [Unreleased]` in `CHANGELOG.md`. This is not optional decoration: the
+   release job extracts that section verbatim as the Release notes, and an empty
+   one degrades to `--generate-notes`. Mira does not use Conventional Commits, so
+   generated notes are a list of imperative prose subjects — worse than what you
+   would have written. `ci-changeset` refuses an engine changeset with an empty
+   `## [Unreleased]`, so this is checked on the branch rather than on `main`.
+3. **Merge, as usual.** The push to `main` runs `version-packages.yml`, which
+   opens or updates a **`chore: version packages`** pull request: it consumes
+   every pending changeset, moves whichever of the two numbers they name, and
+   rewrites every site that restates them. Nothing has shipped yet. That PR can
+   sit for a week accumulating changesets, and what it says at the top is the
+   release you would get by merging it now.
+4. **Merge the Version PR when you want the release.** That is the release —
+   there is nothing after it to remember.
+5. **Watch `verify-release`.** It is the terminal job and the only one whose
    success means anything to a stranger.
+
+The escape hatch is still there and still supported: `make bump TO=X.Y.Z &&
+make drift` writes the engine's sites by hand, for the case where the number has
+to be a specific one rather than whatever the changesets add up to. It is not
+the normal path, it only knows the engine line, and `make changeset` is the one
+to reach for by default.
 
 There is no tag step. `ci.yml`'s `tag` job runs on every push to `main`,
 downstream of both required contexts, and `scripts/tag-release.sh` reads
@@ -154,9 +204,21 @@ identity is still `release.yml@refs/tags/vX.Y.Z`, which is what
 raised under. Triggering off the branch would move that subject to
 `refs/heads/main`, and the pin is not something to change quietly.
 
-It also means no credential. A PAT, a deploy key or a GitHub App token would all
-have worked, and all three are a secret somebody has to rotate; `github.token`
-with `contents: write` and `actions: write` on that one job is not.
+It also means no credential *on the tag path*. A PAT, a deploy key or a GitHub
+App token would all have worked there, and all three are a secret somebody has to
+rotate; `github.token` with `contents: write` and `actions: write` on that one
+job is not.
+
+The Version PR does not get off as cheaply, and it is the same GitHub rule that
+decides it. A pull request opened with `GITHUB_TOKEN` does not start
+`pull_request` workflows; `main`'s ruleset has an empty `bypass_actors`; a PR
+with no required context is a PR that can never merge. The tag path escapes that
+rule through `workflow_dispatch`, which is exempt. A pull request has no exempt
+equivalent, so `version-packages.yml` runs `changesets/action` under a
+**`VERSION_PR_TOKEN`** secret — a fine-grained PAT with contents and pull-requests
+write on this repository and nothing else. It is the one credential on the
+release path that is not `github.token`, and if it is missing or expired the
+symptom is a Version PR that never appears rather than anything red.
 
 Running `release.yml` from the Actions tab **at a branch** is still the
 rehearsal: `publish=false`, `version=<crate>-dev.<sha7>`, and every push, sign
@@ -258,7 +320,10 @@ re-run the job, not to bump.
 
 **`operator-meta`** reads the three version fields out of
 `charts/mira-operator/Chart.yaml` — `version`, `appVersion` and the tag in the
-`artifacthub.io/images` annotation — and **fails if any disagrees**. The chart
+`artifacthub.io/images` annotation — and **fails if any disagrees**. `make drift`
+now checks the same three on every pull request, which is the right side of the
+merge to find out; this stayed because it is the only check that runs on the
+commit the tag actually names. The chart
 installs a Deployment whose image tag defaults to `appVersion`, so a chart at
 `0.2.0` carrying `appVersion: 0.1.0` ships a controller one version behind the
 CRD schema it was installed with. The annotation is worse in a quieter way:
@@ -361,12 +426,13 @@ therefore not a change to make quietly.
 
 ## Where the version lives
 
-`Cargo.toml`'s `[workspace.package] version` is the source; everything below
-restates it, and the right-hand column is what stops it rotting.
-`charts/mira-operator/Chart.yaml` is deliberately **not** in this table — it is
-its own source, for [the reasons above](#and-two-that-do-not), and `make bump`
-leaving it alone is the behaviour rather than an omission. The gate on it is
-`operator-meta`, at release time, not `make drift`.
+Two lines, two tables, and no row of one appears in the other — a test asserts
+that, because a crossed table is only visible on the release where one of them
+moves alone.
+
+**The engine.** `Cargo.toml`'s `[workspace.package] version` is the source;
+everything below restates it, and the right-hand column is what stops it
+rotting.
 
 | Site | Written by | Gate |
 |---|---|---|
@@ -378,16 +444,38 @@ leaving it alone is the behaviour rather than an omission. The gate on it is
 | `.github/ISSUE_TEMPLATE/bug_report.yml` — the `mira X.Y.Z` placeholder | `make bump` | `make drift` |
 | `charts/mira-operator/README.md.gotmpl` — the `spec.image` in the MiraCluster | `make bump` | `make drift` |
 | `CHANGELOG.md` — the heading and the link definitions | `make bump` | **none** (prose) |
+| `release/units/mira-engine/package.json` — the changeset unit | `changeset version` | `make drift` |
 | `Cargo.lock` | `cargo update --workspace` | `--locked` fails the build |
 | `charts/mira-operator/README.md` | `make bump`, then `helm-docs` over it | `make helm-docs-check`, `make drift` |
 
-`make bump TO=X.Y.Z` writes every row above and then regenerates the last two,
-so step 1 is one command and `make drift` is how you check it did. The middle
-column exists because the writer and the gate are deliberately the same thing:
-`version_sites()` in `crates/xtask/src/drift.rs` is one table of anchored patterns,
-read forwards to check and backwards to write. A gate maintained separately
-from the writer drifts, and it drifts in the bad direction — the writer is what
-people actually run.
+The unit is a site like any other, which is the whole trick: `changeset version`
+does the arithmetic on a number that `make drift` has already forced to equal the
+real one, so the bot cannot compute a bump off a stale base.
+
+**The operator.** `release/units/mira-operator/package.json` is the source, and
+`charts/mira-operator/Chart.yaml` follows it rather than leading. Every row here
+is written by `xtask release apply` and gated by `make drift`:
+
+| Site |
+|---|
+| `charts/mira-operator/Chart.yaml` — `version`, `appVersion`, and the tag in the `artifacthub.io/images` annotation |
+| `integrations/kubernetes/Cargo.toml` — `[package] version` |
+| `integrations/kubernetes/Cargo.lock` — the `mira-operator` entry (regenerated, checked anyway: `--locked` is what turns a stale one into a red release) |
+| `docs/install.md` — `helm install --version`, and the `ghcr.io/trianalab/charts/mira-operator:` pull |
+
+`charts/mira-operator/README.md` is deliberately absent: every version in it comes
+from `{{ template "chart.version" . }}`, so `helm-docs` writes it and
+`make helm-docs-check` gates it. Two gates on one generated file is one gate too
+many.
+
+`make version` writes both tables and then regenerates the derived files, so the
+Version PR is one command and `make drift` is how CI checks it did. The middle
+column above exists because the writer and the gate are deliberately the same
+thing: `version_sites()` in `crates/xtask/src/drift.rs` and `operator_sites()` in
+`crates/xtask/src/release.rs` are tables of anchored patterns, read forwards to
+check and backwards to write. A gate maintained separately from the writer
+drifts, and it drifts in the bad direction — the writer is what people actually
+run.
 
 Anchored patterns rather than a find-and-replace, because this page is full of
 sentences that name a past release on purpose, and a bump must not rewrite one

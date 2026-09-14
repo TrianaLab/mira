@@ -21,6 +21,7 @@
 //! | [`ci`] | `scripts/check_ci.py` | the workflow graph is what everyone assumes |
 //! | [`drift`] | `scripts/check_drift.py` | the numbers the README promises are still true |
 //! | `drift --bump X.Y.Z` | `check_drift.py --bump` | rewrite every version site at once |
+//! | `release apply` | nothing — both lines were hand-edited | copy what `changeset version` wrote into the tree that ships |
 //! | [`measurements`](mod@measurements) | nothing — the numbers were loose | every site still quotes the figure the last run measured |
 //! | `measurements render` | — | rewrite the registry table on the contract page |
 //! | `measurements ingest RUN.json` | — | fold a load test's output back into the registry |
@@ -36,6 +37,7 @@ mod coverage_json;
 mod drift;
 mod measurements;
 mod reference;
+mod release;
 mod util;
 
 use std::process::ExitCode;
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
         (Some("ci"), []) => ci::run(),
         (Some("drift"), []) => drift::check(),
         (Some("drift"), ["--bump", to]) => drift::bump(to),
+        (Some("release"), ["apply"]) => release::apply(),
         (Some("measurements"), []) => measurements::check(),
         (Some("measurements"), ["render"]) => measurements::render(),
         (Some("measurements"), ["ingest", run]) => measurements::ingest(run, false),
@@ -74,6 +77,7 @@ fn main() -> ExitCode {
                  \x20 ci                        the workflow graph can block a merge\n\
                  \x20 drift                     the numbers the docs promise are measured\n\
                  \x20 drift --bump X.Y.Z        rewrite every version site\n\
+                 \x20 release apply             apply what `changeset version` wrote\n\
                  \x20 measurements              every site quotes the measured figure\n\
                  \x20 measurements render       rewrite the registry table\n\
                  \x20 measurements ingest RUN.json [--write]\n\

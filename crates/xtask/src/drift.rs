@@ -157,10 +157,22 @@ fn version_sites() -> Vec<(&'static str, Regex)> {
             "Cargo.toml",
             re(r#"(?m)^mira-(?:core|proto) = \{.*?version = "(\d+\.\d+\.\d+)""#),
         ),
-        // No chart row. `charts/mira-operator/Chart.yaml` is the operator's own
-        // source of truth on its own version line, deliberately not this one —
-        // see docs/internals/releases.md. `operator-meta` in release.yml is
-        // what gates it, and `make bump` must leave it alone.
+        // The engine's changeset unit. Its only content is this number, and
+        // `changeset version` is what writes it — but the instant it disagrees
+        // with `[workspace.package]` the bot computes the next release off the
+        // wrong base, so it is a site like every other and `make bump` moves it
+        // too. That is the whole reason the unit is not a second source of
+        // truth: it is a source of truth for exactly one command.
+        (
+            "release/units/mira-engine/package.json",
+            re(r#"(?m)^\s*"version": "(\d+\.\d+\.\d+)""#),
+        ),
+        // No chart row *on this table*. `charts/mira-operator/Chart.yaml` is
+        // the operator's own source of truth on its own version line,
+        // deliberately not this one — see docs/internals/releases.md. It has a
+        // table of its own now, `operator_sites()` in
+        // crates/xtask/src/release.rs, checked by the call in `check()` below;
+        // `make bump` still must leave it alone.
         //
         // The commands a reader copies rather than reads. A stale version here
         // is a 404 rather than a typo. The `v` is required rather than
@@ -225,6 +237,9 @@ pub fn check() -> bool {
     check_binary_size(declared_mib, &mut f, &mut notes);
     check_sites(declared_crates, declared_mib, &mut f);
     check_version_sites(&workspace_version(), &mut f);
+    // The operator's line, off its own source. Same shape, same rule that a
+    // pattern matching nothing is a failure — see crates/xtask/src/release.rs.
+    crate::release::check_sites(&mut f);
     check_artifacthub_repo(&mut f);
     check_coverage_badge(&mut f);
     check_section_refs(&mut f);
@@ -447,7 +462,7 @@ fn check_sites(declared_crates: usize, declared_mib: f64, f: &mut Failures) {
 /// Read with a regex rather than a TOML parser because that is one dependency
 /// for one line, and the shape of that line is already asserted by
 /// [`version_sites`] — the first entry there matches the same text.
-fn workspace_version() -> String {
+pub(crate) fn workspace_version() -> String {
     let text = read_or_exit("Cargo.toml");
     // The lines between the header and the next table. By hand rather than by
     // regex: "up to the next `[`" wants a lookahead, which this engine does not
@@ -665,7 +680,7 @@ fn check_section_refs(f: &mut Failures) {
 /// putting the surrounding syntax back means re-spelling every pattern twice,
 /// once to find and once to restore. Splicing by group span keeps one pattern
 /// per site, and one pattern is what lets the gate and the writer share a table.
-fn rewrite_group1(pattern: &Regex, text: &str, new: &str) -> (String, usize) {
+pub(crate) fn rewrite_group1(pattern: &Regex, text: &str, new: &str) -> (String, usize) {
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     let mut count = 0;

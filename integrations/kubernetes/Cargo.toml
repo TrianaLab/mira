@@ -17,7 +17,13 @@ resolver = "3"
 
 [package]
 name = "mira-operator"
-version = "0.0.0"
+# The operator's own line, the same number as charts/mira-operator/Chart.yaml.
+# It was 0.0.0 because nothing local read it, which was never quite true: the
+# binary prints `CARGO_PKG_VERSION` in `--version`, so 0.0.0 was a lie available
+# to anyone debugging a cluster. `make version` writes it from an
+# `"@mira/operator"` changeset and `make drift` checks it — see
+# `operator_sites()` in crates/xtask/src/release.rs.
+version = "0.1.0"
 edition = "2024"
 # kube 4.x floor. Deliberately not the engine's 1.85: a user compiling Mira is
 # not compiling this.

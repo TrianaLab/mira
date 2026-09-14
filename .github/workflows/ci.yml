@@ -51,6 +51,7 @@ jobs:
       image: ${{ steps.filter.outputs.image }}
       chart: ${{ steps.filter.outputs.chart }}
       operator: ${{ steps.filter.outputs.operator }}
+      changeset: ${{ steps.filter.outputs.changeset }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -420,6 +421,37 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make ci-section-text
 
+  changeset:
+    name: changeset
+    needs: changes
+    # Three conditions, and each one removes a way this gate could block
+    # something it has no business blocking.
+    #
+    # Only on a pull request: on a push to main the diff is already merged, and
+    # a gate that cannot be acted on is noise.
+    #
+    # Only when the diff ships something — `changes` says so. The Version PR is
+    # exempted inside the script rather than here, because the hand-run
+    # `make bump` fallback needs the same exemption and one mechanism is enough.
+    #
+    # Never on Dependabot, which cannot write a changeset and would otherwise go
+    # red on every single bump. A dependency change worth a release note gets
+    # one from whoever merges it; the gate is for humans, who can.
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.changes.outputs.changeset == 'true'
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate is a diff against the base, so it needs the range.
+          fetch-depth: 0
+      - name: this diff declares which version line it moves
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: make ci-changeset BASE="${BASE}"
+
   # Two status contexts, and branch protection requires both. Every leg above
   # feeds into one of them, so adding a job never means remembering to update a
   # setting in the GitHub UI — and `xtask ci` fails if a job is ever
@@ -438,7 +470,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [changes, rust, msrv, operator, operator-e2e, ui, coverage, supply-chain, drift, docs, release-dry-run, helm, meta]
+    needs: [changes, rust, msrv, operator, operator-e2e, ui, coverage, supply-chain, drift, docs, release-dry-run, helm, meta, changeset]
     runs-on: ubuntu-latest
     steps:
       - name: Every leg green or deliberately skipped

@@ -30,7 +30,17 @@ crates/mira-proto/proto/** linguist-vendored=true
 # in diffs; the interesting question about a lockfile change is what `make deps`
 # and `make audit` say about it, not which line moved.
 Cargo.lock                     linguist-generated=true
+integrations/kubernetes/Cargo.lock linguist-generated=true
 crates/mira/ui/package-lock.json linguist-generated=true
+package-lock.json              linguist-generated=true
+
+# The changeset units and the root package.json. Four numbers and a description
+# between them, and none of it is JavaScript: without this the language bar on
+# the repository page starts counting a release mechanism as a JavaScript
+# project, which is the same wrong first impression the UI bundle rule above
+# exists to prevent.
+package.json     linguist-generated=true
+release/units/** linguist-generated=true
 
 # architecture.md is the reasoning of record and config.md is the whole config
 # surface — prose, not code. Counting them as a language would misreport the

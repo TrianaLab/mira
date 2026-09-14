@@ -1,0 +1,66 @@
+name: version-packages
+
+# The Version PR, and nothing else. Merging it is the release: `ci.yml`'s `tag`
+# job reads Cargo.toml on the push to main that follows, and tags.
+#
+# Not in ci.yml, because ci.yml is a dispatcher over gates and this writes to the
+# repository. Not triggered by `pull_request` either, so it needs no `required`
+# job and `xtask ci` does not ask for one.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # One Version PR. A second push to main while this is open must update that
+  # branch rather than race it — and `cancel-in-progress` is right here for the
+  # same reason it is wrong for ci.yml's main runs: there is no history to keep.
+  group: version-packages
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The action pushes a branch; a shallow clone cannot be the base of one
+          # that is updated across several runs.
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      # `make version` runs `xtask release apply`, which is a cargo build.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          env-vars: ImageOS
+          key: version
+      # `make version` regenerates the chart README, because the Version PR has
+      # to pass `make helm-docs-check` like any other PR. Same target the helm
+      # leg uses, so the two pinned versions cannot drift apart.
+      - run: make ci-tool-chart
+
+      - uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          # A pull request opened with GITHUB_TOKEN does not start
+          # `pull_request` workflows, main's ruleset has an empty
+          # `bypass_actors`, and a PR with no required context is a PR that can
+          # never merge. This is the one credential on the release path; see
+          # docs/internals/releases.md.
+          github-token: ${{ secrets.VERSION_PR_TOKEN }}
+          # Not `changeset version`: that writes the two stub package.json files
+          # and stops. This is the whole bump — both Cargo.tomls, both
+          # Cargo.locks, the chart, the docs and the changelog promotion.
+          version-script: make version
+          commit-message: "chore: version packages"
+          pr-title: "chore: version packages"
+          # No `publish-script`. Nothing here goes to npm — both units are
+          # `private: true` — and the artefacts are published by release.yml,
+          # off the tag, under an OIDC identity this job does not have and must
+          # not acquire.
