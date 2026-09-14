@@ -12,11 +12,19 @@
 //!
 //! So the whole protocol is: send the same `after` cursor to every replica, ask
 //! each for the newest `limit` rows behind it, merge the answers on that same
-//! order, cut to `limit`, and hand back the cursor of the last row emitted.
-//! Every row not emitted sorts strictly after that cursor on every replica, so
-//! the next page is exact — no duplicates, no gaps — and the proxy has
-//! forgotten the reader by the time the response is written. Principle 4 is
-//! satisfied by construction rather than by care.
+//! order, drop repeated cursors, cut to `limit`, and hand back the cursor of
+//! the last row emitted. Every row not emitted sorts strictly after that cursor
+//! on every replica, so the next page is exact — no duplicates, no gaps — and
+//! the proxy has forgotten the reader by the time the response is written.
+//! Principle 4 is satisfied by construction rather than by care.
+//!
+//! The repeats are not a paging failure but a placement one, and they are
+//! expected rather than exceptional. `node` in a cursor names the *writer*, so
+//! one block reachable from two replicas is answered for twice with the same
+//! cursor: that is the steady state of shared-volume mode (section 12.5), where
+//! every replica's `scan` sees every writer's blocks, and the transient state of
+//! a block being re-homed (section 6.1). Equal cursors are the same row and
+//! never a collision, so `merge` keeps one and the promise above holds.
 //!
 //! # What it refuses
 //!
@@ -217,6 +225,23 @@ fn merge(bodies: &[String], limit: usize, keep_cursors: bool) -> Result<query::R
     // still exceed `limit` between them, and one full page means that replica
     // has more even when the merged set does not overflow.
     rows.sort_unstable_by_key(|(c, _)| c.key());
+    // A cursor is `(ts, node, seq, row)` where `node` is the *writer* and not
+    // the replica that answered, so two replicas holding one block hand back
+    // byte-identical cursors for the same row. Equal keys are therefore always
+    // the same row and never two rows that collided, which is what makes
+    // dropping one of them safe rather than lossy.
+    //
+    // Two supported shapes produce it. Shared-volume mode (section 12.5) is the
+    // permanent one: every replica's `scan` sees every writer's blocks, so
+    // without this line a two-replica proxy returns every row twice. The other
+    // is the window while a block is being re-homed, when it is deliberately
+    // present on both its old node and its new one (section 6.1).
+    //
+    // Before the cut, not after. Duplicates left in the count report a `more`
+    // that is not there, and they spend the reader's `limit` on rows it has
+    // already been handed: across N replicas sharing a volume, a page of 100
+    // comes back carrying 100/N distinct rows and the reader has no way to tell.
+    rows.dedup_by_key(|(c, _)| c.key());
     more |= rows.len() > limit;
     rows.truncate(limit);
 
@@ -726,6 +751,42 @@ mod tests {
         // Not asked for, so not carried: a caller who did not ask sees the same
         // body a single node would have sent.
         assert!(r.cursors.is_empty());
+    }
+
+    /// One block seen by two replicas is one row, not two.
+    ///
+    /// `node` in a cursor is the writer, never the replica that answered, so a
+    /// block reachable from two places yields byte-identical cursors and equal
+    /// keys are always the same row. That is the *steady state* of shared-volume
+    /// mode (section 12.5), where every replica's `scan` sees every writer's
+    /// blocks — so without the dedup a two-replica proxy returns the whole
+    /// dataset twice and the module's "no duplicates" promise is false for a
+    /// configuration the chart documents. It is also the deliberate state of a
+    /// block part-way through being re-homed (section 6.1).
+    ///
+    /// The cut matters as much as the rows: duplicates spend the reader's
+    /// `limit`, so the second half asserts a page of two carries two *distinct*
+    /// rows rather than one row twice.
+    #[test]
+    fn one_block_seen_by_two_replicas_is_not_two_copies_of_every_row() {
+        let shared = [(100, 1, 9), (80, 1, 9), (60, 1, 8)];
+        let both = || [page(&shared, false), page(&shared, false)];
+
+        let r = merge(&both(), 10, false).unwrap();
+        assert_eq!(
+            r.json,
+            "[{\"body\":\"100.1.9.0\"},{\"body\":\"80.1.9.0\"},{\"body\":\"60.1.8.0\"}]"
+        );
+        // Three distinct rows fit under ten, so there is nothing behind them.
+        // Un-deduplicated this is six and the reader is told to come back.
+        assert!(r.next.is_none());
+
+        let cut = merge(&both(), 2, false).unwrap();
+        assert_eq!(
+            cut.json, "[{\"body\":\"100.1.9.0\"},{\"body\":\"80.1.9.0\"}]",
+            "a page of two is two rows, not one row twice"
+        );
+        assert_eq!(cut.next.unwrap().to_string(), "80.1.9.0");
     }
 
     /// A tie on `ts` across two nodes is the case a per-node order cannot
