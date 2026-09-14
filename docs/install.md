@@ -241,7 +241,7 @@ cosign verify \
 
 The [chart reference](reference/chart.md) has every value, how a scale-in is
 sequenced, and why there is no leader election.
-It is also listed on [Artifact Hub](https://artifacthub.io/packages/helm/mira/mira-operator),
+It is also listed on [Artifact Hub](https://artifacthub.io/packages/search?repo=mira),
 which renders that README, the signature above and the image's current CVE
 report against the same coordinate. Every value the chart itself owns — `image`,
 `rbac`, `serviceAccount`, `replicaCount`, `logLevel` — is covered by a

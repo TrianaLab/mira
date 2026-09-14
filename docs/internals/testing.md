@@ -166,9 +166,11 @@ any. Both fail open.
 ### 8. Against a real API server
 
 `make operator-apiserver` runs `integrations/kubernetes/tests/apiserver.rs`
-against whatever cluster the current kubeconfig context points at, and returns
-immediately unless `MIRA_OPERATOR_APISERVER` is set — so `make operator` stays a
-gate a laptop with no cluster can pass.
+against whatever cluster the current kubeconfig context points at. The target
+sets `MIRA_OPERATOR_APISERVER` itself; a bare `cargo test` does not, and every
+test in the file returns immediately without it — so `make operator` stays a
+gate a laptop with no cluster can pass, and asking for this leg is a separate
+command rather than an environment a contributor has to know about.
 
 kube-rs has no `envtest`. Go operators get a real `kube-apiserver` and `etcd`
 pair downloaded and started by `controller-runtime`; no Rust crate does that, so
@@ -183,9 +185,13 @@ failures a fake client cannot see:
   `..Default::default()`, so adding a spec field breaks the build here.
 - **Server-side apply and ownership.** The field manager, the owner reference's
   uid and kind, `clusterIP: None` surviving on the headless Service.
-- **Write loops.** Two reconciles, and `resourceVersion` and `generation` must
-  not move on the second. A fake client cannot fail this because nothing in it
-  increments a resourceVersion.
+- **Write loops.** Two reconciles, and the operator's own `managedFields`
+  entry must not move on the second. Explicitly *not* `resourceVersion`: on a
+  real cluster kube-controller-manager writes the StatefulSet's `.status`
+  within milliseconds of the create, which bumps the version with no second
+  write from the operator at all — it passed on a warm cluster and failed on
+  the freshly created one in the Kind suite. A fake client cannot fail this
+  either way, because nothing in it has another writer.
 - **The status subresource.** An unsatisfiable spec has to land on `.status`
   rather than in a log line, and build nothing.
 
@@ -276,7 +282,8 @@ ratchet below — plus `operator`, which is that row and the second workspace's
 own fmt, clippy and tests. It leaves out the four `make ci` picks up: `msrv` refuses a
 construct newer than the declared minimum Rust, `scan-image` a fixable HIGH or
 CRITICAL in the release image, `dist` a Linux binary that will not start on the
-glibc the README promises (through `glibc-floor`), and `e2e` is level 8.
+glibc the README promises (through `glibc-floor`), and `operator-e2e` is
+level 9.
 
 `section` has a `--selftest`, because every way that gate can break makes it
 pass. `workflows` runs two things that do not subsume each other: actionlint

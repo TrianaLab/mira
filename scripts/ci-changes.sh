@@ -50,7 +50,10 @@ else
   # here for the obvious reason; Cargo.lock is here because a dependency bump is
   # exactly the change that introduces the advisory this leg exists to catch.
   image=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|\.dockerignore\$|Makefile\$)${W}")
-  chart=$(m "^charts/${W}")
+  # `Makefile$` for the same reason as the three legs around it: this leg is
+  # `make ci-chart`, so an edit to `helm-schema` or `helm-docs-check` changes
+  # what the job asserts even when no chart file moved.
+  chart=$(m "^(charts/|Makefile\$)${W}")
   # The operator is a second Cargo workspace with a second Cargo.lock, so an
   # engine-only diff has nothing for it to recompile. `Makefile$` is here for
   # the same reason it is in `code` and `image`: the leg is `make operator`, so

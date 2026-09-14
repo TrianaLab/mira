@@ -33,6 +33,31 @@ the config keys, the `/mcp` tool set.
   sender onto replica zero. It buys nothing for the merged read; what it buys is
   that each replica's blocks stay entity-local, which is what the 501s above are
   waiting on.
+- **`mira-operator`, a second binary that scales a Mira tier, and a
+  `MiraCluster` CRD it reconciles.** A StatefulSet of storage nodes, a proxy
+  Deployment in front of them, and a controller that reads `free_fraction` off
+  every replica and adds one when the *fullest* is too full or drains one when
+  *every* one is roomy. `spec.replicas` is a floor rather than a desired count:
+  up is immediate, down only permits a drain the thresholds still have to
+  authorise. It is a separate process on purpose — talking to the Kubernetes
+  API means TLS means ~220 crates, none of which belongs in the binary a user
+  runs to store telemetry, and principle 4 constrains *Mira*. Kill the operator
+  and every pod keeps ingesting and serving; only the scaling stops.
+- **`mira offload push`**, the drain half of scale-in: copy a departing
+  replica's blocks to the offload target without unlinking them, since the
+  volume they are on is about to be deleted anyway. The operator runs it as a
+  Job against the claim the removed pod left behind, and deletes the claim only
+  after that Job succeeds. A failed drain keeps the volume and parks the tier
+  in `Degraded` rather than retrying into a different shape.
+- **The operator's four test levels**, including the first end-to-end gate in
+  the tree that builds a cluster: `make operator-apiserver` reconciles against
+  whatever kubeconfig context is current (opt-in, because `cargo test` cannot
+  start needing a cluster), and `make operator-e2e` builds a Kind cluster,
+  installs the chart as published, and puts three signals through a stock
+  collector into a tier the operator built. It found five bugs that the fake
+  client could not, and carries its own coverage ratchet because `cargo
+  llvm-cov --workspace` on the root manifest cannot reach a nested workspace.
+
 - **`"cursors": "true"` on a search document** returns a `cursors` array beside
   `rows`, index-aligned and absent otherwise. Beside and not inside, because the
   rendered row *is* the OTLP record and a reader that did not ask for cursors
@@ -56,6 +81,19 @@ the config keys, the `/mcp` tool set.
   `submit.admit` goes from 0.000-0.002 ms to 92% of submit time: **ingest is
   bounded by the rate blocks seal and publish.** All of it on a laptop, labelled
   as such.
+
+### Removed
+
+- **The `mira` Helm chart, entirely.** It templated a Deployment with a
+  replica count and no way to route between the replicas, which is a chart that
+  cannot scale the thing it installs. `charts/mira-operator` is the only chart
+  now; installing Mira means installing the operator and applying a
+  `MiraCluster`.
+- **`make e2e` and the compose file behind it.** One Mira behind one collector,
+  asserted from a shell script. Everything it checked is checked by
+  `make operator-e2e` — the same three signals through the same stock collector
+  — but through a tier the operator built, so the reconciler, the chart, the CRD
+  and the RBAC are all on the path rather than beside it.
 
 ### Fixed
 

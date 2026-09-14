@@ -320,14 +320,19 @@ struct Inner {
 /// a tokio runtime worker** — section 5's rule that blocking work goes through
 /// `spawn_blocking` applies here for the same reason it applies to `publish`.
 ///
-/// `pipeline::submit` breaks that rule, and the ingest plateau is what it costs.
+/// `pipeline::submit` breaks that rule, and `wal.lock_wait` is what it costs.
 /// It calls [`Wal::append_then`] directly from the worker handling the export,
 /// so the mutex below is contended by runtime workers and taken with a
 /// `lock()` that parks them in the kernel. Moving the call to `spawn_blocking`
-/// is not the fix either: it would unpark the workers and leave the same single
-/// serialised section, now with a thread handoff per append on top. The fix is
-/// to make the section shorter or to stop having one of it — see the module
-/// docs, which name both and say why neither is in this tree yet.
+/// is not the fix: it would unpark the workers and leave the same single
+/// serialised section, now with a thread handoff per append on top.
+///
+/// Nor is shortening that section the fix, which is the reading the paragraph
+/// above used to invite. Both ways of shortening it were built and priced — one
+/// log per signal, and a RAM disk standing in for a perfect group commit — and
+/// the module docs above have the numbers: ~10% at one connection count and
+/// nothing at the other, because the queue re-forms at `submit.admit` the
+/// moment the log is free. What bounds ingest is the flusher, not this file.
 pub struct Wal {
     inner: Mutex<Inner>,
     dir: PathBuf,

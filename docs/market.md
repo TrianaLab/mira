@@ -228,7 +228,7 @@ This table shows what the axis looks like; it is not one Mira wins.
 
 **1. Artifact size, and it is not close.** 5.76 MiB stripped: one binary, three
 signals, query API, MCP surface and two UIs. The nearest peer is VictoriaLogs at
-16.26 MiB — 2.9x — and that binary covers logs only; matching Mira's signal
+16.26 MiB — 2.8x — and that binary covers logs only; matching Mira's signal
 coverage takes VictoriaLogs plus VictoriaTraces, two processes and 32.44 MiB.
 Everything else surveyed is 94–153 MiB, 17x to 28x. This is the strongest claim
 in the document precisely because it is a byte count and not a measurement: no

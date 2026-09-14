@@ -2175,8 +2175,9 @@ Reading these honestly:
   where the bullet two up ruled it out. `submit.admit` is 0.000–0.002 ms in every
   disk-backed dump in the table and was dismissed on exactly that reading; with
   the log's write removed it is **44.054 ms of a 47.910 ms `submit.total`, 92%**,
-  while `wal.encode`, `wal.lock_wait`, `wal.held` and `wal.write` together come to
-  3.7 ms. Admission blocks when no `Config::queue` slot frees on any shard, so
+  while the whole of the log — `wal.encode`, `wal.lock_wait` and `wal.held`,
+  the last of which *contains* `wal.write` rather than sitting beside it —
+  comes to under 4 ms. Admission blocks when no `Config::queue` slot frees on any shard, so
   what bounds ingest is the rate at which blocks seal and publish. The log was
   the louder constraint, not the binding one.
 
@@ -2914,7 +2915,7 @@ The fan-out lives in a **second process that stores nothing**. `mira proxy` is
 the same binary under a subcommand, given a static list of replica addresses
 (`--replica http://host:port`, or `proxy.replicas` in the file), serving the
 OTLP endpoints and `/api/v1/query` on one HTTP listener and no gRPC one. It is
-`crates/mira/src/proxy.rs`, roughly six hundred lines, and it cost **zero new
+`crates/mira/src/proxy.rs`, about eleven hundred lines, and it cost **zero new
 dependencies**: `hyper`, `hyper-util` and `http-body-util` were already direct
 dependencies of the binary for the webhook dispatcher.
 

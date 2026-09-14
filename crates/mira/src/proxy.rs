@@ -29,8 +29,8 @@
 //! # What it refuses
 //!
 //! `/api/v1/query` and the three OTLP endpoints, and nothing else. `correlate`,
-//! `map`, `metrics/query` and `entities` all answer with something built by
-//! walking one node's blocks — a trace assembled from the spans that are local,
+//! `map`, `metrics/query`, `metrics/names` and `entities` all answer with
+//! something built by walking one node's blocks — a trace assembled from the spans that are local,
 //! a service map from the edges that are local. Merging those is not "sort and
 //! cut": two nodes each holding half a trace produce two partial frames, and
 //! there is no cursor to interleave them on. So this proxy answers 501 and says

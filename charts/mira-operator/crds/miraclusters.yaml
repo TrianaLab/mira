@@ -93,9 +93,15 @@ spec:
                   deleted. `${node}` interpolates to the replica name.
 
                   Required for scale-in and only for scale-in. With it unset the operator
-                  still scales *out*, and refuses to scale in — see `Scaling::down`. That
-                  is the safe direction to fail in: the cost of not shrinking is a bill,
-                  and the cost of shrinking without an archive is the data.
+                  still scales *out*, and a `Decision::Down` lands on `.status` as a
+                  message instead of removing a pod — see `controller::reconcile`. That is
+                  the safe direction to fail in: the cost of not shrinking is a bill, and
+                  the cost of shrinking without an archive is the data.
+
+                  It reaches the *drain Job* and nothing else. A running replica never
+                  sees it: `storage.offload` on a node is a retention setting that unlinks
+                  each block it copies, and the replicas mount no cold volume — see
+                  `resources::node_config`.
 
                   `file://` is the only scheme Mira's offload target parses, so on
                   Kubernetes this path has to be a mount — hence `coldStorageClaim`, which
