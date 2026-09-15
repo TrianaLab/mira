@@ -250,6 +250,7 @@ pub fn series_open(root: &Path, q: &SeriesQuery, open: &[Arc<Open>]) -> Result<R
         // Metrics are bounded by `max_series` and `max_points`, which cap what
         // a chart can render rather than cut a list short. Nothing to page.
         next: None,
+        cursors: Vec::new(),
     })
 }
 
@@ -315,6 +316,7 @@ pub fn names_open(root: &Path, from: i64, to: i64, open: &[Arc<Open>]) -> Result
         // Metrics are bounded by `max_series` and `max_points`, which cap what
         // a chart can render rather than cut a list short. Nothing to page.
         next: None,
+        cursors: Vec::new(),
     })
 }
 

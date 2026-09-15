@@ -407,6 +407,7 @@ fn search(rng: &mut Rng, base: i64) -> Search {
         terms: (0..rng.below(3)).map(|_| term(rng)).collect(),
         limit: 1 + rng.below(20) as usize,
         after: None,
+        cursors: false,
     }
 }
 

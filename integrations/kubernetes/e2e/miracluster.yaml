@@ -1,0 +1,66 @@
+# The tier under test, and the cold volume a drain archives into.
+#
+# Two storage replicas, not one, because one replica cannot show the two things
+# this suite exists to check: that the proxy merges results from more than one
+# store, and that `hash(resource) % n` actually spreads resources across them.
+#
+# The thresholds below are set so that `Down` is the standing verdict, and that
+# needs explaining, because the obvious setting is the opposite.
+#
+# `spec.replicas` is a *floor*, not a desired count, and the two directions are
+# not symmetric. Raising it grows the tier immediately — a floor that is not met
+# is not a floor. Lowering it only *permits* a shrink: the drain archives a
+# volume and then deletes it, so the operator will not start one until the
+# replicas themselves say the data fits without that volume. So "patch
+# spec.replicas down and watch it follow" is not a thing the product does, and a
+# suite that asserted it would be asserting a bug.
+#
+# Which leaves the real reading as an input to a gate, and the least
+# reproducible one available — how full a Kind node's disk happens to be. The
+# way out is not to avoid the threshold but to put it somewhere a disk cannot
+# reach: `downWhenFreeAbove: 0.002` is true of any node this suite could run on
+# at all. `Down` is then constant, the scale decision stops being an input, and
+# what phase D actually tests is the mechanism underneath it — floor, drain,
+# archive, claim, in that order.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mira-cold
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: mira.miradb.dev/v1alpha1
+kind: MiraCluster
+metadata:
+  name: tel
+spec:
+  # Overwritten by `make operator-e2e` with the tag it just loaded into Kind.
+  image: mira:e2e
+  replicas: 2
+  maxReplicas: 3
+  storage:
+    size: 1Gi
+  # Set here so the apiserver has to accept the block against the generated
+  # schema — `ResourceRequirements` carries `x-kubernetes-int-or-string`
+  # quantities, which a unit test round-tripping the Rust type cannot exercise.
+  # Requests only: a limit on a Kind node sized for CI is a pod that does not
+  # schedule.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+  scaling:
+    upWhenFreeBelow: 0.001
+    downWhenFreeAbove: 0.002
+    cooldownSeconds: 1
+  offload: "file:///cold/${node}"
+  # Required alongside `offload`, and the reason is the whole point of this
+  # gate: without it the drain Job writes the archive into its own container,
+  # exits 0, and the operator deletes the volume it believes it archived.
+  coldStorageClaim: mira-cold
+  proxy:
+    replicas: 1

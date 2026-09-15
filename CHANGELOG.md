@@ -9,6 +9,100 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **`mira proxy`, one OTLP and query surface in front of N storage nodes, and
+  it stores nothing.** The same binary under a subcommand, given a static
+  `--replica http://host:port` list (or `proxy.replicas` in the file), serving
+  the three OTLP endpoints and `/api/v1/query` on one HTTP listener. It needs no
+  session store because the keyset cursor was already global: `(ts, node, seq,
+  row)` where `node` is the block's `node_id` is a total order across every row
+  on every replica, so the merge is a sort and a cut and the next page is exact
+  with nothing remembered per reader. Zero new dependencies — `hyper`,
+  `hyper-util` and `http-body-util` were already in the tree for webhooks. One
+  failed replica fails the whole query rather than returning the others'
+  rows, and `correlate`, `map`, `metrics/query`, `metrics/names` and `entities`
+  answer **501 naming themselves**: each is built by walking one node's blocks,
+  and a plausible subset with nothing in the response saying so is the failure
+  this design has always refused.
+- **Hash-based ingest routing, shipped alongside the proxy and never before
+  it.** The proxy splits an export resource by resource on `resource_key`, the
+  same 64-bit entity identity the storage layer already joins on, so every
+  record describing one entity lands on one replica whatever batch it arrived
+  in. `NO_IDENTITY` spreads by position instead of piling every unidentified
+  sender onto replica zero. It buys nothing for the merged read; what it buys is
+  that each replica's blocks stay entity-local, which is what the 501s above are
+  waiting on.
+- **`mira-operator`, a second binary that scales a Mira tier, and a
+  `MiraCluster` CRD it reconciles.** A StatefulSet of storage nodes, a proxy
+  Deployment in front of them, and a controller that reads `free_fraction` off
+  every replica and adds one when the *fullest* is too full or drains one when
+  *every* one is roomy. `spec.replicas` is a floor rather than a desired count:
+  up is immediate, down only permits a drain the thresholds still have to
+  authorise. It is a separate process on purpose — talking to the Kubernetes
+  API means TLS means ~220 crates, none of which belongs in the binary a user
+  runs to store telemetry, and principle 4 constrains *Mira*. Kill the operator
+  and every pod keeps ingesting and serving; only the scaling stops.
+- **`mira offload push`**, the drain half of scale-in: copy a departing
+  replica's blocks to the offload target without unlinking them, since the
+  volume they are on is about to be deleted anyway. The operator runs it as a
+  Job against the claim the removed pod left behind, and deletes the claim only
+  after that Job succeeds. A failed drain keeps the volume and parks the tier
+  in `Degraded` rather than retrying into a different shape.
+- **The operator's four test levels**, including the first end-to-end gate in
+  the tree that builds a cluster: `make operator-apiserver` reconciles against
+  whatever kubeconfig context is current (opt-in, because `cargo test` cannot
+  start needing a cluster), and `make operator-e2e` builds a Kind cluster,
+  installs the chart as published, and puts three signals through a stock
+  collector into a tier the operator built. It found five bugs that the fake
+  client could not, and carries its own coverage ratchet because `cargo
+  llvm-cov --workspace` on the root manifest cannot reach a nested workspace.
+
+- **`"cursors": "true"` on a search document** returns a `cursors` array beside
+  `rows`, index-aligned and absent otherwise. Beside and not inside, because the
+  rendered row *is* the OTLP record and a reader that did not ask for cursors
+  should not step over one in every object. It is the only thing a storage node
+  grew for the proxy: no hop flag, no peer set, no notion that it is part of
+  one.
+
+### Changed
+
+- **The WAL mutex is not the ingest ceiling, and both of the fixes proposed for
+  it are rejected.** `wal.lock_wait` at 82-84% of submit time reproduces, and
+  `sample(1)` confirms it — 74,650 of 155,615 thread samples in
+  `__psynch_mutexwait`. What does not follow is the rate that was read off it.
+  One log per signal was built and measured (nine paired passes a shape, three
+  sittings): the mutex time comes off and goes straight back on as write time,
+  `wal.write` 1.9x and 2.4x, and throughput signs split at every shape, so no
+  figure is quotable. Group commit is priced rather than built, because the
+  envelope both fixes share is measurable directly — a RAM-disk log deletes the
+  serialised section rather than shortening it and is worth 1.096x at
+  thirty-two connections and nothing at ninety-six. With the log free,
+  `submit.admit` goes from 0.000-0.002 ms to 92% of submit time: **ingest is
+  bounded by the rate blocks seal and publish.** All of it on a laptop, labelled
+  as such.
+
+### Removed
+
+- **The `mira` Helm chart, entirely.** It templated a Deployment with a
+  replica count and no way to route between the replicas, which is a chart that
+  cannot scale the thing it installs. `charts/mira-operator` is the only chart
+  now; installing Mira means installing the operator and applying a
+  `MiraCluster`.
+- **`make e2e` and the compose file behind it.** One Mira behind one collector,
+  asserted from a shell script. Everything it checked is checked by
+  `make operator-e2e` — the same three signals through the same stock collector
+  — but through a tier the operator built, so the reconciler, the chart, the CRD
+  and the RBAC are all on the path rather than beside it.
+
+### Fixed
+
+- **Four RAM-disk figures are withdrawn in place** (0.291x, 0.296x, 0.117x,
+  0.127x). Every one was ENOSPC: truncation fires once a minute, so no 20 s run
+  reclaims a byte, and the faster arm fills the disk *because* it appends faster
+  — the speedup the instrument exists to detect is what guarantees the failure
+  that hides it. Both A/B scripts now assert `0 shed` before a number is read.
+
 ## [0.0.4] - 2026-09-13
 
 ### Added
@@ -36,10 +130,10 @@ the config keys, the `/mcp` tool set.
 - **A block's checksum is verified once per process, not once per open.** A
   published block never changes, so a scan that reopens the same corpus
   re-hashes bytes this process already hashed. `open_table` now consults a
-  process-scoped map of `path -> (len, mtime, ino)` — the path alone is not
+  process-scoped map of `path -> (len, mtime, ino)`. The path alone is not
   enough, because `compact` renames a new table over an existing name, and the
-  inode is what catches a restore that preserves both other fields — and an
-  entry is only recorded once the file has been untouched for longer than any
+  inode is what catches a restore that preserves both other fields. An entry is
+  only recorded once the file has been untouched for longer than any
   filesystem's mtime granularity, so a corruption that preserves the length
   cannot slip in inside one mtime tick. Worth between a quarter and two fifths
   of a single block's read path and 1.47x on a trace lookup. **The guarantee is
@@ -52,16 +146,16 @@ the config keys, the `/mcp` tool set.
   was a coincidence published as a mechanism. Measured on both sides of one run
   instead, re-verification is between a quarter and two fifths of a single
   block's read path and about 1.1x of a full-corpus scan. What that scan is
-  bound by is whether the corpus fits in page cache: a paired A/B changing only
-  the corpus size puts it at 27-64 ns/row over 9.6 GiB — where one binary ranges
-  2.6x against itself and the two arms are not separable — and **8.9 ns/row over
-  5.01 GiB**, same binary, same predicate, ~187 K rows per block either way. The
+  bound by is whether the corpus fits in page cache. A paired A/B changing only
+  the corpus size puts it at 27-64 ns/row over 9.6 GiB, where one binary ranges
+  2.6x against itself and the two arms are not separable, against **8.9 ns/row
+  over 5.01 GiB** — same binary, same predicate, ~187 K rows per block. The
   change that did move the unpruned scan is the one below it, reading fewer
   bytes rather than hashing them faster: opening the root table alone is
   **1.45x on logs and 1.88x on traces** over nine paired passes, or **1.8x and
   2.6x** for both changes together against 0.0.3. The row is still listed as a
   gap, because a page-cache-bound scan is not something either change fixes.
-  `docs/architecture.md` section 11 now carries a second, named sitting rather
+  `docs/architecture/performance.md` section 11 now carries a second, named sitting rather
   than folding the new numbers into the old table; `scan_cost_per_row` prints
   the checksum's share as a column of its own run so the next such claim is a
   measurement.
@@ -125,6 +219,32 @@ the config keys, the `/mcp` tool set.
   match is lazy up to the next header and consumes it instead of looking at it,
   and the extraction is a `unreleased_body` function with a test — the thing
   actually missing, since no test executed this path either.
+- **One torn segment and the WAL never reclaimed another byte, for the life of
+  the node.** `Wal::open` and `replay` both treat a half-written frame at the
+  tail as the ordinary post-crash state and stop at it. `truncate` is the third
+  reader of the same log and was the only one that propagated the error, so the
+  whole sweep aborted — and `Wal::segments` is ordered oldest-first, so the tear
+  hid every younger segment behind it and every later sweep failed at the same
+  place. The ordinary crash this log exists to survive left a node whose
+  write-ahead log could only grow.
+- **A query's `from:` or `to:` could overflow into a window nobody asked for.**
+  `config::duration` scaled with `n * scale` and `api::time_field` cast
+  nanoseconds with `as i64` — both reached from `/api/v1/query` with whatever
+  string arrived on the wire. `"1000000000000000000d"` parses as a `u64` and
+  then wraps: a release build answered the query from the wrapped window, and a
+  debug build panicked, which under `panic = "abort"` is the process. Both steps
+  are checked now, and a duration too large to represent is a parse error like
+  every other bad one.
+- **The sweep behind every published ingest figure never checked whether it
+  shed.** `measurements.kyaml` says of `ingest.records_per_s` that "the run
+  asserts there were none", and no assertion existed: `wal-volume.sh`,
+  `wal-split-ab.sh` and `proxy-ab.sh` each read the shed count and abort, and
+  `conn-sweep.sh` — the one that produces the published corpus — did not. It
+  matters in three directions at once, because a retried export's bytes are
+  counted again in `ingest.wire_mib_s` and in `cost.hot_bytes_per_byte`'s
+  denominator, and loadgen's 20 ms backoff sits inside the ack window. No figure
+  is withdrawn: nothing suggests the published runs shed, only that nothing
+  would have said so if they had. The guard is there for the next one.
 
 ## [0.0.3] - 2026-09-12
 
@@ -177,7 +297,7 @@ writes is read by 0.0.2.
   `errors`, taking the whole mix from 40 to 50 queries/s. The metrics `series`
   class read slower in the mix and does not share this path at all — see
   **Fixed** below and
-  [architecture section 11](docs/architecture.md#11-performance-model).
+  [architecture section 11](docs/architecture/performance.md).
 - **The WAL watermark is a set, not a high-water mark.** Shards seal out of
   order, so the highest sequence in a block says nothing about the ones below it.
   A block now claims the oldest sequence of its signal that nobody has published
@@ -381,7 +501,7 @@ delta — there is no previous version to have changed from.
 
 Tracked here because they are the difference between what the README promises
 and what a reader might assume;
-[`docs/architecture.md`](docs/architecture.md) section 0.1 is the authoritative
+[`docs/architecture/corrections.md`](docs/architecture/corrections.md) section 0.1 is the authoritative
 list.
 
 - Ingestion is allocation-lean, not zero-copy: `prost` memcpies every string.

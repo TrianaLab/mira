@@ -10,7 +10,7 @@
 //! things that can be done with the file:
 //!
 //! | | |
-//! |---|---|
+//! | --- | --- |
 //! | `measurements` | every site still contains the value it is supposed to, and the generated table in the contract page is current |
 //! | `measurements render` | rewrite that table from the registry |
 //! | `measurements ingest RUN.json [--write]` | compare a run's output against the registry, name every value that moved and every site that now lies, and optionally update the values |
@@ -385,7 +385,11 @@ fn check_rendered(all: &[Measurement], f: &mut Failures) {
 /// command that produces it again.
 fn table(all: &[Measurement]) -> String {
     let mut out = String::from(
-        "| Quantity | Measured | What the number is | Reproduce |\n|---|---|---|---|\n",
+        // The delimiter row is spelled the way `.markdownlint-cli2.yaml` pins
+        // MD060 — one space each side of every pipe. A generator that emits a
+        // second table style puts the docs gate and the drift gate in a loop
+        // where fixing either one breaks the other.
+        "| Quantity | Measured | What the number is | Reproduce |\n| --- | --- | --- | --- |\n",
     );
     for m in all {
         let unit = if m.unit.is_empty() {

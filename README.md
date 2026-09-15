@@ -25,21 +25,20 @@ is the only state there is.
 ## The numbers
 
 | | |
-|---|---|
+| --- | --- |
 | **1,537,875 records/s** | ingest, on **2.23 of 12 cores** — 886k/s/core at one connection |
 | **2.6 ms** | to prove a value is in **none** of 137 blocks, zero blocks opened |
 | **4.7 ms** | every span of one trace, out of 27.1M spans on disk |
 | **7 µs** | the durable log append inside an acknowledgement |
 | **0.14** | bytes on disk per byte on the wire, once compacted |
-| **5.63 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
+| **5.76 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
-Apple M3 Pro, one process, reproducible with the load harness in this
-repository. What each number measures — the numerator, the denominator, and what
-is outside the measurement:
-**[the measurement contract](docs/internals/measurement.md)**, which also carries
-every published figure in one generated table. The full sweep:
+Apple M3 Pro, one process, reproducible with the load harness in this repository.
+What each number measures — the numerator, the denominator, and what is outside
+the measurement — is **[the measurement contract](docs/internals/measurement.md)**,
+which also carries every published figure in one generated table. The full sweep:
 **[end-to-end testing](docs/internals/e2e.md)**. Why they land there:
-**[architecture section 11](docs/architecture.md#11-performance-model)**. How
+**[architecture section 11](docs/architecture/performance.md)**. How
 they read against the market, including where Mira is behind:
 **[docs/market.md](docs/market.md)**.
 
@@ -49,7 +48,7 @@ Same data, same filter grammar, same code underneath. Nothing to deploy for any
 of them.
 
 | | | |
-|---|---|---|
+| --- | --- | --- |
 | **Browser** | `http://localhost:4318/` | Served out of `include_bytes!`; the whole view lives in the URL, so an alert webhook links straight back into it. |
 | **Terminal** | `mira mira` | The same views over a running replica — or over a block directory **with no server at all**. |
 | **MCP** | `POST /mcp` | Eight tools, no session id, so any replica answers any call. |
@@ -62,7 +61,8 @@ of both UIs, from data you generated a minute earlier.
 
 ```sh
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
-helm install mira oci://ghcr.io/trianalab/charts/mira
+helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
+  --namespace mira-system --create-namespace   # then: kubectl apply a MiraCluster
 ```
 
 Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.0.4` pins the
@@ -72,20 +72,22 @@ a cosign signature and a SLSA provenance attestation.
 ## Where to go next
 
 | | |
-|---|---|
+| --- | --- |
 | Install it properly, on Kubernetes or otherwise | **[docs/install.md](docs/install.md)** |
 | First query, and what the `stats` object tells you | **[docs/quickstart.md](docs/quickstart.md)** |
 | Connect an agent, and a worked investigation | **[docs/agents.md](docs/agents.md)** |
 | Every flag and config key | **[docs/config.md](docs/config.md)** · **[CLI](docs/reference/cli.md)** |
-| How it works, and why it is shaped this way | **[docs/architecture.md](docs/architecture.md)** |
+| How it works, and why it is shaped this way | **[docs/architecture/index.md](docs/architecture/index.md)** |
 | Why it exists at all | **[MANIFESTO.md](MANIFESTO.md)** |
 
 ## Scope
 
 Mira is pre-1.0 and says so. Ingestion is allocation-lean rather than zero-copy
-(*queries* are zero-copy); there is no cross-replica query fan-out; there is no
-entity predicate and no block cache. The full list, with the reasoning, is
-[architecture section 0.1](docs/architecture.md#01-what-is-not-true-yet).
+(*queries* are zero-copy); a storage node answers only from its own blocks, and
+the cross-replica merge lives in `mira proxy` rather than in the node, which
+merges record search and refuses correlate, map, metrics and entities; there is
+no entity predicate and no block cache. The full list, with the reasoning, is
+[architecture section 0.1](docs/architecture/corrections.md#01-what-is-not-true-yet).
 
 ## Contributing
 
@@ -97,11 +99,10 @@ make            # the target list
 make check      # fmt, clippy, tests, rustdoc, UI, supply chain, drift, docs, coverage
 ```
 
-Read [architecture section 0](docs/architecture.md#0-corrections-to-the-original-brief)
+Read [architecture section 0](docs/architecture/corrections.md)
 first if the change is structural — it lists the mechanisms that do not survive
-contact with the formats, and re-proposing one is the most common way to waste
-an afternoon. [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough, with
-[the test levels](docs/internals/testing.md) and
+contact with the formats. [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough,
+with [the test levels](docs/internals/testing.md) and
 [how a release is cut](docs/internals/releases.md) behind it. Vulnerabilities go
 to [SECURITY.md](SECURITY.md), not to an issue.
 

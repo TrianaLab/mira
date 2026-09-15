@@ -12,8 +12,8 @@
 #
 # Names are `otlp_grpc` / `otlp_http`: the demo pins collector-contrib 0.159,
 # where the old `otlp` / `otlphttp` spellings are deprecated aliases. Both work;
-# docs/e2e/otelcol.yaml uses the old ones because it runs against `:latest` and
-# they are the pair that works on every version.
+# integrations/kubernetes/e2e/telemetry.yaml uses the old ones because it runs
+# against `:latest` and they are the pair that works on every version.
 exporters:
   otlp_grpc/mira:
     endpoint: mira:4317

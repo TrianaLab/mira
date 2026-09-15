@@ -246,6 +246,14 @@ pub struct Search {
     pub limit: usize,
     /// Start after this row. See [`Cursor`].
     pub after: Option<Cursor>,
+    /// Also return the cursor of every row, not just of the last one.
+    ///
+    /// Off by default because a page has one `next` and that is all a reader
+    /// paging through one node needs. It is on for a reader merging pages from
+    /// several nodes — see `proxy` — which has to know where each row sits in
+    /// the global order to interleave them, and cannot recover that from the
+    /// row itself.
+    pub cursors: bool,
 }
 
 /// Where the previous page stopped.
@@ -278,7 +286,12 @@ impl Cursor {
     /// Descending: newest first, and for rows sharing a nanosecond, the
     /// higher-numbered block and row first. Any total order would do; what
     /// matters is that it is total, so no row can hide in a tie.
-    fn key(&self) -> std::cmp::Reverse<(i64, u32, u64, u32)> {
+    ///
+    /// Public because it is total across *nodes* as well as within one — `node`
+    /// is [`crate::block::node_id`] — which is what lets a merging reader
+    /// interleave pages from several replicas without asking anyone whose row
+    /// comes first. See `proxy`.
+    pub fn key(&self) -> std::cmp::Reverse<(i64, u32, u64, u32)> {
         std::cmp::Reverse((self.ts, self.node, self.seq, self.row))
     }
 }
@@ -358,6 +371,14 @@ pub struct Results {
     /// one — not "ask again and see", which is the ambiguity that makes readers
     /// poll forever.
     pub next: Option<Cursor>,
+    /// One cursor per row in `json`, in the same order, and empty unless
+    /// [`Search::cursors`] asked for them.
+    ///
+    /// Beside the rows rather than inside them. A rendered row is the OTLP
+    /// record and nothing else (principle 3), and a reader that did not ask
+    /// for cursors should not have to step over one in every object to find
+    /// the fields it came for.
+    pub cursors: Vec<Cursor>,
 }
 
 /// The trace id this search pins down exactly, if it pins one down.
@@ -589,6 +610,10 @@ pub fn search_open(root: &Path, q: &Search, open_blocks: &[Arc<Open>]) -> Result
         next: (hits.len() == q.limit)
             .then(|| hits.last().map(|h| cursor(&refs[h.block], h)))
             .flatten(),
+        cursors: match q.cursors {
+            true => hits.iter().map(|h| cursor(&refs[h.block], h)).collect(),
+            false => Vec::new(),
+        },
     })
 }
 
@@ -883,7 +908,7 @@ struct Child {
 /// the whole table per emitted row per level — on a 330 K-row logs block that
 /// is 66 million comparisons to render a hundred records, and it measured as
 /// *most* of an unfiltered `limit 100`, more than the scan and more than the
-/// paging docs/architecture.md section 11 attributes it to. Same shape
+/// paging docs/architecture/performance.md section 11 attributes it to. Same shape
 /// [`Block::emit_children`] already fixed for the child tables; this is the
 /// other half of it.
 ///
@@ -1036,7 +1061,7 @@ impl Block {
         // buys it back for one realloc.
         let mut sel: Vec<u32> = (0..n as u32).collect();
         if !(q.from <= bref.min_ts && q.to >= bref.max_ts) {
-            // The `&[i64]` loop docs/architecture.md section 10 names as what
+            // The `&[i64]` loop docs/architecture/not-here.md section 10 names as what
             // replaces intrinsics on the scan, and the one column every query
             // has a predicate on. `None` for the validity because the time
             // column is non-nullable in every signal's schema — and the scan it
@@ -1465,7 +1490,7 @@ pub(crate) fn dict_index(values: &StringArray, needle: &str) -> Option<u16> {
 ///
 /// One monomorphic loop per column type, where this used to build a
 /// `Box<dyn Fn(u32) -> bool>` and pay an indirect call per row.
-/// docs/architecture.md section 10 rejects hand-written intrinsics on the scan
+/// docs/architecture/not-here.md section 10 rejects hand-written intrinsics on the scan
 /// and names what replaces them: "a tight loop over `&[i64]` with no bounds
 /// checks and no branches, which LLVM turns into NEON unasked". That is what
 /// [`keep`] is; this function's only job is to hand it a values slice and a
@@ -2242,6 +2267,7 @@ mod tests {
                     terms,
                     limit: 100,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2528,6 +2554,7 @@ mod tests {
                     }],
                     limit: 10,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2684,6 +2711,7 @@ mod tests {
                     terms,
                     limit: 10,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -2792,6 +2820,7 @@ mod tests {
                     terms: Vec::new(),
                     limit: 2,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -3040,6 +3069,7 @@ mod tests {
             terms,
             limit: 100,
             after: None,
+            cursors: false,
         };
         let field = |name: &str, op, value| {
             all(vec![Term {
@@ -3108,7 +3138,7 @@ mod tests {
         // Everything outside it — the mmap's minor faults, the CRC32 of every
         // table body, the dictionary scan, `Block::open`'s two child indexes,
         // the cursor filter and the JSON of `limit` rows — is the "no term"
-        // line, and that is the claim in docs/architecture.md section 11 that
+        // line, and that is the claim in docs/architecture/performance.md section 11 that
         // the per-block cost is paging rather than scanning.
         //
         // Measured twice, because the CRC is the larger half and it is paid

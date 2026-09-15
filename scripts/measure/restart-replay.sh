@@ -1,6 +1,6 @@
 #!/bin/sh
 # Does a restart re-ingest rows that are already published? Reproducer for the
-# finding in architecture.md section 11 under "a restart replays past the
+# finding in docs/architecture/performance.md section 11 under "a restart replays past the
 # slowest shard".
 #
 # Boot, ingest, stop. Then boot and stop again N times with **no ingest at

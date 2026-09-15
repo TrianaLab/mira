@@ -21,13 +21,13 @@ if [ -z "${base}" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
   # no origin/main locally. Unknown means "everything", never "nothing": a
   # filter that fails open costs CI minutes, one that fails closed ships bugs.
   echo "base ref '${base}' unusable — running every leg" >&2
-  code=true; docs=true; ui=true; image=true; chart=true
+  code=true; docs=true; ui=true; image=true; chart=true; operator=true
+  changeset=true
 else
   files=$(git diff --name-only "${base}" HEAD)
   echo "changed files:" >&2
   printf '%s\n' "${files}" | sed 's/^/  /' >&2
   m() { printf '%s\n' "${files}" | grep -qE "$1" && echo true || echo false; }
-
   # A workflow change re-runs everything — the thing most likely to be wrong
   # about a CI edit is the leg you did not think it touched. `ci.mk` is in the
   # same clause for the same reason: it *is* the workflow now.
@@ -40,7 +40,24 @@ else
   # `docs/install.sh` is a symlink to it: the docs site *publishes* it, so it is
   # a documentation artefact that happens to be a script, and this is the leg
   # that checks it.
-  docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$)${W}")
+  # The last four are `make docs-check`'s inputs: its rule configuration, the
+  # pinned markdownlint, the structural gate in xtask, and the Makefile that
+  # decides which pages any of them see. Changing what a gate asserts without
+  # running it is the one way to land a red main from a green pull request.
+  #
+  # `.*\.md$` reaches `.changeset/` too, and used to be filtered so a one-line
+  # release note did not rebuild the site. It is not filtered now: a changeset
+  # is hand-written prose that `docs-check` lints, and a gate that skips the
+  # diff which introduces the file is not a gate. The cost is a site build on a
+  # release-note-only pull request.
+  #
+  # The last four are the drift leg's other inputs, and they are in this clause
+  # because `drift` runs on `code || docs` and nothing else would start it:
+  # `measurements.kyaml` is the figure registry, `artifacthub-repo.yml` and
+  # `release/units/` are version sites the gate diffs, and the issue templates
+  # carry a version line too. A diff touching only those skipped the leg that
+  # reads them, and a skipped required check reports as a pass.
+  docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$|\.vale|\.markdownlint-cli2\.yaml\$|package(-lock)?\.json\$|crates/xtask/|Makefile\$|measurements\.kyaml\$|artifacthub-repo\.yml\$|\.github/ISSUE_TEMPLATE/|release/units/)${W}")
   # `Makefile$` for the same reason it is in `code` and `image`: both of that
   # leg's steps are make targets, so an edit to `ui-check` or `ui-demo` is a
   # change to what the job asserts.
@@ -50,10 +67,28 @@ else
   # here for the obvious reason; Cargo.lock is here because a dependency bump is
   # exactly the change that introduces the advisory this leg exists to catch.
   image=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|\.dockerignore\$|Makefile\$)${W}")
-  chart=$(m "^charts/${W}")
+  # `Makefile$` for the same reason as the three legs around it: this leg is
+  # `make ci-chart`, so an edit to `helm-schema` or `helm-docs-check` changes
+  # what the job asserts even when no chart file moved.
+  chart=$(m "^(charts/|Makefile\$)${W}")
+  # The operator is a second Cargo workspace with a second Cargo.lock, so an
+  # engine-only diff has nothing for it to recompile. `Makefile$` is here for
+  # the same reason it is in `code` and `image`: the leg is `make operator`, so
+  # an edit to those targets changes what the job asserts. `charts/mira-operator`
+  # is here too — the CRD drift gate lives in this leg and diffs a file under
+  # that directory, so a hand-edit there has to be caught by the gate that
+  # regenerates it rather than only by `helm lint`.
+  operator=$(m "^(integrations/kubernetes/|charts/mira-operator/|Makefile\$)${W}")
+  # What a changeset is *for*: a diff that changes something a stranger
+  # installs. Deliberately without the `${W}` workflow clause every other leg
+  # carries — editing CI ships nothing to anybody, and a gate that demands a
+  # release note for a CI edit is a gate people learn to route around.
+  # `.changeset/` itself is absent for the same reason: a changeset is the
+  # declaration, not a thing to declare.
+  changeset=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|integrations/kubernetes/|charts/)")
 fi
 
-out=$(printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\n' \
-  "${code}" "${docs}" "${ui}" "${image}" "${chart}")
+out=$(printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\noperator=%s\nchangeset=%s\n' \
+  "${code}" "${docs}" "${ui}" "${image}" "${chart}" "${operator}" "${changeset}")
 printf '%s\n' "${out}"
 [ -z "${GITHUB_OUTPUT:-}" ] || printf '%s\n' "${out}" >> "${GITHUB_OUTPUT}"

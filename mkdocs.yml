@@ -145,7 +145,7 @@ extra_css:
 # A reader's path, not a directory listing: see it work, install it, use it, look
 # something up, then understand why it is shaped this way. `demo.md` is first
 # because the question a first-time reader actually has is "what does this look
-# like", and no amount of prose answers it. architecture.md and market.md come
+# like", and no amount of prose answers it. docs/architecture/ and market.md come
 # last for the same reason — they are the reasoning, and nobody needs the
 # reasoning before the thing. Filenames are lower case because mkdocs derives the
 # URL from the filename and nothing else: `CONFIG.md` published `/CONFIG/`, a
@@ -167,9 +167,12 @@ nav:
   - Reference:
       - CLI: reference/cli.md
       - HTTP API: reference/http.md
-      # A symlink to charts/mira/README.md, which helm-docs generates and
-      # `helm-docs-check` diffs — so the values table on the site is the one the
-      # chart ships, not a second copy of it that goes stale.
+      # A symlink to charts/mira-operator/README.md, which helm-docs generates
+      # and `helm-docs-check` diffs — so the values table on the site is the one
+      # the chart ships, not a second copy of it that goes stale. The path stays
+      # `reference/chart.md` after the engine chart was removed, because
+      # `docs/install.md` links it and the published route is the one readers
+      # have.
       - Helm chart: reference/chart.md
       - Rust API: https://miradb.dev/api/
   - Understand:
@@ -189,7 +192,27 @@ nav:
   # who arrived at miradb.dev should not be bounced to a code host to read
   # prose. Nothing on this site links out to a file in the repository.
   - Project internals:
-      - Architecture: architecture.md
+      - Architecture:
+          - Overview and reading order: architecture/index.md
+          - 0. Corrections to the brief: architecture/corrections.md
+          - 1. Principles: architecture/principles.md
+          - 2. Workspace: architecture/workspace.md
+          - 3. Data layout: architecture/data-layout.md
+          - 4. Ingest path: architecture/ingest.md
+          - 5. Flusher state machine: architecture/flushers.md
+          - 6. Retention worker: architecture/retention.md
+          - 7. Correlation: architecture/correlation.md
+          - 8. Read surfaces: architecture/read-surfaces.md
+          - 9. Durability and failure model: architecture/durability.md
+          - 10. What is deliberately not here: architecture/not-here.md
+          - 11. Performance model: architecture/performance.md
+          - "11. — the ingest plateau": architecture/performance-ingest.md
+          - "11. — verification and restart": architecture/performance-durability.md
+          - "11. — query cost": architecture/performance-query.md
+          - "11. — cost per GB": architecture/performance-cost.md
+          - 12. Multiple active replicas: architecture/replicas.md
+          - "12. — scaling and the coordinator": architecture/replicas-scaling.md
+          - 13. Alerting: architecture/alerting.md
       - Testing architecture: internals/testing.md
       - End-to-end testing: internals/e2e.md
       - Measurement contract: internals/measurement.md

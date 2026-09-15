@@ -1,0 +1,80 @@
+grants exactly this list and nothing more:
+  1: |
+    - apiGroups:
+        - mira.miradb.dev
+      resources:
+        - miraclusters
+      verbs:
+        - get
+        - list
+        - watch
+    - apiGroups:
+        - mira.miradb.dev
+      resources:
+        - miraclusters/status
+      verbs:
+        - get
+        - update
+        - patch
+    - apiGroups:
+        - apps
+      resources:
+        - statefulsets
+        - deployments
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+    - apiGroups:
+        - apps
+      resources:
+        - statefulsets/scale
+      verbs:
+        - get
+        - update
+        - patch
+    - apiGroups:
+        - ""
+      resources:
+        - services
+        - configmaps
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+    - apiGroups:
+        - policy
+      resources:
+        - poddisruptionbudgets
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+    - apiGroups:
+        - ""
+      resources:
+        - persistentvolumeclaims
+      verbs:
+        - get
+        - list
+        - watch
+        - delete
+    - apiGroups:
+        - batch
+      resources:
+        - jobs
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - delete

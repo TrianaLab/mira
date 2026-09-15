@@ -149,6 +149,19 @@ impl Cmp {
         }
     }
 
+    /// Whether a reading breaches, which is not the same as whether the
+    /// comparison holds.
+    ///
+    /// An empty ratio window reports 0.0 — see `count_pair` for why 0.0 rather
+    /// than NaN — and 0.0 is below every threshold a `<` rule could name. So a
+    /// rule written `ratio < 99%`, which is how anyone writes a success-rate
+    /// SLO, fires the moment traffic stops and stays firing: the same false
+    /// positive the `>` direction was already spared, in the direction nobody
+    /// checked. `count` is the rule for alerting on the absence of traffic.
+    fn breaches(self, v: f64, t: f64, total: Option<usize>) -> bool {
+        total != Some(0) && self.holds(v, t)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Cmp::Gt => ">",
@@ -486,7 +499,7 @@ impl Engine {
                     continue;
                 }
             };
-            let breaching = r.cmp.holds(value, r.threshold);
+            let breaching = r.cmp.breaches(value, r.threshold, total);
 
             // Lock, decide, unlock. The dispatch below awaits, and a `MutexGuard`
             // held across an await is both a deadlock waiting for a second
@@ -1406,7 +1419,24 @@ mod tests {
         // the classic false positive this avoids.
         let r = Rules::parse(DOC).unwrap();
         let rule = &r.rules[0];
-        assert!(!rule.cmp.holds(0.0, rule.threshold));
+        assert!(!rule.cmp.breaches(0.0, rule.threshold, Some(0)));
+
+        // And not a zero percent success rate either. `ratio < 99%` is how a
+        // success-rate SLO is written, and 0.0 is below every threshold such a
+        // rule could name — so the guard the `>` direction got for free has to
+        // be explicit, or an idle deployment pages permanently.
+        let slo =
+            Rules::parse(&DOC.replace(r#""when":  "ratio > 5%""#, r#""when":  "ratio < 99%""#))
+                .unwrap();
+        let slo = &slo.rules[0];
+        assert!(!slo.cmp.breaches(0.0, slo.threshold, Some(0)));
+        // A window with traffic in it still decides normally, in both
+        // directions: the guard is about the empty window, not about zero.
+        assert!(slo.cmp.breaches(0.0, slo.threshold, Some(200)));
+        assert!(!slo.cmp.breaches(1.0, slo.threshold, Some(200)));
+        // And a `count` rule, which has no denominator, is untouched — it is
+        // the documented way to alert on the absence of traffic.
+        assert!(r.rules[1].cmp.breaches(1.0, r.rules[1].threshold, None));
     }
 
     #[test]

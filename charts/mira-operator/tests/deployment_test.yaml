@@ -1,0 +1,112 @@
+suite: deployment
+templates:
+  - templates/deployment.yaml
+release:
+  name: mira-operator
+  namespace: mira-system
+tests:
+  # The Lease makes an overlap survivable; Recreate makes it not happen. A
+  # rolling update would put every upgrade through the standby wait for no gain.
+  - it: never runs two controllers at once
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  # The one pod in this repo that is supposed to have a token. The engine's own
+  # StatefulSet turns it off, and this being explicit is what makes the
+  # difference deliberate rather than inherited from a default.
+  - it: mounts a service account token
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: mira-operator
+
+  - it: defaults the image tag to the chart appVersion
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: '^ghcr\.io/trianalab/mira-operator:\d+\.\d+\.\d+$'
+
+  - it: takes an explicit tag
+    set:
+      image:
+        tag: "1.2.3"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/trianalab/mira-operator:1.2.3
+
+  # A version label in the selector makes the first `helm upgrade` fail on an
+  # immutable field and leaves the release wedged.
+  - it: keeps the version out of the immutable selector
+    asserts:
+      - isNull:
+          path: spec.selector.matchLabels["app.kubernetes.io/version"]
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: mira-operator
+
+  - it: runs unprivileged with a read-only root
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL
+
+  - it: passes the log filter through
+    set:
+      logLevel: "debug,kube=info"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0].value
+          value: "debug,kube=info"
+
+  # The lease holder has to be the pod name. The operator falls back to a pid if
+  # this is missing, which is neither unique across pods nor legible in
+  # `kubectl get lease` — and the fallback is silent, so nothing else would
+  # notice the env var going away.
+  - it: tells the operator which pod it is
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[1].name
+          value: POD_NAME
+      - equal:
+          path: spec.template.spec.containers[0].env[1].valueFrom.fieldRef.fieldPath
+          value: metadata.name
+
+  # The other half of `rbac.namespaces`. A `Role` can only authorise a
+  # namespaced LIST, so an operator left watching cluster-wide under those
+  # Roles watches nothing: every reflector takes a 403 and the tier it was
+  # installed to manage is never reconciled.
+  - it: watches only the namespaces its Roles cover
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[2].name
+          value: WATCH_NAMESPACES
+      - equal:
+          path: spec.template.spec.containers[0].env[2].value
+          value: alpha,beta
+
+  - it: watches the whole cluster when no namespaces are listed
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers[0].env
+          count: 2

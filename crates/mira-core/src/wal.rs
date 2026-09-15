@@ -1,7 +1,7 @@
 //! The write-ahead log, which exists to decouple the acknowledgement from the
 //! seal.
 //!
-//! # Why this exists, given `docs/architecture.md` section 4 says "No WAL"
+//! # Why this exists, given `docs/architecture/ingest.md` section 4 says "No WAL"
 //!
 //! section 4's argument is about *recovery*, and it is still correct: a block
 //! directory is renamed into place atomically, so there is no torn state and
@@ -65,14 +65,44 @@
 //! `wal.lock_wait` by six, because the ceiling is the serialised section rather
 //! than scheduling capacity.
 //!
-//! ponytail: one global log with one mutex, and the ceiling is ~1/2.5 ms ≈ 400
-//! appends/s, or roughly 2.2M records/s at 8,192-record exports. The upgrade
-//! path is group commit — one `writev` for every frame that arrived while the
-//! last write was in flight, with the ack still released after the write, so it
-//! is not the `BufWriter` ruled out above — or one log per signal, which is
-//! three mutexes for free. Neither needs coordination state. Neither is in this
-//! tree, because neither can be validated to section 11's standard on the box
-//! that produced these numbers; see `docs/market.md`.
+//! # …but the serialised section is not the ceiling either
+//!
+//! The paragraph above says where the time goes and it is right. It was then
+//! read as saying what the *rate* is, and that does not follow: a queue forms at
+//! whatever is slowest to acquire, which need not be what is slowest to finish.
+//! Both fixes it proposed were priced before either was believed.
+//!
+//! One log per signal was built, measured against the binary it replaces, and
+//! **rejected**: nine paired passes at 4/32/96 connections across three
+//! sittings, records/s signs split at every shape. It moves `wal.lock_wait` —
+//! 0.63x at four connections, 0.795x at thirty-two — and gives the whole of it
+//! back in `wal.write`, 1.94x and 2.39x at thirty-two and ninety-six with all
+//! nine passes agreeing. The volume does not absorb a second appender: two
+//! concurrent writers at this frame size return 0.98x the aggregate bandwidth of
+//! one and three return 0.86x, measured with no Mira code in the loop. The diff
+//! is kept on the `wal-per-signal` branch rather than deleted.
+//!
+//! Group commit needs no separate arm, because the *envelope* was measured
+//! directly: put the log on a RAM disk, change nothing else, and `wal.write`
+//! falls 89% to 0.245 ms, `wal.held` 83% to 0.395 ms and `wal.lock_wait` 93% to
+//! 1.245 ms — the serialised section effectively deleted — for **1.096x at
+//! thirty-two connections (3 of 3 passes) and 1.005x at ninety-six, signs
+//! split**. A perfect log fix is worth ten percent at one shape and nothing at
+//! the other, and group commit writes the same bytes down the same fd.
+//!
+//! What that run shows instead is where the queue re-forms once the log is free:
+//! `submit.admit`, 0.000–0.002 ms in the disk-backed dumps and ruled out there
+//! on that basis, becomes **44.05 ms of a 47.91 ms `submit.total`, 92%**. Admission
+//! blocks when no flusher queue slot frees, so the constraint behind the log is
+//! the block seal and publish path — the same device, writing Arrow IPC.
+//!
+//! ponytail: one global log with one mutex. The ceiling that matters is not
+//! this file's: `wal.lock_wait` is the largest term in `submit` and still worth
+//! ~10% at most, so the upgrade path here is bytes — the re-encode below is 790
+//! KiB a frame and compressing or eliding it is the only lever with room — and
+//! the upgrade path for *ingest* is the flusher, not the log. Do not re-propose
+//! group commit or a log per signal without a number that contradicts the two
+//! paragraphs above; see `docs/architecture/performance.md` section 11.
 //!
 //! # The frame is the OTLP request, in its canonical protobuf encoding
 //!
@@ -141,6 +171,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -290,21 +321,78 @@ struct Inner {
 /// a tokio runtime worker** — section 5's rule that blocking work goes through
 /// `spawn_blocking` applies here for the same reason it applies to `publish`.
 ///
-/// `pipeline::submit` breaks that rule, and the ingest plateau is what it costs.
+/// `pipeline::submit` breaks that rule, and `wal.lock_wait` is what it costs.
 /// It calls [`Wal::append_then`] directly from the worker handling the export,
 /// so the mutex below is contended by runtime workers and taken with a
 /// `lock()` that parks them in the kernel. Moving the call to `spawn_blocking`
-/// is not the fix either: it would unpark the workers and leave the same single
-/// serialised section, now with a thread handoff per append on top. The fix is
-/// to make the section shorter or to stop having one of it — see the module
-/// docs, which name both and say why neither is in this tree yet.
+/// is not the fix: it would unpark the workers and leave the same single
+/// serialised section, now with a thread handoff per append on top.
+///
+/// Nor is shortening that section the fix, which is the reading the paragraph
+/// above used to invite. Both ways of shortening it were built and priced — one
+/// log per signal, and a RAM disk standing in for a perfect group commit — and
+/// the module docs above have the numbers: ~10% at one connection count and
+/// nothing at the other, because the queue re-forms at `submit.admit` the
+/// moment the log is free. What bounds ingest is the flusher, not this file.
 pub struct Wal {
     inner: Mutex<Inner>,
     dir: PathBuf,
     node: u32,
+    /// Held open for the life of the log, and never read or written. See
+    /// [`lock_node`]: closing the fd is what releases the lock, so this field
+    /// existing is the whole mechanism.
+    _lock: File,
+}
+
+/// Take this node's writer lock under `dir`, or refuse to start.
+///
+/// Segments are named `{node}-{first_seq}`, so two processes over one
+/// directory with one node id read the same files, resume to the same number
+/// and then hand it out twice. `O_APPEND` keeps each frame whole, which is
+/// what makes the damage quiet rather than obvious: replay finds two different
+/// bodies at one sequence, and a block claiming the watermark for either
+/// covers both. `--node` has a default, so nothing has to be misconfigured for
+/// two replicas over one volume to land here.
+///
+/// Per node and not per directory, because a shared volume with one log per
+/// replica is the supported arrangement (section 12) — the collision is the id, not
+/// the path.
+///
+/// `flock` and not `fcntl`: the lock belongs to the open file description, so
+/// the kernel drops it when the fd closes, including for a process that died.
+/// A restart after a crash is never locked out by its own predecessor.
+fn lock_node(dir: &Path, node: u32) -> Result<File> {
+    let path = dir.join(format!("{node:08x}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ctx(&path)?;
+    // SAFETY: `file` is live for the whole call, so the descriptor is open and
+    // owned here. `flock` takes no pointer and writes nothing back; the only
+    // output is the return code, checked below.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // Anything else — a filesystem with no `flock`, most likely — is
+        // reported as what it is rather than as a second writer.
+        return match e.kind() {
+            std::io::ErrorKind::WouldBlock => Err(Error::WalLocked { path, node }),
+            _ => Err(e).ctx(path),
+        };
+    }
+    Ok(file)
 }
 
 impl Wal {
+    /// The writer identity this log's segments are named for.
+    ///
+    /// Recovery needs it to scope [`crate::block::wal_watermarks`] to the blocks
+    /// that absorbed *this* log's sequences — a number from another replica's
+    /// log is not comparable with one of ours. See that function.
+    pub fn node(&self) -> u32 {
+        self.node
+    }
+
     /// Open (or create) the log under `<root>/.wal/`, resuming the sequence
     /// counter past anything already on disk.
     ///
@@ -315,6 +403,9 @@ impl Wal {
     pub fn open(root: &Path, node: u32) -> Result<Self> {
         let dir = root.join(".wal");
         fs::create_dir_all(&dir).ctx(&dir)?;
+        // Before anything is read, so the loser of the race never resumes a
+        // sequence it is not going to be allowed to use.
+        let _lock = lock_node(&dir, node)?;
 
         let segments = Self::segments(&dir, node)?;
         // The highest sequence actually present, which is not the same as the
@@ -368,6 +459,7 @@ impl Wal {
             }),
             dir,
             node,
+            _lock,
         })
     }
 
@@ -447,14 +539,21 @@ impl Wal {
         // twenty bytes would double the memcpy the ingest path is already
         // trying not to pay twice.
         //
-        // A short write partway through leaves a torn frame at the tail, which
-        // is the case `FrameReader` is built to stop at. It cannot corrupt a
-        // frame that was already complete, because the file is opened in
-        // append mode and nothing rewrites what is behind the offset.
+        // A failure part-way leaves a torn frame — the case `FrameReader` is
+        // built to stop at — and nothing here can know how many bytes got out.
+        // So the segment ends at it: `written` is forced past the roll
+        // threshold, the next append opens a new file, and the tear is the
+        // *tail* that `open` and `replay` both already handle. Leaving it
+        // where it is instead buries every frame appended behind it, and those
+        // frames were acknowledged 200.
         let t_write = std::time::Instant::now();
-        inner.file.write_all(&header).ctx(&inner.path)?;
-        inner.file.write_all(body).ctx(&inner.path)?;
-        inner.file.write_all(&crc.to_le_bytes()).ctx(&inner.path)?;
+        for part in [&header[..], body, &crc.to_le_bytes()[..]] {
+            let wrote = inner.file.write_all(part);
+            if wrote.is_err() {
+                inner.written = SEGMENT_BYTES;
+            }
+            wrote.ctx(&inner.path)?;
+        }
         crate::diag::WAL_WRITE.record(t_write.elapsed().as_nanos() as u64);
 
         inner.written += (HEADER_LEN + body.len() + CRC_LEN) as u64;
@@ -624,9 +723,19 @@ impl Wal {
             }
             // The last frame decides, not the first: a segment is only dead
             // once everything in it is covered.
+            //
+            // A tear stops the scan rather than failing it, because that is
+            // what the other two readers of this log already do: a
+            // half-written frame was never acked, so no block covers it and no
+            // caller is waiting for it, and `replay` would stop there anyway.
+            // Propagating it aborted the entire sweep instead, and `segments`
+            // is ordered oldest-first — so one torn segment hid every younger
+            // one from reclamation for as long as the node lived, on the
+            // ordinary crash this log exists to survive.
             let mut highest = None;
             for frame in FrameReader::open(path)? {
-                highest = Some(frame?.seq);
+                let Ok(frame) = frame else { break };
+                highest = Some(frame.seq);
             }
             match highest {
                 // An empty segment is a crash artefact between create and
@@ -1138,6 +1247,38 @@ mod tests {
         assert_eq!(stats.skipped, 1);
     }
 
+    /// One node id over one directory is one writer, and the second is refused
+    /// at startup rather than at 3am.
+    ///
+    /// Two processes here resume to the same sequence — the segment name is
+    /// `{node}-{first_seq}`, so they read the same files and reach the same
+    /// number — and then hand that number out twice. `O_APPEND` keeps each
+    /// frame whole, which is what makes the damage quiet: replay reads two
+    /// different bodies at one sequence, and a block that claims the watermark
+    /// for one covers the other, so an export that was acknowledged is never
+    /// replayed again. `--node` has a default, so this is the configuration
+    /// reached by not choosing one.
+    #[test]
+    fn one_node_id_over_one_directory_is_one_writer() {
+        let root = tmpdir("nodelock");
+        let held = Wal::open(&root, 9).unwrap();
+
+        let Err(e) = Wal::open(&root, 9) else {
+            panic!("a second writer over the same log was allowed");
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--node"),
+            "the message has to say what to fix: {e}"
+        );
+
+        // `flock`, so the lock belongs to the open file description and the
+        // kernel drops it when the fd closes — including for a process that
+        // died. A restart is not locked out by the log its predecessor left.
+        drop(held);
+        Wal::open(&root, 9).unwrap();
+    }
+
     #[test]
     fn another_nodes_segments_are_left_alone() {
         let root = tmpdir("twonodes");
@@ -1192,6 +1333,92 @@ mod tests {
         // 1 would lose seq 1, which no block covers yet.
         assert_eq!(wal.truncate(1).unwrap(), 0);
         assert_eq!(wal.truncate(2).unwrap(), 1);
+    }
+
+    /// `open` and `replay` both treat a torn tail as the ordinary post-crash
+    /// state and stop at it. `truncate` was the third reader and the only one
+    /// that propagated it, which made the sweep abort — and because `segments`
+    /// is ordered oldest-first, one crash meant no segment was ever reclaimed
+    /// again for the life of the node. A WAL that cannot retire its own log is
+    /// a disk that fills.
+    #[test]
+    fn truncate_reclaims_a_segment_whose_tail_is_torn() {
+        let root = tmpdir("truncate-torn");
+        let wal = Wal::open(&root, 0x7c).unwrap();
+        wal.append(Signal::Logs, b"covered").unwrap(); // seq 0
+        wal.append(Signal::Logs, b"never-acked").unwrap(); // seq 1
+        wal.sync().unwrap();
+        let first = {
+            let inner = wal.inner.lock().unwrap();
+            inner.path.clone()
+        };
+        {
+            let mut inner = wal.inner.lock().unwrap();
+            inner.written = SEGMENT_BYTES;
+        }
+        wal.append(Signal::Logs, b"newest").unwrap(); // seq 2, new segment
+        assert_eq!(Wal::segments(&wal.dir, 0x7c).unwrap().len(), 2);
+
+        // Chop seq 1's checksum, which is what a crash mid-write leaves.
+        let len = fs::metadata(&first).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_len(len - 4)
+            .unwrap();
+
+        // seq 1 was torn, so it was never acked and no block can cover it.
+        // A watermark past seq 0 therefore retires the whole segment.
+        assert_eq!(wal.truncate(1).unwrap(), 1);
+        assert!(!first.exists(), "a tear is not a reason to keep the file");
+    }
+
+    /// A tear only stops at the tail if something stops the segment there.
+    ///
+    /// `write_all` can fail with the header already durable — ENOSPC on a
+    /// volume the free-space floor has not caught, EDQUOT, EIO — and the frame
+    /// is then correctly refused. But `written` and `next_seq` never advanced,
+    /// so the *next* append does not roll: it writes a whole frame behind the
+    /// tear, returns `Ok`, and is acknowledged 200. Every reader stops at the
+    /// tear, so that frame is gone. Silent loss of acked data, which is the one
+    /// failure this log exists to prevent, and the comment above the writes
+    /// claimed it could not happen.
+    #[test]
+    fn a_failed_write_ends_the_segment_rather_than_burying_what_follows() {
+        const TORN: &[u8] = b"the write that failed";
+        let root = tmpdir("torn-mid-segment");
+        let wal = Wal::open(&root, 0x5e).unwrap();
+        wal.append(Signal::Logs, b"acked-before").unwrap(); // seq 0
+        wal.append(Signal::Logs, TORN).unwrap(); // seq 1
+        wal.sync().unwrap();
+        let seg = wal.inner.lock().unwrap().path.clone();
+
+        // Chop seq 1's body and checksum: byte for byte what a `write_all` that
+        // failed after the header leaves durable.
+        let len = fs::metadata(&seg).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&seg)
+            .unwrap()
+            .set_len(len - (TORN.len() + CRC_LEN) as u64)
+            .unwrap();
+
+        // And the error that left it, from a handle nothing can be written to.
+        wal.inner.lock().unwrap().file = File::open(&seg).unwrap();
+        assert!(wal.append(Signal::Logs, b"refused").is_err());
+
+        // The condition clearing — the volume grew, the quota was raised. The
+        // log is still open on the segment it tore, which is the whole problem.
+        wal.inner.lock().unwrap().file = OpenOptions::new().append(true).open(&seg).unwrap();
+        wal.append(Signal::Logs, b"acked-after").unwrap();
+        wal.sync().unwrap();
+
+        let (got, _) = collect(&root, 0x5e, [0, 0, 0]);
+        assert!(
+            got.contains(&(Signal::Logs, b"acked-after".to_vec())),
+            "a frame acked after a tear has to survive it: {got:?}"
+        );
     }
 
     #[test]

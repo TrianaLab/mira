@@ -81,7 +81,7 @@ exceptions = []
 
 [bans]
 # Two versions of the same crate is two copies in the binary, and binary size
-# is one of the four axes (docs/architecture.md section 11). It is also the early
+# is one of the four axes (docs/architecture/performance.md section 11). It is also the early
 # warning for the failure the Arrow pin exists to prevent: two majors of
 # arrow-array means `RecordBatch` is two different types and the compiler
 # error is unreadable.

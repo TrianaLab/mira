@@ -1,0 +1,97 @@
+# The telemetry half of `make operator-e2e`: a stock collector, and the
+# OpenTelemetry project's own generator aimed at it.
+#
+# This is the compose-based `make e2e` that used to live in docs/e2e/, moved
+# into the cluster. The reason it moved rather than being duplicated is that the
+# compose version could only ever prove one thing — that Mira accepts what the
+# stock exporter sends — and this proves that *plus* that the tier the operator
+# built is reachable, routes, and merges. Two e2e suites asserting overlapping
+# halves of one pipeline is one suite too many.
+#
+# The export target is `tel-proxy`, the Service the operator created — with one
+# deliberate exception, below, for the transport a proxy does not speak.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otelcol
+data:
+  # The collector config from the compose scenario, with the hostnames changed.
+  # Nothing Mira-specific: the `otlp` and `otlphttp` exporters out of the box,
+  # pointed at names.
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+
+    processors:
+      batch: {}
+
+    # `compression` is unset on both because the default is already gzip, and
+    # that is the point: Mira accepts what the stock exporter sends, on both
+    # transports, without being told.
+    exporters:
+      # A replica, not the proxy. `mira proxy` has no gRPC listener and its
+      # Service has no 4317 — splitting an export by entity means decoding it,
+      # and a tonic service that decodes in order to re-encode to three HTTP
+      # clients is a second transport to keep in step for a hop inside one
+      # deployment. So gRPC is what a *node* speaks, and this is the only thing
+      # in the file that names an ordinal. A default `otlp` exporter aimed at
+      # `tel-proxy:4317` gets an i/o timeout rather than a refusal, which is
+      # how the first run of this suite spent four minutes looking like a
+      # sealing problem; the collector's own log said `dial tcp …:4317` all
+      # along.
+      otlp:
+        endpoint: tel-0.tel-headless:4317
+        tls: { insecure: true }
+      otlphttp:
+        endpoint: http://tel-proxy:4318
+
+    service:
+      telemetry:
+        logs: { level: info }
+      pipelines:
+        # Traces and logs through the proxy over HTTP — the two signals it can
+        # merge, and the path a user is told to use. Metrics over gRPC straight
+        # at a node: the transport the proxy does not carry, and the signal it
+        # answers 501 for anyway.
+        traces: { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
+        logs: { receivers: [otlp], processors: [batch], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], processors: [batch], exporters: [otlp] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otelcol
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: otelcol }
+  template:
+    metadata:
+      labels: { app: otelcol }
+    spec:
+      containers:
+        - name: otelcol
+          image: otel/opentelemetry-collector-contrib:0.142.0
+          args: ["--config=/etc/otelcol/config.yaml"]
+          ports:
+            - { containerPort: 4317 }
+            - { containerPort: 4318 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol }
+      volumes:
+        - name: config
+          configMap: { name: otelcol }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otelcol
+spec:
+  selector: { app: otelcol }
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }

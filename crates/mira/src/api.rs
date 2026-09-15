@@ -208,6 +208,7 @@ pub(crate) fn correlate(
             ..Default::default()
         },
         next: None,
+        cursors: Vec::new(),
     })
 }
 
@@ -307,6 +308,13 @@ async fn run(
 /// enjoy. Microseconds because a hot query here is single-digit milliseconds
 /// and "0 ms" is not a measurement.
 pub fn envelope(field: &str, r: &query::Results, elapsed: std::time::Duration) -> String {
+    // Absent rather than null on the last page, so `if (doc.next)` is the whole
+    // of a reader's paging logic.
+    let next = r
+        .next
+        .map(|c| format!(",\"next\":\"{c}\""))
+        .unwrap_or_default();
+    let tail = next + &cursors(&r.cursors);
     format!(
         "{{\"{field}\":{},\"stats\":{{\"blocks_total\":{},\"blocks_scanned\":{},\
          \"rows_scanned\":{},\"rows_matched\":{},\"elapsed_us\":{}}}{}}}",
@@ -316,15 +324,34 @@ pub fn envelope(field: &str, r: &query::Results, elapsed: std::time::Duration) -
         r.stats.rows_scanned,
         r.stats.rows_matched,
         elapsed.as_micros(),
-        // Absent rather than null on the last page, so `if (doc.next)` is the
-        // whole of a reader's paging logic.
-        r.next
-            .map(|c| format!(",\"next\":\"{c}\""))
-            .unwrap_or_default()
+        tail
     )
 }
 
-fn json_ok(body: String) -> Response {
+/// `"cursors": ["…", "…"]`, index-aligned with the rows, or nothing at all.
+///
+/// Only a merging reader asks — see `proxy` — so the key is absent on every
+/// other response rather than present and empty: an empty array reads as "this
+/// page has no rows", which is what `rows` is for.
+fn cursors(cs: &[mira_core::query::Cursor]) -> String {
+    if cs.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(",\"cursors\":[");
+    for (i, c) in cs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        // All digits, dots and a possible leading `-`; nothing to escape.
+        s.push('"');
+        s.push_str(&c.to_string());
+        s.push('"');
+    }
+    s.push(']');
+    s
+}
+
+pub(crate) fn json_ok(body: String) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -338,13 +365,19 @@ fn json_ok(body: String) -> Response {
 /// eventually feed the failure to a JSON parser and report the parse error
 /// instead of the actual problem.
 fn bad_request(msg: &str) -> Response {
+    error(StatusCode::BAD_REQUEST, msg)
+}
+
+/// [`bad_request`] under a status the caller picks, for the proxy — whose
+/// refusals are 501 and 502 and want the same body shape.
+pub(crate) fn error(code: StatusCode, msg: &str) -> Response {
     let mut j = mira_core::json::Json::new();
     j.obj(|j| {
         j.key("error");
         j.str(msg);
     });
     (
-        StatusCode::BAD_REQUEST,
+        code,
         [(header::CONTENT_TYPE, "application/json")],
         j.into_string(),
     )
@@ -394,7 +427,10 @@ pub fn parse_search(text: &str, now: i64) -> Result<Search, String> {
 /// [`parse_search`] on an already-parsed document, for callers that received one
 /// nested inside something else — an MCP tool call, say.
 pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
-    known(doc, &["signal", "from", "to", "where", "limit", "after"])?;
+    known(
+        doc,
+        &["signal", "from", "to", "where", "limit", "after", "cursors"],
+    )?;
     let signal = match doc["signal"].as_str() {
         Some(s) => Signal::parse(s).ok_or(format!("unknown signal {s:?}"))?,
         None => Signal::Logs,
@@ -419,7 +455,23 @@ pub fn search_doc(doc: &Yaml, now: i64) -> Result<Search, String> {
         terms: terms(doc)?,
         limit,
         after,
+        cursors: flag(doc, "cursors")?,
     })
+}
+
+/// A boolean key, absent meaning false.
+///
+/// Both spellings, because KYAML quotes every scalar and JSON does not, and
+/// the same document has to work sent either way (principle 5).
+fn flag(doc: &Yaml, key: &str) -> Result<bool, String> {
+    match &doc[key] {
+        Yaml::BadValue | Yaml::Null => Ok(false),
+        Yaml::Boolean(b) => Ok(*b),
+        y => y
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .ok_or(format!("{key}: expected \"true\" or \"false\"")),
+    }
 }
 
 /// Parse a metrics query document.
@@ -746,7 +798,16 @@ fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
                 None => (1, s.strip_prefix('+').unwrap_or(s)),
             };
             let d = crate::config::duration(rest)?;
-            Ok(now + sign * (d.as_nanos() as i64))
+            // `duration` bounds the multiply; this bounds the two steps after
+            // it. Nanoseconds are a `u128` and the window is an `i64`, so a
+            // duration well inside what `duration` accepts — `"3000000000s"`,
+            // say — still has more nanoseconds than a timestamp holds, and the
+            // `as` cast that used to be here turned that into a window on the
+            // far side of the epoch rather than into an error.
+            i64::try_from(d.as_nanos())
+                .ok()
+                .and_then(|ns| now.checked_add(sign * ns))
+                .ok_or_else(|| format!("{s:?} is further from now than a timestamp reaches"))
         }
         other => Err(format!("{other:?} is not a time")),
     }
@@ -755,6 +816,26 @@ fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second half of the overflow on the unauthenticated query path.
+    /// `config::duration` bounds its own multiply, but a duration it happily
+    /// accepts can still hold more nanoseconds than an `i64` timestamp, and
+    /// then more again once `now` is added — `~292 years` is the whole budget.
+    /// The `as` cast that used to be here turned either case into a window on
+    /// the far side of the epoch and answered the query from it.
+    #[test]
+    fn a_time_further_from_now_than_a_timestamp_reaches_is_rejected() {
+        let now = 1_757_000_000_000_000_000;
+        let at = |s: &str| time_field(&Yaml::String(s.to_owned()), now, 0);
+        // Too many nanoseconds for an i64 at all; enough for an i64 but not
+        // once `now` is added; and too large for `duration` in the first place.
+        for s in ["-10000000000s", "+9000000000s", "1000000000000000000d"] {
+            assert!(at(s).is_err(), "{s:?} must not wrap");
+        }
+        assert_eq!(at("-1h").unwrap(), now - 3_600_000_000_000);
+        assert_eq!(at("now").unwrap(), now);
+        assert_eq!(time_field(&Yaml::BadValue, now, 42).unwrap(), 42);
+    }
 
     /// The query document is written here as a browser would send it — bare
     /// JSON — because "KYAML is a superset of JSON" is load-bearing for the API

@@ -17,7 +17,7 @@
 //! add one.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -135,6 +135,10 @@ fn local(dir: &Path, route: &str, body: &str) -> Result<String, String> {
     }
 }
 
+/// Long enough that a loaded node is not mistaken for an absent one, short
+/// enough that a wrong `--addr` is a message rather than a hang.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// HTTP/1.1 POST, one connection per request.
 ///
 /// ponytail: `Connection: close` and `read_to_end`, which is what lets this
@@ -149,8 +153,31 @@ fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> Result<Stri
     // A write that died is this end's socket going away mid-request; a read
     // that died is the node. They send the operator to different machines.
     let io = || -> Result<Vec<u8>, String> {
-        let mut s = TcpStream::connect(addr).map_err(|e| format!("{addr}: {e}"))?;
+        // `TcpStream::connect` has no timeout: the OS retries the SYN on its own
+        // schedule, 75 seconds on macOS and over two minutes on Linux. This is a
+        // blocking client on a single-threaded UI, so an `--addr` that
+        // blackholes — a node behind a firewall rule, a stale DNS answer, a
+        // NetworkPolicy — is not a slow query, it is a terminal that will not
+        // even take `q`. `connect_timeout` takes a `SocketAddr` and not a host
+        // string, so the resolution and the walk down the list are `connect`'s
+        // own, kept because `localhost` is `::1` before `127.0.0.1`.
+        let mut last = format!("{addr}: resolved to no address");
+        let mut sock = None;
+        for sa in addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))? {
+            match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
+                Ok(c) => {
+                    sock = Some(c);
+                    break;
+                }
+                Err(e) => last = format!("{addr}: {e}"),
+            }
+        }
+        let mut s = sock.ok_or(last)?;
         s.set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| format!("{addr}: {e}"))?;
+        // Beside the read timeout for the same reason: a peer that stops
+        // reading stalls the write, and this thread is drawing the screen.
+        s.set_write_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| format!("{addr}: {e}"))?;
         let body = body.unwrap_or("");
         write!(
@@ -481,5 +508,35 @@ mod tests {
             e.starts_with(&format!("{addr}: sending the request: ")),
             "the write failed and the message says which half died: {e}"
         );
+    }
+
+    /// A name that resolves to more than one address is tried down the list.
+    ///
+    /// `TcpStream::connect` does that itself; `connect_timeout` takes one
+    /// `SocketAddr`, so bounding the connect meant resolving here and looping.
+    /// On a dual-stack host `localhost` is `::1` first and `127.0.0.1` second,
+    /// and a listener bound to `127.0.0.1` is only reachable through the
+    /// second — so taking `.next()` and stopping would make `--addr localhost`
+    /// stop working on exactly the machine a contributor runs this on.
+    ///
+    /// This is the regression guard for that change, not a test of the timeout:
+    /// making a host *drop* a SYN rather than refuse it needs a firewall rule,
+    /// and an unroutable literal is the routing table answering, not this code.
+    ///
+    /// Mutation check: `.next()` instead of the loop, and this fails wherever
+    /// `::1` sorts first.
+    #[test]
+    fn a_name_resolving_to_several_addresses_is_tried_down_the_list() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"rows\":[],\
+                  \"stats\":{\"blocks_total\":0,\"blocks_scanned\":0,\"rows_scanned\":0,\
+                  \"rows_matched\":0}}";
+        // `serve` binds 127.0.0.1, so reaching it through `localhost` is the
+        // whole assertion: the address that resolves first may be `::1`.
+        let bound = serve(vec![ok.into()]);
+        let port = bound.rsplit(':').next().unwrap();
+        let d = Source::Remote(format!("localhost:{port}"))
+            .post(QUERY, "{}")
+            .unwrap();
+        assert!(d["rows"].as_vec().unwrap().is_empty());
     }
 }

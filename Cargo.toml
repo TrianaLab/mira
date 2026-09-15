@@ -79,7 +79,7 @@ mira-proto = { package = "miradb-proto", path = "crates/mira-proto", version = "
 
 # Arrow. Pinned as one version across the workspace: arrow_array::RecordBatch
 # from two different major versions is two different types, and the error you
-# get is unreadable. See docs/architecture.md "Arrow version pin".
+# get is unreadable. See docs/architecture/workspace.md "Arrow version pin".
 arrow-array = "59.3"
 arrow-buffer = "59.3"
 # `zstd` for the cold tier (section 11). Hot blocks stay uncompressed so they can be

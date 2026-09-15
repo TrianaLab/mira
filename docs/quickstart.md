@@ -18,8 +18,7 @@ down 45 minutes of backdated telemetry for a four-service shop, waits for the
 first block of each signal to seal, and prints where to look. Ctrl-C stops it;
 `make demo-clean` deletes the directory. No Docker, no second terminal, nothing
 to install beyond a Rust toolchain. [See it work](demo.md) is what comes out.
-
-The rest of this page is the manual path — your own data, and the query API.
+The rest of this page is the manual path: your own data, and the query API.
 
 ## Run it
 
@@ -32,7 +31,7 @@ That is the whole configuration. OTLP/gRPC on `4317`, OTLP/HTTP on `4318`, and
 — protobuf or JSON, plain or gzipped. There is no Mira-specific collector
 component.
 
-```
+```text
 --data-dir PATH            where blocks go            (./mira-data)
 --grpc ADDR --http ADDR    listen addresses           (0.0.0.0:4317 / :4318)
 --retention DURATION       TTL: 7d, 12h, 30m, 500ms   (7d)
@@ -88,7 +87,7 @@ which is the sidecar pruning made visible. A response that filled `limit` also
 carries `next`; pass it back as `after` for the following page.
 
 | endpoint | what it answers |
-|---|---|
+| --- | --- |
 | `POST /api/v1/query` | log records and spans, with events and links |
 | `POST /api/v1/metrics/query` | metric series, with the exemplars naming the traces behind them |
 | `POST /api/v1/metrics/names` | which metric names exist; an empty body means "right now" |
@@ -150,7 +149,7 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
 
 - [Connect an agent](agents.md) — the MCP wiring, the eight tools, and one
   investigation worked end to end.
-- [Configuration](config.md) — the thirteen keys, and how much machine to give it.
+- [Configuration](config.md) — the fourteen keys, and how much machine to give it.
 - [End-to-end testing](internals/e2e.md) — a live binary, `telemetrygen`, and a stock
   Collector in front of it in Docker.
 - [The load harness](internals/e2e.md#3-the-load-harness) — `loadgen` without

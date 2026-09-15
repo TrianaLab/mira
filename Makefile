@@ -84,12 +84,21 @@ LOADGEN := target/release/examples/loadgen
 # Most of that race has since been closed at the source: the tests poll for the
 # sweep rather than assume it, and their budget was two seconds, which is not
 # enough on a machine whose cores are all busy — under load three of them failed
-# together. The budget is a minute now and polling makes that free. Whoever
-# raises this next should check whether those five lines have gone quiet on the
-# runner rather than inherit the allowance: the honest floor may now be the
-# figure CI prints, but that has to be read off a green Linux run and not
-# assumed from here.
-COVERAGE_MIN ?= 99.22
+# together. The budget is a minute now and polling makes that free.
+#
+# The rest of it is gone too. Those arms are `pipeline::report_sweep` now with a
+# unit test that drives every one of them, and `serve_with`'s never-fires stop
+# edge — whose `pending()` arm was polled or not depending on what the server
+# was doing at the time — has one as well. Three consecutive runs on this Mac
+# then measured 99.2368 (182 of 23,847) with byte-identical uncovered-line
+# lists, where the same tree before them moved between 180 and 183.
+#
+# So 99.23, which is that figure floored, and not the 99.24 one of those runs
+# printed on the way there. What is left uncovered is stably uncovered rather
+# than flickering, which is the property this gate actually needs; the honest
+# next move is still to read a figure off a green Linux run rather than assume
+# the drift's direction from here.
+COVERAGE_MIN ?= 99.23
 
 # MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
 # count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor
@@ -179,6 +188,10 @@ test: ## Unit tests + the in-process end-to-end suite
 	@# that sum to their count, exemplars naming traces that exist) therefore
 	@# ride behind a flag instead of in a test module, and this is what runs it.
 	$(CARGO) run --quiet --locked --example loadgen -- --selftest
+	@# The page that tells a contributor where a new test belongs, against the
+	@# tests that now exist. Here and not in `drift`, because the count comes
+	@# from `--list` on the binaries the line above has just built.
+	$(XTASK) testcounts
 
 # What the ratchet measures: the shipped crates, not the tooling.
 #
@@ -251,7 +264,7 @@ build: ## Release binary and the load harness (the artifact; see `make drift`)
 	@# `dist-tarball` depends on this target, so that is the artifact that ships.
 	@# Nothing in `mira` calls any of what the wider resolutions drag in. The
 	@# cost is a second compile of the dev-unified tokio; binary size is a scored
-	@# axis (docs/architecture.md section 11), so the trade is not close.
+	@# axis (docs/architecture/performance.md section 11), so the trade is not close.
 	$(CARGO) build --release --locked -p miradb --bin mira
 	$(CARGO) build --release --locked -p miradb --example loadgen
 
@@ -500,9 +513,9 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 	@# that just went green, which is how a bump ends up taking three pushes.
 	@test -n "$(TO)" || { \
 		echo "usage: make bump TO=X.Y.Z" >&2; \
-		echo "  writes Cargo.toml, Chart.yaml, the chart test, README.md," >&2; \
-		echo "  SECURITY.md, docs/install.md, the issue template, CHANGELOG.md" >&2; \
-		echo "  then regenerates Cargo.lock and charts/mira/README.md" >&2; \
+		echo "  writes Cargo.toml, README.md, SECURITY.md, docs/install.md," >&2; \
+		echo "  the issue template, CHANGELOG.md and the MiraCluster examples," >&2; \
+		echo "  then regenerates Cargo.lock and the operator chart's README" >&2; \
 		exit 1; }
 	$(XTASK) drift --bump $(TO)
 	$(CARGO) update --workspace --quiet
@@ -510,6 +523,54 @@ bump: ## Rewrite every version site to TO=X.Y.Z (step 1 of a release)
 	@echo
 	@echo "Now: \`make drift\` to verify, then a PR. Merging it cuts $(TO) —"
 	@echo "there is no tag to remember. See docs/internals/releases.md."
+
+# ---------------------------------------------------------------------------
+# Changesets: the declaration, the gate on it, and the writer it drives
+# ---------------------------------------------------------------------------
+#
+# `make bump TO=X.Y.Z` above is still the whole bump and still works offline.
+# What changesets adds is *who chooses X.Y.Z*: a contributor says "this is a
+# patch to the operator" in a five-line file, a bot accumulates them, and
+# `make version` applies the arithmetic. Both paths share one writer —
+# `xtask drift --bump` for the engine, `xtask release apply` for the operator,
+# and the same two tables `make drift` reads — so there is no second way for a
+# version to end up wrong.
+
+.PHONY: changeset
+changeset: ## Declare which version line this change moves
+	@# The only Node on a contributor's path, and it is optional: the file
+	@# this writes is five lines of markdown and .changeset/README.md has the
+	@# shape.
+	npm ci
+	npx changeset add
+
+.PHONY: changeset-check
+changeset-check: ## Every diff that ships something declares its version line (BASE=<ref>)
+	@# Not in `check`. It reads a pull request's range, and on main that range
+	@# is empty, so a laptop has nothing to run it against — the same reason
+	@# `ci-section-range` is not in `ci-meta`. The fail-open behaviour and the
+	@# reasoning are in the script.
+	sh scripts/changeset-check.sh $(BASE)
+
+.PHONY: version
+version: ## Apply the pending changesets (this is what the bot runs)
+	@# Three steps and a hand-off. `changeset version` computes the arithmetic
+	@# and writes the two stubs under release/units/; `release apply` copies
+	@# those two numbers into the ~20 places Mira actually states a version,
+	@# through the same tables `make drift` checks; then the generated files.
+	@#
+	@# Both Cargo.locks, because the two workspaces are separate: the root one
+	@# carries the three miradb-* entries and integrations/kubernetes/Cargo.lock
+	@# carries mira-operator. A `--locked` build against a stale one fails at
+	@# release time, which is the wrong place to find out.
+	npm ci
+	npx changeset version
+	$(XTASK) release apply
+	$(CARGO) update --workspace --quiet
+	$(CARGO) update --workspace --quiet --manifest-path $(OPERATOR)/Cargo.toml
+	$(MAKE) --no-print-directory helm-docs
+	@echo
+	@echo "Now: \`make drift\` to verify. Merging this cuts the release."
 
 .PHONY: workflows
 workflows: ## Lint the workflows, and check every CI job can block a merge
@@ -526,11 +587,13 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 	$(XTASK) ci
 	@# actionlint shellchecks every `run:` block for free, so the scripts those
 	@# blocks call have to be checked somewhere too — lifting shell out of YAML
-	@# must not be how it stops being linted. A glob rather than a list: the
-	@# list is what rots, and re-checking get-mira.sh (which `make
-	@# install-script` also does, with more) costs nothing.
+	@# must not be how it stops being linted. `git ls-files` rather than two
+	@# globs: `scripts/*.sh` is not recursive, so the nine scripts under
+	@# `scripts/measure/` were never linted and had nine warnings between them
+	@# when this line was written. Re-checking get-mira.sh — twice, since
+	@# docs/install.sh is a symlink to it — costs nothing.
 	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
-	shellcheck scripts/*.sh
+	shellcheck $$(git ls-files '*.sh')
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs
@@ -579,6 +642,183 @@ msrv: ## Compile with exactly the declared MSRV ($(MSRV))
 	$(CARGO) +$(MSRV) check --workspace --all-targets --locked
 
 # ---------------------------------------------------------------------------
+# The operator
+# ---------------------------------------------------------------------------
+#
+# `integrations/kubernetes/` is a second Cargo workspace, and everything in this
+# section exists because of that one fact. It is not a member of the root one,
+# so `--workspace` above never sees it and none of the gates above apply to it.
+#
+# That is the point rather than a gap. The operator needs kube-rs, which is 160
+# crates against the engine's 120, wants a newer MSRV than the engine declares,
+# and brings duplicate versions and licences that `deny.toml` refuses. Inside
+# the root workspace it would move the crate count the README publishes, break
+# `make msrv`, fail `cargo deny`, and dilute a coverage ratchet with no margin.
+# Outside it, the engine's numbers stay statements about the engine — which is
+# the same reason pacto keeps its Kubernetes integration behind a second
+# `go.mod`.
+#
+# What it costs is this section: the gates the operator does get have to be
+# written out a second time, pointed at the other manifest.
+
+OPERATOR := integrations/kubernetes
+
+.PHONY: operator-fmt
+operator-fmt: ## Format the operator's sources in place
+	$(CARGO) fmt --manifest-path $(OPERATOR)/Cargo.toml --all
+
+.PHONY: operator-fmt-check
+operator-fmt-check: ## Fail if the operator is unformatted
+	$(CARGO) fmt --manifest-path $(OPERATOR)/Cargo.toml --all --check
+
+.PHONY: operator-lint
+operator-lint: ## Clippy over the operator, warnings are errors
+	$(CARGO) clippy --manifest-path $(OPERATOR)/Cargo.toml --all-targets --locked -- -D warnings
+
+.PHONY: operator-test
+operator-test: ## The operator's unit tests
+	$(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml --locked
+	$(XTASK) testcounts --operator
+
+# The operator's own ratchet, separate from the engine's because it is measured
+# over a different manifest — `cargo llvm-cov --workspace` on the root cannot
+# reach a nested workspace, which is why the operator was invisible to
+# COVERAGE_MIN for as long as it existed.
+#
+# 92.17 lines measured here with the pod-hardening tests in place — the flag is
+# --fail-under-lines, so it is the Lines column and not Regions that has to clear
+# this. It is *not* 99-point-something and cannot be: `main.rs` and `crdgen.rs`
+# are 33 lines of process entry point at 0%, which puts the ceiling at about
+# 98.2 — those two are covered by `make operator-e2e`, and coverage
+# instrumentation does not follow a binary into a container. Floored to 92.0 for
+# the same reason COVERAGE_MIN is floored: a ratchet with no margin fails on a
+# run that measured the same tree.
+OPERATOR_COVERAGE_MIN ?= 92.0
+
+.PHONY: operator-coverage
+operator-coverage: ## Operator line coverage against its ratchet ($(OPERATOR_COVERAGE_MIN)%)
+	$(call need,cargo-llvm-cov)
+	@# Its own target dir: coverage takes the same lock as a normal build, and
+	@# sharing one with the engine's ratchet serialises two legs that have no
+	@# reason to wait for each other.
+	CARGO_TARGET_DIR=target/llvm-cov-operator \
+	  $(CARGO) llvm-cov --manifest-path $(OPERATOR)/Cargo.toml --locked \
+	  --summary-only --show-missing-lines --fail-under-lines $(OPERATOR_COVERAGE_MIN)
+
+.PHONY: operator-crd
+operator-crd: ## Regenerate the CRD the chart ships from the Rust types
+	$(CARGO) run --quiet --manifest-path $(OPERATOR)/Cargo.toml --locked --bin crdgen \
+	  > $(CHART)/crds/miraclusters.yaml
+
+.PHONY: operator-crd-check
+operator-crd-check: operator-crd ## Fail if the committed CRD is stale
+	@# The CRD is generated from `#[derive(CustomResource)]`, so a field added to
+	@# the Rust struct and not regenerated here is a field the API server
+	@# *rejects* — apiextensions prunes anything the schema does not name, so the
+	@# value silently disappears between `kubectl apply` and the reconciler
+	@# reading it. That failure has no error message anywhere, which is why it is
+	@# a drift gate rather than a note in a README.
+	git diff --exit-code -- $(CHART)/crds/miraclusters.yaml
+
+# The envtest-shaped hole. `controller-runtime` hands Go operators a real
+# `kube-apiserver` and `etcd` pair on a temp port; kube-rs has no equivalent and
+# no crate offers one, so the cluster has to come from outside and the suite has
+# to be opt-in — `cargo test` is the first command a contributor runs and it
+# cannot start needing a kubeconfig.
+#
+# Opt-in by environment variable rather than by `#[ignore]`: an ignored test
+# that cannot reach a cluster *passes* when someone runs `--ignored` on a laptop
+# with the wrong context, and this suite's job is to fail loudly about a cluster.
+.PHONY: operator-apiserver
+operator-apiserver: ## Reconcile against the current kube context (needs a cluster)
+	MIRA_OPERATOR_APISERVER=1 $(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml \
+	  --locked --test apiserver -- --test-threads=4
+
+.PHONY: operator-e2e
+operator-e2e: ## The operator against a real cluster: Kind, a stock collector, a drain
+	@# The only end-to-end gate in the tree, and it replaced a compose file that
+	@# ran one Mira behind one collector. Everything that one asserted is
+	@# asserted here — the three signals still make the full trip from a stock
+	@# collector — but through a tier the operator built, so the reconciler, the
+	@# chart, the CRD and the RBAC are all on the path rather than beside it.
+	@#
+	@# It is not in `make check`. It builds two images and a cluster and takes
+	@# minutes; `make ci-operator-e2e` is its own CI leg, and `KEEP=1` leaves the
+	@# cluster up when it fails.
+	$(OPERATOR)/e2e/run.sh
+
+.PHONY: operator
+operator: operator-fmt-check operator-lint operator-test operator-coverage operator-crd-check ## Every operator gate
+
+# ---------------------------------------------------------------------------
+# Prose — the markup, the words, and the shape of a page
+# ---------------------------------------------------------------------------
+
+# Every Markdown file the repository tracks, minus the five symlinks under
+# docs/: their targets are already in the list, and linting both ends reports
+# every finding twice at a path you cannot fix it at.
+#
+# One list, not three. markdownlint, Vale and `xtask prose` all need the same
+# answer to "which pages did we write", and a scope written out once per tool
+# is a scope that disagrees with itself by the third release. Recursive `=`, so
+# a make invocation that touches no prose does not shell out to git.
+PROSE = $(shell git ls-files '*.md' | while read -r f; do [ -L "$$f" ] || echo "$$f"; done)
+
+# The pages nobody writes. `xtask prose` budgets authored prose, and a budget
+# on a generator's output is a budget on the surface it renders: a new CLI flag
+# would fail the gate, and the only way to pass would be to delete the flag or
+# to stop documenting it. The markup and the words are still checked on all
+# four, which is what catches a generator emitting marketing or a broken table.
+#
+#   CHANGELOG.md                  changesets, from .changeset/*.md
+#   charts/mira-operator/README.md  helm-docs, from values.yaml
+#   docs/reference/*.md           xtask reference, from the code
+GENERATED = CHANGELOG.md charts/mira-operator/README.md docs/reference/cli.md \
+            docs/reference/http.md
+
+.PHONY: docs-check
+docs-check: node_modules ## Markdown structure, prose style, and the shape of a page
+	@# Three gates, none of them a model, all of them reproducible on a laptop:
+	@#
+	@#   markdownlint   the markup — one table style, every fence labelled
+	@#   vale           the words — marketing, filler, terminology
+	@#   xtask prose    the shape — page, section and sentence length, depth
+	@#   xtask links    the cross-references, on the half of the tree
+	@#                  `make docs` cannot reach
+	@#
+	@# The split is not arbitrary. markdownlint cannot see a word and Vale
+	@# cannot see a page, and the thing this repository actually kept getting
+	@# wrong was the page: eight thousand words under one heading passes both.
+	@# Rule configuration lives in .markdownlint-cli2.yaml and .vale/styles/Mira.
+	@#
+	@# `links` takes the pages outside docs/ and nothing else, because
+	@# `mkdocs build --strict` already resolves every link and anchor on the
+	@# site and a second opinion on the same file is a second place to suppress
+	@# something. What it leaves uncovered is README.md and its neighbours,
+	@# which link into docs/ constantly with nothing resolving them.
+	$(call need_bin,vale,brew install vale   (see https://vale.sh/docs/install))
+	npx markdownlint-cli2 $(PROSE)
+	vale $(PROSE)
+	$(XTASK) prose $(filter-out $(GENERATED),$(PROSE))
+	$(XTASK) links $(filter-out docs/%,$(PROSE))
+
+# markdownlint is pinned in package.json beside @changesets/cli, which is the
+# only reason there is a package.json at the root at all. A stamp target rather
+# than `npm ci` in the recipe: `docs-check` is in `check`, and reinstalling
+# node_modules on every run is how a gate becomes the slow one nobody runs.
+node_modules: package.json package-lock.json
+	npm ci --silent
+	@touch $@
+
+.PHONY: market
+market: ## Rewrite the market page's claim tally from its own tables
+	$(XTASK) market render
+
+.PHONY: market-check
+market-check: ## That tally is still what the tables add up to
+	$(XTASK) market
+
+# ---------------------------------------------------------------------------
 # Documentation site
 # ---------------------------------------------------------------------------
 
@@ -620,6 +860,33 @@ docs: $(VENV)/bin/mkdocs ## Build the docs site; --strict, so a dead link fails
 		exit 1; \
 	fi
 	$(VENV)/bin/mkdocs build --strict
+	@# The other other half: an absolute URL into a page mkdocs *did* build.
+	@# Splitting `architecture.md` into a directory moved every anchor on it, and
+	@# one spelled out in full in a Rust doc comment turned into a 404 that
+	@# --strict cannot see, because that URL is external as far as it is
+	@# concerned. Resolved against the HTML just built rather than against a
+	@# slugifier of our own: python-markdown's rules are the only ones that
+	@# decide what an anchor is, and a second implementation of them is a second
+	@# thing to be wrong.
+	@# `api/`, `play/` and `coverage.json` are not mkdocs pages — `make site` and
+	@# `make coverage-json` write those, after this target has run.
+	@bad=$$(for u in $$(git grep -hoE --untracked 'https://miradb\.dev/[A-Za-z0-9_./#-]*' \
+	    | sed -e 's#https://miradb\.dev/##' -e 's/\.$$//' \
+	    | grep -vE '^(api$$|api/|play/|coverage\.json$$)' | sort -u); do \
+		frag=$${u#*\#}; [ "$$frag" = "$$u" ] && frag=; \
+		page=site/$${u%%\#*}; page=$${page%/}; \
+		[ -d "$$page" ] && page=$$page/index.html; \
+		[ -f "$$page" ] || { echo "$$u -- no $$page"; continue; }; \
+		if [ -n "$$frag" ] && ! grep -q "id=\"$$frag\"" "$$page"; then \
+			echo "$$u -- $$page has no anchor $$frag"; \
+		fi; \
+	done); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these absolute site URLs resolve to nothing:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  \`git grep -n <url>\` finds every one."; \
+		exit 1; \
+	fi
 
 .PHONY: docs-serve
 docs-serve: $(VENV)/bin/mkdocs ## Serve the docs site with live reload
@@ -650,10 +917,19 @@ site: docs doc ui-demo ## The published site: the docs, rustdoc at /api, the UI 
 # The Helm chart
 # ---------------------------------------------------------------------------
 #
-# One chart, one workload, and the same rule as everywhere else here: CI calls
-# these targets and adds nothing of its own.
+# One chart, and it installs the operator. There used to be a second one that
+# installed a StatefulSet directly, and it was removed rather than kept beside
+# this: two charts is two answers to "how do I run Mira on Kubernetes", and the
+# one that cannot scale, cannot drain and cannot be told a ceiling is the wrong
+# answer to ship as the default. A tier is a `MiraCluster` now.
+#
+# `CHART` stays a variable rather than being inlined, because the gates below
+# differ in what they can iterate: lint, the unit suites and the schema parse
+# are shape-independent, but `helm template`'s permutations are a specific
+# chart's own values — and `--set` on a key a chart does not define is silently
+# accepted, so a shared flag list would render happily while testing nothing.
 
-CHART := charts/mira
+CHART := charts/mira-operator
 
 # The plugin is pinned because an unpinned test runner is a test suite that
 # changes meaning on someone else's machine.
@@ -674,19 +950,14 @@ helm-template: ## Render the chart across the permutations that change its shape
 	$(call need_bin,helm,brew install helm   (see https://helm.sh/docs/intro/install/))
 	@# Not golden files — helm-unittest below asserts the *claims*, and a golden
 	@# file asserts whitespace. This gate answers the other question: does every
-	@# combination that adds or removes a resource still render at all? Each
-	@# line below is one axis: no PVC, a named class, an Ingress, no account,
-	@# several replicas, the durability switch, self-telemetry, and the rules.
-	helm template mira $(CHART) --debug >/dev/null
-	helm template mira $(CHART) --set persistence.enabled=false >/dev/null
-	helm template mira $(CHART) --set persistence.storageClass=gp3 --set persistence.size=100Gi >/dev/null
-	helm template mira $(CHART) --set ingress.enabled=true >/dev/null
-	helm template mira $(CHART) --set serviceAccount.create=false >/dev/null
-	helm template mira $(CHART) --set replicaCount=3 --set service.type=LoadBalancer >/dev/null
-	helm template mira $(CHART) --set config.ingest.wal=false --set config.storage.retention=720h >/dev/null
-	helm template mira $(CHART) --set config.telemetry.self=true --set config.ingest.queue=1024 >/dev/null
-	helm template mira $(CHART) --values $(CHART)/ci/alerting-values.yaml >/dev/null
-	helm template mira $(CHART) --values $(CHART)/ci/ephemeral-values.yaml >/dev/null
+	@# combination that adds or removes a resource still render at all? The
+	@# axes: the default cluster-wide install, the scoped one where the
+	@# ClusterRole becomes a Role per namespace, and the two opt-outs that leave
+	@# the controller with no permissions and no account of its own.
+	helm template mira-operator $(CHART) --debug >/dev/null
+	helm template mira-operator $(CHART) --set 'rbac.namespaces={alpha,beta}' >/dev/null
+	helm template mira-operator $(CHART) --set rbac.create=false >/dev/null
+	helm template mira-operator $(CHART) --set serviceAccount.create=false --set serviceAccount.name=existing >/dev/null
 
 .PHONY: helm-unittest
 helm-unittest: ## The chart's own test suites
@@ -700,21 +971,26 @@ helm-unittest: ## The chart's own test suites
 .PHONY: helm-schema
 helm-schema: ## values.schema.json parses, admits the defaults, and refuses a typo
 	$(call need_bin,helm,brew install helm   (see https://helm.sh/docs/intro/install/))
-	$(XTASK) parse-json $(CHART)/values.schema.json
+	@$(XTASK) parse-json $(CHART)/values.schema.json
 	@# Helm validates values against the schema on every template and install,
 	@# so `helm-template` above already proves the shipped defaults satisfy it.
 	@# What that cannot prove is that the schema *refuses* anything: a schema
 	@# with a typo'd key name, or one helm never loaded, passes that test
-	@# perfectly. So assert the refusals — a closed object, an enum, a minimum,
-	@# an access mode Mira cannot use, and one of Mira's own value grammars.
-	@for bad in persistenc.enabled=true \
-	            service.type=Bogus \
-	            replicaCount=0 \
-	            persistence.accessMode=ReadWriteMany \
-	            config.storage.retention=1week \
-	            config.ingest.queue=0; do \
-		if helm template mira $(CHART) --set "$$bad" >/dev/null 2>&1; then \
-			echo "error: values.schema.json accepted --set $$bad."; \
+	@# perfectly. So assert the refusals — a bound, an enum, an empty list, an
+	@# empty string, and a plain typo in a key name.
+	@#
+	@# `replicaCount=0` is the one that matters: the operator's lease makes a
+	@# second replica a warm standby rather than a second scaling decision, so
+	@# the ceiling came off — but zero operators is a tier that silently stops
+	@# scaling, and a Deployment scaled to zero looks installed.
+	@for bad in replicaCount=0 \
+	            replicaCount=1.5 \
+	            image.pullPolicy=Sometimes \
+	            rbac.namespaces={} \
+	            logLevel= \
+	            rbac.craete=true; do \
+		if helm template mira-operator $(CHART) --set "$$bad" >/dev/null 2>&1; then \
+			echo "error: $(CHART)/values.schema.json accepted --set $$bad."; \
 			echo "  the schema is the only thing between a typo'd value and a"; \
 			echo "  cluster that installs happily with the default instead."; \
 			exit 1; \
@@ -741,7 +1017,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check market-check measurements-check docs-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 
@@ -850,7 +1126,7 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 #   * COPYFILE_DISABLE, because macOS tar otherwise writes ._ AppleDouble
 #     sidecars into the archive and they surface as junk on a Linux extract.
 # The size line goes to the run summary as well as stdout: README and
-# docs/architecture.md section 11 both quote a binary size, and a release that
+# docs/architecture/performance.md section 11 both quote a binary size, and a release that
 # quietly doubles it should be visible without opening a log.
 
 .PHONY: dist-sbom
@@ -907,11 +1183,10 @@ publish: ## Publish all three crates to crates.io. Irreversible.
 # [workspace.dependencies] block says why.
 
 # ---------------------------------------------------------------------------
-# The image, and the two gates over it
+# The image, and the gate over it
 # ---------------------------------------------------------------------------
 
 SCAN_IMAGE  ?= local/mira:scan
-E2E_COMPOSE := docs/e2e/compose.yaml
 # Docker's spelling of the architecture, which is not uname's. The Dockerfile's
 # prebuilt stage copies dist/linux/$$TARGETARCH/mira.
 DOCKER_ARCH  = $(if $(filter aarch64 arm64,$(shell uname -m)),arm64,amd64)
@@ -939,45 +1214,6 @@ scan-image: dist-image ## Trivy over the release image; a fixable HIGH/CRITICAL 
 	@# switched off. HIGH,CRITICAL because the distroless base carries a
 	@# permanent tail of MEDIUM glibc findings that would drown the signal.
 	trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress $(SCAN_IMAGE)
-
-.PHONY: e2e
-e2e: dist-image ## docs/e2e: a stock collector in front of a real binary, asserted
-	@# dist-image copies the host binary in, so on macOS the image builds happily
-	@# around a Mach-O that Linux cannot exec — and the symptom is 240 seconds of
-	@# silence followed by "the pipeline is broken", which it is not. Say so now.
-	@head -c 4 "$(DIST_BIN)" | grep -q ELF || { \
-		echo "error: $(DIST_BIN) is not a Linux binary, so the container cannot start it."; \
-		echo "  this gate runs on Linux (ci.yml's e2e leg). Locally, use \`make demo\`."; \
-		exit 1; }
-	@# The scenario docs/internals/e2e.md section 6 documents, run as a gate. The
-	@# --build-arg makes compose reuse the layers dist-image just built instead
-	@# of compiling a second time inside the Dockerfile; everything else about
-	@# the stack is exactly what a reader of that section types.
-	docker compose -f $(E2E_COMPOSE) build --build-arg BIN=prebuilt mira
-	@# The assertion at the end is the same three questions `make demo` waits on,
-	@# asked as a gate rather than as a warning. This is the only test in the
-	@# tree where the client on the wire is not ours — the stock collector gzips
-	@# by default, batches on its own schedule, and drops a batch permanently
-	@# rather than retry if the server answers UNIMPLEMENTED — so a timeout here
-	@# is a failure. Four minutes is generous on purpose: the runner pulls two
-	@# images, starts a collector, runs four one-shot generators and waits for a
-	@# block to seal. Slow is fine; never is what this is looking for.
-	@#
-	@# Every service, not `mira otelcol`, and `ps -a` before the logs. The two
-	@# things the narrow version could not show are the two that matter when
-	@# this fails: which containers are still up (a name that stops resolving is
-	@# a container that exited, not a network fault), and whether the generators
-	@# ever reached the collector. `--tail 100` is per container, and the one
-	@# line that explains the whole run is usually the container's first, so the
-	@# dead one gets its log in full.
-	@trap 'rc=$$?; [ $$rc -eq 0 ] || { \
-	         echo "--- containers"; docker compose -f $(E2E_COMPOSE) ps -a; \
-	         echo "--- mira"; docker compose -f $(E2E_COMPOSE) logs --no-color mira; \
-	         echo "--- everything else"; docker compose -f $(E2E_COMPOSE) logs --no-color --tail 100; }; \
-	       docker compose -f $(E2E_COMPOSE) down -v --remove-orphans >/dev/null 2>&1 || true; \
-	       exit $$rc' EXIT; \
-	docker compose -f $(E2E_COMPOSE) up -d; \
-	scripts/wait-for-signals.sh 240 assert
 
 # ---------------------------------------------------------------------------
 # The pipeline

@@ -5,8 +5,12 @@
 # on each build.
 
 # Several GB of objects for the wrong architecture, and a cache mount inside the
-# image already covers incremental rebuilds.
+# image already covers incremental rebuilds. Both lines are needed: a pattern
+# with no leading `**` is anchored at the context root, so `target/` alone would
+# ship the nested operator workspace's build directory — the context is the
+# repository root for that image too.
 target/
+integrations/kubernetes/target/
 
 # Blocks. A data directory in the context would be baked into a layer.
 data/

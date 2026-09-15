@@ -1,6 +1,6 @@
 #!/bin/sh
 # Paired A/B: what does *not* CRC32ing the attribute tables buy a query that
-# does not read them? Produces the numbers in architecture.md section 11 under
+# does not read them? Produces the numbers in docs/architecture/performance.md section 11 under
 # "a query verifies the tables it reads".
 #
 # Two binaries, one corpus, alternating on the same box. Four cases, chosen so

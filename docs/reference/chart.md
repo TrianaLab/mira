@@ -1,1 +1,1 @@
-../../charts/mira/README.md
+../../charts/mira-operator/README.md

@@ -285,34 +285,9 @@ async fn export<R: Message + Default, T: Message>(
     ok: T,
     from_json: fn(&yaml_rust2::Yaml) -> Result<R, String>,
 ) -> Response {
-    let json = match encoding(headers) {
-        Some(Encoding::Protobuf) => false,
-        Some(Encoding::Json) => true,
-        None => {
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "expected application/x-protobuf or application/json",
-            )
-                .into_response();
-        }
-    };
-
-    let body = match inflate(headers, body, max) {
-        Ok(b) => b,
-        Err((code, e)) => return fail(json, code, &e),
-    };
-
-    let decoded = if json {
-        std::str::from_utf8(&body)
-            .map_err(|e| e.to_string())
-            .and_then(crate::api::parse)
-            .and_then(|doc| from_json(&doc))
-    } else {
-        R::decode(body).map_err(|e| e.to_string())
-    };
-    let req = match decoded {
-        Ok(r) => r,
-        Err(e) => return fail(json, StatusCode::BAD_REQUEST, &e),
+    let (json, req) = match decode(headers, body, max, from_json) {
+        Ok(v) => v,
+        Err((json, code, e)) => return fail(json, code, &e),
     };
 
     match ingest.submit(req).await {
@@ -351,7 +326,47 @@ async fn export<R: Message + Default, T: Message>(
 /// object, and hand-writing it costs less than a serializer. The protobuf case
 /// keeps returning text — encoding a `Status` there means another generated type
 /// for a path no exporter parses.
-fn fail(json: bool, code: StatusCode, message: &str) -> Response {
+/// Content type, then content encoding, then the wire format. The `bool` is
+/// "the client speaks JSON", which every answer to it has to be written in.
+///
+/// Split out of [`export`] for `proxy`, which decodes the same three request
+/// types in order to split them by entity and forward the parts. One copy of
+/// the header handling, so a gzip or content-type rule fixed on one path is
+/// fixed on both.
+pub(crate) fn decode<R: Message + Default>(
+    headers: &HeaderMap,
+    body: Bytes,
+    max: usize,
+    from_json: fn(&yaml_rust2::Yaml) -> Result<R, String>,
+) -> Result<(bool, R), (bool, StatusCode, String)> {
+    let json = match encoding(headers) {
+        Some(Encoding::Protobuf) => false,
+        Some(Encoding::Json) => true,
+        // Answered as protobuf because the client has not said it speaks
+        // anything else — this is the one error where that is unknown.
+        None => {
+            return Err((
+                false,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected application/x-protobuf or application/json".to_owned(),
+            ));
+        }
+    };
+    let body = inflate(headers, body, max).map_err(|(code, e)| (json, code, e))?;
+    let decoded = if json {
+        std::str::from_utf8(&body)
+            .map_err(|e| e.to_string())
+            .and_then(crate::api::parse)
+            .and_then(|doc| from_json(&doc))
+    } else {
+        R::decode(body).map_err(|e| e.to_string())
+    };
+    decoded
+        .map(|r| (json, r))
+        .map_err(|e| (json, StatusCode::BAD_REQUEST, e))
+}
+
+pub(crate) fn fail(json: bool, code: StatusCode, message: &str) -> Response {
     if !json {
         return (code, message.to_owned()).into_response();
     }

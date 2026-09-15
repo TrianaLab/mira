@@ -8,6 +8,7 @@ mod e2e;
 mod json;
 mod mcp;
 mod pipeline;
+mod proxy;
 mod receiver;
 mod telemetry;
 mod term;
@@ -32,8 +33,11 @@ const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http AD
      [--alerts FILE] [--version]
 
 mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
+mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
+             --replica http://HOST:PORT [--replica ...]
 mira offload list    [--config FILE] --offload URI
 mira offload restore [--config FILE] --offload URI [--data-dir PATH]
+mira offload push    [--config FILE] --offload URI [--data-dir PATH]
 mira update  [--version VERSION] [--dry-run]
 
 Flags override the config file, which overrides the defaults. Every value can
@@ -49,26 +53,27 @@ the catalog and there is nothing else to keep in sync. `mira offload list`
 reads that listing; `mira offload restore` copies every block in it that is not
 already local back into --data-dir, and is safe to re-run.
 
+`mira offload push` is the same copy in the other direction and deletes
+nothing. It is how a volume a scale-down left behind is re-homed: push it, then
+restore it into a node that is still running. Give it a URI of its own —
+`file:///archive/${node}` — so the restore pulls back one node's blocks rather
+than the whole archive.
+
+`mira proxy` is one OTLP and query surface in front of N storage nodes. It
+stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
+is answered by merging every replica's page on the cursor order. The reads it
+cannot merge — correlate, map, metrics and entities — answer 501 naming
+themselves rather than returning one node's share of the answer.
+
 `mira update` replaces this binary with the latest GitHub release, using the
 same installer as the curl one-liner at https://miradb.dev/install/.";
 
 /// Precedence is flag > file > default. Hand-rolled: the flag set exists only to
 /// override the file, so a parser crate would be more code than the thing it
 /// parses.
-fn load() -> Result<Config, String> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        std::process::exit(0);
-    }
-    if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("mira {}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
-    }
-    load_from(argv)
-}
-
-/// [`load`] without the two flags that end the process, so it can be called.
+///
+/// `-h` and `-V` are not here. They belong to every subcommand, not just the
+/// server, and this is reached by only two of them — see [`run`].
 fn load_from(argv: Vec<String>) -> Result<Config, String> {
     // The file has to be read first so flags can override it.
     let mut cfg = match argv.iter().position(|a| a == "--config") {
@@ -94,6 +99,11 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
             "--shards" => cfg.shards = config::whole(&value()?)?,
             "--telemetry-interval" => cfg.telemetry_interval = config::duration(&value()?)?,
             "--alerts" => cfg.alerts = Some(PathBuf::from(value()?)),
+            // Repeatable, unlike every other flag here, because the value is a
+            // list and `--replica a --replica b` is what a process manager's
+            // args array already looks like. The file form is one
+            // comma-separated string; see `config::replicas`.
+            "--replica" => cfg.replicas.extend(config::replicas(&value()?)?),
             // These two take no value, unlike every other flag here. They are
             // the settings whose file form has to be able to say `false` — to
             // turn off what an inherited config turned on — and whose flag form
@@ -107,17 +117,36 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
     Ok(cfg)
 }
 
-/// `mira offload list` and `mira offload restore`.
+/// `mira offload list`, `mira offload restore` and `mira offload push`.
 ///
-/// Both are `readdir` against the store and nothing else. There is no state
-/// here to be stale, no index to rebuild and nothing to reconcile with a
-/// running server: a `restore` into the data directory of a live node is a
-/// block appearing in it, which is the same event as a publish and is already
-/// how the read path learns about anything (section 4).
+/// All three are `readdir` against one side or the other and nothing else.
+/// There is no state here to be stale, no index to rebuild and nothing to
+/// reconcile with a running server: a `restore` into the data directory of a
+/// live node is a block appearing in it, which is the same event as a publish
+/// and is already how the read path learns about anything (section 4).
+///
+/// `push` copies and does not unlink, and that is the design rather than
+/// caution. A node derives two numbers from the blocks it still holds locally,
+/// and emptying the directory walks both backwards: the WAL watermark
+/// ([`mira_core::block::wal_watermarks`]) falls to `0` for any signal left with
+/// no block, so the next boot replays a log that has already been absorbed, and
+/// the block sequence resumes at `max(seq) + 1` over the local scan, so the
+/// node reissues `(node, seq)` pairs that are still alive wherever they were
+/// copied — and `Cursor` is documented as a total order over exactly that pair.
+/// The case this verb exists for is a volume that is about to be deleted, where
+/// freeing space on it buys nothing at all, let alone those two.
+///
+/// ponytail: `push` reads the directory live, so a block being compacted at
+/// that moment — `<table>.arrow.<node>.tmp` renamed over `<table>.arrow` — can
+/// be copied mid-rewrite. It is meant for a volume whose server is stopped,
+/// which is the case it was asked for; holding it against a running one needs
+/// the compaction lock this module deliberately does not have.
 fn offload_cmd(argv: &[String]) -> Result<(), String> {
     let verb = argv.first().map(String::as_str).unwrap_or("");
-    if !matches!(verb, "list" | "restore") {
-        return Err(format!("mira offload takes `list` or `restore`\n\n{USAGE}"));
+    if !matches!(verb, "list" | "restore" | "push") {
+        return Err(format!(
+            "mira offload takes `list`, `restore` or `push`\n\n{USAGE}"
+        ));
     }
     let cfg = load_from(argv[1..].to_vec())?;
     let uri = cfg
@@ -134,7 +163,15 @@ fn offload_cmd(argv: &[String]) -> Result<(), String> {
     }
     let (mut blocks, mut bytes) = (0u64, 0u64);
     for signal in pipeline::SIGNALS {
-        for b in target.list(signal).map_err(|e| e.to_string())? {
+        // The verb chooses which side is the source. Both sides are the same
+        // `scan` over the same names, which is the property section 3.2's
+        // naming scheme exists to have — a store needs no listing code of its
+        // own, and neither does reading one backwards.
+        let source = match verb {
+            "push" => mira_core::block::scan(&cfg.data_dir, signal),
+            _ => target.list(signal),
+        };
+        for b in source.map_err(|e| e.to_string())? {
             let name = b.dir.file_name().unwrap_or_default().to_string_lossy();
             let size = block_bytes(&b.dir);
             blocks += 1;
@@ -145,6 +182,10 @@ fn offload_cmd(argv: &[String]) -> Result<(), String> {
                     .map_err(|e| e.to_string())?
                 {
                     true => "restored",
+                    false => "present",
+                },
+                "push" => match target.push(signal, &b).map_err(|e| e.to_string())? {
+                    true => "pushed",
                     false => "present",
                 },
                 _ => "",
@@ -310,14 +351,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if argv.first().is_some_and(|a| a == "update") {
         return update::run(&argv[1..]).map_err(Into::into);
     }
+
+    // Above every remaining arm, below `update`. Above, because the parser each
+    // arm reaches knows nothing about these two and reported them as unknown
+    // flags — so `mira proxy --help`, the usage somebody is most likely to ask
+    // for, answered with an error and exit 1. Below `update`, because that arm
+    // prints its own usage and its `--version` *takes a value*: hoisted past
+    // it, `mira update --version v0.1.0` would print this binary's version and
+    // exit instead of installing the tag.
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if argv.iter().any(|a| a == "-V" || a == "--version") {
+        println!("mira {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if argv.first().is_some_and(|a| a == "offload") {
         return offload_cmd(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() });
     }
     if argv.first().is_some_and(|a| a == "mira" || a == "tui") {
-        if argv.iter().any(|a| a == "-h" || a == "--help") {
-            println!("{USAGE}");
-            return Ok(());
-        }
         // No tracing subscriber on this path, and no runtime. Both write to the
         // terminal the TUI has just taken over, and one stray `info!` in the
         // middle of a frame corrupts the whole screen.
@@ -340,14 +394,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // file, a collector, or an agent wrapped in escape codes.
         .with_ansi(std::io::stdout().is_terminal())
         .init();
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(serve())
+        .build()?;
+    // After the subscriber and inside the runtime, unlike the three above: the
+    // proxy is a server and wants both, it just has no storage under it.
+    match argv.first().is_some_and(|a| a == "proxy") {
+        true => rt.block_on(proxy_cmd(argv[1..].to_vec())),
+        false => rt.block_on(serve()),
+    }
+}
+
+/// `mira proxy`: the HTTP surface of [`proxy`] and nothing else.
+///
+/// No data directory, no flusher, no gRPC listener. gRPC is left off rather
+/// than proxied because splitting an export by entity means decoding it, and a
+/// tonic service that decodes in order to re-encode to three HTTP clients is a
+/// second transport to keep in step for a hop that is inside one deployment.
+/// Point collectors at 4318; see `docs/architecture/replicas.md` section 12.
+async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let p = proxy::Proxy::new(cfg.replicas.clone(), cfg.max_request_bytes)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("{e}\n\n{USAGE}").into() })?;
+    let socket = tokio::net::TcpListener::bind(cfg.http).await?;
+    let addr = socket.local_addr()?;
+    tracing::info!(
+        http = %addr,
+        replicas = %cfg.replicas.join(" "),
+        max_request_bytes = cfg.max_request_bytes,
+        "mira proxy listening"
+    );
+    axum::serve(socket, proxy::router(p))
+        .with_graceful_shutdown(shutdown())
+        .await?;
+    Ok(())
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let argv = std::env::args().skip(1).collect();
+    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     serve_with(cfg, shutdown()).await
 }
 
@@ -357,6 +442,17 @@ async fn serve_with(
     cfg: Config,
     stop_signal: impl std::future::Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A setting only the other mode reads is a setting that does nothing, and
+    // doing nothing in silence is what `config::check_keys` exists to prevent.
+    // The likely typo is `mira --replica ...` for `mira proxy --replica ...`,
+    // which would otherwise start a storage node that looks like a proxy.
+    if !cfg.replicas.is_empty() {
+        return Err(format!(
+            "--replica / proxy.replicas is read by `mira proxy`; this is a storage node\n\n{USAGE}"
+        )
+        .into());
+    }
+
     // First, because a rules file that does not parse is a deployment that
     // believes it is being paged and is not. Nothing has been created, bound or
     // mapped at this point, so the failure is a message and an exit rather than
@@ -695,7 +791,7 @@ async fn replay(
     let dir = dir.to_path_buf();
     let started = std::time::Instant::now();
     let done = tokio::task::spawn_blocking(move || {
-        let watermarks = mira_core::block::wal_watermarks(&dir)?;
+        let watermarks = mira_core::block::wal_watermarks(&dir, node)?;
         let mut undecodable = 0u64;
         let out = mira_core::wal::Wal::replay(&dir, node, watermarks, |signal, seq, body| {
             let pushed = match signal {
@@ -1087,6 +1183,24 @@ mod tests {
         }
     }
 
+    /// The edge that never fires is still pending once something polls it.
+    ///
+    /// Less circular than it looks. Three tests below hand `serve_with` this
+    /// future to prove the server *keeps* serving, and every one of them would
+    /// pass for the wrong reason if it resolved. And `serve_with` only polls
+    /// its stop edge when it has nothing else to do, so whether that arm runs
+    /// inside any given test run is otherwise a race against the request the
+    /// test is making — which is a line of coverage that moves on its own.
+    #[tokio::test]
+    async fn the_stop_edge_fires_when_it_is_told_to_and_never_otherwise() {
+        let zero = std::time::Duration::ZERO;
+        let never = tokio::time::timeout(zero, stop_edge(false));
+        assert!(never.await.is_err(), "the never-stop edge stopped");
+        tokio::time::timeout(zero, stop_edge(true))
+            .await
+            .expect("the immediate edge did not fire");
+    }
+
     /// The probe tasks wake up and write into the statics the diagnosis reads.
     ///
     /// `start_paused` is what makes this an assertion rather than a stopwatch:
@@ -1176,6 +1290,50 @@ mod tests {
             std::fs::read(local.join("logs.arrow")).unwrap(),
             b"local edit",
             "a block already present is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mira offload push` is `restore` read backwards, and it removes nothing.
+    ///
+    /// The unlinking version of this verb is the one that cannot be built, and
+    /// the assertion that the source survives is that argument rather than
+    /// tidiness: a node reads both its WAL watermark and its next block
+    /// sequence off the blocks it still holds, so emptying the directory walks
+    /// both backwards and the next boot replays an absorbed log under reissued
+    /// sequence numbers. Mutation check: make `push` unconditional and the last
+    /// call overwrites an archived block with a volume someone has since
+    /// edited, which is the one direction a backup verb must never go.
+    #[test]
+    fn offload_push_copies_out_of_the_data_dir_and_unlinks_nothing() {
+        let dir = tmp("offload-push");
+        let (store, data) = (dir.join("cold"), dir.join("data"));
+        let uri = format!("file://{}", store.display());
+
+        let name = format!("{:020}-{:020}-{:08x}-{:012}-{:020}", 1_000, 2_000, 7, 1, 0);
+        let local = data.join("logs").join("p=0").join(&name);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("logs.arrow"), b"bytes").unwrap();
+
+        let push = format!("push --offload {uri} --data-dir {}", data.display());
+        offload_cmd(&argv(&push)).unwrap();
+        let remote = store.join("logs").join("p=0").join(&name);
+        assert_eq!(std::fs::read(remote.join("logs.arrow")).unwrap(), b"bytes");
+        assert!(local.exists(), "push copies the block, it does not move it");
+
+        // The same block again: already archived, so a no-op rather than a
+        // re-copy, and the verb still succeeds.
+        offload_cmd(&argv(&push)).unwrap();
+
+        // Different bytes under the same name is the collision, not a no-op —
+        // reporting it as archived is what would let a scale-in delete the
+        // volume holding the only copy.
+        std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
+        offload_cmd(&argv(&push)).unwrap_err();
+        assert_eq!(
+            std::fs::read(remote.join("logs.arrow")).unwrap(),
+            b"bytes",
+            "a block already in the store is left alone"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1813,7 +1971,10 @@ mod tests {
         // Sequence 3 being dropped rather than pinned is the point of that
         // retirement: a frame that will never decode must not hold a watermark,
         // or every frame published behind it is replayed on every boot forever.
-        assert_eq!(mira_core::block::wal_watermarks(&dir).unwrap(), [4, 4, 4]);
+        assert_eq!(
+            mira_core::block::wal_watermarks(&dir, node).unwrap(),
+            [4, 4, 4]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

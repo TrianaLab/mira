@@ -1,0 +1,29 @@
+extends: existence
+message: "'%s' carries no information. Delete it, or say the thing it stands in for."
+level: error
+ignorecase: true
+# Every word here can be struck from a sentence without changing what the
+# sentence asserts — which is the test for being on this list, and why words
+# this repository leans on deliberately are not. "Actually" and "just" are both
+# common here and both doing work: they mark the difference between what a
+# reader expects and what the code does. A rule that flagged them would be a
+# rule contributors learned to `vale:off` around.
+tokens:
+  - very
+  - really
+  - simply
+  - essentially
+  - basically
+  - obviously
+  - of course
+  - needless to say
+  - it is (important|worth) (to )?not(e|ing) that
+  - it should be noted that
+  - please note( that)?
+  - as (we all|you) know
+  - at the end of the day
+  - in today's [a-z]+ world
+  - in order to
+  - due to the fact that
+  - a (wide )?variety of
+  - in terms of

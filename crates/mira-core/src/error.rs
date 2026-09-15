@@ -85,6 +85,19 @@ pub enum Error {
     )]
     OffloadScheme { uri: String },
 
+    /// The store already holds this block's name over other bytes. See
+    /// `offload::Target::push`.
+    #[error(
+        "{dest} is already in the store and does not match the block being \
+         pushed ({why}). A block name is its identity, so this one cannot be \
+         reported as already archived — a scale-in would take that as licence \
+         to delete the volume. The likely cause is a replica re-created on a \
+         fresh volume: it keeps its node id and restarts its sequence, so it \
+         reissues (node, seq) pairs the store still holds. Move the copy in \
+         the store aside, then push again."
+    )]
+    OffloadCollision { dest: PathBuf, why: String },
+
     /// An export bigger than the WAL will frame. Distinct from a corrupt
     /// length on read: this one is the caller's fault and is answerable with a
     /// 4xx, so it must not be confused with the file being damaged.
@@ -97,6 +110,17 @@ pub enum Error {
     /// process.
     #[error("{path}: corrupt write-ahead log frame: {why}")]
     WalCorrupt { path: PathBuf, why: &'static str },
+
+    /// Another process already holds this node's log. See `wal::lock_node`.
+    #[error(
+        "{path} is held by another process writing as node {node:#010x}. A \
+         write-ahead log has one writer: both would resume to the same \
+         sequence and hand it out twice, and a block that claims the watermark \
+         for one frame would cover the other — an acknowledged export never \
+         replayed. Two replicas may share a volume, but not a node id: give \
+         each one its own --node."
+    )]
+    WalLocked { path: PathBuf, node: u32 },
 
     /// A WAL segment written by a different build. Refused rather than
     /// guessed at, for the same reason a block with an unknown format version

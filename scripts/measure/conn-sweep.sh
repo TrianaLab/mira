@@ -1,5 +1,5 @@
 #!/bin/sh
-# The connection sweep behind architecture.md section 11: ingest rate, consumed
+# The connection sweep behind docs/architecture/performance.md section 11: ingest rate, consumed
 # CPU, per-core ceiling, ack latency, peak RSS and hot-tier cost, at four
 # connection counts, three passes each. It is the script named as `provenance`
 # by most of measurements.kyaml, and its output feeds straight back in:
@@ -64,6 +64,19 @@ pass() { # conns
   "$BIN/examples/loadgen" --addr "$HTTP" --records "$RECORDS" --conns "$1" \
     --batch "$BATCH" --pid "$P" --data-dir "$ROOT/d" --emit "$RUN" \
     | tee "$ROOT/pass.out"
+  # Every figure this script emits assumes nothing was shed, and until now that
+  # was an assumption rather than a check — the registry's `measures:` text for
+  # ingest.records_per_s says "the run asserts there were none" and no assert
+  # existed. It matters in three directions at once: a retried export's bytes
+  # are counted again in ingest.wire_mib_s and in cost.hot_bytes_per_byte's
+  # denominator, and loadgen's 20ms backoff sits inside the ack window, so
+  # ingest.ack_p99_ms absorbs it. wal-volume.sh, wal-split-ab.sh and
+  # proxy-ab.sh have each asserted this for a while; this is the sweep that
+  # produces the published corpus and it was the one without the guard.
+  SHED=$(awk '/records\/s/{for(i=1;i<=NF;i++) if($(i+1)=="shed") print $i}' "$ROOT/pass.out")
+  [ "${SHED:-0}" = "0" ] ||
+    { echo "conn-sweep: $1 conns shed $SHED exports -- these readings are not publishable; df:" >&2
+      df -h "$ROOT" >&2; kill $P 2>/dev/null; exit 1; }
   # Before the kill: the census is of a store the server still owns, which is
   # the only state a reader can reproduce. After a kill it is a store with an
   # unreplayed log beside it, and the block count is whatever the timing was.
@@ -82,7 +95,7 @@ census() {
   # <signal>/p=<partition>/<block>, which is depth three — the same expression
   # restart-replay.sh and offload-cycle.sh already use — and the `.arrow` files
   # inside one are its tables.
-  awk -v gib="$(find "$ROOT/d" -mindepth 3 -maxdepth 3 -type d | xargs du -sk \
+  awk -v gib="$(find "$ROOT/d" -mindepth 3 -maxdepth 3 -type d -exec du -sk {} + \
                  | awk '{s += $1} END {printf "%.2f", s / 1048576}')" \
       -v tables="$(find "$ROOT/d" -name '*.arrow' | wc -l | tr -d ' ')" \
       -v blocks="$(find "$ROOT/d/logs" -mindepth 2 -maxdepth 2 -type d | wc -l | tr -d ' ')" \

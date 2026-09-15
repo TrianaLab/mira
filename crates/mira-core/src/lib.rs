@@ -13,7 +13,7 @@
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
 //!   mmap reads back out of them.
 //!
-//! See `docs/architecture.md` for why each of those is shaped the way it is.
+//! See `docs/architecture/` for why each of those is shaped the way it is.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -118,7 +118,7 @@ mod sync_tests {
     /// `cargo test` runs a crate's tests on many threads: three tests each
     /// asserting a delta on one counter is a race, and the first draft of this
     /// module was exactly that. No `tempfile` either — the dependency budget is
-    /// a product property (`docs/architecture.md` section 11) for one file.
+    /// a product property (`docs/architecture/performance.md` section 11) for one file.
     #[test]
     fn the_barrier_runs_and_only_enotsup_degrades() {
         let path = std::env::temp_dir().join(format!("mira-sync-{}", std::process::id()));
@@ -845,6 +845,7 @@ mod tests {
             terms,
             limit,
             after: None,
+            cursors: false,
         };
         let attr = |k: &str, v: &str| Term {
             target: Target::Attr(k.into()),
@@ -1038,6 +1039,7 @@ mod tests {
             terms,
             limit,
             after: None,
+            cursors: false,
         };
         let body = |v: &str| Term {
             target: Target::Field("body".into()),
@@ -1145,6 +1147,7 @@ mod tests {
                     terms: vec![],
                     limit,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1286,6 +1289,7 @@ mod tests {
             }],
             limit: 100,
             after: None,
+            cursors: false,
         };
 
         let hex = |b: [u8; 16]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -1369,6 +1373,7 @@ mod tests {
                     terms: vec![],
                     limit,
                     after,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1527,6 +1532,7 @@ mod tests {
             }],
             limit: 10,
             after: None,
+            cursors: false,
         };
         let (f, st) = frame::anchor(&root, &q, &[]).unwrap();
         assert_eq!(f.traces, vec![tid(3)], "one row matched, so one trace");
@@ -1674,6 +1680,7 @@ mod tests {
                     }],
                     limit: 100,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()
@@ -1931,6 +1938,7 @@ mod tests {
                 }],
                 limit: 2_000,
                 after: None,
+                cursors: false,
             },
         )
         .unwrap();
@@ -2000,6 +2008,7 @@ mod tests {
                     }],
                     limit: 2_000,
                     after: None,
+                    cursors: false,
                 },
             )
             .unwrap()

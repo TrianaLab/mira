@@ -1,0 +1,14 @@
+{
+  "name": "mira-release",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Not a JavaScript project. This file exists so @changesets/cli can see the two things Mira versions independently: the engine (Cargo.toml's [workspace.package] version) and the operator (charts/mira-operator/Chart.yaml). The units under release/units/ hold one number each and nothing else. crates/mira/ui is deliberately NOT a member: npm reroutes an install run from inside a workspace member up to the root, and `make ui`'s `git diff --exit-code dist` would stop being reproducible.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "release/units/*"
+  ],
+  "devDependencies": {
+    "@changesets/cli": "3.0.3",
+    "markdownlint-cli2": "0.23.2"
+  }
+}

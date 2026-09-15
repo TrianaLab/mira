@@ -146,7 +146,7 @@ pub struct Config {
     pub queue: usize,
     /// How many flushers a signal runs, or 0 for "one per two cores".
     ///
-    /// One shard per core is the sanctioned unit (architecture.md section 4);
+    /// One shard per core is the sanctioned unit (docs/architecture/ingest.md section 4);
     /// this is only here so the number can be pinned when the machine lies
     /// about its core count. `available_parallelism` honours cgroup v1 and v2
     /// CPU quotas, so a container with a quota set needs no help here — but
@@ -220,6 +220,13 @@ pub struct Config {
     /// N replicas over one block directory would each page, so exactly one
     /// replica gets this key. See [`crate::alert`].
     pub alerts: Option<PathBuf>,
+
+    /// The storage nodes `mira proxy` sits in front of, and nothing else reads.
+    ///
+    /// Empty on a storage node, and [`crate::proxy`] refuses to start without
+    /// at least one — so the two modes cannot be confused for each other by a
+    /// config that half-says which one it meant.
+    pub replicas: Vec<String>,
 }
 
 impl Default for Config {
@@ -253,6 +260,7 @@ impl Default for Config {
             self_telemetry: false,
             telemetry_interval: Duration::from_secs(15),
             alerts: None,
+            replicas: Vec::new(),
         }
     }
 }
@@ -314,13 +322,16 @@ impl Config {
         if let Some(v) = get(&root, "alerts.rules", env)? {
             cfg.alerts = Some(PathBuf::from(v));
         }
+        if let Some(v) = get(&root, "proxy.replicas", env)? {
+            cfg.replicas = replicas(&v).map_err(|e| format!("proxy.replicas: {e}"))?;
+        }
         check_keys(&root, "")?;
         Ok(cfg)
     }
 }
 
 /// Every path this file may contain, in the order [`Config::parse`] reads them.
-const KNOWN: [&str; 13] = [
+const KNOWN: [&str; 14] = [
     "node",
     "listen.grpc",
     "listen.http",
@@ -334,6 +345,7 @@ const KNOWN: [&str; 13] = [
     "telemetry.self",
     "telemetry.interval",
     "alerts.rules",
+    "proxy.replicas",
 ];
 
 /// Refuse a key Mira does not read, or a shape it cannot read.
@@ -577,6 +589,33 @@ pub fn positive(s: &str) -> Result<usize> {
     }
 }
 
+/// A replica list: `"http://a:4318, http://b:4318"`.
+///
+/// One comma-separated string rather than a YAML sequence, which would read
+/// better and is the one shape this file cannot hold. Every value Mira reads
+/// from it is a string (see [`scalar`]), and [`check_keys`] refuses a list at
+/// every path precisely so that a list where a string belongs is an error
+/// instead of a silent default — one exception costs that rule. The flag form
+/// is `--replica URI`, repeated, which is what anyone types anyway.
+///
+/// `http://` only. A replica is this deployment's own node on its own network,
+/// and refusing the other scheme here is what keeps the proxy's client free of
+/// the eleven crates behind `webhook-tls` (see [`crate::proxy`]). The trailing
+/// slash is trimmed so that a pasted browser URL and a typed one produce the
+/// same request line.
+pub fn replicas(s: &str) -> Result<Vec<String>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(|u| match u.strip_prefix("http://") {
+            Some(rest) if !rest.is_empty() => Ok(u.trim_end_matches('/').to_owned()),
+            _ => Err(format!(
+                "{u:?} is not a replica address; expected http://host:port"
+            )),
+        })
+        .collect()
+}
+
 /// A count of things where zero is an answer rather than a mistake — see
 /// [`Config::shards`], where it means "ask the machine".
 pub fn whole(s: &str) -> Result<usize> {
@@ -606,7 +645,17 @@ pub fn duration(s: &str) -> Result<Duration> {
         "d" => 86_400,
         other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
     };
-    Ok(Duration::from_secs(n * scale))
+    // Checked, because this is reached from unauthenticated input: the query
+    // API's `time_field` hands it whatever string a `from:` or `to:` carried,
+    // and `"1000000000000000000d"` parses as a `u64` and then overflows the
+    // scale. A release build wraps it into a window nobody asked for and
+    // answers the query from that; a debug build panics, and `panic = "abort"`
+    // makes a panic on a request path the whole process. A parse error is the
+    // only honest answer, and it is the one every other bad duration gets.
+    let secs = n
+        .checked_mul(scale)
+        .ok_or_else(|| format!("{s:?} is a longer duration than this system can represent"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// `4MiB`, `512k`, `1048576`. Binary units, because every other size in this
@@ -639,6 +688,29 @@ pub fn bytes(s: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `duration` is not only a config parser. The query API's `time_field`
+    /// calls it on the `from:`/`to:` of an unauthenticated request, so a string
+    /// that parses as a `u64` and then overflows the unit scale is reachable
+    /// from the wire. It used to be `n * scale`: a release build wrapped and
+    /// answered the query from a window nobody asked for, and a debug build
+    /// panicked — which under `panic = "abort"` is the process.
+    #[test]
+    fn a_duration_too_large_to_represent_is_a_parse_error_not_a_wrap() {
+        for s in [
+            "1000000000000000000d",
+            "18446744073709551615h",
+            "999999999999999d",
+        ] {
+            assert!(duration(s).is_err(), "{s:?} must not wrap");
+        }
+        // The boundary still parses, so the check costs nothing real.
+        assert_eq!(
+            duration("106751991167d").unwrap().as_secs(),
+            9_223_372_036_828_800
+        );
+        assert_eq!(duration("7d").unwrap().as_secs(), 604_800);
+    }
 
     /// The environment these tests parse against. A literal, not the process's:
     /// see [`Env`] for why writing the real one is not an option.
@@ -941,5 +1013,38 @@ mod tests {
         assert!(e.contains("telemetry.self"), "{e}");
         let e = Config::parse(r#"{ "telemetry": { "interval": "soon" } }"#).unwrap_err();
         assert!(e.contains("telemetry.interval"), "{e}");
+    }
+
+    /// One comma-separated scalar, `http://` only, and a refusal an operator can
+    /// act on.
+    ///
+    /// The one key in this file that is a list, written as a scalar because
+    /// `check_keys` refuses a YAML sequence at every path. So the splitting is
+    /// this function's own and nothing else checks it — and the scheme rule is
+    /// load-bearing rather than fussy: it is what keeps `proxy`'s client free of
+    /// the eleven crates a TLS one would cost.
+    #[test]
+    fn a_replica_list_is_one_scalar_of_http_addresses() {
+        let cfg = Config::parse(
+            r#"{ "proxy": { "replicas": "http://a:4318, http://b:4318/ ,, http://c:4318" } }"#,
+        )
+        .unwrap();
+        // Trimmed, de-slashed, empty pieces dropped — so a trailing comma and a
+        // pasted browser URL both produce the same request line as a typed one.
+        assert_eq!(
+            cfg.replicas,
+            ["http://a:4318", "http://b:4318", "http://c:4318"]
+        );
+        assert!(Config::default().replicas.is_empty());
+        assert!(replicas("").unwrap().is_empty());
+
+        for bad in ["https://a:4318", "a:4318", "http://"] {
+            let e =
+                Config::parse(&format!(r#"{{ "proxy": {{ "replicas": "{bad}" }} }}"#)).unwrap_err();
+            assert!(
+                e.contains("proxy.replicas") && e.contains("http://host:port"),
+                "{bad}: {e}"
+            );
+        }
     }
 }

@@ -11,7 +11,7 @@
 #
 # The shape of it:
 #
-#   * Assets are named by Rust target triple (`mira-0.1.0-aarch64-apple-darwin`)
+#   * Assets are named by Rust target triple (`mira-0.0.4-aarch64-apple-darwin`)
 #     and each is a tarball with the binary one directory down, because that is
 #     what release.yml publishes.
 #   * There is no Windows build. Mira mmaps its blocks and the whole storage
@@ -246,7 +246,7 @@ installFile() {
 
 help() {
   echo "Usage: get-mira.sh [--version <version>] [--no-sudo] [--no-verify] [--help]"
-  echo "  --version, -v  specify version (e.g. v0.1.0); default: latest release"
+  echo "  --version, -v  specify version (e.g. v0.0.4); default: latest release"
   echo "  --no-sudo      disable sudo for installation"
   echo "  --no-verify    skip SLSA provenance verification (the checksum is still checked)"
   echo "  --help, -h     show help"

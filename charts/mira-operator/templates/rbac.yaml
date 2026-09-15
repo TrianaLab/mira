@@ -1,0 +1,160 @@
+{{/*
+The operator's permissions, written out rather than generated.
+
+Rust has no kubebuilder RBAC marker and no controller-gen, so this file is the
+authoring surface rather than an artefact of one. That is the one place the Go
+toolchain is genuinely ahead, and the mitigation is that the list is short
+enough to read: every verb here is reachable from controller.rs, and nothing in
+controller.rs needs a verb that is not here.
+
+Scoped down twice over. No wildcard on any resource, and no delete on anything
+except the two objects a scale-in must remove: a PersistentVolumeClaim and the
+Job that drained it. In particular there is deliberately no delete on pods,
+statefulsets or deployments — the controller shrinks a tier by patching the
+scale subresource, and a bug that reached for delete should fail with a 403
+rather than succeed.
+*/}}
+{{- define "mira-operator.rules" -}}
+# The custom resource itself. The status subresource needs its own rule;
+# without it every status write is a 403 and the operator reconciles silently
+# forever while kubectl shows an empty PHASE.
+- apiGroups: ["mira.miradb.dev"]
+  resources: ["miraclusters"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["mira.miradb.dev"]
+  resources: ["miraclusters/status"]
+  verbs: ["get", "update", "patch"]
+# The tier. The scale subresource is the only way replicas ever change.
+- apiGroups: ["apps"]
+  resources: ["statefulsets", "deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets/scale"]
+  verbs: ["get", "update", "patch"]
+# Services and the two ConfigMaps: the node config and the proxy's replica list.
+- apiGroups: [""]
+  resources: ["services", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+# The budget that caps how much of a tier one node drain may evict at once.
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+# The drain. Deleting a claim is the single irreversible permission in this
+# file, and the controller only reaches it after a drain Job reported success.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+{{- end }}
+{{/*
+One writer. The operator holds a Lease in the *release* namespace for as long
+as it is the one reconciling; see `lease.rs`. Separate from the rules above
+because it is the one permission that does not follow the watch: in namespaced
+mode those go to the watched namespaces and this still belongs here, and in
+cluster-wide mode a ClusterRole would grant leases everywhere to hold one.
+
+Namespaced like everything else, which is also its limit: two separate
+cluster-wide installs hold two leases.
+*/}}
+{{- define "mira-operator.leaseRules" -}}
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+{{- end }}
+{{- if .Values.rbac.create }}
+{{- $name := include "mira-operator.fullname" . }}
+{{- $labels := include "mira-operator.labels" . }}
+{{- $sa := include "mira-operator.serviceAccountName" . }}
+{{/*
+Always, and in both modes. `hold()` is the operator's first call — before the
+controller starts — so without this the process takes a 403 and exits, and
+namespaced mode shipped an operator that could not boot unless the release
+namespace happened to be in the watch list.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  {{- include "mira-operator.leaseRules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-lease
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+{{- if .Values.rbac.namespaces }}
+{{/*
+Namespaced mode: a Role in each listed namespace instead of one ClusterRole.
+The CRD is still cluster-scoped to install; the operator's powers are not.
+*/}}
+{{- range $ns := .Values.rbac.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  {{- include "mira-operator.rules" $ | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- else }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  {{- include "mira-operator.rules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

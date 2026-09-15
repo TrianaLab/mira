@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mira-operator.fullname" . }}
+  labels:
+    {{- include "mira-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # `Recreate`, not the default rolling update. The Lease means an overlap is
+  # survivable — the new pod waits in standby rather than reconciling — but the
+  # wait costs up to the lease duration on every upgrade, and a rolling update
+  # would pay it every time. Recreate ends the old pod first, so the lease is
+  # already stale when the new one looks. A moment of no controller is safe;
+  # Mira keeps serving either way.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mira-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "mira-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mira-operator.serviceAccountName" . }}
+      # The one place in this repo where a service-account token is genuinely
+      # required. The engine's StatefulSet turns it off by default and the
+      # reasoning holds: a Mira pod that can read the API server is a Mira pod
+      # that could read membership, which is the thing principle 4 refuses. The
+      # operator is the process that is *allowed* to, and it is a different pod.
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            # Who the Lease records as its holder. Without it the operator
+            # falls back to a pid, which is not unique across pods and makes
+            # `kubectl get lease` useless for the one question it is there to
+            # answer.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.rbac.namespaces }}
+            # The other half of namespaced RBAC. A `Role` can only authorise a
+            # namespaced LIST, so an operator left watching cluster-wide under
+            # those Roles watches nothing: every reflector takes a 403 and the
+            # tier is never reconciled.
+            - name: WATCH_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

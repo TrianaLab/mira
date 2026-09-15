@@ -1,0 +1,40 @@
+extends: existence
+message: "'%s' is a claim about how you feel, not a fact about the software."
+level: error
+ignorecase: true
+link: MANIFESTO.md
+# The README is a promise and every bullet in it has to be true of the committed
+# code. None of these words can be. They are here before they appear rather than
+# after: this list started empty of findings and the gate is what keeps it that
+# way, because the first one always arrives in a hurry, in a release week.
+tokens:
+  - blazing(ly)?
+  - lightning[ -]fast
+  - cutting[ -]edge
+  - state[ -]of[ -]the[ -]art
+  - best[ -]in[ -]class
+  - world[ -]class
+  - first[ -]class
+  - industry[ -]leading
+  - next[ -]gen(eration)?
+  - revolutionary
+  - game[ -]chang(er|ing)
+  - seamless(ly)?
+  - effortless(ly)?
+  - unparalleled
+  - unmatched
+  - unleash(es|ing)?
+  - supercharge[sd]?
+  - turbocharge[sd]?
+  - battle[ -]tested
+  - rock[ -]solid
+  - enterprise[ -]grade
+  - military[ -]grade
+  - powerful(ly)?
+  - delightful(ly)?
+  - magical(ly)?
+  - synerg(y|ies|istic)
+  - holistic(ally)?
+  - paradigm
+  - turnkey
+  - out[ -]of[ -]the[ -]box

@@ -1,4 +1,10 @@
-# Artifact Hub repository metadata for oci://ghcr.io/trianalab/charts/mira.
+# Artifact Hub repository metadata for oci://ghcr.io/trianalab/charts/mira-operator.
+#
+# It used to be `charts/mira`, and the `repositoryID` below did not change when
+# that chart was removed: an Artifact Hub repository is a registration with a
+# URL field, so re-pointing it at the operator's coordinate is an edit in the
+# control panel rather than a new ID. Registering a second one would have
+# orphaned this one and lost the badge for the time it took to notice.
 #
 # This file is the ownership proof. Artifact Hub grants the "Verified Publisher"
 # badge to a repository whose metadata it can fetch and whose `repositoryID`
@@ -11,7 +17,7 @@
 # travels as its own artifact under a reserved tag. `.github/workflows/release.yml`
 # pushes it with oras:
 #
-#   oras push ghcr.io/trianalab/charts/mira:artifacthub.io \
+#   oras push ghcr.io/trianalab/charts/mira-operator:artifacthub.io \
 #     --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
 #     artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
 #

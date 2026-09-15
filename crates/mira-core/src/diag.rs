@@ -207,8 +207,8 @@ mod tests {
     /// The dump is the whole point of the module, and the failure it can have
     /// is silent: a probe added above and not listed below simply never
     /// appears, and the run it was added for is measured without it. So the
-    /// test names every probe the diagnosis in `docs/architecture.md` section
-    /// 11 is read off, and a nine-line dump is what that section quotes.
+    /// test names every probe the diagnosis in `docs/architecture/performance-ingest.md`
+    /// section 11 is read off, and a nine-line dump is what that section quotes.
     #[test]
     fn the_dump_names_every_probe_the_diagnosis_reads() {
         let _scope = wal_scope();

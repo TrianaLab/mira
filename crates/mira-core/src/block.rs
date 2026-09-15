@@ -101,7 +101,7 @@ const LEGACY_VERSION: u32 = 1;
 /// The ZSTD level every compressed table is written at.
 ///
 /// The same as arrow-ipc's default, and set explicitly anyway: the ratio in
-/// `docs/architecture.md` section 11 is a published number, and an upstream
+/// `docs/architecture/performance.md` section 11 is a published number, and an upstream
 /// default that moved would move it without anything in this tree changing.
 ///
 /// 3 and not higher, which was measured and rejected. Over 8 real blocks per
@@ -227,7 +227,7 @@ pub fn write_table_zstd(path: &Path, batch: &RecordBatch) -> Result<()> {
 
 /// The same again as LZ4_FRAME, so the `tier` example can price the pure-Rust
 /// alternative against the C one on real blocks. Nothing in the engine writes
-/// LZ4; see the decisions table in `docs/architecture.md`.
+/// LZ4; see the decisions table in `docs/architecture/data-layout.md`.
 pub fn write_table_lz4(path: &Path, batch: &RecordBatch) -> Result<()> {
     write_table_with(
         path,
@@ -452,6 +452,30 @@ fn parse_dir_name(name: &str) -> Option<(i64, i64, u32, u64, u64)> {
     Some((min, max, node, seq, wal_hi))
 }
 
+/// The same block name, saying it covers no log.
+///
+/// [`crate::offload::Target::pull`] lands blocks written by a volume that is
+/// gone. `wal_hi` is a position in *that* volume's log, and the log it arrives
+/// beside starts at sequence 0 — a re-created pod, a new claim — while
+/// [`wal_watermarks`] filters only by node, which is a hash of `--node` and so
+/// survives the re-creation. Kept as written, the restored name tells the fresh
+/// log that thousands of frames it has not issued yet are already published,
+/// and the next replay skips them.
+///
+/// Zero is what the four-field names that predate the log already mean, and
+/// [`publish`] states the rule: too high is silent loss, too low is a
+/// re-ingest.
+///
+/// A name `parse_dir_name` rejects is returned unchanged: it is not a block, so
+/// `scan` will not see it either way, and inventing a name for it here would be
+/// the only place in the tree that renames something it cannot read.
+pub fn name_covering_no_log(name: &str) -> String {
+    match parse_dir_name(name) {
+        Some((min_ts, max_ts, node, seq, _)) => dir_name(min_ts, max_ts, node, seq, 0),
+        None => name.to_string(),
+    }
+}
+
 fn fsync_dir(path: &Path) -> Result<()> {
     crate::sync_all(&File::open(path).ctx(path)?).ctx(path)
 }
@@ -655,11 +679,23 @@ pub fn sweep_staging(root: &Path, signal: &str, node: u32) -> Result<usize> {
 ///
 /// A signal with no blocks gets `0` — replay everything the log holds for it,
 /// which is right, because nothing has absorbed any of it.
-pub fn wal_watermarks(root: &Path) -> Result<crate::wal::Watermarks> {
+///
+/// `node` scopes it to one writer's blocks, and that is not an optimisation.
+/// Sequences are per-log: [`crate::wal::Wal`] hands them out from its own
+/// counter, so two replicas sharing a volume (section 12) number their frames
+/// independently and a sequence means nothing outside the log that issued it.
+/// An unscoped maximum therefore hands the quiet replica the busy one's
+/// progress, and both consumers act on it destructively — [`crate::wal::Wal::replay`]
+/// skips every frame below it, and `wal_sweep` unlinks the segments holding
+/// them. The blocks are still filtered by nothing else: `scan` returns the whole
+/// directory because the *read* path wants every replica's blocks, and only
+/// recovery wants one replica's.
+pub fn wal_watermarks(root: &Path, node: u32) -> Result<crate::wal::Watermarks> {
     let mut out = [0u64; 3];
     for signal in crate::wal::Signal::ALL {
         out[signal.index()] = scan(root, signal.as_str())?
             .iter()
+            .filter(|b| b.node == node)
             .map(|b| b.wal_hi)
             .max()
             .unwrap_or(0);
@@ -950,7 +986,7 @@ fn remote_fs(magic: u64) -> Option<String> {
 
 /// The cold-tier marker. Its presence means every table in the block is already
 /// ZSTD-encoded, so a sweep can skip the directory without opening a file.
-const COLD_MARKER: &str = "cold";
+pub(crate) const COLD_MARKER: &str = "cold";
 
 /// A block goes cold once it has aged out of the hour it was partitioned into.
 ///
@@ -1236,7 +1272,7 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// this. The "35-39%, a median of 1.55x" this comment used to carry was three
 /// samples of a quantity that moves between 1.14x and 2.21x, and is withdrawn
 /// as a median. `scan_cost_per_row` in `query.rs` is the run; section 11 of
-/// `docs/architecture.md` is the write-up.
+/// `docs/architecture/performance-query.md` is the write-up.
 ///
 /// The identity is the path *plus* [`FileId`], never the path alone, because a
 /// name in this tree is not a file for life: [`compact`] renames a new table
@@ -2158,6 +2194,30 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Two replicas share a volume, and the quiet one must not be handed the
+    /// busy one's progress.
+    ///
+    /// Sequences are per-log, so the busy replica's 1000 says nothing about the
+    /// quiet one's 5. Taking the maximum over both would drop frames 5..1000 on
+    /// the quiet replica's next boot — [`crate::wal::Wal::replay`] skips every
+    /// frame below the watermark — and then unlink the segments holding them,
+    /// because `wal_sweep` truncates to the same number.
+    #[test]
+    fn a_watermark_covers_only_the_replica_that_wrote_the_blocks() {
+        let root = dir("wm-per-node");
+        let busy = node_id("busy");
+        let quiet = node_id("quiet");
+        publish(&root, "logs", busy, 0, 1_000, &sealed(1_000, 2_000)).unwrap();
+        publish(&root, "logs", quiet, 0, 5, &sealed(3_000, 4_000)).unwrap();
+
+        assert_eq!(wal_watermarks(&root, quiet).unwrap()[0], 5);
+        assert_eq!(wal_watermarks(&root, busy).unwrap()[0], 1_000);
+        // A replica with no blocks of its own here replays its whole log, even
+        // standing on a volume full of someone else's.
+        assert_eq!(wal_watermarks(&root, node_id("new")).unwrap()[0], 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A block directory written before the write-ahead log existed has four
     /// fields, not five, and it is still a block. There is no manifest to
     /// migrate and no version to bump, so the only place backward compatibility
@@ -2187,7 +2247,7 @@ mod tests {
     fn the_watermark_is_the_highest_per_signal_not_the_newest() {
         let root = dir("watermark");
         let node = node_id("a");
-        assert_eq!(wal_watermarks(&root).unwrap(), [0, 0, 0]);
+        assert_eq!(wal_watermarks(&root, node).unwrap(), [0, 0, 0]);
 
         // Published second, timestamped first: `scan` puts this one at the
         // front, and its watermark is the low one.
@@ -2196,7 +2256,7 @@ mod tests {
         publish(&root, "traces", node, 0, 3, &sealed(1_000, 2_000)).unwrap();
 
         // Indexed by `wal::Signal`: logs, traces, metrics.
-        assert_eq!(wal_watermarks(&root).unwrap(), [40, 3, 0]);
+        assert_eq!(wal_watermarks(&root, node).unwrap(), [40, 3, 0]);
         let _ = fs::remove_dir_all(&root);
     }
 

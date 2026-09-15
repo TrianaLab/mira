@@ -1,0 +1,220 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.badgesSection" . }}
+
+<!--
+Links to the repository listing, not to /packages/helm/mira/mira-operator —
+that page 404s until the first release publishes this chart. The repository
+slug stays `mira` (only its display name changed), so both URLs here are
+stable across the rename.
+-->
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/search?repo=mira)
+
+{{ template "chart.description" . }}
+
+This is the only chart Mira publishes. There used to be a second one that
+installed a StatefulSet directly, and it was removed rather than kept beside
+this: two charts is two answers to "how do I run Mira on Kubernetes", and the
+one that cannot scale, cannot drain and cannot be told a ceiling is the wrong
+answer to ship as the default. A tier is a `MiraCluster` now.
+
+## Why not an HPA
+
+Mira has no metric that moves when it needs another replica.
+[Section 11](https://miradb.dev/architecture/performance/) measures
+**2.23 of twelve cores at 1,537,875 records/s** — a CPU-target HPA reads
+single-digit utilisation at saturation, and a memory-target one reads page
+cache, which is the `mmap` working as designed. The quantity that actually runs
+out is **disk**, and an HPA has never been able to scale a StatefulSet on its
+own volumes filling.
+
+So the trigger is `free_fraction` from `/api/v1/stats`, and something has to
+read it. That something also has to sequence a scale-*in*, which an HPA could
+never do safely: the volume about to be deleted holds blocks no other replica
+has, because nothing replicates and nothing rebalances.
+
+## Does this break "no coordination state"?
+
+No, and the distinction is worth being precise about. Principle 4 says **Mira**
+holds no coordination state — no Raft, no membership, no external metadata
+store, the block directory is the manifest. A controller is not Mira.
+
+The test is what happens when you delete this Deployment: every Mira pod keeps
+ingesting, keeps serving queries and keeps its blocks readable, because none of
+them ever asked the operator anything. Only the scaling stops. That is the line
+between a coordinator and coordination state — and it is the same delegation the
+engine already makes to the platform for pod identity and volume lifecycle.
+
+## Install
+
+```bash
+helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
+  --version {{ template "chart.version" . }} \
+  --namespace mira-system --create-namespace
+```
+
+The CRD ships in `crds/`, so Helm installs it on first install and **never
+upgrades or deletes it**. That is Helm's rule, not this chart's. This matters
+more here than it usually does: the API server **prunes** a field the CRD does
+not declare rather than rejecting it, so a `MiraCluster` written against a newer
+schema than the cluster holds loses those fields silently, with no error
+anywhere. On a chart upgrade that changes the schema, apply the CRD yourself
+first, or pull it out of the chart you are about to install:
+
+```bash
+helm pull oci://ghcr.io/trianalab/charts/mira-operator \
+  --version {{ template "chart.version" . }} --untar
+kubectl apply -f mira-operator/crds/miraclusters.yaml
+```
+
+Not a `raw.githubusercontent.com` URL at a tag, which is the obvious thing to
+write and would 404: the chart is versioned independently of the engine and
+there is no `v{{ template "chart.version" . }}` tag on the repository. `helm
+pull` also gets you the CRD from the exact artifact you are installing rather
+than from whatever the branch says today.
+
+Then create a tier:
+
+```yaml
+apiVersion: mira.miradb.dev/v1alpha1
+kind: MiraCluster
+metadata:
+  name: telemetry
+spec:
+  image: ghcr.io/trianalab/mira:0.0.4
+  replicas: 1          # floor
+  maxReplicas: 5       # ceiling; there is no "unbounded"
+  storage:
+    size: 50Gi
+    className: gp3
+  # Unset is BestEffort. The drain Job inherits this: same binary, same volume.
+  resources:
+    requests:
+      cpu: 2500m
+      memory: 2048Mi
+  scaling:
+    upWhenFreeBelow: 0.15
+    downWhenFreeAbove: 0.60
+    cooldownSeconds: 600
+  offload: "file:///cold/${node}"
+  coldStorageClaim: mira-cold
+  proxy:
+    replicas: 2
+```
+
+## How scaling decides
+
+Read from every replica each reconcile, then:
+
+- **Out** when the *fullest* replica drops below `upWhenFreeBelow`. The fullest,
+  not the mean: `route` sends a resource to `hash(resource) % n` and resources
+  are not the same size, so a mean of 0.4 across ten replicas is compatible with
+  one at 0.02 — and it is the one at 0.02 that stops accepting writes.
+- **In** when *every* replica is above `downWhenFreeAbove`. Every, not the mean,
+  because the drained replica's share lands on whoever is left.
+- **Neither** if any replica is unreachable, or answered `null` for
+  `free_fraction` — which is Mira saying it could not `statfs` its own volume.
+  Read as 0 that means "scale out"; read as 1 it means "delete a volume". It
+  must mean neither.
+
+The two thresholds must not meet. Adjacent thresholds oscillate, each action
+creating the condition for its opposite, and every cycle moves a whole
+replica's dataset through `offload push`. The operator refuses such a spec and
+reports `Degraded` rather than acting on it.
+
+## What a scale-in actually does
+
+`spec.offload` is **required** before the operator will ever shrink a tier, and
+unset it never does. The cost of not shrinking is a bill; the cost of
+shrinking without an archive is the data.
+
+It never travels alone. `file://` is the only scheme Mira's offload target
+parses, so the archive is a mount and `spec.coldStorageClaim` names the claim to
+put there — an existing `ReadWriteMany` claim, or `ReadWriteOnce` on a
+single-node cluster. Without it the drain Job writes the archive inside its own
+container, exits 0, and the claim is deleted anyway, so the operator refuses the
+pair rather than documenting it.
+
+1. `status.draining` is written **first**, so a controller that restarts
+   mid-sequence resumes instead of orphaning a volume.
+2. The StatefulSet scales down. The pod goes; the claim stays.
+3. A Job runs `mira offload push` against the released claim. This is why the
+   pod has to go first — the claim is `ReadWriteOnce` and a Job cannot attach it
+   while the pod holds it.
+4. **Only on success**, the claim is deleted.
+
+A failed drain stops at step 3 with the claim intact and the phase `Degraded`:
+the tier is one replica smaller and every block is still on disk.
+
+### It does not re-home the blocks
+
+`offload push` copies to the cold store and the blocks stay there, queryable
+again only after a deliberate `mira offload restore`. That is
+[section 12.4](https://miradb.dev/architecture/replicas-scaling/#124-what-scales-and-what-this-deliberately-does-not-buy)'s
+"No rebalancing, ever" rather than an omission — and the same `ReadWriteOnce`
+constraint that forced the order above forbids the reverse: a restore has to
+mount a *surviving* replica's volume, which its running pod holds. Automating it
+would mean taking a healthy replica down to grow it.
+
+## Permissions
+
+One `ClusterRole`, no wildcards, and `delete` on exactly two kinds — the claim a
+drained replica leaves behind and the Job that drained it. There is deliberately
+no `delete` on pods, statefulsets or deployments: a tier is resized through
+`statefulsets/scale`, and a bug that reached for `delete` should get a 403.
+
+Set `rbac.namespaces` to a list to get a `Role` in each instead of one
+`ClusterRole`; the operator then watches only those namespaces, because a `Role`
+can authorise nothing wider. The CRD is still cluster-scoped to install, and the
+Lease keeps a `Role` of its own in the release namespace either way — claiming
+it is the operator's first call, before the controller starts.
+
+## Replicas
+
+Exactly one operator reconciles at a time, held by a `coordination.k8s.io`
+Lease in the release namespace. kube-rs ships no election
+([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485), open since
+2021), so the operator holds its own: extra replicas stand by and take over
+when the holder stops renewing. Two controllers acting on the same reading
+would move two replicas for one decision.
+
+It is soft, in two ways worth knowing. A holder whose renewal is stuck can
+still be inside a reconcile when a standby's clock says the lease expired —
+there is no fencing token to prevent that, so the window is seconds after a
+failure rather than never. And the Lease is per-release while the watch is
+cluster-wide by default, so *two installs* in two namespaces hold two leases and
+both reconcile everything. Install the operator once, or give each one its own
+`rbac.namespaces`.
+
+`Recreate` rather than a rolling update, so an upgrade does not pay the standby
+wait every time. A moment with no controller is safe; Mira keeps serving either
+way.
+
+## Verifying the chart
+
+```bash
+cosign verify \
+  --new-bundle-format=false \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
+  ghcr.io/trianalab/charts/mira-operator:{{ template "chart.version" . }}
+```
+
+{{/*
+The built-in `chart.valuesTable` writes its delimiter row as `|-----|------|`,
+which is the one table style in this tree that MD060 rejects — and the README is
+generated, so there is nothing to fix in the file itself. A definition here wins
+over the one helm-docs registers, so this is the built-in with that row respelled
+and nothing else changed.
+*/}}
+{{ define "chart.valuesTable" }}
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+{{- range .Values }}
+| {{ .Key }} | {{ .Type }} | {{ if .Default }}{{ .Default }}{{ else }}{{ .AutoDefault }}{{ end }} | {{ if .Description }}{{ .Description }}{{ else }}{{ .AutoDescription }}{{ end }} |
+{{- end }}
+{{ end }}
+
+{{ template "chart.valuesSection" . }}
+
+{{ template "chart.maintainersSection" . }}

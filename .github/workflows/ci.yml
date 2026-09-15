@@ -50,6 +50,8 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       image: ${{ steps.filter.outputs.image }}
       chart: ${{ steps.filter.outputs.chart }}
+      operator: ${{ steps.filter.outputs.operator }}
+      changeset: ${{ steps.filter.outputs.changeset }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,8 +95,21 @@ jobs:
       # components, and rustup on the runner honours it on the first cargo
       # invocation. One less third-party action in the supply chain, and the
       # toolchain CI uses is the one a contributor gets by cloning.
+      # `env-vars: ImageOS` on every rust-cache in the tree, and it is load-
+      # bearing rather than tidy. The automatic key records `Linux-x64` and not
+      # which Ubuntu that is, so a `target/` built on 24.04 restores cleanly onto
+      # a 22.04 runner and then dies in a build script — `GLIBC_2.39 not found`,
+      # from a cached `getrandom` binary nothing in the job asked to rebuild.
+      # Cargo fingerprints inputs, not the host libc, so it never notices. This
+      # repo pins `image` and `release-dry-run` to 22.04 *because* the glibc
+      # floor is the thing under test, which makes it the repo most likely to
+      # mix the two. `ImageOS` is `ubuntu22`/`ubuntu24` in the runner's
+      # environment and rust-cache hashes it into the key, so the two can no
+      # longer see each other's caches. Empty off GitHub-hosted runners, which
+      # degrades to the old behaviour rather than breaking.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: ${{ matrix.os }}
 
       # Two targets, because formatting, the feature swap and rustdoc are
@@ -114,11 +129,47 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: msrv
       # `rust-version` in Cargo.toml is a promise to anyone pinned to an older
       # toolchain, and a promise nothing compiles against is a wish. The target
       # reads the floor out of Cargo.toml, installs exactly it, and builds.
       - run: make ci-msrv
+
+  # `integrations/kubernetes/` is a second Cargo workspace, so `rust` above
+  # cannot reach it: `--workspace` in the root manifest does not enumerate it,
+  # and that is deliberate — kube-rs would move the crate count the README
+  # publishes, raise the MSRV floor and fail `cargo deny`'s duplicate and
+  # licence rules. The separation is in the Makefile's "The operator" section.
+  #
+  # One runner, not the three `rust` uses. The operator has no memory-mapped
+  # on-disk format and no cfg-gated arms; it is API calls and arithmetic, and
+  # "works on x86_64" is a statement about all of it.
+  operator:
+    name: operator
+    needs: changes
+    if: needs.changes.outputs.operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          env-vars: ImageOS
+          # Its own cache key and its own lock file. Sharing the engine's key
+          # would evict one tree's artifacts on every alternate run.
+          key: operator
+          workspaces: integrations/kubernetes
+      # The operator carries its own ratchet, because `cargo llvm-cov
+      # --workspace` on the root manifest cannot reach a nested workspace — so
+      # this leg needs the same tool the `coverage` leg does, for a different
+      # tree and a different floor.
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-llvm-cov
+      # fmt, clippy, the unit tests, the coverage floor, and the CRD drift gate
+      # — the generated schema has to match the Rust types, because
+      # apiextensions silently prunes any field the schema does not name.
+      - run: make ci-operator
 
   ui:
     name: ui
@@ -148,8 +199,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: coverage
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-llvm-cov
       # The ratchet lives in the Makefile (COVERAGE_MIN), not here, so raising
@@ -163,7 +215,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-deny,cargo-machete
       # Advisories, licences, duplicate versions, and the ban on new C-backed
@@ -182,6 +234,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: drift
       # Two halves of one question, and they share a release binary. `drift`
       # checks the crate count, the binary size against the section 11 ceiling,
@@ -204,6 +257,21 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: docs/requirements.txt
+      # Three toolchains, because `ci-docs` is three gates. Python builds the
+      # site; Node runs markdownlint; Rust runs `xtask prose`, which is in Rust
+      # for the reason every other check here is — it gets fmt, clippy and
+      # tests, and a check nobody can test is a check that quietly stops
+      # matching.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          env-vars: ImageOS
+          key: docs
+      - run: make ci-tool-vale
       # `mkdocs build --strict` plus mkdocs.yml's `validation:` block is the
       # whole link checker — a dead internal link or a missing anchor fails the
       # build. No separate link-checking action, and none needed. Then
@@ -215,7 +283,7 @@ jobs:
     name: image
     needs: changes
     if: needs.changes.outputs.image == 'true'
-    # Same pin as `e2e` and `release-dry-run`: `make scan-image` goes through
+    # Same pin as `release-dry-run`: `make scan-image` goes through
     # `dist-image`, which puts this runner's binary in the image and asserts its
     # glibc floor. Scanning an image built from a binary that could not ship is
     # scanning something else.
@@ -224,6 +292,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: image
 
       # The pin and its digest are in ci.mk, alongside the argument for why
@@ -236,30 +305,51 @@ jobs:
       # place a broken base image showed up was a tag.
       - run: make ci-image
 
-  e2e:
-    name: e2e
+  # The only end-to-end gate, and it replaced one. The compose leg that used to
+  # live here put a stock collector in front of one Mira container and asserted
+  # three signals came back. That is still asserted — same collector, same
+  # generator, same three questions — but through a tier the operator builds
+  # from a MiraCluster, so the reconciler, the CRD, the chart and its RBAC are
+  # on the path rather than beside it. Keeping both would have tested the OTLP
+  # surface twice and the operator once.
+  #
+  # It is also where the API-server suite runs: `run.sh` calls
+  # `make operator-apiserver` as soon as the cluster is up and before it builds
+  # anything, because a pruned CRD field or a StatefulSet the API server refuses
+  # should fail in thirty seconds, not after two image builds.
+  operator-e2e:
+    name: operator-e2e
     needs: changes
-    # Docs are in the trigger set because docs/e2e/ *is* the scenario: the
-    # compose file and the collector config live there, so editing them has to
-    # re-run the thing they describe.
-    if: needs.changes.outputs.image == 'true' || needs.changes.outputs.docs == 'true'
-    # ubuntu-22.04, the same pin and the same reason as release.yml's two linux
-    # legs: this is the only job in the tree that *runs* the release binary
-    # inside the release image, so building it against a glibc newer than the
-    # distroless base makes it the only job that can catch that — and building
-    # it on `ubuntu-latest` made it the job that caused it instead.
-    runs-on: ubuntu-22.04
+    # `code` as well as `operator`, because the engine image is half of what
+    # this runs — and `docs`, because docs/internals/e2e.md documents it.
+    if: >-
+      needs.changes.outputs.operator == 'true' ||
+      needs.changes.outputs.code == 'true' ||
+      needs.changes.outputs.image == 'true' ||
+      needs.changes.outputs.docs == 'true'
+    # ubuntu-latest, unlike the compose leg this replaced. That one pinned
+    # 22.04 because it ran a *release* binary — built by `make build` on the
+    # runner — inside the distroless image, which made it the one job that could
+    # catch a glibc floor regression. This one compiles the engine inside the
+    # Dockerfile against its own pinned base, so the runner's glibc never
+    # touches the artefact and the pin would only be pinning the build host.
+    # `make ci-image` still covers the floor, on 22.04, where it belongs.
+    runs-on: ubuntu-latest
+    # Two container builds, a cluster, a collector and a drain. The default 360
+    # would hide a hang as a six-hour job.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: e2e
-      # docs/internals/e2e.md has described this scenario since before CI could
-      # run it: a real binary in a container, a stock OpenTelemetry Collector in
-      # front of it, the OpenTelemetry project's own generator on the wire, and
-      # then the query API asked whether the data arrived. Every other test in
-      # the tree uses a client we wrote.
-      - run: make ci-e2e
+          env-vars: ImageOS
+          # The operator's workspace: the API-server suite is a `cargo test` on
+          # the runner, and it is the only Rust this leg compiles outside Docker.
+          key: operator-e2e
+          workspaces: integrations/kubernetes
+      # kubectl and helm are on the runner image; kind is not.
+      - run: make ci-tool-kind
+      - run: make ci-operator-e2e
 
   release-dry-run:
     name: release-dry-run
@@ -274,8 +364,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          env-vars: ImageOS
           key: release-dry-run
-      - uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-cyclonedx@0.5.9
       # Both halves of the release, run on every code PR: `make dist` is the
@@ -319,6 +410,7 @@ jobs:
           # commits — a shallow clone has the tree but not the range.
           fetch-depth: 0
       - run: make ci-tool-actionlint
+      - run: make ci-tool-shellcheck
 
       # Every job in this file must be reachable from a required context below,
       # every `run:` must be a `make ci-*` call, every `uses:` must be
@@ -345,6 +437,37 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make ci-section-text
 
+  changeset:
+    name: changeset
+    needs: changes
+    # Three conditions, and each one removes a way this gate could block
+    # something it has no business blocking.
+    #
+    # Only on a pull request: on a push to main the diff is already merged, and
+    # a gate that cannot be acted on is noise.
+    #
+    # Only when the diff ships something — `changes` says so. The Version PR is
+    # exempted inside the script rather than here, because the hand-run
+    # `make bump` fallback needs the same exemption and one mechanism is enough.
+    #
+    # Never on Dependabot, which cannot write a changeset and would otherwise go
+    # red on every single bump. A dependency change worth a release note gets
+    # one from whoever merges it; the gate is for humans, who can.
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.changes.outputs.changeset == 'true'
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate is a diff against the base, so it needs the range.
+          fetch-depth: 0
+      - name: this diff declares which version line it moves
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: make ci-changeset BASE="${BASE}"
+
   # Two status contexts, and branch protection requires both. Every leg above
   # feeds into one of them, so adding a job never means remembering to update a
   # setting in the GitHub UI — and `xtask ci` fails if a job is ever
@@ -363,7 +486,7 @@ jobs:
   required:
     name: required
     if: always()
-    needs: [changes, rust, msrv, ui, coverage, supply-chain, drift, docs, e2e, release-dry-run, helm, meta]
+    needs: [changes, rust, msrv, operator, operator-e2e, ui, coverage, supply-chain, drift, docs, release-dry-run, helm, meta, changeset]
     runs-on: ubuntu-latest
     steps:
       - name: Every leg green or deliberately skipped

@@ -75,6 +75,15 @@ impl Target {
     /// Staged under `.tmp` and renamed, for the reason [`block::publish`]
     /// stages: the store's list API is the catalog, so a half-copied block
     /// visible under its final name is a catalog entry that does not open.
+    ///
+    /// "Already there" is checked against the bytes, not only the name,
+    /// because `false` is what licenses the caller to unlink the local copy —
+    /// `block::expire_with` on the retention sweep, the operator deleting a
+    /// drained replica's volume on `mira offload push` exiting 0. A replica
+    /// re-created on a fresh volume keeps its node id and restarts its
+    /// sequence, so it reissues `(node, seq)` pairs the store may still hold,
+    /// and a name taken by somebody else's rows is the one case where "already
+    /// archived" is a lie with a volume behind it.
     pub fn push(&self, signal: &str, b: &BlockRef) -> Result<bool> {
         let Some((partition, name)) = split(&b.dir) else {
             return Ok(false);
@@ -82,7 +91,10 @@ impl Target {
         let dest_dir = self.root.join(signal).join(partition);
         let dest = dest_dir.join(name);
         if dest.exists() {
-            return Ok(false);
+            return match differs(&b.dir, &dest)? {
+                None => Ok(false),
+                Some(why) => Err(Error::OffloadCollision { dest, why }),
+            };
         }
         copy_block(
             &b.dir,
@@ -99,18 +111,86 @@ impl Target {
     /// `node` only names the staging directory, so that a restore killed
     /// half-way leaves a directory [`block::sweep_staging`] already knows how
     /// to clear at the next start.
+    ///
+    /// It lands under [`block::name_covering_no_log`] rather than the name the
+    /// store holds, because the log the stored name refers to is the one on the
+    /// volume this block is being rescued *from*.
     pub fn pull(&self, signal: &str, b: &BlockRef, data_dir: &Path, node: u32) -> Result<bool> {
         let Some((partition, name)) = split(&b.dir) else {
             return Ok(false);
         };
+        let name = block::name_covering_no_log(name);
         let dest_dir = data_dir.join(signal).join(partition);
-        let dest = dest_dir.join(name);
+        let dest = dest_dir.join(&name);
         if dest.exists() {
             return Ok(false);
         }
         let staging = format!("{signal}-{node:08x}-restore-{name}");
         copy_block(&b.dir, data_dir, &dest_dir, &dest, &staging)
     }
+}
+
+/// Why two copies of one block name are not the same block, or `None`.
+///
+/// Names and sizes, not content. A block is sealed and immutable, its files
+/// are written once and the store's copy came from `copy_files` — so a byte
+/// that differs under a name and a length that both match has no writer in
+/// this design. Reading both sides to compare them would put the block's whole
+/// size through the retention sweep once a minute for every block already in
+/// the store, to rule out a case nothing can produce.
+///
+/// The same `is_file` filter as [`copy_files`], which walks past directories:
+/// a stray one beside the tables is not part of the block and was never
+/// copied, so counting it would report a mismatch against the store's faithful
+/// copy of it.
+fn differs(src: &Path, dest: &Path) -> Result<Option<String>> {
+    let (mut ours, mut theirs) = (sizes(src)?, sizes(dest)?);
+    // Names only, when one side has gone cold and the other has not: `compact`
+    // ZSTD-encodes every table in place and drops the marker beside them, so no
+    // size on either side is a size on the other. That is not an edge case — it
+    // happens to every block a sweep pushed while it was still inside its own
+    // hour, so comparing sizes across the boundary fails the *steady state*: an
+    // error on every subsequent sweep, and retention unable to expire the block
+    // it had already archived.
+    //
+    // ponytail: the name set is what is left, and it does not discriminate a
+    // reissued `(node, seq)` — two blocks of the same signal have the same
+    // table names. Narrower than the check it replaces, and only on the
+    // handful of blocks mid-boundary; the fix is an identity in the block
+    // rather than one derived from its bytes, which is a format change.
+    let marker = |v: &[(String, u64)]| v.iter().any(|(n, _)| n == block::COLD_MARKER);
+    let across = marker(&ours) != marker(&theirs);
+    if across {
+        ours.retain(|(n, _)| n != block::COLD_MARKER);
+        theirs.retain(|(n, _)| n != block::COLD_MARKER);
+    }
+    for (name, len) in &ours {
+        match theirs.iter().find(|(n, _)| n == name) {
+            None => return Ok(Some(format!("{name} is missing from it"))),
+            Some((_, there)) if !across && there != len => {
+                return Ok(Some(format!("{name} is {there} bytes there, {len} here")));
+            }
+            Some(_) => {}
+        }
+    }
+    let extra = theirs
+        .iter()
+        .find(|(n, _)| !ours.iter().any(|(o, _)| o == n));
+    Ok(extra.map(|(n, _)| format!("it holds {n}, which this block does not")))
+}
+
+/// `(file name, length)` for the regular files directly in `dir`, sorted.
+fn sizes(dir: &Path) -> Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).ctx(dir)? {
+        let entry = entry.ctx(dir)?;
+        let meta = entry.metadata().ctx(entry.path())?;
+        if meta.is_file() {
+            out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// `(partition, block name)` out of `…/<signal>/p=<hour>/<block>`.
@@ -288,6 +368,53 @@ mod tests {
         assert!(!t.pull("logs", &listed[0], &local, 7).unwrap());
     }
 
+    /// A restored block describes a log that no longer exists.
+    ///
+    /// `wal_hi` is a position in the log of the volume that *wrote* the block,
+    /// and a restore lands it beside a log that starts at sequence 0 — a
+    /// re-created pod, a new claim. [`block::wal_watermarks`] takes the maximum
+    /// over the names it finds and filters only by node, and `node` is a hash
+    /// of `--node`, which the operator keeps stable across exactly this. So the
+    /// fresh log is handed a watermark thousands of sequences ahead of itself,
+    /// and the next replay skips every frame under it: acked data, dropped
+    /// silently, in the one situation the log exists for.
+    ///
+    /// `publish` states the rule this rests on — too high is the dangerous
+    /// direction, too low only costs a re-ingest.
+    #[test]
+    fn a_restored_block_claims_no_progress_in_the_log_it_lands_beside() {
+        let tmp = tempdir("restore-watermark");
+        let (old, store, fresh) = (tmp.join("old"), tmp.join("cold"), tmp.join("fresh"));
+        let dir = old.join("logs").join("p=2").join(format!(
+            "{:020}-{:020}-{:08x}-{:012}-{:020}",
+            7_200_000_000_000u64, 7_200_000_000_001u64, 7, 1, 5000
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("logs.arrow"), b"hello").unwrap();
+
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&old, "logs").unwrap().remove(0);
+        assert_eq!(b.wal_hi, 5000);
+        assert!(t.push("logs", &b).unwrap());
+        assert!(
+            t.pull("logs", &t.list("logs").unwrap()[0], &fresh, 7)
+                .unwrap()
+        );
+
+        assert_eq!(
+            block::wal_watermarks(&fresh, 7).unwrap(),
+            [0, 0, 0],
+            "a fresh log at sequence 0 was told 5000 of its frames are already published"
+        );
+        // Still one block, still readable: only the claim about the log moved.
+        let landed = block::scan(&fresh, "logs").unwrap();
+        assert_eq!(landed.len(), 1);
+        assert_eq!(
+            fs::read(landed[0].dir.join("logs.arrow")).unwrap(),
+            b"hello"
+        );
+    }
+
     /// A copy killed half-way leaves nothing in the catalog, and the next
     /// sweep still lands the block.
     ///
@@ -378,8 +505,95 @@ mod tests {
         assert!(!staged.exists());
     }
 
+    /// "Already there" is what licenses the unlink, so it has to be decided
+    /// from the bytes and not from the name.
+    ///
+    /// A replica re-created on a fresh volume keeps its node id and restarts
+    /// its sequence — `offload_cmd`'s own doc says it "reissues `(node, seq)`
+    /// pairs that are still alive wherever they were copied" — so a second
+    /// drain of the same ordinal can find the first drain's archive under the
+    /// name the new block wants. Decided by name, that block is reported
+    /// `present`, `mira offload push` exits 0, and the operator deletes a
+    /// volume whose rows are in no store: the name in the catalog belongs to
+    /// somebody else's bytes.
+    ///
+    /// Mutation check: drop the comparison and `push` returns `Ok(false)` for
+    /// every case below.
+    #[test]
+    fn a_name_in_the_store_over_other_bytes_is_not_a_block_that_was_pushed() {
+        let tmp = tempdir("collide");
+        let (local, store) = (tmp.join("data"), tmp.join("cold"));
+        block(&local, "logs", 7_200_000_000_000, 1, b"hello");
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&local, "logs").unwrap().remove(0);
+        assert!(t.push("logs", &b).unwrap());
+        let there = t.list("logs").unwrap().remove(0).dir;
+
+        // Same names, different bytes. This is the collision itself.
+        fs::write(there.join("logs.arrow"), b"someone else's rows").unwrap();
+        let e = t.push("logs", &b).unwrap_err().to_string();
+        assert!(
+            e.contains("logs.arrow") && e.contains(&*there.to_string_lossy()),
+            "{e}"
+        );
+
+        // A short copy under the final name, which staging is supposed to make
+        // impossible and a store nobody else writes to would never hold.
+        fs::write(there.join("logs.arrow"), b"hello").unwrap();
+        fs::remove_file(there.join("attr.idx")).unwrap();
+        assert!(t.push("logs", &b).is_err());
+
+        // And a file the local block does not have. Restored to equality, the
+        // push goes back to the idempotent `false` the sweep runs on.
+        fs::write(there.join("attr.idx"), b"sidecar").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+        fs::write(there.join("stray"), b"x").unwrap();
+        assert!(t.push("logs", &b).is_err());
+    }
+
+    /// The same block on the two sides of the cold boundary is the same block.
+    ///
+    /// `compact` ZSTD-encodes every table in place and drops a `cold` marker
+    /// beside them, so a block pushed while hot and swept again after it aged
+    /// out of its hour has the same table names and none of the same sizes.
+    /// Compared byte-for-byte that reads as somebody else's rows under this
+    /// block's name: `push` raises `OffloadCollision`, `mira offload push`
+    /// exits non-zero, and the operator will not delete a drained replica's
+    /// volume — whose blocks are, in fact, already archived.
+    ///
+    /// Mutation check: compare sizes across the boundary too, and every
+    /// assertion below turns into an error.
+    #[test]
+    fn a_block_that_went_cold_after_it_was_pushed_is_still_that_block() {
+        let tmp = tempdir("cold");
+        let (local, store) = (tmp.join("data"), tmp.join("cold"));
+        let dir = block(&local, "logs", 7_200_000_000_000, 1, b"hello");
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&local, "logs").unwrap().remove(0);
+        assert!(t.push("logs", &b).unwrap());
+
+        // What `compact_block` leaves behind: smaller tables, plus the marker.
+        fs::write(dir.join("logs.arrow"), b"zstd").unwrap();
+        fs::write(dir.join("cold"), b"").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+
+        // And the other direction, which is what a restore then a re-drain
+        // does: the store holds the cold copy, the local one is hot again.
+        let there = t.list("logs").unwrap().remove(0).dir;
+        fs::write(there.join("logs.arrow"), b"zstd").unwrap();
+        fs::write(there.join("cold"), b"").unwrap();
+        fs::remove_file(dir.join("cold")).unwrap();
+        fs::write(dir.join("logs.arrow"), b"hello").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+
+        // Still a collision when the *names* disagree. Compression cannot add
+        // or drop a table, so this is the check that survives the boundary.
+        fs::remove_file(there.join("attr.idx")).unwrap();
+        assert!(t.push("logs", &b).is_err());
+    }
+
     /// The invariant [section
-    /// 6.1](https://miradb.dev/architecture/#61-offload-a-copy-before-the-unlink)
+    /// 6.1](https://miradb.dev/architecture/retention/#61-offload-a-copy-before-the-unlink)
     /// states: a restore rewrites what is at a path, so the path's `mtime` has
     /// to say the bytes are new.
     ///
