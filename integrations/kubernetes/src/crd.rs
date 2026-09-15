@@ -28,6 +28,7 @@
 //! because none of them ever asked the operator anything. Only the *scaling*
 //! stops. That is the line between a coordinator and coordination state.
 
+use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -102,6 +103,21 @@ pub struct MiraClusterSpec {
 
     /// Per-replica volume.
     pub storage: Storage,
+
+    /// CPU and memory for one storage replica, and for the drain Job that
+    /// archives its volume.
+    ///
+    /// Unset is BestEffort, which is the first thing the kubelet evicts under
+    /// node pressure. For the drain that is the worst possible moment: the Job
+    /// is copying out the only surviving reference to a volume the operator is
+    /// about to delete. The Job inherits this rather than taking a field of its
+    /// own because it runs the same binary against the same volume — a drain
+    /// sized differently from the replica that filled it is a number nobody can
+    /// derive.
+    ///
+    /// docs/config.md's sizing table is what goes here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirements>,
 
     /// When to add a replica, and when to take one away.
     #[serde(default)]
@@ -222,6 +238,14 @@ pub struct Proxy {
     /// storage pods addressable only through the headless Service.
     #[serde(default = "default_proxy_replicas")]
     pub replicas: i32,
+
+    /// CPU and memory for one proxy pod.
+    ///
+    /// Separate from `spec.resources` because the two workloads size on
+    /// different things: a replica is memory for the page cache behind its
+    /// mmap, a proxy is CPU for merging N answers and holds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirements>,
 }
 
 /// What the operator observed and what it did about it.
@@ -302,6 +326,7 @@ impl Default for Proxy {
     fn default() -> Self {
         Self {
             replicas: default_proxy_replicas(),
+            resources: None,
         }
     }
 }
@@ -385,6 +410,7 @@ mod tests {
                 size: Quantity("10Gi".into()),
                 class_name: None,
             },
+            resources: None,
             scaling: Scaling::default(),
             offload: None,
             cold_storage_claim: None,

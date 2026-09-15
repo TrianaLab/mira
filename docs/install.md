@@ -171,28 +171,31 @@ spec:
   replicas: 1          # floor
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage: { size: 50Gi, className: gp3 }
+  resources:                    # unset is BestEffort; the drain inherits this
+    requests: { cpu: 2500m, memory: 2048Mi }
   offload: "file:///cold/${node}"
   coldStorageClaim: mira-cold   # must already exist; see below
-  proxy: { replicas: 2 }
+  proxy: { replicas: 2, resources: { requests: { cpu: 500m, memory: 512Mi } } }
 ```
 
 `offload` and `coldStorageClaim` are a pair: the operator refuses a spec with
 one and not the other, and a tier with neither still scales out, and never in.
-`file://` is the only scheme Mira's offload target parses, so on Kubernetes the
-archive is a *mount* — a drain Job with no claim at `/cold` writes it into its
-own container filesystem, and the operator deletes the volume it believes it
-archived.
+`file://` is the only scheme Mira's offload target parses, so the archive is a
+*mount* — a drain Job with no claim at `/cold` writes it into its own container,
+and the operator deletes the volume it believes it archived.
 
-`kubectl apply` that and the operator builds a StatefulSet, a PVC per replica,
-the governing headless Service, which publishes not-ready addresses so a pod
-whose volume has filled stays reachable by name, and a `mira proxy`
-Deployment with a ClusterIP Service in front of it. It writes both ConfigMaps —
-the node's `node`, `listen`, `storage.dir` and `storage.offload`, the proxy's
-replica list — on every reconcile, and a PodDisruptionBudget of
-`maxUnavailable: 1`, because a replica's blocks are the only copy and a drain
-would otherwise evict every replica on the node at once. How much CPU,
-memory and disk to give a replica is
+`kubectl apply` that and the operator builds a StatefulSet, a PVC per replica, a
+headless Service publishing not-ready addresses so a replica whose volume filled
+stays reachable by name, a `mira proxy` Deployment behind a ClusterIP, both
+ConfigMaps on every reconcile, and a PodDisruptionBudget of `maxUnavailable: 1`,
+because a replica's blocks are the only copy. What to put in `resources` is
 [Configuration's sizing table](config.md#sizing).
+
+Every pod it builds satisfies the `restricted` Pod Security Standard unmodified:
+uid 65532, `fsGroup` set, no service-account token, `seccompProfile:
+RuntimeDefault`. A replica gets 60 seconds to seal on SIGTERM and a startup
+probe worth five minutes, because it replays its log before it answers anything
+and a liveness probe alone would kill it part-way through, for ever.
 
 !!! note "A chart that installed a StatefulSet used to exist"
 
@@ -200,9 +203,6 @@ memory and disk to give a replica is
     Ingress, a ServiceAccount per tier, and arbitrary `config.*` keys. Write the
     Ingress yourself against the proxy Service; the tier's pods run as
     `default`.
-
-The controller does not make Mira stateful: delete the operator's Deployment and
-every Mira pod keeps ingesting and serving. Only the scaling stops.
 
 ### What the chart carries
 

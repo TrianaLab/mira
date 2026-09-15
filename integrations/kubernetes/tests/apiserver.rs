@@ -35,11 +35,12 @@
 //! run in parallel against one cluster and a failure leaves one namespace
 //! behind rather than poisoning the next run.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{Namespace, Service};
+use k8s_openapi::api::core::v1::{Namespace, ResourceRequirements, Service};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::wait::{await_condition, conditions};
@@ -148,7 +149,24 @@ fn spec() -> MiraClusterSpec {
         },
         offload: Some("file:///cold/${node}".into()),
         cold_storage_claim: Some("mira-cold".into()),
-        proxy: Proxy { replicas: 3 },
+        // Set rather than `None`, because this is the one field in the spec
+        // whose schema a unit test cannot exercise: `ResourceRequirements`
+        // generates `x-kubernetes-int-or-string` quantities, and only a real
+        // apiserver decides whether a string in an int-or-string slot survives.
+        resources: Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".into(), Quantity("2500m".into())),
+                ("memory".into(), Quantity("2048Mi".into())),
+            ])),
+            ..Default::default()
+        }),
+        proxy: Proxy {
+            replicas: 3,
+            resources: Some(ResourceRequirements {
+                limits: Some(BTreeMap::from([("cpu".into(), Quantity("1".into()))])),
+                ..Default::default()
+            }),
+        },
     }
 }
 

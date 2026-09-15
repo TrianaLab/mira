@@ -278,6 +278,37 @@ pub fn pod_disruption_budget(c: &MiraCluster) -> PodDisruptionBudget {
     .expect("pod disruption budget is well-formed")
 }
 
+/// The pod-level hardening every pod in this module gets.
+///
+/// `fsGroup` is the load-bearing one and the reason this is not left to the
+/// image: a freshly provisioned PVC is mounted root-owned, and without a group
+/// for the CSI driver to chown it to, the engine's first block directory is a
+/// permission error minutes after a pod that looked healthy — the failure
+/// `mira_core::error` names in the message it prints.
+///
+/// `runAsUser` is spelled out beside `runAsNonRoot` rather than inherited from
+/// the image because the Dockerfile's `USER nonroot:nonroot` is a *name*. The
+/// kubelet cannot prove a name is not root, so `runAsNonRoot` on its own
+/// refuses to start the container rather than allowing it. 65532 is that name's
+/// uid in the distroless base and the owner of `/data` in the image.
+fn pod_security_context() -> serde_json::Value {
+    json!({
+        "runAsNonRoot": true,
+        "runAsUser": 65532,
+        "runAsGroup": 65532,
+        "fsGroup": 65532,
+        // Mira makes ordinary syscalls — mmap, statfs, fsync, sockets — and
+        // needs no exemption from the default filter. Named because the
+        // `restricted` Pod Security Standard rejects a pod that leaves it unset.
+        "seccompProfile": {"type": "RuntimeDefault"},
+    })
+}
+
+/// Nothing in the image is setuid and there is no shell to escalate into.
+fn container_security_context() -> serde_json::Value {
+    json!({"allowPrivilegeEscalation": false})
+}
+
 pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
     serde_json::from_value(json!({
         "metadata": meta(c, c.name_any(), "storage"),
@@ -307,6 +338,22 @@ pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
                             {"name": "otlp-grpc", "containerPort": GRPC},
                             {"name": "otlp-http", "containerPort": HTTP},
                         ],
+                        // The probe that has to run before the other two, and
+                        // the reason a replica with a large log comes back at
+                        // all. `main.rs` binds the HTTP socket before it
+                        // replays the WAL and serves after, so during a replay
+                        // the port accepts and then answers nothing — every
+                        // probe against it hangs to its own timeout. Liveness
+                        // alone kills the pod about thirty seconds in, the
+                        // restart replays the same log and dies at the same
+                        // point, and the replica never returns. A startup probe
+                        // suspends both of the others until the container has
+                        // answered once. 60 x 5s = five minutes of replay.
+                        "startupProbe": {
+                            "httpGet": {"path": "/health", "port": HTTP},
+                            "periodSeconds": 5,
+                            "failureThreshold": 60,
+                        },
                         // `/readyz` and not `/health` for readiness: the engine
                         // separates them, and the proxy must not be sent to a
                         // replica that is still replaying its WAL.
@@ -318,11 +365,22 @@ pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
                             "httpGet": {"path": "/health", "port": HTTP},
                             "periodSeconds": 10,
                         },
+                        "resources": c.spec.resources,
+                        "securityContext": container_security_context(),
                         "volumeMounts": [
                             {"name": "data", "mountPath": "/data"},
                             {"name": "config", "mountPath": "/etc/mira"},
                         ],
                     }],
+                    "securityContext": pod_security_context(),
+                    "automountServiceAccountToken": false,
+                    // On SIGTERM the engine stops accepting, finishes the
+                    // exports in flight and seals each signal's open block. The
+                    // kubelet's default 30s is not enough for a loaded node to
+                    // do that, and being killed part-way through is exactly the
+                    // SIGKILL case that loses unflushed records — reached here
+                    // on an ordinary rollout rather than only on a scale-in.
+                    "terminationGracePeriodSeconds": 60,
                     "volumes": [{
                         "name": "config",
                         "configMap": {"name": c.name_any()},
@@ -373,8 +431,12 @@ pub fn proxy_deployment(c: &MiraCluster, replicas: i32) -> Deployment {
                             "httpGet": {"path": "/readyz", "port": HTTP},
                             "periodSeconds": 5,
                         },
+                        "resources": c.spec.proxy.resources,
+                        "securityContext": container_security_context(),
                         "volumeMounts": [{"name": "config", "mountPath": "/etc/mira"}],
                     }],
+                    "securityContext": pod_security_context(),
+                    "automountServiceAccountToken": false,
                     "volumes": [{
                         "name": "config",
                         "configMap": {"name": proxy_name(c)},
@@ -469,8 +531,17 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
                             "--offload", offload,
                         ],
                         "env": [{"name": "POD_NAME", "value": pod}],
+                        // The replica's sizing, because this is the replica's
+                        // binary against the replica's volume. BestEffort here
+                        // is the first thing evicted under node pressure, and
+                        // the moment it would happen in is the copy that is the
+                        // only surviving reference to a volume about to go.
+                        "resources": c.spec.resources,
+                        "securityContext": container_security_context(),
                         "volumeMounts": mounts,
                     }],
+                    "securityContext": pod_security_context(),
+                    "automountServiceAccountToken": false,
                     "volumes": volumes,
                 },
             },
@@ -497,6 +568,7 @@ mod tests {
                     size: Quantity("10Gi".into()),
                     class_name: Some("fast".into()),
                 },
+                resources: None,
                 scaling: Scaling::default(),
                 offload: Some("file:///cold/${node}".into()),
                 cold_storage_claim: Some("mira-cold".into()),
@@ -795,5 +867,160 @@ mod tests {
                 "the budget also selects {other:?}"
             );
         }
+    }
+
+    /// Every pod spec this module builds, named for the assertion message.
+    fn pods(c: &MiraCluster) -> Vec<(&'static str, k8s_openapi::api::core::v1::PodSpec)> {
+        let spec =
+            |p: Option<k8s_openapi::api::core::v1::PodTemplateSpec>| p.unwrap().spec.unwrap();
+        vec![
+            (
+                "statefulset",
+                spec(Some(stateful_set(c, 1).spec.unwrap().template)),
+            ),
+            (
+                "proxy",
+                spec(Some(proxy_deployment(c, 1).spec.unwrap().template)),
+            ),
+            (
+                "drain",
+                spec(Some(
+                    drain_job(c, 4, "file:///cold/${node}")
+                        .spec
+                        .unwrap()
+                        .template,
+                )),
+            ),
+        ]
+    }
+
+    /// A replica serves nothing until its log is replayed, and the liveness
+    /// probe does not know that.
+    ///
+    /// `main.rs` binds the HTTP socket *before* it replays and calls
+    /// `axum::serve` after, so during a replay the port accepts a connection
+    /// and then answers nothing — the probe hangs until its own timeout rather
+    /// than being refused, which is a failure and not an error. With liveness
+    /// alone the kubelet is already counting: three failures at ten seconds
+    /// kills the pod about thirty seconds in, the restart replays the same log
+    /// and is killed at the same point, and the replica never comes back. A
+    /// `startupProbe` is the only thing that holds liveness *and* readiness off
+    /// until the container has answered once.
+    #[test]
+    fn a_replica_replaying_its_log_is_not_killed_for_not_answering_yet() {
+        let s = stateful_set(&cluster(), 1);
+        let ctr = &s.spec.unwrap().template.spec.unwrap().containers[0];
+
+        let startup = ctr.startup_probe.as_ref().expect("startupProbe");
+        assert_eq!(
+            startup.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/health")
+        );
+        // The budget and not just the field: a startup probe that gives up
+        // sooner than a replay takes is the same crash loop with more steps.
+        let budget = startup.period_seconds.unwrap() * startup.failure_threshold.unwrap();
+        assert!(budget >= 300, "{budget}s is not long enough for a replay");
+    }
+
+    /// A freshly provisioned PVC is mounted root-owned and the image runs as
+    /// uid 65532.
+    ///
+    /// Without `fsGroup` the CSI driver never chowns it, so the first thing a
+    /// new replica does — create a block directory — is a permission error;
+    /// `mira_core::error` names this exact cause in the message the operator
+    /// will read. `runAsUser` has to be spelled out beside `runAsNonRoot`
+    /// because the Dockerfile's `USER nonroot:nonroot` is a *name*: the kubelet
+    /// cannot prove a name is not root, and refuses to start the container at
+    /// all if it is asked to.
+    #[test]
+    fn every_pod_here_can_write_the_volume_it_is_given() {
+        for (what, pod) in pods(&cluster()) {
+            let sc = pod
+                .security_context
+                .unwrap_or_else(|| panic!("{what}: no pod securityContext"));
+            assert_eq!(sc.fs_group, Some(65532), "{what}: fsGroup");
+            assert_eq!(sc.run_as_user, Some(65532), "{what}: runAsUser");
+            assert_eq!(sc.run_as_non_root, Some(true), "{what}: runAsNonRoot");
+            assert_eq!(
+                sc.seccomp_profile.map(|p| p.type_),
+                Some("RuntimeDefault".into()),
+                "{what}: seccompProfile"
+            );
+            assert_eq!(
+                pod.containers[0]
+                    .security_context
+                    .as_ref()
+                    .and_then(|s| s.allow_privilege_escalation),
+                Some(false),
+                "{what}: allowPrivilegeEscalation"
+            );
+        }
+    }
+
+    /// Mira never calls the API server, so a mounted token is blast radius and
+    /// nothing else — the difference between a compromised ingest process and a
+    /// compromised cluster client. The operator's own chart already says the
+    /// engine's pods turn it off, which stopped being true when the chart that
+    /// did it was deleted.
+    #[test]
+    fn no_pod_here_is_handed_an_api_token_it_never_uses() {
+        for (what, pod) in pods(&cluster()) {
+            assert_eq!(pod.automount_service_account_token, Some(false), "{what}");
+        }
+    }
+
+    /// Unset, every container here is BestEffort — the first thing the kubelet
+    /// evicts under node pressure, and for the drain that is an eviction during
+    /// the copy that is the only surviving reference to a volume about to be
+    /// deleted. `docs/config.md` has carried a sizing table the whole time and a
+    /// `MiraCluster` could not express one row of it.
+    ///
+    /// The drain reads `spec.resources` and not a field of its own: same binary,
+    /// same volume, and a drain sized differently from the replica that filled
+    /// it is a number with nothing to derive it from.
+    #[test]
+    fn the_sizes_a_spec_asks_for_reach_the_containers_that_honour_them() {
+        for (what, pod) in pods(&cluster()) {
+            assert_eq!(pod.containers[0].resources, None, "{what} defaults sized");
+        }
+
+        let sized = |cpu: &str| {
+            Some(k8s_openapi::api::core::v1::ResourceRequirements {
+                requests: Some(BTreeMap::from([("cpu".into(), Quantity(cpu.into()))])),
+                ..Default::default()
+            })
+        };
+        let mut c = cluster();
+        c.spec.resources = sized("2500m");
+        c.spec.proxy.resources = sized("500m");
+
+        let cpu = |r: &Option<k8s_openapi::api::core::v1::ResourceRequirements>| {
+            r.as_ref().unwrap().requests.as_ref().unwrap()["cpu"]
+                .0
+                .clone()
+        };
+        for (what, pod) in pods(&c) {
+            let want = if what == "proxy" { "500m" } else { "2500m" };
+            assert_eq!(cpu(&pod.containers[0].resources), want, "{what}");
+        }
+    }
+
+    /// Killing a replica early turns a clean shutdown into a replay.
+    ///
+    /// On SIGTERM the engine stops accepting, finishes the exports in flight
+    /// and seals each signal's open block. The kubelet's default is 30 seconds,
+    /// which a loaded node does not finish in — and that is the SIGKILL case
+    /// the scale-in ceiling names, reached on an ordinary rollout rather than
+    /// on a scale-in. `main.rs` already tells the reader to raise this field,
+    /// by name, in the error it prints when the port is still held.
+    #[test]
+    fn a_replica_is_given_long_enough_to_seal_what_it_is_holding() {
+        let pod = stateful_set(&cluster(), 1)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        assert_eq!(pod.termination_grace_period_seconds, Some(60));
     }
 }

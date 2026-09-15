@@ -44,6 +44,15 @@ spec:
   maxReplicas: 3
   storage:
     size: 1Gi
+  # Set here so the apiserver has to accept the block against the generated
+  # schema — `ResourceRequirements` carries `x-kubernetes-int-or-string`
+  # quantities, which a unit test round-tripping the Rust type cannot exercise.
+  # Requests only: a limit on a Kind node sized for CI is a pod that does not
+  # schedule.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
   scaling:
     upWhenFreeBelow: 0.001
     downWhenFreeAbove: 0.002

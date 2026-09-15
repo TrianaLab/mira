@@ -4,7 +4,7 @@
 published numbers*, see [End-to-end testing](e2e.md).
 
 Mira has 427 cargo tests — 369 across levels 1–5, plus 58 in `xtask` that test
-the gates rather than the engine — 22 UI tests, 26 chart tests, and 62 more in
+the gates rather than the engine — 22 UI tests, 26 chart tests, and 67 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
 both targets are in [Contributing](../contributing.md).
@@ -129,7 +129,7 @@ one.
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it. `make operator` is its
-whole gate — fmt, clippy, 57 unit tests, a coverage floor and the CRD drift
+whole gate — fmt, clippy, 62 unit tests, a coverage floor and the CRD drift
 check — and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
 deliberately not in it.
 
@@ -137,7 +137,7 @@ The separation is not about testing: kube-rs declares Rust 1.89 against the
 engine's 1.85 floor and brings ~160 crates and a TLS stack, against a README
 crate count that is a published product property.
 
-Its 57 unit tests are level 1 in shape and almost all about **arithmetic that
+Its 62 unit tests are level 1 in shape and almost all about **arithmetic that
 decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
 a spec whose thresholds would oscillate.

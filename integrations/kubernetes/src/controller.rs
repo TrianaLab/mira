@@ -826,6 +826,7 @@ mod tests {
                     size: Quantity("1Gi".into()),
                     class_name: None,
                 },
+                resources: None,
                 scaling: Scaling {
                     cooldown_seconds: cooldown,
                     ..Default::default()

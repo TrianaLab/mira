@@ -87,6 +87,11 @@ spec:
   storage:
     size: 50Gi
     className: gp3
+  # Unset is BestEffort. The drain Job inherits this: same binary, same volume.
+  resources:
+    requests:
+      cpu: 2500m
+      memory: 2048Mi
   scaling:
     upWhenFreeBelow: 0.15
     downWhenFreeAbove: 0.60
