@@ -774,7 +774,7 @@ PROSE = $(shell git ls-files '*.md' | while read -r f; do [ -L "$$f" ] || echo "
 #   charts/mira-operator/README.md  helm-docs, from values.yaml
 #   docs/reference/*.md           xtask reference, from the code
 GENERATED = CHANGELOG.md charts/mira-operator/README.md docs/reference/cli.md \
-            docs/reference/http.md
+            docs/reference/http.md docs/reference/crd.md
 
 .PHONY: docs-check
 docs-check: node_modules ## Markdown structure, prose style, and the shape of a page

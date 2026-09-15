@@ -165,6 +165,22 @@
   opacity: 1;
 }
 
+/* A sticky sidebar heading hides what scrolls under it with a blurred halo,
+   and a blur fades: the tail of it lands on the next link, which shows through
+   the heading as a half-erased line. Same mask, no blur, and stopping at the
+   heading's own bottom edge — so a link scrolling past is cut, not ghosted. */
+.md-nav--primary .md-nav__title,
+.md-nav--secondary .md-nav__title,
+.md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__link {
+  box-shadow: 0 -0.4rem 0 0.4rem var(--md-default-bg-color);
+}
+
+/* The lifted one is bare text with no padding of its own, so that cut would
+   land on the line immediately below it. Give it room to end in. */
+.md-nav--lifted > .md-nav__list > .md-nav__item--active > .md-nav__link {
+  padding-bottom: 0.4rem;
+}
+
 /* A button is a physical key: square, offset shadow, and it travels the offset
    when pressed. The transform is the whole affordance — the shadow shrinking
    without the button moving reads as a rendering bug. */

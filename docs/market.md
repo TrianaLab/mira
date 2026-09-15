@@ -238,6 +238,11 @@ and whose case is not: ingest through it runs at **0.767x** the single node at
 four connections and a wide unfiltered read costs **3.89x** its `elapsed_us`
 [^m5].
 
+The [operator](install.md#kubernetes) adds a replica when the fullest one runs
+out of room and archives a drained one on the way out. That is elasticity, not
+redundancy: the first sentence of this row still stands, nothing rebalances what
+is already written, and a lost node is lost blocks.
+
 #### Cost per GB
 
 No measured dollar figure, only bytes on disk. Quickwit's $8.4 per ingested TB
