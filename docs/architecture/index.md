@@ -21,7 +21,7 @@ about behaviour, because only one of them describes behaviour.
 | every flag and config key | [CLI](../reference/cli.md), [Configuration](../config.md) — generated from the binary and from `Config` |
 
 **Status:** the workspace under `crates/` implements most of this and its tests
-pass. Sections marked "still not built" are the exceptions; 0.1 below is the
+pass. Sections marked "Not built" are the exceptions; 0.1 below is the
 complete list, and the README's *Scope* is the three-line version of it.
 
 ## Reading order

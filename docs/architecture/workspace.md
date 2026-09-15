@@ -3,7 +3,7 @@
 ```text
 mira/
 ├── Cargo.toml                  # workspace, one pinned Arrow version
-├── docs/architecture.md
+├── docs/architecture/          # this, one page per section
 └── crates/
     ├── mira-proto/             # vendored .proto + codegen. No hand-written code.
     │   ├── build.rs            # protox (pure Rust) -> tonic-prost-build

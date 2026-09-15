@@ -405,10 +405,9 @@ verified until you have looked at it.
 make operator-e2e
 ```
 
-About fifteen minutes; it needs `docker`, `kind`, `kubectl` and `helm`. It is
-the only test where the client is not ours — a stock
-`otel/opentelemetry-collector-contrib`. `integrations/kubernetes/e2e/run.sh`,
-in order:
+About fifteen minutes; it needs `docker`, `kind`, `kubectl` and `helm`. The
+client is a stock `otel/opentelemetry-collector-contrib`.
+`integrations/kubernetes/e2e/run.sh`, in order:
 
 | | |
 | --- | --- |

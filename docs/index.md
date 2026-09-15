@@ -16,9 +16,10 @@ mira --data-dir ./data          # OTLP/gRPC 4317, OTLP/HTTP + UI + MCP 4318
 mira mira --data-dir ./data     # the same views in the terminal, no server needed
 ```
 
-That is the whole of it. [**See it work**](demo.md) is one command and five
+That is the whole of it. [**See it work**](demo.md) is one command and six
 screens of real output — an error log, the trace behind it, the service map, a
-firing alert, and what the whole run cost in memory and disk.
+metric with its exemplars, a firing alert, and what the whole run cost in
+memory and disk.
 
 ## What makes it different
 

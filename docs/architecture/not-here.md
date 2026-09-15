@@ -86,9 +86,10 @@ disable it outright, so performance would depend on whether the sandbox
 allows a syscall. And Mira is not I/O-bound: 190 MiB/s against an NVMe that
 does GB/s, on 1.75 of twelve cores. Revisit when a profile shows syscall
 overhead above ~5% of ingest CPU. The third reason used to name the log's
-group commit as the trigger; that fix is rejected on the numbers two entries
-into the plateau discussion below, so the trigger is now the flusher measuring
-submission-bound rather than device-bound.
+group commit as the trigger; that fix is rejected on the numbers in
+[Group commit](performance-ingest.md#group-commit-is-priced-by-a-ram-disk-and-rejected),
+so the trigger is now the flusher measuring submission-bound rather than
+device-bound.
 
 ## ~~The query-side half of `NO_IDENTITY`~~
 

@@ -171,7 +171,8 @@ nav:
       # and `helm-docs-check` diffs — so the values table on the site is the one
       # the chart ships, not a second copy of it that goes stale. The path stays
       # `reference/chart.md` after the engine chart was removed, because
-      # miradb.dev/reference/chart/ is linked from the README and elsewhere.
+      # `docs/install.md` links it and the published route is the one readers
+      # have.
       - Helm chart: reference/chart.md
       - Rust API: https://miradb.dev/api/
   - Understand:
