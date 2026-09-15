@@ -28,6 +28,12 @@
 //! with tests](fn@starts_sentence) rather than a tokeniser nobody in this
 //! repository can fix.
 //!
+//! Nor are the word budgets Vale `metric` rules, the other obvious home for
+//! them. Vale's `words` counts table cells and footnote definitions and skips
+//! inline code spans — the exclusions above, inverted — and its section scope
+//! folds subsections into the parent heading. Cheaper to configure, and
+//! measuring something else.
+//!
 //! ```console
 //! $ cargo run -p xtask -- prose docs/architecture.md README.md
 //! ```
