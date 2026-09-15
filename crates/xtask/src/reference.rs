@@ -11,6 +11,8 @@
 //! ```text
 //! docs/reference/cli.md    <- `mira --help`, verbatim, from the built binary
 //! docs/reference/http.md   <- `.route(...)` calls + the handler's doc comment
+//! docs/reference/crd.md    <- the shipped `MiraCluster` CRD, itself generated
+//!                             from the operator's Rust types
 //! docs/config.md           <- the `KNOWN` key list + `Config`'s field docs,
 //!                             injected between markers so the prose survives
 //! ```
@@ -30,8 +32,9 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use regex::Regex;
+use yaml_rust2::Yaml;
 
-use crate::util::{Failures, glob, re, read_or_exit, root};
+use crate::util::{Failures, glob, parse_yaml, re, read_or_exit, root};
 
 const SRC: &str = "crates/mira/src";
 
@@ -47,6 +50,7 @@ pub fn run() -> bool {
     let mut changed = false;
     changed |= write("docs/reference/cli.md", &cli_page(&mut f));
     changed |= write("docs/reference/http.md", &http_page(&mut f));
+    changed |= write("docs/reference/crd.md", &crd_page(&mut f));
     changed |= inject("docs/config.md", "keys", &config_table(&mut f), &mut f);
     changed |= inject(
         "docs/config.md",
@@ -1001,6 +1005,269 @@ fn config_table(f: &mut Failures) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The MiraCluster custom resource
+// ---------------------------------------------------------------------------
+
+/// The CRD the chart installs, which `make operator-crd` writes from the
+/// operator's Rust types and `operator-crd-check` diffs.
+///
+/// Two generators in a row, and the middle one is the point: the API server
+/// **prunes** a field its stored schema does not name, so the schema — not the
+/// Rust — is what a `MiraCluster` will actually keep. Reading the YAML means
+/// this page cannot document a field the cluster would silently drop.
+const CRD: &str = "charts/mira-operator/crds/miraclusters.yaml";
+
+/// Paths that get one row instead of a table of their own.
+///
+/// These are core Kubernetes types the operator re-exports. Their sub-fields
+/// are documented by Kubernetes, in Kubernetes' words, and copying that prose
+/// here would be this repository publishing text it did not write. The
+/// generator fails when a path stops existing, so the list cannot quietly
+/// start hiding a field of ours.
+const OPAQUE: [(&str, &str); 2] = [
+    ("spec.resources", "ResourceRequirements"),
+    ("spec.proxy.resources", "ResourceRequirements"),
+];
+
+/// One row of a schema table.
+struct Field {
+    path: String,
+    ty: String,
+    /// `required`, `unset`, or the literal the API server defaults to.
+    default: String,
+    doc: String,
+}
+
+/// A YAML scalar as the value an operator would write. Anything else — an
+/// object default such as `proxy: {replicas: 2}` — is empty, because the rows
+/// for its own fields carry those defaults one line further down.
+fn yaml_scalar(y: &Yaml) -> String {
+    match y {
+        Yaml::String(s) | Yaml::Real(s) => s.clone(),
+        Yaml::Integer(n) => n.to_string(),
+        Yaml::Boolean(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// An OpenAPI property as the word a reader needs.
+fn schema_type(p: &Yaml) -> String {
+    // `x-kubernetes-int-or-string` with no `type` is how a `resource.Quantity`
+    // reaches the schema, and it is what makes `50Gi` and `50000000000` both
+    // legal in the same field.
+    if p["x-kubernetes-int-or-string"].as_bool() == Some(true) {
+        return "quantity".into();
+    }
+    let base = match p["type"].as_str() {
+        // A map of strings is an `object` too, and reads as neither.
+        Some("object") if !p["additionalProperties"].is_badvalue() => "map",
+        Some(t) => t,
+        None => "—",
+    };
+    match p["minimum"].as_f64() {
+        Some(min) => format!("{base} ≥ {min:.0}"),
+        None => base.to_string(),
+    }
+}
+
+/// The first paragraph of a description, as a table cell.
+///
+/// The text is a Rust doc comment that went through the CRD, so it is already
+/// prose — all this does is take the summary and keep a literal `|` from
+/// ending the cell early.
+fn cell(description: &str) -> String {
+    description
+        .split("\n\n")
+        .next()
+        .unwrap_or_default()
+        .replace('\n', " ")
+        .replace('|', r"\|")
+        .trim()
+        .to_string()
+}
+
+/// Every property of an object schema, parents before children.
+fn schema_fields(node: &Yaml, prefix: &str, out: &mut Vec<Field>, hit: &mut Vec<&'static str>) {
+    let required: Vec<&str> = node["required"]
+        .as_vec()
+        .map(|v| v.iter().filter_map(Yaml::as_str).collect())
+        .unwrap_or_default();
+    let Some(props) = node["properties"].as_hash() else {
+        return;
+    };
+    for (key, p) in props {
+        let Some(name) = key.as_str() else { continue };
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        let opaque = OPAQUE.iter().find(|(o, _)| *o == path);
+        if let Some((o, _)) = opaque {
+            hit.push(o);
+        }
+        let default = &p["default"];
+        out.push(Field {
+            ty: opaque.map_or_else(|| schema_type(p), |(_, t)| (*t).to_string()),
+            default: match yaml_scalar(default) {
+                _ if required.contains(&name) => "required".into(),
+                _ if default.is_badvalue() => "unset".into(),
+                // An object default, whose rows carry the values themselves.
+                s if s.is_empty() => "—".into(),
+                s => format!("`{s}`"),
+            },
+            doc: cell(p["description"].as_str().unwrap_or_default()),
+            path: path.clone(),
+        });
+        if opaque.is_none() {
+            schema_fields(p, &path, out, hit);
+        }
+    }
+}
+
+/// One schema table, with the `spec.`/`status.` the heading already said
+/// taken off the front of every path.
+fn table(rows: &[&Field], head: &str, last: &str) -> Vec<String> {
+    let mut out = vec![
+        format!("| Field | Type | Default | {last} |"),
+        "| --- | --- | --- | --- |".into(),
+    ];
+    out.extend(rows.iter().map(|r| {
+        format!(
+            "| `{}` | {} | {} | {} |",
+            r.path.strip_prefix(head).unwrap_or(&r.path),
+            r.ty,
+            r.default,
+            r.doc
+        )
+    }));
+    out.push(String::new());
+    out
+}
+
+fn crd_page(f: &mut Failures) -> String {
+    let text = read_or_exit(CRD);
+    let doc = match parse_yaml(&text) {
+        Ok(y) => y,
+        Err(e) => {
+            f.fail(format!("{CRD}: {e}"));
+            return String::new();
+        }
+    };
+    let spec = &doc["spec"];
+    let version = &spec["versions"][0];
+    let root_schema = &version["schema"]["openAPIV3Schema"];
+    let Some(name) = version["name"].as_str() else {
+        f.fail(format!(
+            "{CRD}: no served version, so there is nothing to document."
+        ));
+        return String::new();
+    };
+
+    let mut hit = Vec::new();
+    let mut rows = Vec::new();
+    schema_fields(root_schema, "", &mut rows, &mut hit);
+    for (path, _) in OPAQUE {
+        if !hit.contains(&path) {
+            f.fail(format!(
+                "{CRD} has no `{path}` any more, so the OPAQUE list in \
+                 crates/xtask/src/reference.rs is hiding a path that moved. Drop the \
+                 entry or point it at the new one."
+            ));
+        }
+    }
+    if rows.is_empty() {
+        f.fail(format!("{CRD}: the schema has no properties."));
+        return String::new();
+    }
+    // `spec` and `status` themselves are the two headings below, not rows.
+    let (of_spec, of_status): (Vec<&Field>, Vec<&Field>) = rows
+        .iter()
+        .filter(|r| r.path.contains('.'))
+        .partition(|r| r.path.starts_with("spec."));
+
+    let names = &spec["names"];
+    let short = names["shortNames"][0].as_str().unwrap_or("—");
+    let mut out: Vec<String> = vec![
+        STAMP.into(),
+        String::new(),
+        format!("# {}", names["kind"].as_str().unwrap_or("?")),
+        String::new(),
+        "**For:** anyone writing the custom resource the operator reconciles.".into(),
+        String::new(),
+        format!(
+            "`{}/{name}`, namespaced, short name `{short}`. The schema below is",
+            spec["group"].as_str().unwrap_or("?")
+        ),
+        "the one the API server stores, which is the one that decides what".into(),
+        "survives a write: a field it does not name is **pruned** on apply, with".into(),
+        "no error anywhere.".into(),
+        String::new(),
+        "Installing it is [Install](../install.md#kubernetes); what the operator builds".into(),
+        "out of it, and how a scale-in is sequenced, is the".into(),
+        "[chart reference](chart.md).".into(),
+        String::new(),
+        "## `spec`".into(),
+        String::new(),
+        cell(
+            root_schema["properties"]["spec"]["description"]
+                .as_str()
+                .unwrap_or_default(),
+        ),
+        String::new(),
+    ];
+    out.extend(table(&of_spec, "spec.", "What it sets"));
+
+    out.extend([
+        "## `status`".into(),
+        String::new(),
+        "A subresource, so the operator writes it without touching the spec, and an".into(),
+        "unsatisfiable spec lands here rather than in a log line nobody reads.".into(),
+        String::new(),
+    ]);
+    out.extend(table(&of_status, "status.", "What it reports"));
+
+    if let Some(rules) = root_schema["x-kubernetes-validations"].as_vec() {
+        out.extend([
+            "## Refused on write".into(),
+            String::new(),
+            "Enforced by the API server rather than by the operator, so the `kubectl`".into(),
+            "that would break the tier fails instead of the reconcile that follows it.".into(),
+            String::new(),
+            "| Rule | Message |".into(),
+            "| --- | --- |".into(),
+        ]);
+        out.extend(rules.iter().map(|r| {
+            format!(
+                "| `{}` | {} |",
+                r["rule"].as_str().unwrap_or("?"),
+                r["message"].as_str().unwrap_or("?")
+            )
+        }));
+        out.push(String::new());
+    }
+
+    if let Some(cols) = version["additionalPrinterColumns"].as_vec() {
+        out.extend([
+            "## `kubectl get miraclusters`".into(),
+            String::new(),
+            "| Column | Read from |".into(),
+            "| --- | --- |".into(),
+        ]);
+        out.extend(cols.iter().map(|c| {
+            format!(
+                "| {} | `{}` |",
+                c["name"].as_str().unwrap_or("?"),
+                c["jsonPath"].as_str().unwrap_or("?")
+            )
+        }));
+        out.push(String::new());
+    }
+
+    format!("{}\n", out.join("\n").trim_end())
+}
+
+// ---------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------
 
@@ -1216,9 +1483,23 @@ mod tests {
         let mut f = Failures::default();
         let http = http_page(&mut f);
         let config = config_table(&mut f);
+        let crd = crd_page(&mut f);
         assert!(f.0.is_empty(), "{:?}", f.0);
         assert!(http.contains("| `POST /api/v1/query` |"), "{http}");
         assert!(config.contains("[`listen.http`]"), "{config}");
         assert!(known_keys(&mut f) > 0);
+        // A field of ours, one nested a level down, the core type that is not
+        // descended into, and the constraint only the API server enforces.
+        for want in [
+            "| `image` | string | required |",
+            "| `scaling.cooldownSeconds` | integer |",
+            "| `resources` | ResourceRequirements | unset |",
+            "self.spec.maxReplicas >= self.spec.replicas",
+        ] {
+            assert!(crd.contains(want), "{want} missing from\n{crd}");
+        }
+        // `spec.resources.limits` is Kubernetes' own prose, and this page does
+        // not publish it.
+        assert!(!crd.contains("Limits describes"), "{crd}");
     }
 }
