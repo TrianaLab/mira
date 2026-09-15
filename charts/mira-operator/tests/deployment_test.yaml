@@ -5,9 +5,8 @@ release:
   name: mira-operator
   namespace: mira-system
 tests:
-  # Two controllers with no leader election both reconcile every MiraCluster and
-  # both act on the same reading. A rolling update creates exactly that overlap
-  # for the length of the rollout, so the strategy has to be Recreate.
+  # The Lease makes an overlap survivable; Recreate makes it not happen. A
+  # rolling update would put every upgrade through the standby wait for no gain.
   - it: never runs two controllers at once
     asserts:
       - equal:
@@ -76,3 +75,16 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].env[0].value
           value: "debug,kube=info"
+
+  # The lease holder has to be the pod name. The operator falls back to a pid if
+  # this is missing, which is neither unique across pods nor legible in
+  # `kubectl get lease` — and the fallback is silent, so nothing else would
+  # notice the env var going away.
+  - it: tells the operator which pod it is
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[1].name
+          value: POD_NAME
+      - equal:
+          path: spec.template.spec.containers[0].env[1].valueFrom.fieldRef.fieldPath
+          value: metadata.name

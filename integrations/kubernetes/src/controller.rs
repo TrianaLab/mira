@@ -50,6 +50,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Service};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use kube::runtime::Controller;
 use kube::runtime::controller::Action;
@@ -270,6 +271,7 @@ async fn ensure(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(
     let svcs: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
     let sets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
     let deps: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+    let pdbs: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), ns);
 
     cms.patch(&name, &params(), &apply(&res::config_map(c)))
         .await?;
@@ -284,6 +286,12 @@ async fn ensure(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(
     // re-applying `spec.replicas` here would undo every scale-out on the next
     // reconcile.
     sets.patch(&name, &params(), &apply(&res::stateful_set(c, replicas)))
+        .await?;
+    // Unconditional, and for every tier including a single-replica one: the
+    // budget is what stops a node drain evicting more of the tier at once than
+    // it can afford, and a tier that has no proxy in front of it is not a tier
+    // that can afford more.
+    pdbs.patch(&name, &params(), &apply(&res::pod_disruption_budget(c)))
         .await?;
 
     if c.spec.proxy.replicas > 0 {
@@ -435,10 +443,30 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
-    if st.failed.unwrap_or(0) > 0 {
+    // The `Failed` condition first, and only then the failed-pod count. When
+    // Kubernetes gives up on a Job it writes the condition and terminates the
+    // pods afterwards, so there is a window where `status.failed` is still 0 —
+    // and on a pod stuck terminating on an unreachable node that window has no
+    // end. Counting only pods reads it as "still running": requeue every ten
+    // seconds, phase `Draining`, for ever, over a drain that was abandoned by
+    // the control plane. The condition also carries the *reason*, which is the
+    // difference between sending an operator to a pod log and telling them the
+    // log ends mid-copy because `drainDeadlineSeconds` was too short.
+    let why = st
+        .conditions
+        .iter()
+        .flatten()
+        .find(|c| c.type_ == "Failed" && c.status == "True")
+        .map(|c| c.reason.clone().unwrap_or_else(|| "Failed".into()))
+        .or_else(|| {
+            let n = st.failed.unwrap_or(0);
+            (n > 0).then(|| format!("{n} failed pods"))
+        });
+
+    if let Some(why) = why {
         // Stop here, loudly, with the claim intact. The tier is one replica
         // smaller and the blocks are still on disk.
-        error!(%ns, ordinal, "drain failed; volume kept");
+        error!(%ns, ordinal, %why, "drain failed; volume kept");
         status(
             ctx,
             c,
@@ -460,7 +488,7 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
                 "lastScaled": c.status.as_ref().and_then(|s| s.last_scaled.clone()),
                 "phase": "Degraded",
                 "message": format!(
-                    "drain of replica {ordinal} failed; its volume was kept. \
+                    "drain of replica {ordinal} failed ({why}); its volume was kept. \
                      Inspect job {job_name} — the blocks are intact on claim data-{}-{}",
                     c.name_any(), ordinal
                 ),
@@ -536,7 +564,7 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
 // "now, as RFC3339" and "how long since that string", and both are a handful of
 // integer arithmetic on a Unix timestamp — cheaper than a dependency whose
 // timezone database is irrelevant to a cooldown measured in minutes.
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -544,11 +572,11 @@ fn now_secs() -> i64 {
 }
 
 /// Unix seconds as RFC3339 UTC.
-fn now() -> String {
+pub(crate) fn now() -> String {
     fmt_rfc3339(now_secs())
 }
 
-fn fmt_rfc3339(secs: i64) -> String {
+pub(crate) fn fmt_rfc3339(secs: i64) -> String {
     // Days since the epoch to a civil date, by the standard algorithm. Kept
     // here rather than imported because it is the only calendar arithmetic the
     // operator does.
@@ -572,7 +600,7 @@ fn fmt_rfc3339(secs: i64) -> String {
 
 /// RFC3339 UTC back to Unix seconds. `None` on anything it does not recognise,
 /// which the caller treats as "no cooldown recorded".
-fn chrono_parse(s: &str) -> Option<i64> {
+pub(crate) fn chrono_parse(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
@@ -595,72 +623,10 @@ mod tests {
     use crate::crd::{MiraClusterSpec, MiraClusterStatus, Proxy, Scaling, Storage};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-    use std::sync::Mutex;
-    use std::task::{Context, Poll};
-
-    use http::{Request, Response, StatusCode};
-    use http_body_util::BodyExt;
-    use kube::client::Body;
-    use tower::Service;
-
-    /// A `kube::Client` with a recorder where the API server should be.
-    ///
-    /// kube-rs has no envtest — there is no Rust equivalent of standing up a
-    /// real kube-apiserver and etcd for a test. What it does have is
-    /// [`Client::new`], which takes any `tower::Service`, so the seam is one
-    /// layer lower: instead of asserting on cluster state after a reconcile,
-    /// these tests assert on the exact sequence of HTTP requests the reconcile
-    /// *issued*. For this controller that is the stronger assertion anyway —
-    /// the thing that must not regress is the drain's ordering, and an ordering
-    /// is a property of the request log rather than of the final state.
-    ///
-    /// ponytail: no request matching beyond the path, and every reply is
-    /// canned. Reach for a real control plane the day a test needs the API
-    /// server's own behaviour — defaulting, admission, a conflict on resource
-    /// version — rather than this controller's behaviour.
-    /// `(method, path) -> (status, body)`.
-    type Reply = Arc<dyn Fn(&str, &str) -> (StatusCode, serde_json::Value) + Send + Sync>;
-
-    #[derive(Clone)]
-    struct Fake {
-        calls: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
-        reply: Reply,
-    }
-
-    /// What a Kubernetes 404 actually looks like on the wire. `get_opt` turns
-    /// this into `None`, and it only recognises it by the parsed `Status`.
-    fn not_found() -> serde_json::Value {
-        json!({
-            "kind": "Status", "apiVersion": "v1", "status": "Failure",
-            "code": 404, "reason": "NotFound", "message": "not found",
-        })
-    }
-
-    /// Enough of a `MiraCluster` to deserialize, for the replies to
-    /// `patch_status`. Every other kind in this file has all-optional fields,
-    /// so `{"metadata":{}}` is a valid one of those.
-    fn cluster_doc() -> serde_json::Value {
-        json!({
-            "apiVersion": "mira.miradb.dev/v1alpha1",
-            "kind": "MiraCluster",
-            "metadata": {"name": "tel", "namespace": "ns"},
-            "spec": {
-                "image": "m:1", "replicas": 1, "maxReplicas": 5,
-                "storage": {"size": "1Gi"},
-            },
-        })
-    }
+    use crate::fake::{Fake, not_found};
+    use http::StatusCode;
 
     impl Fake {
-        fn new(
-            reply: impl Fn(&str, &str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
-        ) -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-                reply: Arc::new(reply),
-            }
-        }
-
         /// The default control plane: every write succeeds, nothing exists yet.
         /// Nothing exists yet, including the MiraCluster's own live read — a
         /// 404 there is `get_opt` returning `None`, which is the same answer as
@@ -699,60 +665,24 @@ mod tests {
 
         fn ctx(&self) -> Arc<Ctx> {
             Arc::new(Ctx {
-                client: Client::new(self.clone(), "ns"),
+                client: self.client("ns"),
             })
-        }
-
-        /// `METHOD /path`, in the order they were issued.
-        fn log(&self) -> Vec<String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(m, p, _)| format!("{m} {p}"))
-                .collect()
-        }
-
-        /// The body of the nth request whose line contains `needle`.
-        fn body(&self, needle: &str) -> serde_json::Value {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(m, p, _)| format!("{m} {p}").contains(needle))
-                .unwrap_or_else(|| panic!("no request matching {needle:?} in {:?}", self.log()))
-                .2
-                .clone()
         }
     }
 
-    impl Service<Request<Body>> for Fake {
-        type Response = Response<Body>;
-        type Error = std::convert::Infallible;
-        type Future = std::pin::Pin<
-            Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
-        >;
-
-        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, req: Request<Body>) -> Self::Future {
-            let (calls, reply) = (self.calls.clone(), self.reply.clone());
-            Box::pin(async move {
-                let method = req.method().to_string();
-                let path = req.uri().path().to_owned();
-                let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-                let (code, out) = reply(&method, &path);
-                calls.lock().unwrap().push((method, path, body));
-                Ok(Response::builder()
-                    .status(code)
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&out).unwrap()))
-                    .unwrap())
-            })
-        }
+    /// Enough of a `MiraCluster` to deserialize, for the replies to
+    /// `patch_status`. Every other kind in this file has all-optional fields,
+    /// so `{"metadata":{}}` is a valid one of those.
+    fn cluster_doc() -> serde_json::Value {
+        json!({
+            "apiVersion": "mira.miradb.dev/v1alpha1",
+            "kind": "MiraCluster",
+            "metadata": {"name": "tel", "namespace": "ns"},
+            "spec": {
+                "image": "m:1", "replicas": 1, "maxReplicas": 5,
+                "storage": {"size": "1Gi"},
+            },
+        })
     }
 
     /// A cluster the API-level tests can reconcile: namespaced, with an offload
@@ -872,6 +802,7 @@ mod tests {
                 "PATCH /api/v1/namespaces/ns/configmaps/tel",
                 "PATCH /api/v1/namespaces/ns/services/tel-headless",
                 "PATCH /apis/apps/v1/namespaces/ns/statefulsets/tel",
+                "PATCH /apis/policy/v1/namespaces/ns/poddisruptionbudgets/tel",
                 "PATCH /api/v1/namespaces/ns/configmaps/tel-proxy",
                 "PATCH /api/v1/namespaces/ns/services/tel-proxy",
                 "PATCH /apis/apps/v1/namespaces/ns/deployments/tel-proxy",
@@ -887,13 +818,13 @@ mod tests {
 
     /// `proxy.replicas: 0` is a supported topology, not a degenerate one.
     #[tokio::test]
-    async fn a_tier_with_no_proxy_applies_only_its_own_three_objects() {
+    async fn a_tier_with_no_proxy_applies_only_its_own_four_objects() {
         let f = Fake::ok();
         let mut c = drainable();
         c.spec.proxy.replicas = 0;
         ensure(&f.ctx(), &c, "ns", 1).await.unwrap();
 
-        assert_eq!(f.log().len(), 3, "{:?}", f.log());
+        assert_eq!(f.log().len(), 4, "{:?}", f.log());
         assert!(!f.log().iter().any(|l| l.contains("proxy")));
     }
 
@@ -1178,6 +1109,43 @@ mod tests {
         // this line a failed drain un-wedges itself, and the pass after it can
         // pick the next replica down while this one's claim is still orphaned.
         assert_eq!(st["draining"], 2);
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+    }
+
+    /// The deadline is only half the fix. When Kubernetes gives up on a Job it
+    /// writes a `Failed` condition and *then* terminates the pods, so there is a
+    /// window — unbounded, if a pod is stuck terminating on an unreachable node
+    /// — where `status.failed` is still 0. Counting only failed pods reads that
+    /// as "still running": requeue every ten seconds, phase `Draining`, for
+    /// ever, over a drain the control plane has already abandoned.
+    #[tokio::test]
+    async fn a_drain_kubernetes_has_already_given_up_on_is_reported_as_failed() {
+        let f = Fake::new(|method, path| match (method, path) {
+            ("GET", p) if p.contains("/jobs/") => (
+                StatusCode::OK,
+                json!({"metadata": {"name": "tel-drain-2"}, "status": {"conditions": [{
+                    "type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+                    "message": "Job was active longer than specified deadline",
+                }]}}),
+            ),
+            (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+            _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+        });
+        let action = finish_drain(&f.ctx(), &drainable(), "ns", 2).await.unwrap();
+
+        assert!(
+            !f.log().iter().any(|l| l.starts_with("DELETE")),
+            "{:?}",
+            f.log()
+        );
+        let st = &f.body("/status")["status"];
+        assert_eq!(st["phase"], "Degraded");
+        assert_eq!(st["draining"], 2);
+        // The reason, not just the fact. "failed" sends an operator to a pod
+        // log; "DeadlineExceeded" tells them the log ends mid-copy and the
+        // deadline is the field to raise.
+        let msg = st["message"].as_str().unwrap();
+        assert!(msg.contains("DeadlineExceeded"), "{msg}");
         assert_eq!(action, Action::requeue(Duration::from_secs(300)));
     }
 

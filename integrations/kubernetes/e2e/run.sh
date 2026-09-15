@@ -189,6 +189,16 @@ helm upgrade --install mira-operator charts/mira-operator \
 	--set image.pullPolicy=Never \
 	--wait --timeout 120s
 
+# The lease, with the real RBAC and the real downward API behind it. The
+# operator reconciles either way if this rule or the POD_NAME env var is wrong
+# — it just stops being the only one that does, which nothing else here would
+# catch.
+kubectl -n mira-system wait --for=jsonpath='{.spec.holderIdentity}' \
+	lease/mira-operator --timeout=60s
+kubectl -n mira-system get lease/mira-operator \
+	-o jsonpath='{.spec.holderIdentity}' | grep -q '^mira-operator-'
+echo "ok: one operator holds the lease, under its own pod name"
+
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
 # ---------------------------------------------------------------------------
@@ -199,8 +209,9 @@ sed "s|image: mira:e2e|image: $ENGINE_IMAGE|" "$here/miracluster.yaml" | kubectl
 until_eq 300 '{.status.readyReplicas}' 2 statefulset/tel
 until_eq 180 '{.status.readyReplicas}' 1 deployment/tel-proxy
 # Applied by the operator and by nothing else: the CR named none of these.
-kubectl -n "$NS" get configmap/tel configmap/tel-proxy service/tel-headless service/tel-proxy >/dev/null
-echo "ok: StatefulSet 2/2, proxy 1/1, four generated objects present"
+kubectl -n "$NS" get configmap/tel configmap/tel-proxy service/tel-headless service/tel-proxy \
+	poddisruptionbudget/tel >/dev/null
+echo "ok: StatefulSet 2/2, proxy 1/1, five generated objects present"
 
 # ---------------------------------------------------------------------------
 say "B — a stock collector exports into it, and all three signals come back"

@@ -15,7 +15,7 @@
 // here: `mod controller;` in a bin that also has a `[lib]` compiles the whole
 // crate a second time, and `cargo test` then runs every unit test twice under
 // two target names. Same binary, half the build.
-use mira_operator::controller;
+use mira_operator::{controller, lease};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +30,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `~/.kube/config` when run on a laptop. The fallback is what makes
     // `cargo run` against a kind cluster the inner loop.
     let client = kube::Client::try_default().await?;
+
+    // Before the controller and not beside it. A standby waits here rather
+    // than reconciling and discovering afterwards that it should not have —
+    // see `lease.rs` for what two controllers do to one tier, and for the two
+    // things this does not cover.
+    let ns = client.default_namespace().to_string();
+    let l = lease::Lease::new(&client, &ns, lease::identity());
+    l.hold().await?;
+    tokio::spawn(l.renew_forever());
+
     tracing::info!("mira-operator watching MiraCluster resources");
     controller::run(client).await?;
     Ok(())

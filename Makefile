@@ -742,6 +742,65 @@ operator-e2e: ## The operator against a real cluster: Kind, a stock collector, a
 operator: operator-fmt-check operator-lint operator-test operator-coverage operator-crd-check ## Every operator gate
 
 # ---------------------------------------------------------------------------
+# Prose — the markup, the words, and the shape of a page
+# ---------------------------------------------------------------------------
+
+# Every Markdown file the repository tracks, minus the five symlinks under
+# docs/: their targets are already in the list, and linting both ends reports
+# every finding twice at a path you cannot fix it at.
+#
+# One list, not three. markdownlint, Vale and `xtask prose` all need the same
+# answer to "which pages did we write", and a scope written out once per tool
+# is a scope that disagrees with itself by the third release. Recursive `=`, so
+# a make invocation that touches no prose does not shell out to git.
+PROSE = $(shell git ls-files '*.md' | while read -r f; do [ -L "$$f" ] || echo "$$f"; done)
+
+# The pages nobody writes. `xtask prose` budgets authored prose, and a budget
+# on a generator's output is a budget on the surface it renders: a new CLI flag
+# would fail the gate, and the only way to pass would be to delete the flag or
+# to stop documenting it. The markup and the words are still checked on all
+# four, which is what catches a generator emitting marketing or a broken table.
+#
+#   CHANGELOG.md                  changesets, from .changeset/*.md
+#   charts/mira-operator/README.md  helm-docs, from values.yaml
+#   docs/reference/*.md           xtask reference, from the code
+GENERATED = CHANGELOG.md charts/mira-operator/README.md docs/reference/cli.md \
+            docs/reference/http.md
+
+.PHONY: docs-check
+docs-check: node_modules ## Markdown structure, prose style, and the shape of a page
+	@# Three gates, none of them a model, all of them reproducible on a laptop:
+	@#
+	@#   markdownlint   the markup — one table style, every fence labelled
+	@#   vale           the words — marketing, filler, terminology
+	@#   xtask prose    the shape — page, section and sentence length, depth
+	@#
+	@# The split is not arbitrary. markdownlint cannot see a word and Vale
+	@# cannot see a page, and the thing this repository actually kept getting
+	@# wrong was the page: eight thousand words under one heading passes both.
+	@# Rule configuration lives in .markdownlint-cli2.yaml and .vale/styles/Mira.
+	$(call need_bin,vale,brew install vale   (see https://vale.sh/docs/install))
+	npx markdownlint-cli2 $(PROSE)
+	vale $(PROSE)
+	$(XTASK) prose $(filter-out $(GENERATED),$(PROSE))
+
+# markdownlint is pinned in package.json beside @changesets/cli, which is the
+# only reason there is a package.json at the root at all. A stamp target rather
+# than `npm ci` in the recipe: `docs-check` is in `check`, and reinstalling
+# node_modules on every run is how a gate becomes the slow one nobody runs.
+node_modules: package.json package-lock.json
+	npm ci --silent
+	@touch $@
+
+.PHONY: market
+market: ## Rewrite the market page's claim tally from its own tables
+	$(XTASK) market render
+
+.PHONY: market-check
+market-check: ## That tally is still what the tables add up to
+	$(XTASK) market
+
+# ---------------------------------------------------------------------------
 # Documentation site
 # ---------------------------------------------------------------------------
 
@@ -875,12 +934,12 @@ helm-schema: ## values.schema.json parses, admits the defaults, and refuses a ty
 	@# perfectly. So assert the refusals — a bound, an enum, an empty list, an
 	@# empty string, and a plain typo in a key name.
 	@#
-	@# `replicaCount=2` is the one that matters: there is no leader election in
-	@# the tree, so a second controller is a second independent scaling decision
-	@# on the same tier. The schema is what stops it, and this is what proves
-	@# the schema is loaded at all.
-	@for bad in replicaCount=2 \
-	            replicaCount=0 \
+	@# `replicaCount=0` is the one that matters: the operator's lease makes a
+	@# second replica a warm standby rather than a second scaling decision, so
+	@# the ceiling came off — but zero operators is a tier that silently stops
+	@# scaling, and a Deployment scaled to zero looks installed.
+	@for bad in replicaCount=0 \
+	            replicaCount=1.5 \
 	            image.pullPolicy=Sometimes \
 	            rbac.namespaces={} \
 	            logLevel= \
@@ -913,7 +972,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check market-check docs-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 

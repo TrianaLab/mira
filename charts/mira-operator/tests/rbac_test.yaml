@@ -51,17 +51,20 @@ tests:
       - notContains:
           path: rules[6].verbs
           content: delete
-      - equal:
-          path: rules[7].resources[0]
-          value: persistentvolumeclaims
-      - contains:
+      - notContains:
           path: rules[7].verbs
           content: delete
       - equal:
           path: rules[8].resources[0]
-          value: jobs
+          value: persistentvolumeclaims
       - contains:
           path: rules[8].verbs
+          content: delete
+      - equal:
+          path: rules[9].resources[0]
+          value: jobs
+      - contains:
+          path: rules[9].verbs
           content: delete
 
   # The assertions above name the rules that matter; this one freezes the rest.
@@ -151,7 +154,7 @@ tests:
           path: rules[4].resources
           content: statefulsets/scale
       - equal:
-          path: rules[7].resources[0]
+          path: rules[8].resources[0]
           value: persistentvolumeclaims
 
   # The binding has to point at the operator's own namespace even when the Role

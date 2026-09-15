@@ -38,6 +38,10 @@ rather than succeed.
 - apiGroups: [""]
   resources: ["services", "configmaps"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
+# The budget that caps how much of a tier one node drain may evict at once.
+- apiGroups: ["policy"]
+  resources: ["poddisruptionbudgets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 # Read-only. The operator never creates a pod directly; the StatefulSet does.
 - apiGroups: [""]
   resources: ["pods"]
@@ -50,6 +54,12 @@ rather than succeed.
 - apiGroups: ["batch"]
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete"]
+# One writer. The operator holds a Lease in its own namespace for as long as it
+# is the one reconciling; see `lease.rs`. Namespaced like everything else here,
+# which is also its limit: two separate cluster-wide installs hold two leases.
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
 # Events, so `kubectl describe miracluster` explains itself.
 - apiGroups: [""]
   resources: ["events"]

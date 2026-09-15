@@ -86,6 +86,7 @@ spec:
                   that is filling, and a runaway ingest with no ceiling turns one full
                   volume into every volume.
                 format: int32
+                minimum: 1.0
                 type: integer
               offload:
                 description: |-
@@ -125,11 +126,13 @@ spec:
                 default: 1
                 description: Replica floor. The tier never shrinks below this.
                 format: int32
+                minimum: 1.0
                 type: integer
               scaling:
                 default:
                   cooldownSeconds: 600
                   downWhenFreeAbove: 0.6
+                  drainDeadlineSeconds: 3600
                   upWhenFreeBelow: 0.15
                 description: When to add a replica, and when to take one away.
                 properties:
@@ -155,6 +158,25 @@ spec:
                       moves the whole dataset of one replica through `offload push`.
                     format: double
                     type: number
+                  drainDeadlineSeconds:
+                    default: 3600
+                    description: |-
+                      Seconds a drain Job may run before Kubernetes fails it.
+
+                      `backoffLimit` bounds how many times the drain is *retried*, not how
+                      long one attempt runs. A copy blocked on an unresponsive cold store
+                      stays `active` indefinitely, and the reconcile that is waiting on it has
+                      nothing to wait *for* — the tier sits at `Draining` with one replica
+                      already gone and no signal that anything is wrong.
+
+                      An hour by default, which is a copy rate rather than a guess: it is a
+                      100 GiB volume at 30 MB/s, the low end of a network-backed cold store.
+                      Raise it for a volume that cannot finish in that, because the cost of a
+                      deadline that is too short is a `Degraded` tier with its blocks intact,
+                      and the cost of one that is too long is only that the operator notices
+                      later.
+                    format: int64
+                    type: integer
                   upWhenFreeBelow:
                     default: 0.15
                     description: |-
@@ -228,6 +250,9 @@ spec:
         - spec
         title: MiraCluster
         type: object
+        x-kubernetes-validations:
+        - message: maxReplicas must be at least replicas
+          rule: self.spec.maxReplicas >= self.spec.replicas
     served: true
     storage: true
     subresources:

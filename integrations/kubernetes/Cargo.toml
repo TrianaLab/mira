@@ -70,4 +70,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # that issues an API call stays untested.
 [dev-dependencies]
 http = "1.5.0"
+# `start_paused`, so a test of the standby poll loop advances tokio's clock
+# instead of sleeping through it. Feature-only on a crate already here.
+tokio = { version = "1.53.1", features = ["test-util"] }
 tower = "0.5.3"

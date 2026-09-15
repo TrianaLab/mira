@@ -30,8 +30,7 @@
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 1,
-      "description": "Exactly one. There is no leader election in the tree (kube-rs/kube#485), so a second controller is a second independent scaling decision on the same tier. Bounded here rather than warned about, because the failure is a tier that moves two replicas for one decision and then drains a volume it did not need to."
+      "description": "One is enough. Extras are warm standbys, not extra capacity: a coordination.k8s.io Lease means exactly one of them reconciles and the rest wait. Raise it to shorten the gap after a node failure, not to go faster."
     },
     "rbac": {
       "type": "object",

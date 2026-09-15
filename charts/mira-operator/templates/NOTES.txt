@@ -40,7 +40,6 @@ reconcile unless a ClusterRole and binding already exist for service account
 {{- end }}
 {{- if gt (int .Values.replicaCount) 1 }}
 
-WARNING: replicaCount is {{ .Values.replicaCount }}. There is no leader election, so every
-replica reconciles every MiraCluster and each one decides to scale independently
-— one scale decision would move several replicas. Set replicaCount: 1.
+NOTE: replicaCount is {{ .Values.replicaCount }}. One holds the lease and reconciles; the rest
+stand by. That shortens the gap after a node failure and adds no throughput.
 {{- end }}

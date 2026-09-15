@@ -15,11 +15,11 @@ nameOverride: ""
 # -- Overrides the full generated resource name.
 fullnameOverride: ""
 
-# -- Replicas. One, and raising it does nothing useful: there is no leader
-# election in the tree (kube-rs has never shipped one — kube-rs/kube#485, open
-# since 2021), so two controllers would both reconcile every MiraCluster and
-# both decide to scale it. The Deployment's `Recreate` strategy below is the
-# other half of that: a rolling update would briefly run two.
+# -- Replicas. Extras are warm standbys, not extra capacity: a
+# `coordination.k8s.io` Lease means exactly one reconciles and the rest wait.
+# Raise it to shorten the gap after a node failure, not to go faster. The
+# Deployment's `Recreate` strategy is the other half — the lease makes an
+# overlap survivable, Recreate makes upgrades not pay for one.
 replicaCount: 1
 
 rbac:

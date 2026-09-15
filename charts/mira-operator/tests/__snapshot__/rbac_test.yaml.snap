@@ -57,6 +57,17 @@ grants exactly this list and nothing more:
         - update
         - patch
     - apiGroups:
+        - policy
+      resources:
+        - poddisruptionbudgets
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+    - apiGroups:
         - ""
       resources:
         - pods
@@ -83,6 +94,14 @@ grants exactly this list and nothing more:
         - watch
         - create
         - delete
+    - apiGroups:
+        - coordination.k8s.io
+      resources:
+        - leases
+      verbs:
+        - get
+        - create
+        - update
     - apiGroups:
         - ""
       resources:

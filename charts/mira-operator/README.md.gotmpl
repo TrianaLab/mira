@@ -119,7 +119,7 @@ reports `Degraded` rather than acting on it.
 ## What a scale-in actually does
 
 `spec.offload` is **required** before the operator will ever shrink a tier, and
-unset it simply never does. The cost of not shrinking is a bill; the cost of
+unset it never does. The cost of not shrinking is a bill; the cost of
 shrinking without an archive is the data.
 
 It never travels alone. `file://` is the only scheme Mira's offload target
@@ -147,7 +147,7 @@ again only after a deliberate `mira offload restore`. That is section 12.4's
 "No rebalancing, ever" rather than an omission — and the same `ReadWriteOnce`
 constraint that forced the order above forbids the reverse: a restore has to
 mount a *surviving* replica's volume, which its running pod holds. Automating it
-would mean taking a healthy replica down in order to grow it.
+would mean taking a healthy replica down to grow it.
 
 ## Permissions
 
@@ -161,12 +161,23 @@ Set `rbac.namespaces` to a list to get a `Role` in each instead of one
 
 ## Replicas
 
-`replicaCount` is bounded to exactly 1 by `values.schema.json`, and the
-Deployment's strategy is `Recreate`. There is no leader election — kube-rs has
-never shipped one ([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485),
-open since 2021) — so two controllers would both reconcile every `MiraCluster`
-and both act on the same reading, moving two replicas for one decision. A moment
-with no controller is safe; Mira keeps serving either way.
+Exactly one operator reconciles at a time, held by a `coordination.k8s.io`
+Lease in the release namespace. kube-rs ships no election
+([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485), open since
+2021), so the operator holds its own: extra replicas stand by and take over
+when the holder stops renewing. Two controllers acting on the same reading
+would move two replicas for one decision.
+
+It is soft, in two ways worth knowing. A holder whose renewal is stuck can
+still be inside a reconcile when a standby's clock says the lease expired —
+there is no fencing token to prevent that, so the window is seconds after a
+failure rather than never. And the Lease is per-release while the watch is
+cluster-wide, so *two installs* in two namespaces hold two leases and both
+reconcile everything. Install the operator once.
+
+`Recreate` rather than a rolling update, so an upgrade does not pay the standby
+wait every time. A moment with no controller is safe; Mira keeps serving either
+way.
 
 ## Verifying the chart
 
@@ -177,6 +188,21 @@ cosign verify \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
   ghcr.io/trianalab/charts/mira-operator:{{ template "chart.version" . }}
 ```
+
+{{/*
+The built-in `chart.valuesTable` writes its delimiter row as `|-----|------|`,
+which is the one table style in this tree that MD060 rejects — and the README is
+generated, so there is nothing to fix in the file itself. A definition here wins
+over the one helm-docs registers, so this is the built-in with that row respelled
+and nothing else changed.
+*/}}
+{{ define "chart.valuesTable" }}
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+{{- range .Values }}
+| {{ .Key }} | {{ .Type }} | {{ if .Default }}{{ .Default }}{{ else }}{{ .AutoDefault }}{{ end }} | {{ if .Description }}{{ .Description }}{{ else }}{{ .AutoDescription }}{{ end }} |
+{{- end }}
+{{ end }}
 
 {{ template "chart.valuesSection" . }}
 

@@ -125,6 +125,7 @@ fn spec() -> MiraClusterSpec {
             up_when_free_below: 0.11,
             down_when_free_above: 0.77,
             cooldown_seconds: 42,
+            drain_deadline_seconds: 900,
         },
         offload: Some("file:///cold/${node}".into()),
         cold_storage_claim: Some("mira-cold".into()),
@@ -165,6 +166,47 @@ async fn every_spec_field_survives_a_round_trip_through_the_schema() {
         serde_json::to_value(&want).unwrap(),
         "apiextensions pruned a field the CRD does not describe; run `make operator-crd`"
     );
+
+    drop_namespace(&client, ns).await;
+}
+
+/// A ceiling below the floor never becomes an object.
+///
+/// `MiraClusterSpec::validate` refuses it too, and that is the wrong place for
+/// it to be refused *first*: `kubectl apply` would return 201, the tier would
+/// keep running whatever it was already running, and the only record that the
+/// edit did nothing is a `Degraded` phase the person who typed it has to know
+/// to go and read. The CEL rule moves the refusal into the apply.
+///
+/// Only a real apiserver can answer this. `x-kubernetes-validations` is
+/// evaluated by apiextensions and by nothing in this crate, so a rule with a
+/// typo in it — `self.maxReplicas` against a root schema where `self` is the
+/// whole resource — generates, installs and silently never fires.
+#[tokio::test]
+async fn a_ceiling_below_the_floor_is_refused_by_the_apiserver() {
+    let Some(client) = client().await else { return };
+    let ns = "mira-test-ceiling";
+    let api = namespace(&client, ns).await;
+
+    let mut bad = spec();
+    bad.replicas = 5;
+    bad.max_replicas = 3;
+    let e = api
+        .create(&PostParams::default(), &MiraCluster::new("tel", bad))
+        .await
+        .expect_err("the API server accepted a ceiling below the floor")
+        .to_string();
+    assert!(e.contains("maxReplicas must be at least replicas"), "{e}");
+
+    // And the floor itself, which is a plain `minimum` rather than a rule.
+    let mut bad = spec();
+    bad.replicas = 0;
+    let e = api
+        .create(&PostParams::default(), &MiraCluster::new("tel", bad))
+        .await
+        .expect_err("the API server accepted a tier of no replicas")
+        .to_string();
+    assert!(e.contains("replicas"), "{e}");
 
     drop_namespace(&client, ns).await;
 }

@@ -9,5 +9,8 @@
 
 pub mod controller;
 pub mod crd;
+#[cfg(test)]
+mod fake;
+pub mod lease;
 pub mod resources;
 pub mod stats;

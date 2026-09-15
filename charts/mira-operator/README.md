@@ -119,7 +119,7 @@ reports `Degraded` rather than acting on it.
 ## What a scale-in actually does
 
 `spec.offload` is **required** before the operator will ever shrink a tier, and
-unset it simply never does. The cost of not shrinking is a bill; the cost of
+unset it never does. The cost of not shrinking is a bill; the cost of
 shrinking without an archive is the data.
 
 It never travels alone. `file://` is the only scheme Mira's offload target
@@ -147,7 +147,7 @@ again only after a deliberate `mira offload restore`. That is section 12.4's
 "No rebalancing, ever" rather than an omission — and the same `ReadWriteOnce`
 constraint that forced the order above forbids the reverse: a restore has to
 mount a *surviving* replica's volume, which its running pod holds. Automating it
-would mean taking a healthy replica down in order to grow it.
+would mean taking a healthy replica down to grow it.
 
 ## Permissions
 
@@ -161,12 +161,23 @@ Set `rbac.namespaces` to a list to get a `Role` in each instead of one
 
 ## Replicas
 
-`replicaCount` is bounded to exactly 1 by `values.schema.json`, and the
-Deployment's strategy is `Recreate`. There is no leader election — kube-rs has
-never shipped one ([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485),
-open since 2021) — so two controllers would both reconcile every `MiraCluster`
-and both act on the same reading, moving two replicas for one decision. A moment
-with no controller is safe; Mira keeps serving either way.
+Exactly one operator reconciles at a time, held by a `coordination.k8s.io`
+Lease in the release namespace. kube-rs ships no election
+([kube-rs/kube#485](https://github.com/kube-rs/kube/issues/485), open since
+2021), so the operator holds its own: extra replicas stand by and take over
+when the holder stops renewing. Two controllers acting on the same reading
+would move two replicas for one decision.
+
+It is soft, in two ways worth knowing. A holder whose renewal is stuck can
+still be inside a reconcile when a standby's clock says the lease expired —
+there is no fencing token to prevent that, so the window is seconds after a
+failure rather than never. And the Lease is per-release while the watch is
+cluster-wide, so *two installs* in two namespaces hold two leases and both
+reconcile everything. Install the operator once.
+
+`Recreate` rather than a rolling update, so an upgrade does not pay the standby
+wait every time. A moment with no controller is safe; Mira keeps serving either
+way.
 
 ## Verifying the chart
 
@@ -181,7 +192,7 @@ cosign verify \
 ## Values
 
 | Key | Type | Default | Description |
-|-----|------|---------|-------------|
+| --- | --- | --- | --- |
 | affinity | object | `{}` | Affinity. |
 | fullnameOverride | string | `""` | Overrides the full generated resource name. |
 | image.pullPolicy | string | `"IfNotPresent"` | Pull policy. |
@@ -196,7 +207,7 @@ cosign verify \
 | podSecurityContext | object | `{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod-level security context. The operator writes nothing and needs no identity beyond its token. |
 | rbac.create | bool | `true` | Create the ClusterRole and binding the operator needs. |
 | rbac.namespaces | list | `[]` | Restrict the operator to a list of namespaces by creating a Role in each instead of one ClusterRole. Empty means cluster-wide. |
-| replicaCount | int | `1` | Replicas. One, and raising it does nothing useful: there is no leader election in the tree (kube-rs has never shipped one — kube-rs/kube#485, open since 2021), so two controllers would both reconcile every MiraCluster and both decide to scale it. The Deployment's `Recreate` strategy below is the other half of that: a rolling update would briefly run two. |
+| replicaCount | int | `1` | Replicas. Extras are warm standbys, not extra capacity: a `coordination.k8s.io` Lease means exactly one reconciles and the rest wait. Raise it to shorten the gap after a node failure, not to go faster. The Deployment's `Recreate` strategy is the other half — the lease makes an overlap survivable, Recreate makes upgrades not pay for one. |
 | resources | object | `{"limits":{"memory":"128Mi"},"requests":{"cpu":"10m","memory":"64Mi"}}` | Resource requests and limits. The controller is idle between reconciles; the ceiling exists to make it evictable rather than because it is reached. |
 | securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context. |
 | serviceAccount.annotations | object | `{}` | Annotations for the ServiceAccount (IRSA, Workload Identity). |

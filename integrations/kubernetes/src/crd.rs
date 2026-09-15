@@ -58,7 +58,23 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".status.replicas"}"#,
     printcolumn = r#"{"name":"Free","type":"string","jsonPath":".status.freeFraction"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
+    // Enforced by the apiserver, not only by `validate()`. Both exist and they
+    // are not redundant: a rule here rejects the `kubectl apply` itself, where
+    // the reconciler can only accept the object and write `Degraded` on its
+    // next pass — so whoever applied a ceiling below the floor learns it from
+    // the command they typed rather than from a status field they have to know
+    // to read. `validate()` stays because the apiserver is not guaranteed to
+    // have evaluated this: a CR created before the rule was added is already
+    // stored, and CEL cost limits can make a rule non-enforcing at admission.
+    //
+    // `self.spec` and not `self`: kube-derive attaches a struct-level rule to
+    // the *root* schema, where `self` is the whole custom resource. `spec` is
+    // in the root's `required`, and both fields have schema defaults that the
+    // apiserver applies before it evaluates this, so the two lookups cannot be
+    // missing.
+    validation = Rule::new("self.spec.maxReplicas >= self.spec.replicas")
+        .message("maxReplicas must be at least replicas")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct MiraClusterSpec {
@@ -72,6 +88,7 @@ pub struct MiraClusterSpec {
 
     /// Replica floor. The tier never shrinks below this.
     #[serde(default = "default_replicas")]
+    #[schemars(range(min = 1))]
     pub replicas: i32,
 
     /// Replica ceiling. Scale-out stops here rather than filling the cluster.
@@ -80,6 +97,7 @@ pub struct MiraClusterSpec {
     /// that is filling, and a runaway ingest with no ceiling turns one full
     /// volume into every volume.
     #[serde(default = "default_max_replicas")]
+    #[schemars(range(min = 1))]
     pub max_replicas: i32,
 
     /// Per-replica volume.
@@ -177,6 +195,23 @@ pub struct Scaling {
     /// that window is acting on a reading that predates the last decision.
     #[serde(default = "default_cooldown")]
     pub cooldown_seconds: i64,
+
+    /// Seconds a drain Job may run before Kubernetes fails it.
+    ///
+    /// `backoffLimit` bounds how many times the drain is *retried*, not how
+    /// long one attempt runs. A copy blocked on an unresponsive cold store
+    /// stays `active` indefinitely, and the reconcile that is waiting on it has
+    /// nothing to wait *for* — the tier sits at `Draining` with one replica
+    /// already gone and no signal that anything is wrong.
+    ///
+    /// An hour by default, which is a copy rate rather than a guess: it is a
+    /// 100 GiB volume at 30 MB/s, the low end of a network-backed cold store.
+    /// Raise it for a volume that cannot finish in that, because the cost of a
+    /// deadline that is too short is a `Degraded` tier with its blocks intact,
+    /// and the cost of one that is too long is only that the operator notices
+    /// later.
+    #[serde(default = "default_drain_deadline")]
+    pub drain_deadline_seconds: i64,
 }
 
 /// The stateless read tier.
@@ -235,6 +270,9 @@ fn default_proxy_replicas() -> i32 {
 fn default_cooldown() -> i64 {
     600
 }
+fn default_drain_deadline() -> i64 {
+    3600
+}
 
 // 0.15/0.60 rather than something tighter. `free_fraction` is whole-filesystem,
 // so it moves when anything else on the volume moves, and the band has to be
@@ -255,6 +293,7 @@ impl Default for Scaling {
             up_when_free_below: default_scale_up_below(),
             down_when_free_above: default_scale_down_above(),
             cooldown_seconds: default_cooldown(),
+            drain_deadline_seconds: default_drain_deadline(),
         }
     }
 }

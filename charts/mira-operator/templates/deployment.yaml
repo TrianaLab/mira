@@ -6,11 +6,12 @@ metadata:
     {{- include "mira-operator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  # `Recreate`, not the default rolling update. There is no leader election, so
-  # the overlap a rolling update creates is two controllers reconciling the same
-  # MiraCluster — and both would read the same `free_fraction`, both decide to
-  # scale, and the tier would move two replicas for one decision. A moment of
-  # no controller is safe; Mira keeps serving either way.
+  # `Recreate`, not the default rolling update. The Lease means an overlap is
+  # survivable — the new pod waits in standby rather than reconciling — but the
+  # wait costs up to the lease duration on every upgrade, and a rolling update
+  # would pay it every time. Recreate ends the old pod first, so the lease is
+  # already stale when the new one looks. A moment of no controller is safe;
+  # Mira keeps serving either way.
   strategy:
     type: Recreate
   selector:
@@ -48,6 +49,14 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Who the Lease records as its holder. Without it the operator
+            # falls back to a pid, which is not unique across pods and makes
+            # `kubectl get lease` useless for the one question it is there to
+            # answer.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:

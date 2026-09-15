@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::ObjectMeta;
 use kube::{Resource, ResourceExt};
 use serde_json::json;
@@ -235,6 +236,32 @@ pub fn proxy_service(c: &MiraCluster) -> Service {
     .expect("proxy service is well-formed")
 }
 
+/// What a node drain is allowed to take from the tier at once.
+///
+/// One replica. Its volume holds blocks no other replica has, nothing
+/// replicates and nothing rebalances (architecture.md section 12.4), so an
+/// eviction is a hole in the corpus until the claim rebinds and the pod
+/// replays. Two at once is two holes, and a node running two of the tier's
+/// pods is the normal case rather than an unlucky one.
+///
+/// `maxUnavailable` and not `minAvailable`, which reads more naturally and is
+/// wrong here: `minAvailable: 1` against the single-replica tier that is the
+/// CRD's default permits no disruption at all, and a node drain then blocks
+/// for ever on a pod the eviction API will never release.
+pub fn pod_disruption_budget(c: &MiraCluster) -> PodDisruptionBudget {
+    serde_json::from_value(json!({
+        "metadata": meta(c, c.name_any(), "storage"),
+        "spec": {
+            "maxUnavailable": 1,
+            // The StatefulSet's own selector, which is the immutable subset —
+            // widened to the proxy's pods as well the budget would stall a node
+            // drain on a tier perfectly happy to lose a stateless replica.
+            "selector": {"matchLabels": selector(c)},
+        },
+    }))
+    .expect("pod disruption budget is well-formed")
+}
+
 pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
     let mut pod_labels = selector(c);
     pod_labels.insert("app.kubernetes.io/component".into(), "storage".into());
@@ -404,6 +431,14 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
             // Retrying forever would hide a full archive behind a Job that
             // looks busy.
             "backoffLimit": 3,
+            // The other half of that, and the one `backoffLimit` does not
+            // cover: it bounds *attempts*, not how long one runs. A copy
+            // blocked on an unresponsive cold store never fails and never
+            // finishes, so the reconcile requeues every ten seconds against a
+            // tier that is one replica down and reports `Draining` for ever.
+            // Past the deadline Kubernetes fails the Job itself, which is the
+            // existing `Degraded` path with the volume kept.
+            "activeDeadlineSeconds": c.spec.scaling.drain_deadline_seconds,
             "template": {
                 "metadata": {"labels": labels(c, "drain")},
                 "spec": {
@@ -436,6 +471,7 @@ mod tests {
     use super::*;
     use crate::crd::{MiraClusterSpec, Proxy, Scaling, Storage};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     fn cluster() -> MiraCluster {
         let mut c = MiraCluster::new(
@@ -509,6 +545,7 @@ mod tests {
             config_map(&c).metadata.owner_references,
             proxy_config_map(&c, 1).metadata.owner_references,
             drain_job(&c, 2, "file:///cold").metadata.owner_references,
+            pod_disruption_budget(&c).metadata.owner_references,
         ];
         for o in owners {
             let o = o.expect("ownerReferences");
@@ -659,5 +696,45 @@ mod tests {
         // directory it does not recognise and pushes nothing.
         let env = pod.containers[0].env.clone().unwrap();
         assert_eq!(env[0].value.as_deref(), Some("tel-4"));
+    }
+
+    /// A drain with no deadline is a scale-in that never ends. `backoffLimit`
+    /// bounds *retries*, not the run: a copy blocked on an unresponsive cold
+    /// store stays `active` for ever, the reconcile requeues every ten seconds
+    /// for ever, and the phase reads `Draining` the whole time with nothing
+    /// anywhere recording how long it has been doing that.
+    #[test]
+    fn a_drain_job_has_a_deadline_so_a_hung_copy_cannot_run_for_ever() {
+        let spec = drain_job(&cluster(), 4, "file:///cold").spec.unwrap();
+        assert_eq!(spec.active_deadline_seconds, Some(3600));
+
+        let mut c = cluster();
+        c.spec.scaling.drain_deadline_seconds = 90;
+        let spec = drain_job(&c, 4, "file:///cold").spec.unwrap();
+        assert_eq!(spec.active_deadline_seconds, Some(90));
+    }
+
+    /// Without a budget, `kubectl drain` on a node running two replicas evicts
+    /// both, and each one's blocks are the only copy there is — nothing
+    /// replicates and nothing rebalances, so two evictions is two holes in the
+    /// corpus for as long as the volumes take to rebind.
+    ///
+    /// `maxUnavailable` and not `minAvailable`, which reads more naturally and
+    /// is wrong here: `minAvailable: 1` on the single-replica tier that is the
+    /// CRD's default allows no disruption at all, and a node drain against it
+    /// blocks for ever on a pod the eviction API will never release.
+    #[test]
+    fn a_node_drain_may_take_one_replica_at_a_time_and_not_the_tier() {
+        let b = pod_disruption_budget(&cluster());
+        let spec = b.spec.expect("spec");
+        assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
+        assert_eq!(spec.min_available, None);
+
+        // The storage pods, and only those. The selector has to be the
+        // StatefulSet's own or the budget guards nothing; widened to the
+        // proxy's pods as well it would let a node drain stall on a tier that
+        // is perfectly happy to lose a stateless replica.
+        let want = selector(&cluster());
+        assert_eq!(spec.selector.expect("selector").match_labels, Some(want));
     }
 }
