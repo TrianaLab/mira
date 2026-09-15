@@ -452,6 +452,30 @@ fn parse_dir_name(name: &str) -> Option<(i64, i64, u32, u64, u64)> {
     Some((min, max, node, seq, wal_hi))
 }
 
+/// The same block name, saying it covers no log.
+///
+/// [`crate::offload::Target::pull`] lands blocks written by a volume that is
+/// gone. `wal_hi` is a position in *that* volume's log, and the log it arrives
+/// beside starts at sequence 0 — a re-created pod, a new claim — while
+/// [`wal_watermarks`] filters only by node, which is a hash of `--node` and so
+/// survives the re-creation. Kept as written, the restored name tells the fresh
+/// log that thousands of frames it has not issued yet are already published,
+/// and the next replay skips them.
+///
+/// Zero is what the four-field names that predate the log already mean, and
+/// [`publish`] states the rule: too high is silent loss, too low is a
+/// re-ingest.
+///
+/// A name `parse_dir_name` rejects is returned unchanged: it is not a block, so
+/// `scan` will not see it either way, and inventing a name for it here would be
+/// the only place in the tree that renames something it cannot read.
+pub fn name_covering_no_log(name: &str) -> String {
+    match parse_dir_name(name) {
+        Some((min_ts, max_ts, node, seq, _)) => dir_name(min_ts, max_ts, node, seq, 0),
+        None => name.to_string(),
+    }
+}
+
 fn fsync_dir(path: &Path) -> Result<()> {
     crate::sync_all(&File::open(path).ctx(path)?).ctx(path)
 }

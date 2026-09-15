@@ -491,14 +491,21 @@ impl Wal {
         // twenty bytes would double the memcpy the ingest path is already
         // trying not to pay twice.
         //
-        // A short write partway through leaves a torn frame at the tail, which
-        // is the case `FrameReader` is built to stop at. It cannot corrupt a
-        // frame that was already complete, because the file is opened in
-        // append mode and nothing rewrites what is behind the offset.
+        // A failure part-way leaves a torn frame — the case `FrameReader` is
+        // built to stop at — and nothing here can know how many bytes got out.
+        // So the segment ends at it: `written` is forced past the roll
+        // threshold, the next append opens a new file, and the tear is the
+        // *tail* that `open` and `replay` both already handle. Leaving it
+        // where it is instead buries every frame appended behind it, and those
+        // frames were acknowledged 200.
         let t_write = std::time::Instant::now();
-        inner.file.write_all(&header).ctx(&inner.path)?;
-        inner.file.write_all(body).ctx(&inner.path)?;
-        inner.file.write_all(&crc.to_le_bytes()).ctx(&inner.path)?;
+        for part in [&header[..], body, &crc.to_le_bytes()[..]] {
+            let wrote = inner.file.write_all(part);
+            if wrote.is_err() {
+                inner.written = SEGMENT_BYTES;
+            }
+            wrote.ctx(&inner.path)?;
+        }
         crate::diag::WAL_WRITE.record(t_write.elapsed().as_nanos() as u64);
 
         inner.written += (HEADER_LEN + body.len() + CRC_LEN) as u64;
@@ -1285,6 +1292,53 @@ mod tests {
         // A watermark past seq 0 therefore retires the whole segment.
         assert_eq!(wal.truncate(1).unwrap(), 1);
         assert!(!first.exists(), "a tear is not a reason to keep the file");
+    }
+
+    /// A tear only stops at the tail if something stops the segment there.
+    ///
+    /// `write_all` can fail with the header already durable — ENOSPC on a
+    /// volume the free-space floor has not caught, EDQUOT, EIO — and the frame
+    /// is then correctly refused. But `written` and `next_seq` never advanced,
+    /// so the *next* append does not roll: it writes a whole frame behind the
+    /// tear, returns `Ok`, and is acknowledged 200. Every reader stops at the
+    /// tear, so that frame is gone. Silent loss of acked data, which is the one
+    /// failure this log exists to prevent, and the comment above the writes
+    /// claimed it could not happen.
+    #[test]
+    fn a_failed_write_ends_the_segment_rather_than_burying_what_follows() {
+        const TORN: &[u8] = b"the write that failed";
+        let root = tmpdir("torn-mid-segment");
+        let wal = Wal::open(&root, 0x5e).unwrap();
+        wal.append(Signal::Logs, b"acked-before").unwrap(); // seq 0
+        wal.append(Signal::Logs, TORN).unwrap(); // seq 1
+        wal.sync().unwrap();
+        let seg = wal.inner.lock().unwrap().path.clone();
+
+        // Chop seq 1's body and checksum: byte for byte what a `write_all` that
+        // failed after the header leaves durable.
+        let len = fs::metadata(&seg).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&seg)
+            .unwrap()
+            .set_len(len - (TORN.len() + CRC_LEN) as u64)
+            .unwrap();
+
+        // And the error that left it, from a handle nothing can be written to.
+        wal.inner.lock().unwrap().file = File::open(&seg).unwrap();
+        assert!(wal.append(Signal::Logs, b"refused").is_err());
+
+        // The condition clearing — the volume grew, the quota was raised. The
+        // log is still open on the segment it tore, which is the whole problem.
+        wal.inner.lock().unwrap().file = OpenOptions::new().append(true).open(&seg).unwrap();
+        wal.append(Signal::Logs, b"acked-after").unwrap();
+        wal.sync().unwrap();
+
+        let (got, _) = collect(&root, 0x5e, [0, 0, 0]);
+        assert!(
+            got.contains(&(Signal::Logs, b"acked-after".to_vec())),
+            "a frame acked after a tear has to survive it: {got:?}"
+        );
     }
 
     #[test]

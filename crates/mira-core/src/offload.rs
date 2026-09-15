@@ -111,12 +111,17 @@ impl Target {
     /// `node` only names the staging directory, so that a restore killed
     /// half-way leaves a directory [`block::sweep_staging`] already knows how
     /// to clear at the next start.
+    ///
+    /// It lands under [`block::name_covering_no_log`] rather than the name the
+    /// store holds, because the log the stored name refers to is the one on the
+    /// volume this block is being rescued *from*.
     pub fn pull(&self, signal: &str, b: &BlockRef, data_dir: &Path, node: u32) -> Result<bool> {
         let Some((partition, name)) = split(&b.dir) else {
             return Ok(false);
         };
+        let name = block::name_covering_no_log(name);
         let dest_dir = data_dir.join(signal).join(partition);
-        let dest = dest_dir.join(name);
+        let dest = dest_dir.join(&name);
         if dest.exists() {
             return Ok(false);
         }
@@ -342,6 +347,53 @@ mod tests {
         assert_eq!(fs::read(dir.join("attr.idx")).unwrap(), b"sidecar");
         assert_eq!(block::scan(&local, "logs").unwrap(), vec![b]);
         assert!(!t.pull("logs", &listed[0], &local, 7).unwrap());
+    }
+
+    /// A restored block describes a log that no longer exists.
+    ///
+    /// `wal_hi` is a position in the log of the volume that *wrote* the block,
+    /// and a restore lands it beside a log that starts at sequence 0 — a
+    /// re-created pod, a new claim. [`block::wal_watermarks`] takes the maximum
+    /// over the names it finds and filters only by node, and `node` is a hash
+    /// of `--node`, which the operator keeps stable across exactly this. So the
+    /// fresh log is handed a watermark thousands of sequences ahead of itself,
+    /// and the next replay skips every frame under it: acked data, dropped
+    /// silently, in the one situation the log exists for.
+    ///
+    /// `publish` states the rule this rests on — too high is the dangerous
+    /// direction, too low only costs a re-ingest.
+    #[test]
+    fn a_restored_block_claims_no_progress_in_the_log_it_lands_beside() {
+        let tmp = tempdir("restore-watermark");
+        let (old, store, fresh) = (tmp.join("old"), tmp.join("cold"), tmp.join("fresh"));
+        let dir = old.join("logs").join("p=2").join(format!(
+            "{:020}-{:020}-{:08x}-{:012}-{:020}",
+            7_200_000_000_000u64, 7_200_000_000_001u64, 7, 1, 5000
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("logs.arrow"), b"hello").unwrap();
+
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&old, "logs").unwrap().remove(0);
+        assert_eq!(b.wal_hi, 5000);
+        assert!(t.push("logs", &b).unwrap());
+        assert!(
+            t.pull("logs", &t.list("logs").unwrap()[0], &fresh, 7)
+                .unwrap()
+        );
+
+        assert_eq!(
+            block::wal_watermarks(&fresh, 7).unwrap(),
+            [0, 0, 0],
+            "a fresh log at sequence 0 was told 5000 of its frames are already published"
+        );
+        // Still one block, still readable: only the claim about the log moved.
+        let landed = block::scan(&fresh, "logs").unwrap();
+        assert_eq!(landed.len(), 1);
+        assert_eq!(
+            fs::read(landed[0].dir.join("logs.arrow")).unwrap(),
+            b"hello"
+        );
     }
 
     /// A copy killed half-way leaves nothing in the catalog, and the next
