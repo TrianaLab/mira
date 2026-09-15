@@ -238,6 +238,24 @@ fn version_sites() -> Vec<(&'static str, Regex)> {
             "charts/mira-operator/README.md",
             re(r"ghcr\.io/trianalab/mira:(\d+\.\d+\.\d+)"),
         ),
+        // The same MiraCluster, printed by `helm install` rather than read on a
+        // page. It was `{{ .Chart.AppVersion }}`, which is the *operator's*
+        // number and deliberately uncoupled from this one — so the first
+        // command a new user copies asked for an engine tag that had never been
+        // published, and the tier it created came up ImagePullBackOff.
+        (
+            "charts/mira-operator/templates/NOTES.txt",
+            re(r"ghcr\.io/trianalab/mira:(\d+\.\d+\.\d+)"),
+        ),
+        // The installer the docs site publishes as `install.sh`. Both of these
+        // read as examples, which is why neither was gated and both still said
+        // `0.1.0` — a tag that does not exist. The one in `--help` is the one
+        // that costs: it is the version string a reader copies.
+        (
+            "scripts/get-mira.sh",
+            re(r"mira-(\d+\.\d+\.\d+)-aarch64-apple-darwin"),
+        ),
+        ("scripts/get-mira.sh", re(r"e\.g\. v(\d+\.\d+\.\d+)")),
         // The two that used to be ungated prose, and rotted exactly as
         // predicted: the 0.0.1 cut left SECURITY.md claiming there was no tagged
         // release, on the day after there was one.
