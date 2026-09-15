@@ -10,5 +10,9 @@
   "devDependencies": {
     "@changesets/cli": "3.0.3",
     "markdownlint-cli2": "0.23.2"
+  },
+  "//overrides": "markdownlint-cli2 0.23.2 pins smol-toml to exactly 1.7.0, and GHSA-7w5x-hrqm-74c2 is fixed in 1.7.1 — so the only fix npm can find on its own is `audit fix --force` down to markdownlint-cli2 0.21.0, a major downgrade of the linter that gates every page here. Drop this the day a markdownlint-cli2 release moves off 1.7.0.",
+  "overrides": {
+    "smol-toml": "1.7.2"
   }
 }
