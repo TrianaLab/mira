@@ -798,7 +798,16 @@ fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
                 None => (1, s.strip_prefix('+').unwrap_or(s)),
             };
             let d = crate::config::duration(rest)?;
-            Ok(now + sign * (d.as_nanos() as i64))
+            // `duration` bounds the multiply; this bounds the two steps after
+            // it. Nanoseconds are a `u128` and the window is an `i64`, so a
+            // duration well inside what `duration` accepts — `"3000000000s"`,
+            // say — still has more nanoseconds than a timestamp holds, and the
+            // `as` cast that used to be here turned that into a window on the
+            // far side of the epoch rather than into an error.
+            i64::try_from(d.as_nanos())
+                .ok()
+                .and_then(|ns| now.checked_add(sign * ns))
+                .ok_or_else(|| format!("{s:?} is further from now than a timestamp reaches"))
         }
         other => Err(format!("{other:?} is not a time")),
     }
@@ -807,6 +816,26 @@ fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The second half of the overflow on the unauthenticated query path.
+    /// `config::duration` bounds its own multiply, but a duration it happily
+    /// accepts can still hold more nanoseconds than an `i64` timestamp, and
+    /// then more again once `now` is added — `~292 years` is the whole budget.
+    /// The `as` cast that used to be here turned either case into a window on
+    /// the far side of the epoch and answered the query from it.
+    #[test]
+    fn a_time_further_from_now_than_a_timestamp_reaches_is_rejected() {
+        let now = 1_757_000_000_000_000_000;
+        let at = |s: &str| time_field(&Yaml::String(s.to_owned()), now, 0);
+        // Too many nanoseconds for an i64 at all; enough for an i64 but not
+        // once `now` is added; and too large for `duration` in the first place.
+        for s in ["-10000000000s", "+9000000000s", "1000000000000000000d"] {
+            assert!(at(s).is_err(), "{s:?} must not wrap");
+        }
+        assert_eq!(at("-1h").unwrap(), now - 3_600_000_000_000);
+        assert_eq!(at("now").unwrap(), now);
+        assert_eq!(time_field(&Yaml::BadValue, now, 42).unwrap(), 42);
+    }
 
     /// The query document is written here as a browser would send it — bare
     /// JSON — because "KYAML is a superset of JSON" is load-bearing for the API

@@ -645,7 +645,17 @@ pub fn duration(s: &str) -> Result<Duration> {
         "d" => 86_400,
         other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
     };
-    Ok(Duration::from_secs(n * scale))
+    // Checked, because this is reached from unauthenticated input: the query
+    // API's `time_field` hands it whatever string a `from:` or `to:` carried,
+    // and `"1000000000000000000d"` parses as a `u64` and then overflows the
+    // scale. A release build wraps it into a window nobody asked for and
+    // answers the query from that; a debug build panics, and `panic = "abort"`
+    // makes a panic on a request path the whole process. A parse error is the
+    // only honest answer, and it is the one every other bad duration gets.
+    let secs = n
+        .checked_mul(scale)
+        .ok_or_else(|| format!("{s:?} is a longer duration than this system can represent"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// `4MiB`, `512k`, `1048576`. Binary units, because every other size in this
@@ -678,6 +688,29 @@ pub fn bytes(s: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `duration` is not only a config parser. The query API's `time_field`
+    /// calls it on the `from:`/`to:` of an unauthenticated request, so a string
+    /// that parses as a `u64` and then overflows the unit scale is reachable
+    /// from the wire. It used to be `n * scale`: a release build wrapped and
+    /// answered the query from a window nobody asked for, and a debug build
+    /// panicked — which under `panic = "abort"` is the process.
+    #[test]
+    fn a_duration_too_large_to_represent_is_a_parse_error_not_a_wrap() {
+        for s in [
+            "1000000000000000000d",
+            "18446744073709551615h",
+            "999999999999999d",
+        ] {
+            assert!(duration(s).is_err(), "{s:?} must not wrap");
+        }
+        // The boundary still parses, so the check costs nothing real.
+        assert_eq!(
+            duration("106751991167d").unwrap().as_secs(),
+            9_223_372_036_828_800
+        );
+        assert_eq!(duration("7d").unwrap().as_secs(), 604_800);
+    }
 
     /// The environment these tests parse against. A literal, not the process's:
     /// see [`Env`] for why writing the real one is not an option.
