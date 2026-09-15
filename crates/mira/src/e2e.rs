@@ -2181,10 +2181,18 @@ impl Node {
     /// A kill: the tasks stop wherever they are, nothing is sealed, and what
     /// survives is whatever the log already holds. That last clause is the claim
     /// every test that calls this is making.
-    fn kill(self) {
+    async fn kill(self) {
         let Node { app, api, flushers } = self;
         for mut h in flushers {
             h.abort();
+            // Awaited, because `abort` only *asks*. A real kill takes the
+            // process' file descriptors with it; in-process the task is dropped
+            // whenever the runtime next gets to it, and until it is, it still
+            // holds the `Arc<Config>` and so the log's writer lock. The node
+            // that boots next would take `WalLocked` from its own predecessor.
+            // The handle resolving is the task having been dropped, which is
+            // the closest thing here to the fd being closed.
+            let _ = h.await;
         }
         // After the abort, not before: dropping the router drops the last
         // `Ingest`, and a shard that saw its senders close before it was
@@ -2540,7 +2548,7 @@ async fn a_kill_with_the_block_open_loses_no_acknowledged_export_and_duplicates_
         mira_core::block::scan(&root, "logs").unwrap().is_empty(),
         "the data reached disk before the kill, so this proves nothing"
     );
-    n.kill();
+    n.kill().await;
 
     let n = restart(&root, true).await;
     let after = query(&n.app, doc).await;
@@ -2588,7 +2596,7 @@ async fn a_kill_between_the_seal_and_the_rename_drops_the_staging_dir_and_not_th
 
     let n = restart(&root, true).await;
     otlp(&n.app, "/v1/logs", logs_export("checkout", 1_000, 5)).await;
-    n.kill();
+    n.kill().await;
 
     let staged = root.join(".tmp").join(format!(
         "logs-{id:08x}-000000000000-{:020}-{:020}",
@@ -2632,7 +2640,7 @@ async fn a_torn_wal_tail_costs_only_the_frame_that_was_in_flight() {
     let n = restart(&root, true).await;
     otlp(&n.app, "/v1/logs", logs_export("checkout", 1_000, 5)).await;
     otlp(&n.app, "/v1/logs", logs_export("payments", 2_000, 5)).await;
-    n.kill();
+    n.kill().await;
 
     // Chop four bytes: the second frame now has no checksum, which is where a
     // kill inside `append` leaves it.
@@ -2691,7 +2699,7 @@ async fn a_torn_wal_tail_does_not_stop_the_node_from_booting() {
     let id = mira_core::block::node_id("mira");
     let n = restart(&root, true).await;
     otlp(&n.app, "/v1/logs", logs_export("checkout", 1_000, 5)).await;
-    n.kill();
+    n.kill().await;
 
     let seg = std::fs::read_dir(root.join(".wal"))
         .unwrap()

@@ -1854,6 +1854,20 @@ mod tests {
         let node = block::node_id("sweeptest");
         let wal = Arc::new(Wal::open(&dir, node).unwrap());
         wal.append(wal::Signal::Logs, b"a frame").unwrap();
+        // Segments only. The log's directory also holds the writer lock this
+        // node took at `Wal::open`, which no sweep has any business removing.
+        let segments = |dir: &std::path::Path| {
+            std::fs::read_dir(dir.join(".wal"))
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "wal")
+                })
+                .count()
+        };
 
         // The common tick: sync, and nothing else looked at.
         wal_sweep(Arc::clone(&wal), dir.clone(), false).await;
@@ -1861,11 +1875,7 @@ mod tests {
         // and the segment holding it stays.
         wal_sweep(Arc::clone(&wal), dir.clone(), true).await;
         assert_eq!(wal.next_seq(), 1, "a sweep renumbers nothing");
-        assert_eq!(
-            std::fs::read_dir(dir.join(".wal")).unwrap().count(),
-            1,
-            "the open segment is never dropped"
-        );
+        assert_eq!(segments(&dir), 1, "the open segment is never dropped");
 
         // A truncate that cannot read the block tree is a warning, not a stop:
         // the sync half already happened and the next append still lands. A
@@ -1888,7 +1898,7 @@ mod tests {
         wal_sweep(Arc::clone(&wal), dir.clone(), true).await;
         assert!(!stale.exists(), "the slow tick removed the dead segment");
         assert_eq!(
-            std::fs::read_dir(dir.join(".wal")).unwrap().count(),
+            segments(&dir),
             1,
             "and left the open one, which is still holding two unclaimed frames"
         );

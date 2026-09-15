@@ -73,9 +73,10 @@ coexisted.
 
 The fix puts the timestamp range the final name already carries into the staging
 name: the path is then unique per block *content*, and a misconfigured `--node`
-is duplicated data rather than a silent mix. `create_dir` rather than
-`create_dir_all` makes a collision fail loudly, and `block::sweep_staging` clears
-at boot what a never-reused name leaks.
+duplicates data rather than mixing it silently. `create_dir` fails loudly on a
+collision, and `block::sweep_staging` clears at boot what a never-reused name
+leaks. The log is the other shared path: `Wal::open` takes an exclusive `flock`
+per node id, so a second writer is refused at startup.
 
 Principle 4 buys freedom from coordination *state*, not from thinking about
 concurrency: on a shared filesystem every path a writer creates is part of the
@@ -88,8 +89,7 @@ binary, `mira-operator`, and a `MiraCluster` CRD. It owns the StatefulSet and is
 the only chart Mira publishes: a controller that only writes `spec.replicas` on
 a Helm-owned object loses the value on the next `helm upgrade`, and on the way
 down that unwinds *after* the drain has copied the blocks out. Everything above
-resizes a tier by hand; that argument is about *Mira*, not about whether
-something else may hold the decision.
+resizes a tier by hand.
 
 ### Why not an HPA
 

@@ -111,6 +111,17 @@ pub enum Error {
     #[error("{path}: corrupt write-ahead log frame: {why}")]
     WalCorrupt { path: PathBuf, why: &'static str },
 
+    /// Another process already holds this node's log. See `wal::lock_node`.
+    #[error(
+        "{path} is held by another process writing as node {node:#010x}. A \
+         write-ahead log has one writer: both would resume to the same \
+         sequence and hand it out twice, and a block that claims the watermark \
+         for one frame would cover the other — an acknowledged export never \
+         replayed. Two replicas may share a volume, but not a node id: give \
+         each one its own --node."
+    )]
+    WalLocked { path: PathBuf, node: u32 },
+
     /// A WAL segment written by a different build. Refused rather than
     /// guessed at, for the same reason a block with an unknown format version
     /// is: a frame layout is not self-describing enough to parse hopefully.

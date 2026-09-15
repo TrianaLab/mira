@@ -279,9 +279,9 @@ write to one volume without coordinating. Both are logged at startup:
 INFO mira: mira listening grpc=… http=… node=mira-1 node_id="a2c1d111"
 ```
 
-Two replicas sharing a volume with the same `node_id` write duplicate data, so
-give each a distinct `--node`. On Kubernetes, one volume per replica, and
-`HOSTNAME` names both:
+Two replicas sharing a volume with the same `node_id` also share a write-ahead
+log, and a log has one writer: the second refuses to start. Give each a distinct
+`--node`. On Kubernetes, one volume per replica, and `HOSTNAME` names both:
 
 ```yaml
 {

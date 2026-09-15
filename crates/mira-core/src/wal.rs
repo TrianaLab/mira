@@ -171,6 +171,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -337,6 +338,49 @@ pub struct Wal {
     inner: Mutex<Inner>,
     dir: PathBuf,
     node: u32,
+    /// Held open for the life of the log, and never read or written. See
+    /// [`lock_node`]: closing the fd is what releases the lock, so this field
+    /// existing is the whole mechanism.
+    _lock: File,
+}
+
+/// Take this node's writer lock under `dir`, or refuse to start.
+///
+/// Segments are named `{node}-{first_seq}`, so two processes over one
+/// directory with one node id read the same files, resume to the same number
+/// and then hand it out twice. `O_APPEND` keeps each frame whole, which is
+/// what makes the damage quiet rather than obvious: replay finds two different
+/// bodies at one sequence, and a block claiming the watermark for either
+/// covers both. `--node` has a default, so nothing has to be misconfigured for
+/// two replicas over one volume to land here.
+///
+/// Per node and not per directory, because a shared volume with one log per
+/// replica is the supported arrangement (section 12) — the collision is the id, not
+/// the path.
+///
+/// `flock` and not `fcntl`: the lock belongs to the open file description, so
+/// the kernel drops it when the fd closes, including for a process that died.
+/// A restart after a crash is never locked out by its own predecessor.
+fn lock_node(dir: &Path, node: u32) -> Result<File> {
+    let path = dir.join(format!("{node:08x}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ctx(&path)?;
+    // SAFETY: `file` is live for the whole call, so the descriptor is open and
+    // owned here. `flock` takes no pointer and writes nothing back; the only
+    // output is the return code, checked below.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // Anything else — a filesystem with no `flock`, most likely — is
+        // reported as what it is rather than as a second writer.
+        return match e.kind() {
+            std::io::ErrorKind::WouldBlock => Err(Error::WalLocked { path, node }),
+            _ => Err(e).ctx(path),
+        };
+    }
+    Ok(file)
 }
 
 impl Wal {
@@ -359,6 +403,9 @@ impl Wal {
     pub fn open(root: &Path, node: u32) -> Result<Self> {
         let dir = root.join(".wal");
         fs::create_dir_all(&dir).ctx(&dir)?;
+        // Before anything is read, so the loser of the race never resumes a
+        // sequence it is not going to be allowed to use.
+        let _lock = lock_node(&dir, node)?;
 
         let segments = Self::segments(&dir, node)?;
         // The highest sequence actually present, which is not the same as the
@@ -412,6 +459,7 @@ impl Wal {
             }),
             dir,
             node,
+            _lock,
         })
     }
 
@@ -1197,6 +1245,38 @@ mod tests {
         assert_eq!(seqs, [1, 2]);
         assert_eq!(got.len(), 2);
         assert_eq!(stats.skipped, 1);
+    }
+
+    /// One node id over one directory is one writer, and the second is refused
+    /// at startup rather than at 3am.
+    ///
+    /// Two processes here resume to the same sequence — the segment name is
+    /// `{node}-{first_seq}`, so they read the same files and reach the same
+    /// number — and then hand that number out twice. `O_APPEND` keeps each
+    /// frame whole, which is what makes the damage quiet: replay reads two
+    /// different bodies at one sequence, and a block that claims the watermark
+    /// for one covers the other, so an export that was acknowledged is never
+    /// replayed again. `--node` has a default, so this is the configuration
+    /// reached by not choosing one.
+    #[test]
+    fn one_node_id_over_one_directory_is_one_writer() {
+        let root = tmpdir("nodelock");
+        let held = Wal::open(&root, 9).unwrap();
+
+        let Err(e) = Wal::open(&root, 9) else {
+            panic!("a second writer over the same log was allowed");
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("--node"),
+            "the message has to say what to fix: {e}"
+        );
+
+        // `flock`, so the lock belongs to the open file description and the
+        // kernel drops it when the fd closes — including for a process that
+        // died. A restart is not locked out by the log its predecessor left.
+        drop(held);
+        Wal::open(&root, 9).unwrap();
     }
 
     #[test]
