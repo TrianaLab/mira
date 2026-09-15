@@ -48,12 +48,12 @@ jobs:
 
       - uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
-          # A pull request opened with GITHUB_TOKEN does not start
-          # `pull_request` workflows, main's ruleset has an empty
-          # `bypass_actors`, and a PR with no required context is a PR that can
-          # never merge. This is the one credential on the release path; see
-          # docs/internals/releases.md.
-          github-token: ${{ secrets.VERSION_PR_TOKEN }}
+          # The stock token. A pull request opened with it does create the
+          # `pull_request` runs, but held: somebody with write access clicks
+          # "Approve workflows to run" before the two required contexts report.
+          # One click per Version PR is what keeps a PAT off the release path;
+          # see docs/internals/releases.md.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           # Not `changeset version`: that writes the two stub package.json files
           # and stops. This is the whole bump — both Cargo.tomls, both
           # Cargo.locks, the chart, the docs and the changelog promotion.
