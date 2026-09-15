@@ -219,6 +219,32 @@ the config keys, the `/mcp` tool set.
   match is lazy up to the next header and consumes it instead of looking at it,
   and the extraction is a `unreleased_body` function with a test — the thing
   actually missing, since no test executed this path either.
+- **One torn segment and the WAL never reclaimed another byte, for the life of
+  the node.** `Wal::open` and `replay` both treat a half-written frame at the
+  tail as the ordinary post-crash state and stop at it. `truncate` is the third
+  reader of the same log and was the only one that propagated the error, so the
+  whole sweep aborted — and `Wal::segments` is ordered oldest-first, so the tear
+  hid every younger segment behind it and every later sweep failed at the same
+  place. The ordinary crash this log exists to survive left a node whose
+  write-ahead log could only grow.
+- **A query's `from:` or `to:` could overflow into a window nobody asked for.**
+  `config::duration` scaled with `n * scale` and `api::time_field` cast
+  nanoseconds with `as i64` — both reached from `/api/v1/query` with whatever
+  string arrived on the wire. `"1000000000000000000d"` parses as a `u64` and
+  then wraps: a release build answered the query from the wrapped window, and a
+  debug build panicked, which under `panic = "abort"` is the process. Both steps
+  are checked now, and a duration too large to represent is a parse error like
+  every other bad one.
+- **The sweep behind every published ingest figure never checked whether it
+  shed.** `measurements.kyaml` says of `ingest.records_per_s` that "the run
+  asserts there were none", and no assertion existed: `wal-volume.sh`,
+  `wal-split-ab.sh` and `proxy-ab.sh` each read the shed count and abort, and
+  `conn-sweep.sh` — the one that produces the published corpus — did not. It
+  matters in three directions at once, because a retried export's bytes are
+  counted again in `ingest.wire_mib_s` and in `cost.hot_bytes_per_byte`'s
+  denominator, and loadgen's 20 ms backoff sits inside the ack window. No figure
+  is withdrawn: nothing suggests the published runs shed, only that nothing
+  would have said so if they had. The guard is there for the next one.
 
 ## [0.0.3] - 2026-09-12
 
