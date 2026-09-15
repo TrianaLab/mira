@@ -668,9 +668,19 @@ impl Wal {
             }
             // The last frame decides, not the first: a segment is only dead
             // once everything in it is covered.
+            //
+            // A tear stops the scan rather than failing it, because that is
+            // what the other two readers of this log already do: a
+            // half-written frame was never acked, so no block covers it and no
+            // caller is waiting for it, and `replay` would stop there anyway.
+            // Propagating it aborted the entire sweep instead, and `segments`
+            // is ordered oldest-first — so one torn segment hid every younger
+            // one from reclamation for as long as the node lived, on the
+            // ordinary crash this log exists to survive.
             let mut highest = None;
             for frame in FrameReader::open(path)? {
-                highest = Some(frame?.seq);
+                let Ok(frame) = frame else { break };
+                highest = Some(frame.seq);
             }
             match highest {
                 // An empty segment is a crash artefact between create and
@@ -1236,6 +1246,45 @@ mod tests {
         // 1 would lose seq 1, which no block covers yet.
         assert_eq!(wal.truncate(1).unwrap(), 0);
         assert_eq!(wal.truncate(2).unwrap(), 1);
+    }
+
+    /// `open` and `replay` both treat a torn tail as the ordinary post-crash
+    /// state and stop at it. `truncate` was the third reader and the only one
+    /// that propagated it, which made the sweep abort — and because `segments`
+    /// is ordered oldest-first, one crash meant no segment was ever reclaimed
+    /// again for the life of the node. A WAL that cannot retire its own log is
+    /// a disk that fills.
+    #[test]
+    fn truncate_reclaims_a_segment_whose_tail_is_torn() {
+        let root = tmpdir("truncate-torn");
+        let wal = Wal::open(&root, 0x7c).unwrap();
+        wal.append(Signal::Logs, b"covered").unwrap(); // seq 0
+        wal.append(Signal::Logs, b"never-acked").unwrap(); // seq 1
+        wal.sync().unwrap();
+        let first = {
+            let inner = wal.inner.lock().unwrap();
+            inner.path.clone()
+        };
+        {
+            let mut inner = wal.inner.lock().unwrap();
+            inner.written = SEGMENT_BYTES;
+        }
+        wal.append(Signal::Logs, b"newest").unwrap(); // seq 2, new segment
+        assert_eq!(Wal::segments(&wal.dir, 0x7c).unwrap().len(), 2);
+
+        // Chop seq 1's checksum, which is what a crash mid-write leaves.
+        let len = fs::metadata(&first).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_len(len - 4)
+            .unwrap();
+
+        // seq 1 was torn, so it was never acked and no block can cover it.
+        // A watermark past seq 0 therefore retires the whole segment.
+        assert_eq!(wal.truncate(1).unwrap(), 1);
+        assert!(!first.exists(), "a tear is not a reason to keep the file");
     }
 
     #[test]
