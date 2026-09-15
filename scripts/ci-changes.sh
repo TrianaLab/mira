@@ -50,7 +50,14 @@ else
   # is hand-written prose that `docs-check` lints, and a gate that skips the
   # diff which introduces the file is not a gate. The cost is a site build on a
   # release-note-only pull request.
-  docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$|\.vale|\.markdownlint-cli2\.yaml\$|package(-lock)?\.json\$|crates/xtask/|Makefile\$)${W}")
+  #
+  # The last four are the drift leg's other inputs, and they are in this clause
+  # because `drift` runs on `code || docs` and nothing else would start it:
+  # `measurements.kyaml` is the figure registry, `artifacthub-repo.yml` and
+  # `release/units/` are version sites the gate diffs, and the issue templates
+  # carry a version line too. A diff touching only those skipped the leg that
+  # reads them, and a skipped required check reports as a pass.
+  docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$|\.vale|\.markdownlint-cli2\.yaml\$|package(-lock)?\.json\$|crates/xtask/|Makefile\$|measurements\.kyaml\$|artifacthub-repo\.yml\$|\.github/ISSUE_TEMPLATE/|release/units/)${W}")
   # `Makefile$` for the same reason it is in `code` and `image`: both of that
   # leg's steps are make targets, so an edit to `ui-check` or `ui-demo` is a
   # change to what the job asserts.

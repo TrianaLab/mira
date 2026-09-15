@@ -76,9 +76,10 @@ const ARCH_PAGES: &str = "docs/architecture/*.md";
 /// Adding a new mention somewhere is free; *removing* the last mention from a
 /// listed file fails here, which is the point — you then either restore it or
 /// delete the line below, and either way a reviewer sees the decision.
-const CRATE_COUNT_SITES: [&str; 6] = [
+const CRATE_COUNT_SITES: [&str; 7] = [
     "README.md",
     "docs/architecture/performance.md",
+    "docs/architecture/principles.md",
     "docs/market.md",
     "docs/index.md",
     "crates/mira/Cargo.toml",
@@ -86,12 +87,44 @@ const CRATE_COUNT_SITES: [&str; 6] = [
 ];
 
 /// Every file that quotes the binary size. See [`CRATE_COUNT_SITES`].
-const BINARY_SIZE_SITES: [&str; 5] = [
+const BINARY_SIZE_SITES: [&str; 6] = [
     "README.md",
     "docs/architecture/performance.md",
+    "docs/architecture/principles.md",
     "docs/market.md",
     "docs/index.md",
     "crates/mira/src/term.rs",
+];
+
+/// Every page that quotes how many configuration keys there are.
+///
+/// `KNOWN` in `crates/mira/src/config.rs` is the source: the set is closed and
+/// an unknown key is a startup error, so the count is a promise about what a
+/// config file may say. `proxy.replicas` made thirteen into fourteen and two of
+/// these three pages went on saying thirteen — nothing was checking.
+const CONFIG_KEY_SITES: [&str; 3] = [
+    "docs/index.md",
+    "docs/quickstart.md",
+    "docs/architecture/principles.md",
+];
+
+/// The count, spelled, because the pages write it as a word.
+///
+/// Indexed from ten. Narrow on purpose: the list grows by ones, and a count
+/// outside this range is a sentence somebody should be rewriting rather than a
+/// table somebody should be extending.
+const SPELLED: [&str; 11] = [
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
 ];
 
 /// The README numbers were measured on an Apple M3 Pro
@@ -247,6 +280,7 @@ pub fn check() -> bool {
     check_artifacthub_repo(&mut f);
     check_coverage_badge(&mut f);
     check_section_refs(&mut f);
+    check_config_keys(&mut f);
 
     for note in &notes {
         println!("note: {note}");
@@ -436,6 +470,39 @@ fn check_binary_size(declared_mib: f64, f: &mut Failures, notes: &mut Vec<String
             drift * 100.0,
             BINARY_SIZE_SITES.map(|s| format!("      {s}\n")).concat()
         ));
+    }
+}
+
+/// The closed set of configuration keys is a number the docs quote. See
+/// [`CONFIG_KEY_SITES`].
+fn check_config_keys(f: &mut Failures) {
+    let text = read_or_exit("crates/mira/src/config.rs");
+    let Some(m) = re(r"const KNOWN: \[&str; (\d+)\]").captures(&text) else {
+        eprintln!(
+            "error: crates/mira/src/config.rs no longer declares `const KNOWN: \
+             [&str; N]`. That array is the closed set the docs promise — restore \
+             it, or teach crates/xtask/src/drift.rs where the keys live."
+        );
+        std::process::exit(1);
+    };
+    let n: usize = m[1].parse().unwrap_or_default();
+    let Some(word) = n.checked_sub(10).and_then(|i| SPELLED.get(i)) else {
+        f.fail(format!(
+            "the config has {n} keys and this check can only spell 10..={}. Extend \
+             SPELLED in crates/xtask/src/drift.rs, or stop writing the count as a word.",
+            9 + SPELLED.len()
+        ));
+        return;
+    };
+    let pat = re(&format!(r"\b{word}\b"));
+    for rel in CONFIG_KEY_SITES {
+        if !pat.is_match(&read_or_exit(rel)) {
+            f.fail(format!(
+                "{rel} does not say the config has {word} ({n}) keys. An unknown key \
+                 is a startup error, so the count is a promise about what a config \
+                 file may say."
+            ));
+        }
     }
 }
 
