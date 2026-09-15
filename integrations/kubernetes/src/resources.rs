@@ -58,6 +58,19 @@ fn proxy_selector(c: &MiraCluster) -> BTreeMap<String, String> {
     l
 }
 
+/// The storage pods, and nothing else the cluster owns.
+///
+/// [`selector`] alone is not this. It is the StatefulSet's `matchLabels` — the
+/// immutable subset, deliberately narrow so a later label can be added without
+/// a recreate — and every pod under this `MiraCluster` carries it, including
+/// the proxy's and the drain Job's. Anything matching *pods* needs the
+/// component too.
+fn storage_selector(c: &MiraCluster) -> BTreeMap<String, String> {
+    let mut l = selector(c);
+    l.insert("app.kubernetes.io/component".into(), "storage".into());
+    l
+}
+
 /// Owned-by metadata, so deleting the `MiraCluster` collects everything.
 ///
 /// Every object below carries it. Without it, deleting a cluster leaves a
@@ -253,19 +266,19 @@ pub fn pod_disruption_budget(c: &MiraCluster) -> PodDisruptionBudget {
         "metadata": meta(c, c.name_any(), "storage"),
         "spec": {
             "maxUnavailable": 1,
-            // The StatefulSet's own selector, which is the immutable subset —
-            // widened to the proxy's pods as well the budget would stall a node
-            // drain on a tier perfectly happy to lose a stateless replica.
-            "selector": {"matchLabels": selector(c)},
+            // The storage pods, and only those. A budget selects pods, and the
+            // StatefulSet's own `matchLabels` is a *subset* match that also
+            // catches the proxy's pods and the drain Job's — so one budget of
+            // one covered the whole cluster, and a node drain could be refused
+            // because a stateless proxy replica was restarting, or a drain Job
+            // the operator itself created was still copying.
+            "selector": {"matchLabels": storage_selector(c)},
         },
     }))
     .expect("pod disruption budget is well-formed")
 }
 
 pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
-    let mut pod_labels = selector(c);
-    pod_labels.insert("app.kubernetes.io/component".into(), "storage".into());
-
     serde_json::from_value(json!({
         "metadata": meta(c, c.name_any(), "storage"),
         "spec": {
@@ -278,7 +291,7 @@ pub fn stateful_set(c: &MiraCluster, replicas: i32) -> StatefulSet {
             "selector": {"matchLabels": selector(c)},
             "template": {
                 "metadata": {
-                    "labels": pod_labels,
+                    "labels": storage_selector(c),
                     "annotations": {"mira.miradb.dev/config": config_hash(&node_config())},
                 },
                 "spec": {
@@ -730,11 +743,23 @@ mod tests {
         assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
         assert_eq!(spec.min_available, None);
 
-        // The storage pods, and only those. The selector has to be the
-        // StatefulSet's own or the budget guards nothing; widened to the
-        // proxy's pods as well it would let a node drain stall on a tier that
-        // is perfectly happy to lose a stateless replica.
-        let want = selector(&cluster());
-        assert_eq!(spec.selector.expect("selector").match_labels, Some(want));
+        // The storage pods, and only those. `matchLabels` is a subset match, so
+        // the StatefulSet's own selector — which every pod the cluster owns
+        // carries — made one budget of one cover the proxy's pods and the drain
+        // Job's too: a node drain refused because a stateless proxy replica was
+        // restarting, or because a Job the operator created was still copying.
+        let pdb = spec
+            .selector
+            .expect("selector")
+            .match_labels
+            .expect("labels");
+        let c = cluster();
+        assert_eq!(pdb, storage_selector(&c));
+        for other in [proxy_selector(&c), labels(&c, "drain")] {
+            assert!(
+                !pdb.iter().all(|(k, v)| other.get(k) == Some(v)),
+                "the budget also selects {other:?}"
+            );
+        }
     }
 }

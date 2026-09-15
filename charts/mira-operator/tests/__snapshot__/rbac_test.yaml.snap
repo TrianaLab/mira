@@ -8,8 +8,6 @@ grants exactly this list and nothing more:
         - get
         - list
         - watch
-        - update
-        - patch
     - apiGroups:
         - mira.miradb.dev
       resources:
@@ -18,12 +16,6 @@ grants exactly this list and nothing more:
         - get
         - update
         - patch
-    - apiGroups:
-        - mira.miradb.dev
-      resources:
-        - miraclusters/finalizers
-      verbs:
-        - update
     - apiGroups:
         - apps
       resources:
@@ -70,14 +62,6 @@ grants exactly this list and nothing more:
     - apiGroups:
         - ""
       resources:
-        - pods
-      verbs:
-        - get
-        - list
-        - watch
-    - apiGroups:
-        - ""
-      resources:
         - persistentvolumeclaims
       verbs:
         - get
@@ -94,18 +78,3 @@ grants exactly this list and nothing more:
         - watch
         - create
         - delete
-    - apiGroups:
-        - coordination.k8s.io
-      resources:
-        - leases
-      verbs:
-        - get
-        - create
-        - update
-    - apiGroups:
-        - ""
-      resources:
-        - events
-      verbs:
-        - create
-        - patch

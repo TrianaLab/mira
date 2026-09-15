@@ -113,12 +113,27 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     // the first replica's claim with nothing anywhere recording that it
     // exists. `current` is read live for the same reason; this field is the
     // one where being stale costs a volume.
+    //
+    // The whole status is taken, not just that field, because `lastScaled` is
+    // in the same window and being stale there costs the cooldown. `scale()`
+    // fires the same watch before the status write recording it has even been
+    // issued, so the reconcile it triggers reads no `lastScaled`, decides there
+    // is no cooldown, and takes a branch that writes a status omitting it —
+    // which under server-side apply *deletes* it. The tier is then free to
+    // swing again on the next reading, creating and archiving a volume each
+    // way. The spec and the metadata stay as delivered: those are what the
+    // watch exists to hand over.
     let clusters: Api<MiraCluster> = Api::namespaced(ctx.client.clone(), &ns);
-    let draining = clusters
-        .get_opt(&name)
-        .await?
-        .and_then(|live| live.status)
-        .and_then(|s| s.draining);
+    let live = clusters.get_opt(&name).await?.and_then(|live| live.status);
+    let mut owned = (*c).clone();
+    owned.status = live;
+    let c = &owned;
+    let draining = c.status.as_ref().and_then(|s| s.draining);
+
+    // Every status write below has to name this. Server-side apply removes
+    // what this manager owned and then omitted, so a branch that leaves it out
+    // is a branch that forgets the tier ever scaled.
+    let carried = c.status.as_ref().and_then(|s| s.last_scaled.clone());
 
     // A drain already in flight owns the next transition, and it takes that
     // claim before anything else in this function touches the tier. Both of
@@ -135,7 +150,7 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     // Re-reading stats and deciding again here would in any case be deciding
     // from a tier that is mid-shrink.
     if let Some(ordinal) = draining {
-        return finish_drain(&ctx, &c, &ns, ordinal).await;
+        return finish_drain(&ctx, c, &ns, ordinal).await;
     }
 
     if let Err(e) = c.spec.validate() {
@@ -149,10 +164,10 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
         // typo in the spec would let the tier scale again immediately.
         status(
             &ctx,
-            &c,
+            c,
             json!({
                 "replicas": c.status.as_ref().map_or(c.spec.replicas, |s| s.replicas),
-                "lastScaled": c.status.as_ref().and_then(|s| s.last_scaled.clone()),
+                "lastScaled": carried,
                 "phase": "Degraded",
                 "message": e,
             }),
@@ -173,13 +188,13 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     // Everything that does not depend on the scale decision, first. A tier with
     // a broken Service is a tier whose stats cannot be read, so the decision
     // below would abstain forever if this ran after it.
-    ensure(&ctx, &c, &ns, current).await?;
+    ensure(&ctx, c, &ns, current).await?;
 
-    if let Some(remaining) = cooling_down(&c) {
+    if let Some(remaining) = cooling_down(c) {
         return Ok(Action::requeue(remaining));
     }
 
-    let readings = read_all(&c, current).await;
+    let readings = read_all(c, current).await;
     let lowest = readings
         .iter()
         .filter_map(|r| match r {
@@ -199,7 +214,7 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
             scale(&sets, &name, current + 1).await?;
             status(
                 &ctx,
-                &c,
+                c,
                 json!({
                     "replicas": current + 1,
                     "phase": "ScalingUp",
@@ -218,11 +233,12 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
             warn!(%ns, %name, max = c.spec.max_replicas, "at maxReplicas and still filling");
             status(
                 &ctx,
-                &c,
+                c,
                 json!({
                     "replicas": current,
                     "phase": "Degraded",
                     "freeFraction": free,
+                    "lastScaled": carried,
                     "message": format!(
                         "free is below {} but the tier is at maxReplicas ({})",
                         c.spec.scaling.up_when_free_below, c.spec.max_replicas
@@ -232,18 +248,19 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
             .await?;
         }
         Decision::Down if current > c.spec.replicas => match c.spec.offload.as_deref() {
-            Some(_) => return start_drain(&ctx, &c, &ns, current, free).await,
+            Some(_) => return start_drain(&ctx, c, &ns, current, free).await,
             // The deliberate refusal. Scaling in without an archive deletes the
             // only copy of those blocks, and the cost of *not* shrinking is a
             // bill rather than the data.
             None => {
                 status(
                     &ctx,
-                    &c,
+                    c,
                     json!({
                         "replicas": current,
                         "phase": "Ready",
                         "freeFraction": free,
+                        "lastScaled": carried,
                         "message": "would scale in, but spec.offload is unset; \
                                     scaling in without an archive would delete the only copy",
                     }),
@@ -254,8 +271,14 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
         Decision::Down | Decision::Hold => {
             status(
                 &ctx,
-                &c,
-                json!({"replicas": current, "phase": "Ready", "freeFraction": free, "message": null}),
+                c,
+                json!({
+                    "replicas": current,
+                    "phase": "Ready",
+                    "freeFraction": free,
+                    "lastScaled": carried,
+                    "message": null,
+                }),
             )
             .await?;
         }
@@ -270,7 +293,6 @@ async fn ensure(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(
     let cms: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), ns);
     let svcs: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
     let sets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
-    let deps: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
     let pdbs: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), ns);
 
     cms.patch(&name, &params(), &apply(&res::config_map(c)))
@@ -294,15 +316,38 @@ async fn ensure(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(
     pdbs.patch(&name, &params(), &apply(&res::pod_disruption_budget(c)))
         .await?;
 
-    if c.spec.proxy.replicas > 0 {
-        let pn = res::proxy_name(c);
-        cms.patch(&pn, &params(), &apply(&res::proxy_config_map(c, replicas)))
-            .await?;
-        svcs.patch(&pn, &params(), &apply(&res::proxy_service(c)))
-            .await?;
-        deps.patch(&pn, &params(), &apply(&res::proxy_deployment(c, replicas)))
-            .await?;
+    ensure_proxy(ctx, c, ns, replicas).await
+}
+
+/// Apply the proxy's view of the tier: the replica list, and the Deployment
+/// that rolls when it changes.
+///
+/// Split out of [`ensure`] because a drain has to narrow this and *only* this.
+/// Calling `ensure` mid-drain would re-apply the StatefulSet at the pre-drain
+/// count and recreate the pod being archived.
+async fn ensure_proxy(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(), Error> {
+    if c.spec.proxy.replicas == 0 {
+        return Ok(());
     }
+    let name = res::proxy_name(c);
+    let cms: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), ns);
+    let svcs: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
+    let deps: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+
+    cms.patch(
+        &name,
+        &params(),
+        &apply(&res::proxy_config_map(c, replicas)),
+    )
+    .await?;
+    svcs.patch(&name, &params(), &apply(&res::proxy_service(c)))
+        .await?;
+    deps.patch(
+        &name,
+        &params(),
+        &apply(&res::proxy_deployment(c, replicas)),
+    )
+    .await?;
     Ok(())
 }
 
@@ -347,10 +392,27 @@ async fn start_drain(
             "phase": "Draining",
             "freeFraction": free,
             "draining": ordinal,
+            // Carried, not re-stamped, for the reason the failure branch of
+            // `finish_drain` spells out — and carried at all because omitting a
+            // field this manager owns is how server-side apply deletes it.
+            // `finish_drain` stamps the new one when the shrink is actually
+            // done.
+            "lastScaled": c.status.as_ref().and_then(|s| s.last_scaled.clone()),
             "message": format!("draining replica {ordinal} before removing its volume"),
         }),
     )
     .await?;
+
+    // Before the pod goes, not after. Every reconcile from here until the drain
+    // ends returns at `finish_drain` without reaching `ensure`, so the replica
+    // list the proxy holds at this moment is the one it holds for the whole
+    // drain — minutes, or indefinitely if the archive fails. `fanout` is every
+    // replica or none, so a list still naming the deleted pod is a tier that
+    // answers no query and accepts no write until someone intervenes. Narrowing
+    // first also means there is no instant where either the config being
+    // replaced or the one replacing it names a replica that does not exist: the
+    // pod is still up.
+    ensure_proxy(ctx, c, ns, ordinal).await?;
 
     let sets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);
     scale(&sets, &name, ordinal).await?;
@@ -536,19 +598,66 @@ pub fn error_policy(_: Arc<MiraCluster>, e: &Error, _: Arc<Ctx>) -> Action {
     Action::requeue(Duration::from_secs(30))
 }
 
+/// Which namespaces to watch, from a comma-separated list, or `None` for the
+/// whole cluster.
+///
+/// The chart sets this from `rbac.namespaces`, and the two have to agree. A
+/// `Role` can only authorise a namespaced LIST, so an operator left on
+/// `Api::all` under namespaced RBAC watches nothing at all: every reflector
+/// takes a 403, backs off, retries, and the tier it was installed to manage is
+/// never reconciled. Empty entries are dropped so a trailing comma is not a
+/// watch on `""`, which the API server reads as every namespace.
+fn namespaces(raw: Option<&str>) -> Option<Vec<String>> {
+    let list: Vec<String> = raw?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// An `Api` over one namespace, or over all of them.
+fn scoped<K>(client: Client, ns: Option<&str>) -> Api<K>
+where
+    K: Resource<Scope = kube::core::NamespaceResourceScope>,
+    K::DynamicType: Default,
+{
+    match ns {
+        Some(n) => Api::namespaced(client, n),
+        None => Api::all(client),
+    }
+}
+
 /// Run the controller until the process is asked to stop.
 pub async fn run(client: Client) -> Result<(), kube::Error> {
-    let clusters: Api<MiraCluster> = Api::all(client.clone());
+    match namespaces(std::env::var("WATCH_NAMESPACES").ok().as_deref()) {
+        None => watch(client, None).await,
+        // One controller per namespace rather than one filtered stream:
+        // kube-rs has no multi-namespace watcher, and a namespaced LIST is the
+        // only kind a `Role` can authorise. They share the client, so this is
+        // one connection pool and one reflector per namespace.
+        Some(list) => {
+            info!(namespaces = ?list, "watching only these namespaces");
+            let each = list.into_iter().map(|ns| watch(client.clone(), Some(ns)));
+            futures::future::join_all(each).await;
+        }
+    }
+    Ok(())
+}
+
+async fn watch(client: Client, ns: Option<String>) {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
     });
+    let ns = ns.as_deref();
 
-    Controller::new(clusters, Config::default())
+    Controller::new(scoped::<MiraCluster>(client.clone(), ns), Config::default())
         // Owned objects, so a StatefulSet somebody edited by hand is corrected
         // on the spot rather than at the next poll.
-        .owns(Api::<StatefulSet>::all(client.clone()), Config::default())
-        .owns(Api::<Deployment>::all(client.clone()), Config::default())
-        .owns(Api::<Job>::all(client), Config::default())
+        .owns(scoped::<StatefulSet>(client.clone(), ns), Config::default())
+        .owns(scoped::<Deployment>(client.clone(), ns), Config::default())
+        .owns(scoped::<Job>(client, ns), Config::default())
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|r| async move {
@@ -557,7 +666,6 @@ pub async fn run(client: Client) -> Result<(), kube::Error> {
             }
         })
         .await;
-    Ok(())
 }
 
 // Time, without a date library. The only two operations this file needs are
@@ -640,26 +748,31 @@ mod tests {
             })
         }
 
-        /// As `ok()`, but the live read at the top of `reconcile` reports a
-        /// drain of `ordinal` in flight.
+        /// As `ok()`, but the live read at the top of `reconcile` returns a
+        /// status the fixture handed to `reconcile` does not carry.
         ///
-        /// Served from here rather than from the fixture the test hands to
-        /// `reconcile`, because the two disagreeing is the entire reason that
-        /// read is live: `start_drain` writes the status and then scales, the
-        /// scale fires the `.owns()` watch on its own stream, and the reconcile
-        /// that triggers can still see a cached status with no drain in it.
-        fn mid_drain(ordinal: i32) -> Self {
+        /// Served from here rather than from that fixture, because the two
+        /// disagreeing is the entire reason the read is live: `start_drain`
+        /// writes the status and then scales, the scale fires the `.owns()`
+        /// watch on its own stream, and the reconcile that triggers can still
+        /// be handed the cached object from before the write.
+        fn live(status: MiraClusterStatus) -> Self {
             let mut c = drainable();
-            c.status = Some(MiraClusterStatus {
-                draining: Some(ordinal),
-                ..Default::default()
-            });
+            c.status = Some(status);
             let doc = serde_json::to_value(&c).unwrap();
             Self::new(move |method, path| match (method, path) {
                 ("GET", p) if p.ends_with("/miraclusters/tel") => (StatusCode::OK, doc.clone()),
                 ("GET", _) => (StatusCode::NOT_FOUND, not_found()),
                 (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
                 _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+            })
+        }
+
+        /// A drain of `ordinal` in flight, visible only to that live read.
+        fn mid_drain(ordinal: i32) -> Self {
+            Self::live(MiraClusterStatus {
+                draining: Some(ordinal),
+                ..Default::default()
             })
         }
 
@@ -918,8 +1031,48 @@ mod tests {
     #[tokio::test]
     async fn a_drain_records_itself_before_it_removes_the_pod() {
         let f = Fake::ok();
-        let c = drainable();
+        let mut c = drainable();
+        c.status.as_mut().unwrap().last_scaled = Some("2024-01-01T00:00:00Z".into());
         let action = start_drain(&f.ctx(), &c, "ns", 3, Some("0.90".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.log().first().map(String::as_str),
+            Some("PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status"),
+            "status must be written before anything is destroyed: {:?}",
+            f.log()
+        );
+        assert_eq!(
+            f.log().last().map(String::as_str),
+            Some("PATCH /apis/apps/v1/namespaces/ns/statefulsets/tel/scale"),
+            "the pod goes last: {:?}",
+            f.log()
+        );
+
+        let st = f.body("/status")["status"].clone();
+        assert_eq!(st["phase"], "Draining");
+        assert_eq!(st["draining"], 2);
+        // Carried. Server-side apply removes what this manager owned and then
+        // omitted, and the shrink is not finished — `finish_drain` stamps the
+        // new one.
+        assert_eq!(st["lastScaled"], "2024-01-01T00:00:00Z");
+        assert_eq!(f.body("/scale")["spec"]["replicas"], 2);
+        assert_eq!(action, Action::requeue(Duration::from_secs(15)));
+    }
+
+    /// The proxy stops naming the replica before the replica goes.
+    ///
+    /// Every reconcile from here until the drain ends returns at `finish_drain`
+    /// without reaching `ensure`, so the replica list the proxy holds at this
+    /// moment is the one it holds for the whole drain. `fanout` is every
+    /// replica or none, so a list still naming the deleted pod is a tier that
+    /// answers no query and accepts no write — for as long as the archive takes,
+    /// and for ever if it fails.
+    #[tokio::test]
+    async fn a_drain_narrows_the_proxy_before_the_pod_it_removes_goes() {
+        let f = Fake::ok();
+        start_drain(&f.ctx(), &drainable(), "ns", 3, None)
             .await
             .unwrap();
 
@@ -927,16 +1080,21 @@ mod tests {
             f.log(),
             [
                 "PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status",
+                "PATCH /api/v1/namespaces/ns/configmaps/tel-proxy",
+                "PATCH /api/v1/namespaces/ns/services/tel-proxy",
+                "PATCH /apis/apps/v1/namespaces/ns/deployments/tel-proxy",
                 "PATCH /apis/apps/v1/namespaces/ns/statefulsets/tel/scale",
             ],
-            "status must be written before the StatefulSet shrinks"
+            "and nothing else: re-applying the StatefulSet here would undo the scale below it"
         );
 
-        let st = f.body("/status")["status"].clone();
-        assert_eq!(st["phase"], "Draining");
-        assert_eq!(st["draining"], 2);
-        assert_eq!(f.body("/scale")["spec"]["replicas"], 2);
-        assert_eq!(action, Action::requeue(Duration::from_secs(15)));
+        let list = f.body("configmaps/tel-proxy")["data"]["mira.yaml"].clone();
+        let list = list.as_str().unwrap();
+        assert!(list.contains("tel-1."), "{list}");
+        assert!(
+            !list.contains("tel-2."),
+            "the departing replica is still routed to: {list}"
+        );
     }
 
     /// A drain in flight owns the next transition. Re-reading stats and
@@ -1184,5 +1342,75 @@ mod tests {
         );
         assert_eq!(f.body("/status")["status"]["phase"], "Ready");
         assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+    }
+
+    /// The watch scope has to match the RBAC the chart rendered, or the
+    /// operator watches nothing: `Api::all` is a cluster-wide LIST and no
+    /// `Role` can authorise one. An empty or absent list is the cluster-wide
+    /// default, and a trailing comma must not become a watch on `""` — the API
+    /// server reads that as every namespace, which is the 403 this exists to
+    /// avoid.
+    #[test]
+    fn a_namespace_list_is_the_chart_s_and_an_empty_one_is_the_whole_cluster() {
+        assert_eq!(namespaces(None), None);
+        assert_eq!(namespaces(Some("")), None);
+        assert_eq!(namespaces(Some(" , ")), None);
+        assert_eq!(namespaces(Some("alpha")), Some(vec!["alpha".into()]));
+        assert_eq!(
+            namespaces(Some("alpha, beta,")),
+            Some(vec!["alpha".into(), "beta".into()])
+        );
+    }
+
+    /// The cooldown is read live, for the same reason `draining` is.
+    ///
+    /// `scale()` fires the `.owns(StatefulSet)` watch before the status write
+    /// stamping `lastScaled` has even been issued, so the reconcile that event
+    /// triggers is handed a cached object from *before* the stamp. Deciding off
+    /// that is deciding with no cooldown at all: the tier acts again on a
+    /// reading that predates its own last scale, before the new volume has been
+    /// bound.
+    #[tokio::test]
+    async fn a_cooldown_the_cached_copy_has_not_caught_up_with_still_holds() {
+        let f = Fake::live(MiraClusterStatus {
+            last_scaled: Some(fmt_rfc3339(now_secs())),
+            ..Default::default()
+        });
+        let c = drainable();
+        assert!(c.status.as_ref().unwrap().last_scaled.is_none());
+
+        let action = reconcile(Arc::new(c), f.ctx()).await.unwrap();
+
+        assert!(
+            !f.log().iter().any(|l| l.contains("/status")),
+            "a pass inside the cooldown decides nothing and writes nothing: {:?}",
+            f.log()
+        );
+        let held = [599, 600].map(|s| Action::requeue(Duration::from_secs(s)));
+        assert!(
+            held.contains(&action),
+            "the requeue is the cooldown's remainder, not the 60s decision interval: {action:?}"
+        );
+    }
+
+    /// And the branch that runs once it has expired has to write it back.
+    ///
+    /// Server-side apply removes a field this manager owned and then omitted,
+    /// so the ordinary `Ready` write at the end of a quiet pass was deleting
+    /// the stamp the scale before it had left. One quiet pass to forget, and
+    /// the next reading was free to swing the tier again.
+    #[tokio::test]
+    async fn a_quiet_pass_does_not_delete_the_cooldown_it_has_outlived() {
+        let stamped = fmt_rfc3339(now_secs() - 5_000);
+        let f = Fake::live(MiraClusterStatus {
+            last_scaled: Some(stamped.clone()),
+            ..Default::default()
+        });
+
+        reconcile(Arc::new(drainable()), f.ctx()).await.unwrap();
+
+        let st = f.body("/status")["status"].clone();
+        assert_eq!(st["phase"], "Ready");
+        assert_eq!(st["lastScaled"], stamped, "{st}");
     }
 }

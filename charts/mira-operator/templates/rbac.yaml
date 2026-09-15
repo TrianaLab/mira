@@ -20,13 +20,10 @@ rather than succeed.
 # forever while kubectl shows an empty PHASE.
 - apiGroups: ["mira.miradb.dev"]
   resources: ["miraclusters"]
-  verbs: ["get", "list", "watch", "update", "patch"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["mira.miradb.dev"]
   resources: ["miraclusters/status"]
   verbs: ["get", "update", "patch"]
-- apiGroups: ["mira.miradb.dev"]
-  resources: ["miraclusters/finalizers"]
-  verbs: ["update"]
 # The tier. The scale subresource is the only way replicas ever change.
 - apiGroups: ["apps"]
   resources: ["statefulsets", "deployments"]
@@ -42,10 +39,6 @@ rather than succeed.
 - apiGroups: ["policy"]
   resources: ["poddisruptionbudgets"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
-# Read-only. The operator never creates a pod directly; the StatefulSet does.
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
 # The drain. Deleting a claim is the single irreversible permission in this
 # file, and the controller only reaches it after a drain Job reported success.
 - apiGroups: [""]
@@ -54,21 +47,58 @@ rather than succeed.
 - apiGroups: ["batch"]
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete"]
-# One writer. The operator holds a Lease in its own namespace for as long as it
-# is the one reconciling; see `lease.rs`. Namespaced like everything else here,
-# which is also its limit: two separate cluster-wide installs hold two leases.
+{{- end }}
+{{/*
+One writer. The operator holds a Lease in the *release* namespace for as long
+as it is the one reconciling; see `lease.rs`. Separate from the rules above
+because it is the one permission that does not follow the watch: in namespaced
+mode those go to the watched namespaces and this still belongs here, and in
+cluster-wide mode a ClusterRole would grant leases everywhere to hold one.
+
+Namespaced like everything else, which is also its limit: two separate
+cluster-wide installs hold two leases.
+*/}}
+{{- define "mira-operator.leaseRules" -}}
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "create", "update"]
-# Events, so `kubectl describe miracluster` explains itself.
-- apiGroups: [""]
-  resources: ["events"]
-  verbs: ["create", "patch"]
 {{- end }}
 {{- if .Values.rbac.create }}
 {{- $name := include "mira-operator.fullname" . }}
 {{- $labels := include "mira-operator.labels" . }}
 {{- $sa := include "mira-operator.serviceAccountName" . }}
+{{/*
+Always, and in both modes. `hold()` is the operator's first call — before the
+controller starts — so without this the process takes a 403 and exits, and
+namespaced mode shipped an operator that could not boot unless the release
+namespace happened to be in the watch list.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+rules:
+  {{- include "mira-operator.leaseRules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-lease
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-lease
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
 {{- if .Values.rbac.namespaces }}
 {{/*
 Namespaced mode: a Role in each listed namespace instead of one ClusterRole.

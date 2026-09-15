@@ -88,3 +88,25 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].env[1].valueFrom.fieldRef.fieldPath
           value: metadata.name
+
+  # The other half of `rbac.namespaces`. A `Role` can only authorise a
+  # namespaced LIST, so an operator left watching cluster-wide under those
+  # Roles watches nothing: every reflector takes a 403 and the tier it was
+  # installed to manage is never reconciled.
+  - it: watches only the namespaces its Roles cover
+    set:
+      rbac:
+        namespaces: [alpha, beta]
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[2].name
+          value: WATCH_NAMESPACES
+      - equal:
+          path: spec.template.spec.containers[0].env[2].value
+          value: alpha,beta
+
+  - it: watches the whole cluster when no namespaces are listed
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers[0].env
+          count: 2

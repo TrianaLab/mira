@@ -20,7 +20,8 @@ answer to ship as the default. A tier is a `MiraCluster` now.
 
 ## Why not an HPA
 
-Mira has no metric that moves when it needs another replica. Section 11 measures
+Mira has no metric that moves when it needs another replica.
+[Section 11](https://miradb.dev/architecture/performance/) measures
 **2.23 of twelve cores at 1,537,875 records/s** — a CPU-target HPA reads
 single-digit utilisation at saturation, and a memory-target one reads page
 cache, which is the `mmap` working as designed. The quantity that actually runs
@@ -143,7 +144,8 @@ the tier is one replica smaller and every block is still on disk.
 ### It does not re-home the blocks
 
 `offload push` copies to the cold store and the blocks stay there, queryable
-again only after a deliberate `mira offload restore`. That is section 12.4's
+again only after a deliberate `mira offload restore`. That is
+[section 12.4](https://miradb.dev/architecture/replicas-scaling/#124-what-scales-and-what-this-deliberately-does-not-buy)'s
 "No rebalancing, ever" rather than an omission — and the same `ReadWriteOnce`
 constraint that forced the order above forbids the reverse: a restore has to
 mount a *surviving* replica's volume, which its running pod holds. Automating it
@@ -157,7 +159,10 @@ no `delete` on pods, statefulsets or deployments: a tier is resized through
 `statefulsets/scale`, and a bug that reached for `delete` should get a 403.
 
 Set `rbac.namespaces` to a list to get a `Role` in each instead of one
-`ClusterRole`. The CRD is still cluster-scoped to install.
+`ClusterRole`; the operator then watches only those namespaces, because a `Role`
+can authorise nothing wider. The CRD is still cluster-scoped to install, and the
+Lease keeps a `Role` of its own in the release namespace either way — claiming
+it is the operator's first call, before the controller starts.
 
 ## Replicas
 
@@ -172,8 +177,9 @@ It is soft, in two ways worth knowing. A holder whose renewal is stuck can
 still be inside a reconcile when a standby's clock says the lease expired —
 there is no fencing token to prevent that, so the window is seconds after a
 failure rather than never. And the Lease is per-release while the watch is
-cluster-wide, so *two installs* in two namespaces hold two leases and both
-reconcile everything. Install the operator once.
+cluster-wide by default, so *two installs* in two namespaces hold two leases and
+both reconcile everything. Install the operator once, or give each one its own
+`rbac.namespaces`.
 
 `Recreate` rather than a rolling update, so an upgrade does not pay the standby
 wait every time. A moment with no controller is safe; Mira keeps serving either
@@ -206,7 +212,7 @@ cosign verify \
 | podLabels | object | `{}` | Pod labels. |
 | podSecurityContext | object | `{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod-level security context. The operator writes nothing and needs no identity beyond its token. |
 | rbac.create | bool | `true` | Create the ClusterRole and binding the operator needs. |
-| rbac.namespaces | list | `[]` | Restrict the operator to a list of namespaces by creating a Role in each instead of one ClusterRole. Empty means cluster-wide. |
+| rbac.namespaces | list | `[]` | Restrict the operator to a list of namespaces: a Role in each instead of one ClusterRole, and a watch scoped to match, since a Role can authorise nothing wider. Empty means cluster-wide. |
 | replicaCount | int | `1` | Replicas. Extras are warm standbys, not extra capacity: a `coordination.k8s.io` Lease means exactly one reconciles and the rest wait. Raise it to shorten the gap after a node failure, not to go faster. The Deployment's `Recreate` strategy is the other half — the lease makes an overlap survivable, Recreate makes upgrades not pay for one. |
 | resources | object | `{"limits":{"memory":"128Mi"},"requests":{"cpu":"10m","memory":"64Mi"}}` | Resource requests and limits. The controller is idle between reconciles; the ceiling exists to make it evictable rather than because it is reached. |
 | securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context. |

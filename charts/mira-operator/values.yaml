@@ -25,8 +25,9 @@ replicaCount: 1
 rbac:
   # -- Create the ClusterRole and binding the operator needs.
   create: true
-  # -- Restrict the operator to a list of namespaces by creating a Role in each
-  # instead of one ClusterRole. Empty means cluster-wide.
+  # -- Restrict the operator to a list of namespaces: a Role in each instead of
+  # one ClusterRole, and a watch scoped to match, since a Role can authorise
+  # nothing wider. Empty means cluster-wide.
   namespaces: []
 
 serviceAccount:

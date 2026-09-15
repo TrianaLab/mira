@@ -57,6 +57,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- with .Values.rbac.namespaces }}
+            # The other half of namespaced RBAC. A `Role` can only authorise a
+            # namespaced LIST, so an operator left watching cluster-wide under
+            # those Roles watches nothing: every reflector takes a 403 and the
+            # tier is never reconciled.
+            - name: WATCH_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
