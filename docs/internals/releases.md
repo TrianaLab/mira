@@ -120,13 +120,20 @@ Every job `needs: meta`, and every job is in `verify-release`'s `needs` closure 
 `make workflows` enforces that statically, so a publisher that silently skips is
 caught at PR time.
 
-```text
-meta ──> build (×4 targets) ──┬─> package ──┐
-                              └─> image ────┴─> release ──> crates ──┐
-                                                                     │
-meta ──> operator-meta ──> operator-build (×2) ──> operator-image ──┐│
-                                                    operator-chart <┘│
-                                                              └──────┴─> verify-release
+```mermaid
+flowchart LR
+  meta --> build["build (×4 targets)"]
+  build --> package
+  build --> image
+  package --> release
+  image --> release
+  release --> crates
+
+  meta --> operator-meta --> operator-build["operator-build (×2)"]
+  operator-build --> operator-image --> operator-chart
+
+  crates --> verify-release
+  operator-chart --> verify-release
 ```
 
 Two chains, one terminal job: a broken operator build does not stop the engine

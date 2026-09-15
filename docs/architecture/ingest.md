@@ -1,10 +1,17 @@
 # 4. Ingest path
 
-```text
-gRPC 4317 (tonic) ─┐                    ┌─ mpsc ─> flusher 0 ─┐
-                   ├─> Ingest::submit ──┼─ mpsc ─> flusher 1 ─┼─> spawn_blocking ─> publish
-HTTP 4318 (axum) ──┘         │          └─ mpsc ─> flusher k ─┘         │
-                             └─────────────── oneshot ack ──────────────┘
+```mermaid
+flowchart LR
+  grpc["gRPC 4317 (tonic)"] --> submit["Ingest::submit"]
+  http["HTTP 4318 (axum)"] --> submit
+  submit -- mpsc --> f0["flusher 0"]
+  submit -- mpsc --> f1["flusher 1"]
+  submit -- mpsc --> fk["flusher k"]
+  f0 --> sb[spawn_blocking]
+  f1 --> sb
+  fk --> sb
+  sb --> publish
+  sb -- "oneshot ack" --> submit
 ```
 
 ## gzip on both listeners

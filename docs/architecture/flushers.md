@@ -2,23 +2,20 @@
 
 One task per shard, one open block each, three transitions:
 
-```text
-        ┌──────────────── recv_many(≤64) ────────────────┐
-        v                                                │
-    [ OPEN ] ──append──> [ ACCUMULATING ] ───────────────┘
-        │                      │
-        │                      ├─ approx_bytes ≥ target (32 MB) ─┐
-        │                      ├─ age ≥ max_block_age (2 s) ─────┤
-        │                      ├─ no dictionary headroom ────────┤
-        │                      └─ channel closed ────────────────┤
-        v                                                        v
-    [ IDLE ]                                            [ SEALING ]
-   (timer pushed out)                                            │
-                                        builder.finish() → 5 RecordBatches
-                                                                 │
-                                              spawn_blocking: publish()
-                                                                 │
-                                                  ack every waiter, reset
+```mermaid
+stateDiagram-v2
+  OPEN --> ACCUMULATING: append
+  ACCUMULATING --> OPEN: recv_many(≤64)
+  OPEN --> IDLE: timer pushed out
+  ACCUMULATING --> SEALING: approx_bytes ≥ target (32 MB)
+  ACCUMULATING --> SEALING: age ≥ max_block_age (2 s)
+  ACCUMULATING --> SEALING: no dictionary headroom
+  ACCUMULATING --> SEALING: channel closed
+  note right of SEALING
+    builder.finish() → 5 RecordBatches
+    spawn_blocking: publish()
+    ack every waiter, reset
+  end note
 ```
 
 Four details that are easy to get wrong:
