@@ -95,7 +95,7 @@ census() {
   # <signal>/p=<partition>/<block>, which is depth three — the same expression
   # restart-replay.sh and offload-cycle.sh already use — and the `.arrow` files
   # inside one are its tables.
-  awk -v gib="$(find "$ROOT/d" -mindepth 3 -maxdepth 3 -type d | xargs du -sk \
+  awk -v gib="$(find "$ROOT/d" -mindepth 3 -maxdepth 3 -type d -exec du -sk {} + \
                  | awk '{s += $1} END {printf "%.2f", s / 1048576}')" \
       -v tables="$(find "$ROOT/d" -name '*.arrow' | wc -l | tr -d ' ')" \
       -v blocks="$(find "$ROOT/d/logs" -mindepth 2 -maxdepth 2 -type d | wc -l | tr -d ' ')" \

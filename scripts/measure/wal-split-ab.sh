@@ -93,7 +93,9 @@ for C in $SHAPES; do
   while [ "$N" -le "$PASSES" ]; do
     # B first. The arm that runs second has the warmer page cache, and B is the
     # arm making the claim — give the advantage to the one it is claimed against.
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$B_BIN" "$C"); BR=$1; BH=$3; BW=$4; BQ=$5
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$A_BIN" "$C"); AR=$1; AH=$3; AW=$4; AQ=$5
     R=$(awk -v a="$AR" -v b="$BR" 'BEGIN{printf "%.3f", (a>0)? b/a : 0}')
     printf '%-5s %11s %11s %7s %22s %22s\n' "$N" "$AR" "$BR" "$R" \

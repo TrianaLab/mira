@@ -144,7 +144,9 @@ for C in $SHAPES; do
   RATIOS=""
   N=1
   while [ "$N" -le "$PASSES" ]; do
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$C" ram);  BR=$1; BH=$2; BW=$3; BQ=$4
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$C" "");   AR=$1; AH=$2; AW=$3; AQ=$4
     R=$(awk -v a="$AR" -v b="$BR" 'BEGIN{printf "%.3f", (a>0)? b/a : 0}')
     printf '%-5s %11s %11s %7s %19s %19s\n' "$N" "$AR" "$BR" "$R" \

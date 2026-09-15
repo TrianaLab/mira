@@ -587,11 +587,13 @@ workflows: ## Lint the workflows, and check every CI job can block a merge
 	$(XTASK) ci
 	@# actionlint shellchecks every `run:` block for free, so the scripts those
 	@# blocks call have to be checked somewhere too — lifting shell out of YAML
-	@# must not be how it stops being linted. A glob rather than a list: the
-	@# list is what rots, and re-checking get-mira.sh (which `make
-	@# install-script` also does, with more) costs nothing.
+	@# must not be how it stops being linted. `git ls-files` rather than two
+	@# globs: `scripts/*.sh` is not recursive, so the nine scripts under
+	@# `scripts/measure/` were never linted and had nine warnings between them
+	@# when this line was written. Re-checking get-mira.sh — twice, since
+	@# docs/install.sh is a symlink to it — costs nothing.
 	$(call need_bin,shellcheck,brew install shellcheck   (see https://github.com/koalaman/shellcheck#installing))
-	shellcheck scripts/*.sh $(OPERATOR)/e2e/*.sh
+	shellcheck $$(git ls-files '*.sh')
 
 .PHONY: install-script
 install-script: ## The published one-liner installer still parses, lints and runs

@@ -174,7 +174,9 @@ for C in $SHAPES; do
   while [ "$N" -le "$PASSES" ]; do
     # B first: the arm that runs second has the warmer page cache, and B is the
     # arm making the claim.
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(arm_b "$C"); BR=$1; BU=$3; BP=$4
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(arm_a "$C"); AR=$1; AU=$3; AP=$4
     RR=$(awk -v a="$AR" -v b="$BR" 'BEGIN{printf "%.3f", (a>0)? b/a : 0}')
     RU=$(awk -v a="$AU" -v b="$BU" 'BEGIN{printf "%.3f", (a>0)? b/a : 0}')

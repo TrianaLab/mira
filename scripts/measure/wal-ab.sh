@@ -98,7 +98,9 @@ for C in $SHAPES; do
   while [ "$N" -le "$PASSES" ]; do
     # B first, then A. The arm that runs second is the one the box has had time
     # to warm for, so fixing the order would hand A a systematic advantage.
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$C" "$ROOT/nowal.kyaml"); BR=$1
+    # shellcheck disable=SC2046 # the fields are separate words on purpose.
     set -- $(run "$C" ""); AR=$1; AHELD=$4; AWAIT=$5
     R=$(awk -v a="$AR" -v b="$BR" 'BEGIN{printf "%.3f", (a>0)? b/a : 0}')
     printf '%-6s %12s %12s %9s %10s %10s\n' "$N" "$AR" "$BR" "$R" "$AHELD" "$AWAIT"

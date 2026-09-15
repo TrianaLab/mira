@@ -77,12 +77,25 @@ case "${1:-}" in
 		echo "check-section selftest: --text passed a dirty string" >&2
 		exit 1
 	}
-	echo "check-section: selftest ok (clean passes, dirty fails with path:line, --text fails)"
+	sh "$0" --commits 'no-such-ref..HEAD' >/dev/null 2>&1 && {
+		echo "check-section selftest: --commits passed an unresolvable range" >&2
+		exit 1
+	}
+	echo "check-section: selftest ok (clean passes, dirty fails with path:line, --text fails, a bad range fails)"
 	;;
 --commits)
 	range="${2:?usage: check-section-sign.sh --commits <range>}"
+	# Resolved before the loop, not inside its `in`: there, `git rev-list`
+	# failing lists nothing, the body never runs, and this gate reports zero
+	# hits and exits 0. A base ref CI could not fetch is exactly when it has
+	# to say so instead.
+	commits=$(git rev-list "$range") || {
+		echo "check-section: cannot resolve $range" >&2
+		exit 1
+	}
 	hits=""
-	for c in $(git rev-list "$range"); do
+	# shellcheck disable=SC2086 # one word per commit is the point.
+	for c in $commits; do
 		if git log -1 --format='%B' "$c" | grep -qF "$sign"; then
 			hits="${hits}commit ${c}: $(git log -1 --format='%s' "$c")
 "
