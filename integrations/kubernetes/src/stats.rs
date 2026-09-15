@@ -104,18 +104,19 @@ pub fn decide(readings: &[Reading], up_below: f64, down_above: f64) -> Decision 
     if readings.is_empty() {
         return Decision::Hold;
     }
-    // One silent replica and the tier holds. The alternative is deciding from a
-    // partial view of a quantity whose whole purpose is to be the minimum.
-    if readings.iter().any(|r| !matches!(r, Reading::Free(_))) {
-        return Decision::Hold;
+    let mut free = Vec::with_capacity(readings.len());
+    for r in readings {
+        // One silent replica and the tier holds. The alternative is deciding
+        // from a partial view of a quantity whose whole purpose is to be the
+        // minimum. Collected in the same pass that checks it: a separate guard
+        // followed by a `filter_map` leaves the filter's other arm unreachable,
+        // which reads as a policy on non-`Free` readings and is really the
+        // guard restated.
+        let Reading::Free(f) = r else {
+            return Decision::Hold;
+        };
+        free.push(*f);
     }
-    let free: Vec<f64> = readings
-        .iter()
-        .filter_map(|r| match r {
-            Reading::Free(f) => Some(*f),
-            _ => None,
-        })
-        .collect();
 
     if free.iter().any(|&f| f < up_below) {
         return Decision::Up;
@@ -128,10 +129,101 @@ pub fn decide(readings: &[Reading], up_below: f64, down_above: f64) -> Decision 
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+
     use super::*;
 
     const UP: f64 = 0.15;
     const DOWN: f64 = 0.60;
+
+    /// Long enough that a loaded machine does not read as a timeout, short
+    /// enough that the timeout test is not the slow one in the suite.
+    const PATIENCE: Duration = Duration::from_millis(500);
+
+    /// One canned HTTP/1.1 reply on a background thread, and the base URL for
+    /// it. A fake at the `Reading` level would assert nothing this function
+    /// does — the parsing that turns a body into a decision is the part that
+    /// deletes a volume — so the client under test is the real one and the
+    /// server is a socket.
+    ///
+    /// `None` accepts the connection and never answers, which is the
+    /// unreachable replica that does not reset: the case the timeout exists
+    /// for, and the one a refused connection does not exercise.
+    fn serve(reply: Option<(&str, &str)>) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let reply = reply.map(|(status, body)| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            // Enough of the request to let the client finish writing it. What
+            // it asked for does not matter; the reply is canned.
+            let _ = s.read(&mut [0u8; 1024]);
+            match &reply {
+                Some(r) => drop(s.write_all(r.as_bytes())),
+                // Held open rather than dropped, so the client waits on the
+                // clock instead of on a reset.
+                None => std::thread::sleep(Duration::from_secs(5)),
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The happy path end to end: a number on the wire is the number the
+    /// scaling arithmetic gets.
+    #[tokio::test]
+    async fn a_replica_that_answers_with_a_number_reads_as_that_number() {
+        let url = serve(Some(("200 OK", r#"{"free_fraction":0.42,"blocks":7}"#)));
+        assert_eq!(read(&url, PATIENCE).await, Reading::Free(0.42));
+    }
+
+    /// The three ways an answer can arrive without a usable number. All are
+    /// `Unknown` and none is a zero: read as 0.0 this scales out for ever, read
+    /// as 1.0 it deletes a volume.
+    #[tokio::test]
+    async fn an_answer_without_a_number_in_it_is_unknown_never_a_number() {
+        for body in [
+            // What the engine itself emits when `statfs` would not answer.
+            r#"{"free_fraction":null}"#,
+            // An older Mira, or something else on the port.
+            r#"{"blocks":7}"#,
+            r#"{"free_fraction":"plenty"}"#,
+        ] {
+            let url = serve(Some(("200 OK", body)));
+            assert_eq!(read(&url, PATIENCE).await, Reading::Unknown, "{body}");
+        }
+    }
+
+    /// A replica that answers badly is not a replica that answered. A 503 body
+    /// is an error document, and `free_fraction` missing from it must not be
+    /// read as the engine declining to stat — that is a different fact, and it
+    /// is the one that holds a scale-out.
+    #[tokio::test]
+    async fn an_error_or_a_body_that_is_not_json_is_unreachable_not_unknown() {
+        for (status, body) in [
+            ("503 Service Unavailable", r#"{"free_fraction":0.42}"#),
+            ("200 OK", "not json"),
+        ] {
+            let url = serve(Some((status, body)));
+            assert_eq!(read(&url, PATIENCE).await, Reading::Unreachable, "{status}");
+        }
+    }
+
+    /// The reason the timeout argument exists: one replica that accepts and
+    /// never answers would otherwise hold the reconcile open, and the reconcile
+    /// holds the decision for every other replica with it.
+    #[tokio::test]
+    async fn a_replica_that_accepts_and_never_answers_gives_up() {
+        let url = serve(None);
+        assert_eq!(
+            read(&url, Duration::from_millis(50)).await,
+            Reading::Unreachable
+        );
+    }
 
     /// The distribution argument, as a test. Nine roomy replicas and one nearly
     /// full is a mean of ~0.7 and a tier that is about to start refusing writes

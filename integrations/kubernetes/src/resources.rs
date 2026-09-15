@@ -414,8 +414,8 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
     // offload push` writes into the container's own filesystem, exits 0, and
     // the operator deletes the claim it believes it has archived — so
     // `validate` refuses the spec that would produce `None` here, and the
-    // `unwrap_or_default` below is the unreachable arm of a check that already
-    // ran rather than a second policy.
+    // `None` arm below is the unreachable half of a check that already ran
+    // rather than a second policy.
     let cold = crate::crd::cold_mount(offload).zip(c.spec.cold_storage_claim.clone());
     let (mounts, volumes) = match &cold {
         Some((at, claim)) => (
@@ -664,6 +664,40 @@ mod tests {
         // `offload push` underneath the mount, and mounting the expanded path
         // would mean one claim per drain forever.
         assert_eq!(at, "/cold");
+    }
+
+    /// The arm `validate` is supposed to make unreachable, pinned anyway.
+    ///
+    /// A cluster with no `coldStorageClaim` cannot be built through the CRD —
+    /// the pair is refused — but this function takes the spec, not the
+    /// verdict, and the shape it produces if the check is ever bypassed
+    /// decides whether a volume is deleted. It must mount `data` and nothing
+    /// else: a `cold` mount with no claim behind it is the container
+    /// filesystem, which is the loss the check exists to prevent, and a
+    /// well-formed Job is what lets the drain fail loudly instead.
+    #[test]
+    fn a_cluster_with_no_cold_claim_still_renders_a_job_that_mounts_only_data() {
+        let mut c = cluster();
+        c.spec.offload = None;
+        c.spec.cold_storage_claim = None;
+
+        let pod = drain_job(&c, 4, "file:///cold/${node}")
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        let names: Vec<_> = pod
+            .volumes
+            .unwrap()
+            .iter()
+            .map(|v| v.name.clone())
+            .collect();
+        assert_eq!(names, ["data"]);
+        let mounts = pod.containers[0].volume_mounts.clone().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_path, "/data");
     }
 
     /// `spec.offload` must never reach a running replica's config.

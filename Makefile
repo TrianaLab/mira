@@ -685,13 +685,15 @@ operator-test: ## The operator's unit tests
 # reach a nested workspace, which is why the operator was invisible to
 # COVERAGE_MIN for as long as it existed.
 #
-# 89.56 measured here with the request-log tests in place. It is *not* 99-point-
-# something and cannot be: `main.rs` and `crdgen.rs` are 33 lines of process
-# entry point at 0%, which puts the ceiling at about 98.2 — those two are
-# covered by `make operator-e2e`, and coverage instrumentation does not follow a
-# binary into a container. Floored to 89.0 for the same reason COVERAGE_MIN is
-# floored: a ratchet with no margin fails on a run that measured the same tree.
-OPERATOR_COVERAGE_MIN ?= 90.0
+# 91.72 lines measured here with the `stats::read` socket tests in place — the
+# flag is --fail-under-lines, so it is the Lines column and not Regions that has
+# to clear this. It is *not* 99-point-something and cannot be: `main.rs` and
+# `crdgen.rs` are 33 lines of process entry point at 0%, which puts the ceiling
+# at about 98.2 — those two are covered by `make operator-e2e`, and coverage
+# instrumentation does not follow a binary into a container. Floored to 91.0 for
+# the same reason COVERAGE_MIN is floored: a ratchet with no margin fails on a
+# run that measured the same tree.
+OPERATOR_COVERAGE_MIN ?= 91.0
 
 .PHONY: operator-coverage
 operator-coverage: ## Operator line coverage against its ratchet ($(OPERATOR_COVERAGE_MIN)%)

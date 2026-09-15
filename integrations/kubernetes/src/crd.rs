@@ -415,6 +415,24 @@ mod tests {
         }
     }
 
+    /// The shortest spec anyone will write, and the one every quickstart shows:
+    /// an image and a size. What it gets for the two fields it left out is a
+    /// tier that starts at one replica and cannot grow past ten, and the pair
+    /// has to satisfy the same `validate` a written-out spec does — a floor
+    /// above the ceiling by default would be a CRD that refuses its own
+    /// example.
+    #[test]
+    fn a_spec_that_names_only_an_image_and_a_size_gets_a_tier_that_validates() {
+        let s: MiraClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ghcr.io/trianalab/mira:0.0.4",
+            "storage": {"size": "10Gi"},
+        }))
+        .unwrap();
+        assert_eq!(s.replicas, 1);
+        assert_eq!(s.max_replicas, 10);
+        assert!(s.validate().is_ok());
+    }
+
     /// A ceiling below the floor asks for a tier that is simultaneously too big
     /// and too small; caught here rather than as a StatefulSet that flaps.
     #[test]
