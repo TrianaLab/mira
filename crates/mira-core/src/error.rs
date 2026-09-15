@@ -85,6 +85,19 @@ pub enum Error {
     )]
     OffloadScheme { uri: String },
 
+    /// The store already holds this block's name over other bytes. See
+    /// `offload::Target::push`.
+    #[error(
+        "{dest} is already in the store and does not match the block being \
+         pushed ({why}). A block name is its identity, so this one cannot be \
+         reported as already archived — a scale-in would take that as licence \
+         to delete the volume. The likely cause is a replica re-created on a \
+         fresh volume: it keeps its node id and restarts its sequence, so it \
+         reissues (node, seq) pairs the store still holds. Move the copy in \
+         the store aside, then push again."
+    )]
+    OffloadCollision { dest: PathBuf, why: String },
+
     /// An export bigger than the WAL will frame. Distinct from a corrupt
     /// length on read: this one is the caller's fault and is answerable with a
     /// 4xx, so it must not be confused with the file being damaged.

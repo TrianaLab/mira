@@ -75,6 +75,15 @@ impl Target {
     /// Staged under `.tmp` and renamed, for the reason [`block::publish`]
     /// stages: the store's list API is the catalog, so a half-copied block
     /// visible under its final name is a catalog entry that does not open.
+    ///
+    /// "Already there" is checked against the bytes, not only the name,
+    /// because `false` is what licenses the caller to unlink the local copy —
+    /// `block::expire_with` on the retention sweep, the operator deleting a
+    /// drained replica's volume on `mira offload push` exiting 0. A replica
+    /// re-created on a fresh volume keeps its node id and restarts its
+    /// sequence, so it reissues `(node, seq)` pairs the store may still hold,
+    /// and a name taken by somebody else's rows is the one case where "already
+    /// archived" is a lie with a volume behind it.
     pub fn push(&self, signal: &str, b: &BlockRef) -> Result<bool> {
         let Some((partition, name)) = split(&b.dir) else {
             return Ok(false);
@@ -82,7 +91,10 @@ impl Target {
         let dest_dir = self.root.join(signal).join(partition);
         let dest = dest_dir.join(name);
         if dest.exists() {
-            return Ok(false);
+            return match differs(&b.dir, &dest)? {
+                None => Ok(false),
+                Some(why) => Err(Error::OffloadCollision { dest, why }),
+            };
         }
         copy_block(
             &b.dir,
@@ -111,6 +123,48 @@ impl Target {
         let staging = format!("{signal}-{node:08x}-restore-{name}");
         copy_block(&b.dir, data_dir, &dest_dir, &dest, &staging)
     }
+}
+
+/// Why two copies of one block name are not the same block, or `None`.
+///
+/// Names and sizes, not content. A block is sealed and immutable, its files
+/// are written once and the store's copy came from `copy_files` — so a byte
+/// that differs under a name and a length that both match has no writer in
+/// this design. Reading both sides to compare them would put the block's whole
+/// size through the retention sweep once a minute for every block already in
+/// the store, to rule out a case nothing can produce.
+///
+/// The same `is_file` filter as [`copy_files`], which walks past directories:
+/// a stray one beside the tables is not part of the block and was never
+/// copied, so counting it would report a mismatch against the store's faithful
+/// copy of it.
+fn differs(src: &Path, dest: &Path) -> Result<Option<String>> {
+    let (ours, theirs) = (sizes(src)?, sizes(dest)?);
+    for (name, len) in &ours {
+        match theirs.iter().find(|(n, _)| n == name) {
+            None => return Ok(Some(format!("{name} is missing from it"))),
+            Some((_, there)) if there != len => {
+                return Ok(Some(format!("{name} is {there} bytes there, {len} here")));
+            }
+            Some(_) => {}
+        }
+    }
+    let extra = theirs.iter().find(|(n, _)| !ours.iter().any(|(o, _)| o == n));
+    Ok(extra.map(|(n, _)| format!("it holds {n}, which this block does not")))
+}
+
+/// `(file name, length)` for the regular files directly in `dir`, sorted.
+fn sizes(dir: &Path) -> Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).ctx(dir)? {
+        let entry = entry.ctx(dir)?;
+        let meta = entry.metadata().ctx(entry.path())?;
+        if meta.is_file() {
+            out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// `(partition, block name)` out of `…/<signal>/p=<hour>/<block>`.
@@ -376,6 +430,49 @@ mod tests {
         // in `.tmp` holding a second copy of the block.
         assert_eq!(fs::read(dest.join("logs.arrow")).unwrap(), b"theirs");
         assert!(!staged.exists());
+    }
+
+    /// "Already there" is what licenses the unlink, so it has to be decided
+    /// from the bytes and not from the name.
+    ///
+    /// A replica re-created on a fresh volume keeps its node id and restarts
+    /// its sequence — `offload_cmd`'s own doc says it "reissues `(node, seq)`
+    /// pairs that are still alive wherever they were copied" — so a second
+    /// drain of the same ordinal can find the first drain's archive under the
+    /// name the new block wants. Decided by name, that block is reported
+    /// `present`, `mira offload push` exits 0, and the operator deletes a
+    /// volume whose rows are in no store: the name in the catalog belongs to
+    /// somebody else's bytes.
+    ///
+    /// Mutation check: drop the comparison and `push` returns `Ok(false)` for
+    /// every case below.
+    #[test]
+    fn a_name_in_the_store_over_other_bytes_is_not_a_block_that_was_pushed() {
+        let tmp = tempdir("collide");
+        let (local, store) = (tmp.join("data"), tmp.join("cold"));
+        block(&local, "logs", 7_200_000_000_000, 1, b"hello");
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&local, "logs").unwrap().remove(0);
+        assert!(t.push("logs", &b).unwrap());
+        let there = t.list("logs").unwrap().remove(0).dir;
+
+        // Same names, different bytes. This is the collision itself.
+        fs::write(there.join("logs.arrow"), b"someone else's rows").unwrap();
+        let e = t.push("logs", &b).unwrap_err().to_string();
+        assert!(e.contains("logs.arrow") && e.contains(&*there.to_string_lossy()), "{e}");
+
+        // A short copy under the final name, which staging is supposed to make
+        // impossible and a store nobody else writes to would never hold.
+        fs::write(there.join("logs.arrow"), b"hello").unwrap();
+        fs::remove_file(there.join("attr.idx")).unwrap();
+        assert!(t.push("logs", &b).is_err());
+
+        // And a file the local block does not have. Restored to equality, the
+        // push goes back to the idempotent `false` the sweep runs on.
+        fs::write(there.join("attr.idx"), b"sidecar").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+        fs::write(there.join("stray"), b"x").unwrap();
+        assert!(t.push("logs", &b).is_err());
     }
 
     /// The invariant [section
