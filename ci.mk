@@ -203,6 +203,12 @@ KIND_VERSION         := 0.31.0
 KIND_SHA256          := eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
 VALE_VERSION         := 3.21.0
 VALE_SHA256          := 96997d19a4ca6981673b0d4c5ca7f3ede4a9f97964a96edc29fba9e28a328336
+# The runner image ships one, and that is the problem: 0.10.0 reports SC2015 on
+# `[ x ] && [ y ] || { …; exit 1; }` and 0.11.0 does not, so `make workflows`
+# was green on a laptop and red on the runner for a line neither version thinks
+# is a bug. Same argument as vale's below.
+SHELLCHECK_VERSION   := 0.11.0
+SHELLCHECK_SHA256    := 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
 
 .PHONY: ci-tool-trivy
 ci-tool-trivy: ## Install the pinned trivy (CI; locally use your own)
@@ -233,6 +239,19 @@ ci-tool-actionlint: ## Install the pinned actionlint (CI; locally use your own)
 	tar -xzf actionlint.tgz actionlint
 	sudo install actionlint /usr/local/bin/actionlint
 	rm actionlint actionlint.tgz
+
+.PHONY: ci-tool-shellcheck
+ci-tool-shellcheck: ## Install the pinned shellcheck (CI; locally use your own)
+	@# Over the runner's preinstalled one, which is older and not under our
+	@# control. Digest taken from the release asset itself: shellcheck publishes
+	@# no checksums file.
+	curl -fsSLo shellcheck.txz \
+	  "https://github.com/koalaman/shellcheck/releases/download/v$(SHELLCHECK_VERSION)/shellcheck-v$(SHELLCHECK_VERSION).linux.x86_64.tar.xz"
+	echo "$(SHELLCHECK_SHA256)  shellcheck.txz" | $(SHA256) -c -
+	tar -xJf shellcheck.txz "shellcheck-v$(SHELLCHECK_VERSION)/shellcheck"
+	sudo install "shellcheck-v$(SHELLCHECK_VERSION)/shellcheck" /usr/local/bin/shellcheck
+	rm -rf shellcheck.txz "shellcheck-v$(SHELLCHECK_VERSION)"
+	shellcheck --version
 
 .PHONY: ci-tool-vale
 ci-tool-vale: ## Install the pinned vale (CI; locally use your own)

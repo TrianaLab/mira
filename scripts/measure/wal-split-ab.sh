@@ -39,8 +39,10 @@ PASSES=${PASSES:-3}
 FOR=${FOR:-20s}
 
 for B in "$A_BIN" "$B_BIN"; do
-  [ -x "$B/mira" ] && [ -x "$B/examples/loadgen" ] ||
-    { echo "wal-split-ab: $B needs both mira and examples/loadgen" >&2; exit 1; }
+  if [ ! -x "$B/mira" ] || [ ! -x "$B/examples/loadgen" ]; then
+    echo "wal-split-ab: $B needs both mira and examples/loadgen" >&2
+    exit 1
+  fi
 done
 mkdir -p "$ROOT"
 

@@ -410,6 +410,7 @@ jobs:
           # commits — a shallow clone has the tree but not the range.
           fetch-depth: 0
       - run: make ci-tool-actionlint
+      - run: make ci-tool-shellcheck
 
       # Every job in this file must be reachable from a required context below,
       # every `run:` must be a `make ci-*` call, every `uses:` must be

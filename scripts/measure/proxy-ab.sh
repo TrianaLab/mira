@@ -52,8 +52,10 @@ PASSES=${PASSES:-3}
 RECORDS=${RECORDS:-4000000}
 PAGE=${PAGE:-200}
 
-[ -x "$BIN/mira" ] && [ -x "$BIN/examples/loadgen" ] ||
-  { echo "proxy-ab: $BIN needs both mira and examples/loadgen" >&2; exit 1; }
+if [ ! -x "$BIN/mira" ] || [ ! -x "$BIN/examples/loadgen" ]; then
+  echo "proxy-ab: $BIN needs both mira and examples/loadgen" >&2
+  exit 1
+fi
 mkdir -p "$ROOT"
 PIDS=""
 
