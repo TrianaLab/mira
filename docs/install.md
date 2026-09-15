@@ -228,9 +228,9 @@ install` rejects a typo'd key. The Kubernetes
 pass-throughs (`resources`, `securityContext`, `podSecurityContext`,
 `nodeSelector`, `tolerations`, `affinity`) stay open.
 
-The `MiraCluster` fields get the same treatment, and the stakes are higher: the
-API server **prunes** a field the CRD does not name rather than rejecting it, so
-a stale CRD is silent data loss. So the CRD is
+The [`MiraCluster` fields](reference/crd.md) get the same treatment, and the
+stakes are higher: the API server **prunes** a field the CRD does not name
+rather than rejecting it, so a stale CRD is silent data loss. So the CRD is
 generated from the Rust types and `make operator-crd-check` fails the build when
 the two disagree — and a chart upgrade that changes the schema needs the CRD
 applied by hand first, since Helm installs `crds/` once and never upgrades it.

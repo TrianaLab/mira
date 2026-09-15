@@ -46,7 +46,11 @@ match, the cross-block merge is ordered, a cursor visits every row once, and
 
 No `proptest`: the dependency budget is a stated product property ([architecture
 section 11](../architecture/performance.md)), and `MIRA_DIFF_SEED=<n>` replays a failure
-exactly.
+exactly:
+
+```sh
+MIRA_DIFF_SEED=12858170866899772564 cargo test -p miradb-core --test differential
+```
 
 ### 3. In-process end-to-end, the one that catches wiring
 
@@ -122,7 +126,7 @@ cluster it just created, because a fake client cannot see:
 `make operator-e2e` builds a Kind cluster, installs the chart as published, and
 asserts five things end to end — including that the tier keeps serving after the
 operator is uninstalled, the claim principle 4 rests on.
-[End-to-end testing](e2e.md) section 6 maps what it asserts and how to debug
+[End-to-end testing](e2e.md) section 5 maps what it asserts and how to debug
 one.
 
 ## The operator, in a workspace of its own
