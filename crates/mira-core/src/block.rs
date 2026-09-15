@@ -986,7 +986,7 @@ fn remote_fs(magic: u64) -> Option<String> {
 
 /// The cold-tier marker. Its presence means every table in the block is already
 /// ZSTD-encoded, so a sweep can skip the directory without opening a file.
-const COLD_MARKER: &str = "cold";
+pub(crate) const COLD_MARKER: &str = "cold";
 
 /// A block goes cold once it has aged out of the hour it was partitioned into.
 ///

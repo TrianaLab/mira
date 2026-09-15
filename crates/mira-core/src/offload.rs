@@ -144,11 +144,30 @@ impl Target {
 /// copied, so counting it would report a mismatch against the store's faithful
 /// copy of it.
 fn differs(src: &Path, dest: &Path) -> Result<Option<String>> {
-    let (ours, theirs) = (sizes(src)?, sizes(dest)?);
+    let (mut ours, mut theirs) = (sizes(src)?, sizes(dest)?);
+    // Names only, when one side has gone cold and the other has not: `compact`
+    // ZSTD-encodes every table in place and drops the marker beside them, so no
+    // size on either side is a size on the other. That is not an edge case — it
+    // happens to every block a sweep pushed while it was still inside its own
+    // hour, so comparing sizes across the boundary fails the *steady state*: an
+    // error on every subsequent sweep, and retention unable to expire the block
+    // it had already archived.
+    //
+    // ponytail: the name set is what is left, and it does not discriminate a
+    // reissued `(node, seq)` — two blocks of the same signal have the same
+    // table names. Narrower than the check it replaces, and only on the
+    // handful of blocks mid-boundary; the fix is an identity in the block
+    // rather than one derived from its bytes, which is a format change.
+    let marker = |v: &[(String, u64)]| v.iter().any(|(n, _)| n == block::COLD_MARKER);
+    let across = marker(&ours) != marker(&theirs);
+    if across {
+        ours.retain(|(n, _)| n != block::COLD_MARKER);
+        theirs.retain(|(n, _)| n != block::COLD_MARKER);
+    }
     for (name, len) in &ours {
         match theirs.iter().find(|(n, _)| n == name) {
             None => return Ok(Some(format!("{name} is missing from it"))),
-            Some((_, there)) if there != len => {
+            Some((_, there)) if !across && there != len => {
                 return Ok(Some(format!("{name} is {there} bytes there, {len} here")));
             }
             Some(_) => {}
@@ -529,6 +548,47 @@ mod tests {
         fs::write(there.join("attr.idx"), b"sidecar").unwrap();
         assert!(!t.push("logs", &b).unwrap());
         fs::write(there.join("stray"), b"x").unwrap();
+        assert!(t.push("logs", &b).is_err());
+    }
+
+    /// The same block on the two sides of the cold boundary is the same block.
+    ///
+    /// `compact` ZSTD-encodes every table in place and drops a `cold` marker
+    /// beside them, so a block pushed while hot and swept again after it aged
+    /// out of its hour has the same table names and none of the same sizes.
+    /// Compared byte-for-byte that reads as somebody else's rows under this
+    /// block's name: `push` raises `OffloadCollision`, `mira offload push`
+    /// exits non-zero, and the operator will not delete a drained replica's
+    /// volume — whose blocks are, in fact, already archived.
+    ///
+    /// Mutation check: compare sizes across the boundary too, and every
+    /// assertion below turns into an error.
+    #[test]
+    fn a_block_that_went_cold_after_it_was_pushed_is_still_that_block() {
+        let tmp = tempdir("cold");
+        let (local, store) = (tmp.join("data"), tmp.join("cold"));
+        let dir = block(&local, "logs", 7_200_000_000_000, 1, b"hello");
+        let t = Target::parse(&format!("file://{}", store.display())).unwrap();
+        let b = block::scan(&local, "logs").unwrap().remove(0);
+        assert!(t.push("logs", &b).unwrap());
+
+        // What `compact_block` leaves behind: smaller tables, plus the marker.
+        fs::write(dir.join("logs.arrow"), b"zstd").unwrap();
+        fs::write(dir.join("cold"), b"").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+
+        // And the other direction, which is what a restore then a re-drain
+        // does: the store holds the cold copy, the local one is hot again.
+        let there = t.list("logs").unwrap().remove(0).dir;
+        fs::write(there.join("logs.arrow"), b"zstd").unwrap();
+        fs::write(there.join("cold"), b"").unwrap();
+        fs::remove_file(dir.join("cold")).unwrap();
+        fs::write(dir.join("logs.arrow"), b"hello").unwrap();
+        assert!(!t.push("logs", &b).unwrap());
+
+        // Still a collision when the *names* disagree. Compression cannot add
+        // or drop a table, so this is the check that survives the boundary.
+        fs::remove_file(there.join("attr.idx")).unwrap();
         assert!(t.push("logs", &b).is_err());
     }
 
