@@ -3,8 +3,8 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 422 cargo tests — 364 across levels 1–5, plus 58 in `xtask` that test
-the gates rather than the engine — 22 UI tests, 20 chart tests, and 52 more in
+Mira has 425 cargo tests — 367 across levels 1–5, plus 58 in `xtask` that test
+the gates rather than the engine — 22 UI tests, 26 chart tests, and 56 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
 both targets are in [Contributing](../contributing.md).
@@ -16,13 +16,13 @@ the industry's least agreed label, so it is absent.
 
 | # | Level | Count | Lives in | Runs from |
 | --- | --- | --- | --- | --- |
-| 1 | Unit, in-source | 141 core + 182 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 144 core + 182 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
-| 7 | Chart rendering | 20 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
+| 7 | Chart rendering | 26 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
 | 8 | Against a real API server | 5 | `integrations/kubernetes/tests/apiserver.rs` | `make operator-apiserver` |
 | 9 | Live, on a real cluster | asserted, not counted | `integrations/kubernetes/e2e/run.sh` | `make operator-e2e` |
 
@@ -65,7 +65,7 @@ new behaviour should land at.
 
 ### 4. Subprocess CLI, for what only a process has
 
-`main`, `run`, `load` and `shutdown` are reachable only by exec'ing the binary: a
+`main`, `run` and `shutdown` are reachable only by exec'ing the binary: a
 unit test in the bin crate never calls its own `main`, `-h` and `-V` end the
 process, and a signal handler needs a process to signal. Three tests, argv in and
 exit code out, with a SIGTERM in the middle; the third puts a real proxy in front
@@ -81,7 +81,7 @@ as a second command.
 
 ### 6. UI, without a browser
 
-`api.test.js` and `replay.test.js` are vitest over the two modules with logic in
+`api.test.js` and `replay.test.js` are `node --test` over the two modules with logic in
 them: the query-document builder and the recorded-snapshot replay the docs site
 serves at `/play`. `make ui-check` rebuilds `crates/mira/ui/dist` and fails on
 `git diff --exit-code`, because that directory is `include_bytes!`d into the
@@ -121,24 +121,24 @@ cluster it just created, because a fake client cannot see:
 
 `make operator-e2e` builds a Kind cluster, installs the chart as published, and
 asserts five things end to end — including that the tier keeps serving after the
-operator is uninstalled, the claim principle 4 rests on. It is the only level
-with a network, a container runtime and a Kubernetes API in it. [End-to-end testing](e2e.md) section 6 maps what it asserts and how to
-debug one.
+operator is uninstalled, the claim principle 4 rests on.
+[End-to-end testing](e2e.md) section 6 maps what it asserts and how to debug
+one.
 
 ## The operator, in a workspace of its own
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it. `make operator` is its
-whole gate — fmt, clippy, 47 tests, a coverage floor and the CRD drift check —
-and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
+whole gate — fmt, clippy, 51 unit tests, a coverage floor and the CRD drift
+check — and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
 deliberately not in it.
 
 The separation is not about testing: kube-rs declares Rust 1.89 against the
 engine's 1.85 floor and brings ~160 crates and a TLS stack, against a README
 crate count that is a published product property.
 
-Its 47 tests are level 1 in shape and almost all about **arithmetic that decides
-to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
+Its 51 unit tests are level 1 in shape and almost all about **arithmetic that
+decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
 a spec whose thresholds would oscillate.
 
@@ -159,6 +159,8 @@ These are the other half of `make check`.
 | `features` | `webhook-tls`, which nothing else compiles, failing to lint |
 | `doc` | A rustdoc warning, private items included — a dead intra-doc link is a dead link |
 | `reference-check` | A generated reference page (`docs/reference/`, `docs/config.md`) that the code has moved past |
+| `market-check` | The claim tally on `docs/market.md` no longer being what its own tables add up to |
+| `measurements-check` | A published performance number disagreeing with `measurements.kyaml`, the registry that owns it |
 | `docs-check` | Markup markdownlint refuses, a word Vale refuses, a page past a structural limit, or a cross-reference outside `docs/` resolving to nothing — `make docs` covers the ones inside it |
 | `ui-check` | A `.svelte` change whose rebuilt bundle was not committed |
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
@@ -170,8 +172,8 @@ These are the other half of `make check`.
 | `docs` | A dead link, a dead anchor, a page outside the nav, a route with a capital letter in it, or an absolute `miradb.dev` URL — anywhere in the tree, including Rust doc comments — that the site just built does not answer |
 
 Listed in `make check`'s own order. It also runs `test`, `chart`, `coverage` and
-`operator`, and leaves `msrv`, `scan-image`, `dist` and `operator-e2e` to `make
-ci`. `section` has a `--selftest`, because every way that gate can break makes it
+`operator`, and leaves `msrv`, `scan-image`, `dist`, `publish-dry` and `operator-e2e` to
+`make ci`. `section` has a `--selftest`, because every way that gate can break makes it
 pass.
 
 ## Coverage is a ratchet

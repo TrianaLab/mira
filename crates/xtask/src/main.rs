@@ -29,6 +29,7 @@
 //! | [`market`](mod@market) | nothing — the tally was hand-counted | the claim tally on the market page is what its tables say |
 //! | [`prose`](mod@prose) | nothing — verbosity was a review comment | no page runs past a structural limit |
 //! | [`reference`](mod@reference) | `scripts/gen_reference.py` | regenerate the reference pages from the code |
+//! | [`testcounts`](mod@testcounts) | nothing — the page was hand-counted | the test counts `testing.md` states are the tests that exist |
 //! | [`coverage_json`] | a `python -c` in the Makefile | the badge's figure, floored |
 //! | `parse-json` | a `python -c` in the Makefile | a JSON file parses |
 //!
@@ -44,6 +45,7 @@ mod measurements;
 mod prose;
 mod reference;
 mod release;
+mod testcounts;
 mod util;
 
 use std::process::ExitCode;
@@ -65,6 +67,8 @@ fn main() -> ExitCode {
         (Some("market"), ["render"]) => market::render(),
         (Some("prose"), paths) if !paths.is_empty() => prose::check(paths),
         (Some("reference"), []) => reference::run(),
+        (Some("testcounts"), []) => testcounts::check(),
+        (Some("testcounts"), ["--operator"]) => testcounts::check_operator(),
         (Some("coverage-json"), [out, commit]) => coverage_json::run(out, commit),
         // Not a check of anything clever: `helm template` loads
         // `values.schema.json` on every render, so a syntax error in it makes
@@ -97,6 +101,7 @@ fn main() -> ExitCode {
                  \x20 market render             rewrite that tally from the tables\n\
                  \x20 prose PATH...             those pages are within the structural limits\n\
                  \x20 reference                 regenerate the reference pages\n\
+                 \x20 testcounts [--operator]   testing.md counts the tests that exist\n\
                  \x20 coverage-json OUT COMMIT  llvm-cov JSON on stdin -> the badge's file\n\
                  \x20 parse-json PATH           that file is valid JSON"
             );

@@ -188,6 +188,10 @@ test: ## Unit tests + the in-process end-to-end suite
 	@# that sum to their count, exemplars naming traces that exist) therefore
 	@# ride behind a flag instead of in a test module, and this is what runs it.
 	$(CARGO) run --quiet --locked --example loadgen -- --selftest
+	@# The page that tells a contributor where a new test belongs, against the
+	@# tests that now exist. Here and not in `drift`, because the count comes
+	@# from `--list` on the binaries the line above has just built.
+	$(XTASK) testcounts
 
 # What the ratchet measures: the shipped crates, not the tooling.
 #
@@ -672,6 +676,7 @@ operator-lint: ## Clippy over the operator, warnings are errors
 .PHONY: operator-test
 operator-test: ## The operator's unit tests
 	$(CARGO) test --manifest-path $(OPERATOR)/Cargo.toml --locked
+	$(XTASK) testcounts --operator
 
 # The operator's own ratchet, separate from the engine's because it is measured
 # over a different manifest — `cargo llvm-cov --workspace` on the root cannot
@@ -1008,7 +1013,7 @@ chart: helm-lint helm-template helm-unittest helm-schema helm-docs-check ## Ever
 # ---------------------------------------------------------------------------
 
 .PHONY: check
-check: section fmt-check lint features test doc reference-check market-check docs-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
+check: section fmt-check lint features test doc reference-check market-check measurements-check docs-check ui-check ui-demo deps drift workflows install-script operator chart docs coverage ## Every PR gate, in the order they fail fastest
 	@echo
 	@echo "all gates passed."
 
