@@ -42,6 +42,7 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Namespace, Service};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::runtime::wait::{await_condition, conditions};
 use kube::{Api, Client, CustomResourceExt, ResourceExt};
 use mira_operator::controller::{Ctx, reconcile};
 use mira_operator::crd::{MiraCluster, MiraClusterSpec, Proxy, Scaling, Storage};
@@ -80,6 +81,24 @@ async fn namespace(client: &Client, name: &str) -> Api<MiraCluster> {
     )
     .await
     .expect("the CRD did not apply");
+
+    // Applied is not served. apiextensions installs the handler for
+    // `/apis/mira.miradb.dev/v1alpha1/.../miraclusters` asynchronously, and
+    // until it has, that path answers a bare `404 page not found` — not a
+    // `Status` object, so the error reads "Failed to parse error data" and
+    // looks like anything but a race. Five tests applying the same CRD in
+    // parallel against a cluster created seconds earlier is what surfaces it.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        await_condition(
+            crds,
+            "miraclusters.mira.miradb.dev",
+            conditions::is_crd_established(),
+        ),
+    )
+    .await
+    .expect("the CRD was never established")
+    .expect("watching the CRD failed");
 
     let nss: Api<Namespace> = Api::all(client.clone());
     let _ = nss.delete(name, &DeleteParams::default()).await;
