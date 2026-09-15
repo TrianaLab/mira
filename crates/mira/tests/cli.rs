@@ -1,11 +1,11 @@
 //! The binary as an operator meets it: argv in, exit code out, SIGTERM in the
 //! middle.
 //!
-//! `main`, `run`, `load` and `shutdown` are only reachable by exec'ing the
-//! thing. A unit test inside the bin crate never calls its own `main`, `-h` and
-//! `-V` end the process rather than returning a value, and a signal handler
-//! needs a process to send a signal to. Coverage still counts: the child
-//! inherits `LLVM_PROFILE_FILE` and writes a profraw that gets merged.
+//! `main`, `run` and `shutdown` are only reachable by exec'ing the thing. A
+//! unit test inside the bin crate never calls its own `main`, `-h` and `-V` end
+//! the run rather than returning a value, and a signal handler needs a process
+//! to send a signal to. Coverage still counts: the child inherits
+//! `LLVM_PROFILE_FILE` and writes a profraw that gets merged.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -79,6 +79,32 @@ fn the_command_line_answers_before_it_starts_a_server() {
     let (code, _, err) = mira(&["mira", "--nope"]);
     assert_eq!(code, Some(1));
     assert!(err.contains("unknown flag --nope"), "{err:?}");
+
+    // Every subcommand, not just the bare binary. `proxy` and `offload` reach
+    // the config parser, which knows nothing about `--help` and reported it as
+    // an unknown flag — so the two commands whose usage somebody is most likely
+    // to ask for were the two that answered with an error and exit 1.
+    for cmd in ["proxy", "offload"] {
+        for flag in ["-h", "--help"] {
+            let (code, out, err) = mira(&[cmd, flag]);
+            assert_eq!((code, err.as_str()), (Some(0), ""), "mira {cmd} {flag}");
+            assert!(out.contains("mira mira"), "mira {cmd} {flag}: {out:?}");
+        }
+        let (code, out, _) = mira(&[cmd, "-V"]);
+        assert_eq!(code, Some(0), "mira {cmd} -V");
+        assert_eq!(out.trim(), format!("mira {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    // `update` keeps both for itself: it prints its own usage, and its
+    // `--version` *takes a value* — the tag to install. A general version flag
+    // hoisted above it would turn `mira update --version v0.1.0` into a print
+    // of this binary's version and an exit.
+    let (code, out, _) = mira(&["update", "--help"]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("mira update ["), "{out:?}");
+    let (code, out, _) = mira(&["update", "--version", "v0.1.0", "--dry-run"]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("v0.1.0"), "{out:?}");
 }
 
 /// A SIGTERM is a rolling restart, not a crash.

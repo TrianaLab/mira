@@ -71,20 +71,9 @@ same installer as the curl one-liner at https://miradb.dev/install/.";
 /// Precedence is flag > file > default. Hand-rolled: the flag set exists only to
 /// override the file, so a parser crate would be more code than the thing it
 /// parses.
-fn load() -> Result<Config, String> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        std::process::exit(0);
-    }
-    if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("mira {}", env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
-    }
-    load_from(argv)
-}
-
-/// [`load`] without the two flags that end the process, so it can be called.
+///
+/// `-h` and `-V` are not here. They belong to every subcommand, not just the
+/// server, and this is reached by only two of them — see [`run`].
 fn load_from(argv: Vec<String>) -> Result<Config, String> {
     // The file has to be read first so flags can override it.
     let mut cfg = match argv.iter().position(|a| a == "--config") {
@@ -362,14 +351,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if argv.first().is_some_and(|a| a == "update") {
         return update::run(&argv[1..]).map_err(Into::into);
     }
+
+    // Above every remaining arm, below `update`. Above, because the parser each
+    // arm reaches knows nothing about these two and reported them as unknown
+    // flags — so `mira proxy --help`, the usage somebody is most likely to ask
+    // for, answered with an error and exit 1. Below `update`, because that arm
+    // prints its own usage and its `--version` *takes a value*: hoisted past
+    // it, `mira update --version v0.1.0` would print this binary's version and
+    // exit instead of installing the tag.
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if argv.iter().any(|a| a == "-V" || a == "--version") {
+        println!("mira {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if argv.first().is_some_and(|a| a == "offload") {
         return offload_cmd(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() });
     }
     if argv.first().is_some_and(|a| a == "mira" || a == "tui") {
-        if argv.iter().any(|a| a == "-h" || a == "--help") {
-            println!("{USAGE}");
-            return Ok(());
-        }
         // No tracing subscriber on this path, and no runtime. Both write to the
         // terminal the TUI has just taken over, and one stray `info!` in the
         // middle of a frame corrupts the whole screen.
@@ -429,7 +431,8 @@ async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let argv = std::env::args().skip(1).collect();
+    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     serve_with(cfg, shutdown()).await
 }
 
