@@ -63,7 +63,7 @@ beside the existing one.
    updates a **`chore: version packages`** pull request: it consumes every
    pending changeset, moves whichever of the two numbers they name and rewrites
    every site that restates them.
-4. **Merge the Version PR when you want the release.** That is the release.
+4. **Approve its held workflows, then merge it.** Merging is the release.
 5. **Watch `verify-release`**, the terminal job.
 
 `make bump TO=X.Y.Z && make drift` is the escape hatch: it writes the engine's
@@ -85,11 +85,11 @@ Dispatching *at the tag* is about the OIDC subject: `meta` branches on
 `GITHUB_REF_TYPE`, so the certificate identity is still
 `release.yml@refs/tags/vX.Y.Z`, which is what `verify-release` pins.
 
-A pull request opened with `GITHUB_TOKEN` does not start `pull_request`
-workflows and has no exempt equivalent, so `version-packages.yml` runs
-`changesets/action` under a **`VERSION_PR_TOKEN`** secret — a fine-grained PAT
-with contents and pull-requests write on this repository. Missing or expired,
-the symptom is a Version PR that never appears rather than anything red.
+The other exemption is partial: a pull request opened with `GITHUB_TOKEN` *does*
+create the `pull_request` runs, but holds them, so somebody with write access
+clicks **Approve workflows to run** in the merge box. Until then the required
+contexts have not reported — the symptom is a Version PR with no checks, not a
+red one. Skipping that click is all a PAT would buy.
 
 `meta` fails the run before anything builds if the tag and `Cargo.toml`
 disagree, because `mira --version` prints `CARGO_PKG_VERSION` and a hand-pushed
