@@ -166,22 +166,28 @@ fn headings(page: &str) -> BTreeSet<String> {
 /// Linux runner and on the published site. So every component is compared
 /// against its directory's listing rather than asked of the kernel — every
 /// one, because `Docs/market.md` is wrong in the half `rsplit` throws away.
+///
+/// The listing is also what makes the two failures distinguishable, and the
+/// same sentence on both platforms: a name absent from its directory under
+/// any spelling is a dead link, and a name present under another spelling is
+/// the case bug, reported with the name to use.
 fn exists(rel: &str) -> Result<(), String> {
-    if !root().join(rel).exists() {
-        return Err("no such file in this repository".into());
-    }
     let mut dir = String::new();
     for name in rel.split('/') {
-        let listed = std::fs::read_dir(root().join(&dir))
+        let listed: Vec<String> = std::fs::read_dir(root().join(&dir))
             .into_iter()
             .flatten()
             .flatten()
-            .any(|e| e.file_name() == name);
-        if !listed {
-            return Err(format!(
-                "spelled {name:?}, which is not how it is spelled on disk; this Mac resolves \
-                 it and the Linux runner will not. `ls {dir}` has the real name."
-            ));
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if !listed.iter().any(|n| n == name) {
+            return match listed.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+                Some(real) => Err(format!(
+                    "spelled {name:?} and the name on disk is {real:?} — a case-insensitive \
+                     filesystem resolves that and the Linux runner does not"
+                )),
+                None => Err("no such file in this repository".into()),
+            };
         }
         dir = join(&dir, name);
     }
@@ -295,13 +301,15 @@ mod tests {
         assert!(f[0].contains("imagined-heading"), "{f:?}");
     }
 
-    /// Reproduces the case-insensitive filesystem: this passes `Path::exists`
-    /// on the machine every one of these pages is written on.
+    /// Reproduces the case-insensitive filesystem: this opens on the machine
+    /// every one of these pages is written on, and 404s on the runner. The
+    /// wrong component is the *directory*, which is the half a check on the
+    /// file name alone throws away.
     #[test]
     fn a_target_spelled_in_the_wrong_case_is_a_finding_even_on_a_mac() {
         let f = findings("[a](Docs/market.md)");
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(f[0].contains("Linux runner"), "{f:?}");
+        assert!(f[0].contains("the name on disk is \"docs\""), "{f:?}");
     }
 
     #[test]
