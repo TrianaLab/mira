@@ -163,7 +163,7 @@ jobs:
       # --workspace` on the root manifest cannot reach a nested workspace — so
       # this leg needs the same tool the `coverage` leg does, for a different
       # tree and a different floor.
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-llvm-cov
       # fmt, clippy, the unit tests, the coverage floor, and the CRD drift gate
@@ -201,7 +201,7 @@ jobs:
         with:
           env-vars: ImageOS
           key: coverage
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-llvm-cov
       # The ratchet lives in the Makefile (COVERAGE_MIN), not here, so raising
@@ -215,7 +215,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-deny,cargo-machete
       # Advisories, licences, duplicate versions, and the ban on new C-backed
@@ -366,7 +366,7 @@ jobs:
         with:
           env-vars: ImageOS
           key: release-dry-run
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-cyclonedx@0.5.9
       # Both halves of the release, run on every code PR: `make dist` is the
