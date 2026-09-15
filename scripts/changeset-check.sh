@@ -31,8 +31,14 @@ fi
 # being applied. This exempts both the bot's Version PR (which deletes
 # changesets rather than adding them) and the hand-run `make bump` fallback,
 # with one mechanism rather than two.
-if git diff "${base}" HEAD -- Cargo.toml charts/mira-operator/Chart.yaml \
-  | grep -qE '^\+(version = "|version: )'; then
+#
+# Both halves are required, and that is the whole point: a bump *replaces* a
+# version line, so it shows up as a `-` and a `+`. Matching the `+` alone let a
+# diff that merely introduces the file — a new chart, a new manifest — exempt
+# itself along with everything else it shipped.
+vdiff=$(git diff "${base}" HEAD -- Cargo.toml charts/mira-operator/Chart.yaml)
+if printf '%s\n' "${vdiff}" | grep -qE '^\+(version = "|version: )' \
+  && printf '%s\n' "${vdiff}" | grep -qE '^-(version = "|version: )'; then
   echo "this diff moves a version line — it is the release, not a change to declare" >&2
   exit 0
 fi
