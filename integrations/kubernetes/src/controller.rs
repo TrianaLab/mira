@@ -103,11 +103,60 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     let ns = c.namespace().unwrap_or_else(|| "default".into());
     let name = c.name_any();
 
+    // Live, not the reflector cache `c` came from. `start_drain` writes the
+    // status and *then* scales the StatefulSet, and the scale fires the
+    // `.owns()` watch on a stream with no ordering against the MiraCluster
+    // one — so on the reconcile that scale triggers, a cached `c.status` can
+    // still read `draining: None`. The decision path below would then start a
+    // second drain, overwrite `draining` with the next ordinal down, and leave
+    // the first replica's claim with nothing anywhere recording that it
+    // exists. `current` is read live for the same reason; this field is the
+    // one where being stale costs a volume.
+    let clusters: Api<MiraCluster> = Api::namespaced(ctx.client.clone(), &ns);
+    let draining = clusters
+        .get_opt(&name)
+        .await?
+        .and_then(|live| live.status)
+        .and_then(|s| s.draining);
+
+    // A drain already in flight owns the next transition, and it takes that
+    // claim before anything else in this function touches the tier. Both of
+    // the steps below used to run first, and both could abandon the volume:
+    //
+    //   * `ensure` re-applies the StatefulSet at `max(current, spec.replicas)`,
+    //     so raising the floor mid-drain recreated the pod whose volume was
+    //     being archived — and then `finish_drain` deleted the claim under it.
+    //   * the Degraded patch names two fields, and server-side apply *removes*
+    //     what a manager owned and then omits, so an invalid spec arriving
+    //     mid-drain silently unset `draining` and freed the next pass to drain
+    //     the following replica.
+    //
+    // Re-reading stats and deciding again here would in any case be deciding
+    // from a tier that is mid-shrink.
+    if let Some(ordinal) = draining {
+        return finish_drain(&ctx, &c, &ns, ordinal).await;
+    }
+
     if let Err(e) = c.spec.validate() {
         // A spec that cannot be satisfied is reported and then left alone. Not
         // requeued fast: nothing the controller does will fix it, and a hot
         // loop on an invalid object is how an operator takes out an API server.
-        status(&ctx, &c, json!({"phase": "Degraded", "message": e})).await?;
+        //
+        // `replicas` and `lastScaled` are repeated for the server-side-apply
+        // reason spelled out at the end of `finish_drain`: omitting them here
+        // resets the printer column to 0 and forgets the cooldown, so fixing a
+        // typo in the spec would let the tier scale again immediately.
+        status(
+            &ctx,
+            &c,
+            json!({
+                "replicas": c.status.as_ref().map_or(c.spec.replicas, |s| s.replicas),
+                "lastScaled": c.status.as_ref().and_then(|s| s.last_scaled.clone()),
+                "phase": "Degraded",
+                "message": e,
+            }),
+        )
+        .await?;
         warn!(%ns, %name, "invalid spec");
         return Ok(Action::requeue(Duration::from_secs(300)));
     }
@@ -124,12 +173,6 @@ pub async fn reconcile(c: Arc<MiraCluster>, ctx: Arc<Ctx>) -> Result<Action, Err
     // a broken Service is a tier whose stats cannot be read, so the decision
     // below would abstain forever if this ran after it.
     ensure(&ctx, &c, &ns, current).await?;
-
-    // A drain already in flight owns the next transition. Re-reading stats and
-    // deciding again here would be deciding from a tier that is mid-shrink.
-    if let Some(ordinal) = c.status.as_ref().and_then(|s| s.draining) {
-        return finish_drain(&ctx, &c, &ns, ordinal).await;
-    }
 
     if let Some(remaining) = cooling_down(&c) {
         return Ok(Action::requeue(remaining));
@@ -339,8 +382,23 @@ async fn finish_drain(ctx: &Ctx, c: &MiraCluster, ns: &str, ordinal: i32) -> Res
         // this is the one irreversible step in the sequence.
         let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
         let claim = format!("data-{}-{}", c.name_any(), ordinal);
-        if let Err(e) = pvcs.delete(&claim, &Default::default()).await {
-            warn!(%ns, %claim, "archive complete but claim not deleted: {e}");
+        // Retried, not warned past. Clearing `draining` below is what routes
+        // every future reconcile away from this function, so a delete that
+        // failed and was only logged is a delete that nothing ever attempts
+        // again: the claim stays bound and billed for ever while the log line
+        // under it says "volume released" and the status says "archived and
+        // removed". Both would be false, and no state anywhere would let a
+        // human or a later pass find it. A 429 from priority-and-fairness, a
+        // policy webhook or a transient 500 are all recoverable, so hold
+        // `draining` and come back. A 404 is the delete having already landed
+        // on an earlier attempt, which is success.
+        match pvcs.delete(&claim, &Default::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => {
+                warn!(%ns, %claim, "archive complete but claim not deleted, retrying: {e}");
+                return Ok(Action::requeue(Duration::from_secs(15)));
+            }
         }
         info!(%ns, ordinal, "drain complete, volume released");
         // `replicas` is repeated rather than left to carry over, and this is the
@@ -604,8 +662,35 @@ mod tests {
         }
 
         /// The default control plane: every write succeeds, nothing exists yet.
+        /// Nothing exists yet, including the MiraCluster's own live read — a
+        /// 404 there is `get_opt` returning `None`, which is the same answer as
+        /// "no drain in flight" and leaves every non-drain test reading exactly
+        /// as it did before that read was added.
         fn ok() -> Self {
             Self::new(|method, path| match (method, path) {
+                ("GET", _) => (StatusCode::NOT_FOUND, not_found()),
+                (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+                _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+            })
+        }
+
+        /// As `ok()`, but the live read at the top of `reconcile` reports a
+        /// drain of `ordinal` in flight.
+        ///
+        /// Served from here rather than from the fixture the test hands to
+        /// `reconcile`, because the two disagreeing is the entire reason that
+        /// read is live: `start_drain` writes the status and then scales, the
+        /// scale fires the `.owns()` watch on its own stream, and the reconcile
+        /// that triggers can still see a cached status with no drain in it.
+        fn mid_drain(ordinal: i32) -> Self {
+            let mut c = drainable();
+            c.status = Some(MiraClusterStatus {
+                draining: Some(ordinal),
+                ..Default::default()
+            });
+            let doc = serde_json::to_value(&c).unwrap();
+            Self::new(move |method, path| match (method, path) {
+                ("GET", p) if p.ends_with("/miraclusters/tel") => (StatusCode::OK, doc.clone()),
                 ("GET", _) => (StatusCode::NOT_FOUND, not_found()),
                 (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
                 _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
@@ -826,10 +911,71 @@ mod tests {
 
         assert_eq!(
             f.log(),
-            ["PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status"]
+            [
+                "GET /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel",
+                "PATCH /apis/mira.miradb.dev/v1alpha1/namespaces/ns/miraclusters/tel/status",
+            ]
         );
-        assert_eq!(f.body("/status")["status"]["phase"], "Degraded");
+        let st = f.body("/status")["status"].clone();
+        assert_eq!(st["phase"], "Degraded");
+        // Server-side apply removes what this manager owned and then omits, so
+        // the patch has to carry the fields it is not changing. Dropping
+        // `lastScaled` would forget the cooldown, and fixing the typo in the
+        // spec would then let the tier scale again on the very next pass.
+        assert!(st.get("replicas").is_some(), "{st}");
+        assert!(st.get("lastScaled").is_some(), "{st}");
         assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+    }
+
+    /// A spec that goes invalid *under* an in-flight drain must not cancel it.
+    ///
+    /// The Degraded patch names its fields, and server-side apply removes the
+    /// ones a manager owned and then omitted — so when this ran before the
+    /// drain check, an edit that tripped `validate` silently unset `draining`.
+    /// The next pass took the decision path instead, free to start draining the
+    /// replica below while this one's claim and its half-run Job were still
+    /// there, with nothing anywhere recording that the volume existed.
+    #[tokio::test]
+    async fn a_spec_that_goes_invalid_under_a_drain_does_not_cancel_it() {
+        let f = Fake::mid_drain(2);
+        let mut c = drainable();
+        c.spec.scaling.up_when_free_below = 0.6;
+        c.spec.scaling.down_when_free_above = 0.2;
+
+        reconcile(Arc::new(c), f.ctx()).await.unwrap();
+
+        assert!(
+            f.log().iter().any(|l| l.contains("jobs/tel-drain-2")),
+            "the drain owns the pass; Degraded must wait its turn: {:?}",
+            f.log()
+        );
+        assert!(
+            !f.log().iter().any(|l| l.contains("/status")),
+            "{:?}",
+            f.log()
+        );
+    }
+
+    /// `spec.replicas` is a floor and `current` takes `max()` of it, so raising
+    /// the floor takes effect immediately — including mid-drain. When `ensure`
+    /// ran before the drain check, that re-applied the StatefulSet at the
+    /// higher count and recreated the pod whose volume was being archived;
+    /// `finish_drain` then deleted the claim out from under it, or wedged
+    /// forever because the drain Job could not mount a claim the new pod held.
+    #[tokio::test]
+    async fn raising_the_floor_mid_drain_does_not_rebuild_the_pod_being_archived() {
+        let f = Fake::mid_drain(2);
+        let mut c = drainable();
+        c.spec.replicas = 3;
+
+        reconcile(Arc::new(c), f.ctx()).await.unwrap();
+
+        assert!(
+            !f.log().iter().any(|l| l.contains("statefulsets/tel")),
+            "the StatefulSet must not be re-applied while a drain is in flight: {:?}",
+            f.log()
+        );
+        assert!(f.log().iter().any(|l| l.contains("jobs/tel-drain-2")));
     }
 
     /// Step 1 before step 2, which is the crash-safety of the whole sequence.
@@ -865,14 +1011,18 @@ mod tests {
     /// A drain in flight owns the next transition. Re-reading stats and
     /// deciding again from a tier that is mid-shrink is how one decision moves
     /// two replicas.
+    ///
+    /// The fixture's *cached* status is deliberately empty and the drain is
+    /// visible only to the live read. That is the case that orphaned a volume:
+    /// `start_drain` scales the StatefulSet right after writing the status, the
+    /// scale fires the `.owns()` watch on a stream with no ordering against the
+    /// MiraCluster one, and the reconcile it triggers could see the status from
+    /// before the drain.
     #[tokio::test]
     async fn a_reconcile_mid_drain_resumes_it_rather_than_deciding_again() {
-        let f = Fake::ok();
-        let mut c = drainable();
-        c.status = Some(MiraClusterStatus {
-            draining: Some(2),
-            ..Default::default()
-        });
+        let f = Fake::mid_drain(2);
+        let c = drainable();
+        assert!(c.status.as_ref().and_then(|s| s.draining).is_none());
 
         reconcile(Arc::new(c), f.ctx()).await.unwrap();
 
@@ -944,6 +1094,57 @@ mod tests {
         // here is a key deleted there — the Kind suite caught `REPLICAS 0`
         // beside two running pods.
         assert_eq!(st["replicas"], 2);
+    }
+
+    /// The status patch two lines after the claim delete clears `draining`,
+    /// and that is what routes every future reconcile away from `finish_drain`.
+    /// So a delete that failed and was only logged is a delete nothing ever
+    /// attempts again: the claim stays bound and billed while the status reads
+    /// "archived and removed" and no state anywhere records otherwise.
+    ///
+    /// Both directions, because the retry is only safe if the second attempt
+    /// can finish: a 429 holds the drain open, and the 404 it leaves behind
+    /// once the delete does land is success rather than a permanent wedge.
+    #[tokio::test]
+    async fn a_claim_that_could_not_be_deleted_keeps_the_drain_open() {
+        fn fake(code: StatusCode) -> Fake {
+            Fake::new(move |method, path| match (method, path) {
+                ("GET", p) if p.contains("/jobs/") => (
+                    StatusCode::OK,
+                    json!({"metadata": {"name": "tel-drain-2"}, "status": {"succeeded": 1}}),
+                ),
+                ("DELETE", p) if p.contains("/persistentvolumeclaims/") => (
+                    code,
+                    json!({"kind": "Status", "status": "Failure", "code": code.as_u16(),
+                           "reason": "TooManyRequests", "message": "please try again"}),
+                ),
+                (_, p) if p.ends_with("/status") => (StatusCode::OK, cluster_doc()),
+                _ => (StatusCode::OK, json!({"metadata": {"name": "tel"}})),
+            })
+        }
+
+        let f = fake(StatusCode::TOO_MANY_REQUESTS);
+        let action = finish_drain(&f.ctx(), &drainable(), "ns", 2).await.unwrap();
+        assert_eq!(action, Action::requeue(Duration::from_secs(15)));
+        assert_eq!(
+            f.log(),
+            [
+                "GET /apis/batch/v1/namespaces/ns/jobs/tel-drain-2",
+                "DELETE /api/v1/namespaces/ns/persistentvolumeclaims/data-tel-2",
+            ],
+            "`draining` must stay set, so neither the status patch nor the Job delete runs"
+        );
+
+        // Already gone is done. Anything else and a drain whose claim was
+        // deleted by an earlier attempt could never be closed out.
+        let f = fake(StatusCode::NOT_FOUND);
+        finish_drain(&f.ctx(), &drainable(), "ns", 2).await.unwrap();
+        assert!(
+            f.log().iter().any(|l| l.contains("/status")),
+            "{:?}",
+            f.log()
+        );
+        assert!(f.body("/status")["status"]["draining"].is_null());
     }
 
     /// A failed drain is a bad day, not a data-loss incident: the tier is one

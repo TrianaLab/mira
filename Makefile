@@ -684,7 +684,7 @@ operator-test: ## The operator's unit tests
 # covered by `make operator-e2e`, and coverage instrumentation does not follow a
 # binary into a container. Floored to 89.0 for the same reason COVERAGE_MIN is
 # floored: a ratchet with no margin fails on a run that measured the same tree.
-OPERATOR_COVERAGE_MIN ?= 89.0
+OPERATOR_COVERAGE_MIN ?= 90.0
 
 .PHONY: operator-coverage
 operator-coverage: ## Operator line coverage against its ratchet ($(OPERATOR_COVERAGE_MIN)%)
