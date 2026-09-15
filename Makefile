@@ -15,8 +15,13 @@
 # works without touching your profile — but exporting PATH is nicer:
 #   export PATH="$$HOME/.cargo/bin:$$PATH"
 
-SHELL := /usr/bin/env bash
-.SHELLFLAGS := -eu -o pipefail -c
+# A recipe shell reads no dotfiles. `-u` turns any startup file that touches
+# PS1 into a failure, /etc/bash.bashrc line 7 is exactly that, and `make
+# version` under `changesets/action` inherits an environment that reaches it —
+# so it died on a comment line, before running anything. `--norc` alone does
+# not cover that: BASH_ENV is honoured regardless of it.
+SHELL := /usr/bin/env -u BASH_ENV bash
+.SHELLFLAGS := --noprofile --norc -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
 CARGO   ?= cargo
