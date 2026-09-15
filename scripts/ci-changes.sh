@@ -28,14 +28,6 @@ else
   echo "changed files:" >&2
   printf '%s\n' "${files}" | sed 's/^/  /' >&2
   m() { printf '%s\n' "${files}" | grep -qE "$1" && echo true || echo false; }
-  # The same list without the changeset declarations, for the one leg that
-  # would otherwise catch them. A changeset is markdown, so `.*\.md$` in the
-  # `docs` clause below makes a one-line release note rebuild the site and
-  # re-run the drift gate. POSIX `grep -E` has no negative lookahead, so this is
-  # a second stream rather than a cleverer pattern.
-  authored=$(printf '%s\n' "${files}" | grep -v '^\.changeset/' || true)
-  a() { printf '%s\n' "${authored}" | grep -qE "$1" && echo true || echo false; }
-
   # A workflow change re-runs everything — the thing most likely to be wrong
   # about a CI edit is the leg you did not think it touched. `ci.mk` is in the
   # same clause for the same reason: it *is* the workflow now.
@@ -48,7 +40,17 @@ else
   # `docs/install.sh` is a symlink to it: the docs site *publishes* it, so it is
   # a documentation artefact that happens to be a script, and this is the leg
   # that checks it.
-  docs=$(a "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$)${W}")
+  # The last four are `make docs-check`'s inputs: its rule configuration, the
+  # pinned markdownlint, the structural gate in xtask, and the Makefile that
+  # decides which pages any of them see. Changing what a gate asserts without
+  # running it is the one way to land a red main from a green pull request.
+  #
+  # `.*\.md$` reaches `.changeset/` too, and used to be filtered so a one-line
+  # release note did not rebuild the site. It is not filtered now: a changeset
+  # is hand-written prose that `docs-check` lints, and a gate that skips the
+  # diff which introduces the file is not a gate. The cost is a site build on a
+  # release-note-only pull request.
+  docs=$(m "^(docs/|overrides/|mkdocs\.yml\$|scripts/get-mira\.sh\$|.*\.md\$|\.vale|\.markdownlint-cli2\.yaml\$|package(-lock)?\.json\$|crates/xtask/|Makefile\$)${W}")
   # `Makefile$` for the same reason it is in `code` and `image`: both of that
   # leg's steps are make targets, so an edit to `ui-check` or `ui-demo` is a
   # change to what the job asserts.

@@ -1,7 +1,7 @@
 //! The write-ahead log, which exists to decouple the acknowledgement from the
 //! seal.
 //!
-//! # Why this exists, given `docs/architecture.md` section 4 says "No WAL"
+//! # Why this exists, given `docs/architecture/ingest.md` section 4 says "No WAL"
 //!
 //! section 4's argument is about *recovery*, and it is still correct: a block
 //! directory is renamed into place atomically, so there is no torn state and
@@ -102,7 +102,7 @@
 //! KiB a frame and compressing or eliding it is the only lever with room — and
 //! the upgrade path for *ingest* is the flusher, not the log. Do not re-propose
 //! group commit or a log per signal without a number that contradicts the two
-//! paragraphs above; see `docs/architecture.md` section 11.
+//! paragraphs above; see `docs/architecture/performance.md` section 11.
 //!
 //! # The frame is the OTLP request, in its canonical protobuf encoding
 //!

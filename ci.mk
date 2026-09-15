@@ -117,10 +117,10 @@ ci-coverage-json: ## The coverage figure the deployed site publishes
 ci-supply-chain: deps ## The `supply-chain` leg
 
 .PHONY: ci-drift
-ci-drift: drift reference-check measurements-check ## The `drift` leg
+ci-drift: drift reference-check measurements-check market-check ## The `drift` leg
 
 .PHONY: ci-docs
-ci-docs: docs install-script ## The `docs` leg
+ci-docs: docs-check docs install-script ## The `docs` leg
 
 .PHONY: ci-image
 ci-image: scan-image ## The `image` leg
@@ -201,6 +201,8 @@ ACTIONLINT_SHA256    := 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387
 # separately is how a cluster that only exists here comes about.
 KIND_VERSION         := 0.31.0
 KIND_SHA256          := eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
+VALE_VERSION         := 3.21.0
+VALE_SHA256          := 96997d19a4ca6981673b0d4c5ca7f3ede4a9f97964a96edc29fba9e28a328336
 
 .PHONY: ci-tool-trivy
 ci-tool-trivy: ## Install the pinned trivy (CI; locally use your own)
@@ -231,6 +233,21 @@ ci-tool-actionlint: ## Install the pinned actionlint (CI; locally use your own)
 	tar -xzf actionlint.tgz actionlint
 	sudo install actionlint /usr/local/bin/actionlint
 	rm actionlint actionlint.tgz
+
+.PHONY: ci-tool-vale
+ci-tool-vale: ## Install the pinned vale (CI; locally use your own)
+	@# Pinned, unlike trivy: a newer vulnerability database finds more, but a
+	@# newer prose linter just disagrees with the one on the contributor's
+	@# laptop, and a gate that fails only on the runner is a gate people learn
+	@# to re-run rather than read. Digest from the checksums file Vale publishes
+	@# beside the tarball.
+	curl -fsSLo vale.tgz \
+	  "https://github.com/errata-ai/vale/releases/download/v$(VALE_VERSION)/vale_$(VALE_VERSION)_Linux_64-bit.tar.gz"
+	echo "$(VALE_SHA256)  vale.tgz" | $(SHA256) -c -
+	tar -xzf vale.tgz vale
+	sudo install vale /usr/local/bin/vale
+	rm vale vale.tgz
+	vale --version
 
 .PHONY: ci-tool-kind
 ci-tool-kind: ## Install the pinned kind (CI; locally use your own)

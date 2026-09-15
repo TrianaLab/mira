@@ -199,7 +199,7 @@ consumer saturated bought contention rather than work and the curve *fell*:
 | 96 | 734,142 | 1,136,941 | **1.55x** |
 
 Six because this box has twelve cores and the default is half of them
-([Architecture section 4](../architecture.md#4-ingest-path)). Dispatch is first
+([Architecture section 4](../architecture/ingest.md)). Dispatch is first
 fit from shard 0, so a node not saturating one flusher never starts a second.
 
 Peak RSS fell with it, 689 MiB against 1,366 MiB at four connections: one
@@ -258,7 +258,7 @@ the mix.**
 ### The one-off scripts
 
 Five things the harness cannot express. Each prints a figure
-[architecture section 11](../architecture.md#11-performance-model) quotes:
+[architecture section 11](../architecture/performance.md) quotes:
 
 | script | answers |
 | --- | --- |

@@ -149,7 +149,9 @@ fn differs(src: &Path, dest: &Path) -> Result<Option<String>> {
             Some(_) => {}
         }
     }
-    let extra = theirs.iter().find(|(n, _)| !ours.iter().any(|(o, _)| o == n));
+    let extra = theirs
+        .iter()
+        .find(|(n, _)| !ours.iter().any(|(o, _)| o == n));
     Ok(extra.map(|(n, _)| format!("it holds {n}, which this block does not")))
 }
 
@@ -459,7 +461,10 @@ mod tests {
         // Same names, different bytes. This is the collision itself.
         fs::write(there.join("logs.arrow"), b"someone else's rows").unwrap();
         let e = t.push("logs", &b).unwrap_err().to_string();
-        assert!(e.contains("logs.arrow") && e.contains(&*there.to_string_lossy()), "{e}");
+        assert!(
+            e.contains("logs.arrow") && e.contains(&*there.to_string_lossy()),
+            "{e}"
+        );
 
         // A short copy under the final name, which staging is supposed to make
         // impossible and a store nobody else writes to would never hold.
@@ -476,7 +481,7 @@ mod tests {
     }
 
     /// The invariant [section
-    /// 6.1](https://miradb.dev/architecture/#61-offload-a-copy-before-the-unlink)
+    /// 6.1](https://miradb.dev/architecture/retention/#61-offload-a-copy-before-the-unlink)
     /// states: a restore rewrites what is at a path, so the path's `mtime` has
     /// to say the bytes are new.
     ///

@@ -4,7 +4,7 @@
 //!
 //! Shrinking a Mira tier is not `replicas -= 1`. The volume about to go holds
 //! blocks no other replica has — nothing replicates and nothing rebalances
-//! (architecture.md section 12.4) — so they have to be copied out first, and
+//! (docs/architecture/replicas-scaling.md section 12.4) — so they have to be copied out first, and
 //! the copy has to mount the volume.
 //!
 //! That mount is what fixes the order. The claim is `ReadWriteOnce`, so a Job

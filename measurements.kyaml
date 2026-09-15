@@ -74,7 +74,12 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "629,384"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.records_per_s.conns4
     value: 1350502
@@ -86,7 +91,12 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "1,350,502"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.records_per_s.conns32
     value: 1537875
@@ -100,12 +110,12 @@ measurements:
       - as: "1,537,875"
         sites:
           [
+            docs/architecture/performance.md,
+            docs/architecture/replicas-scaling.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/internals/e2e.md,
           ]
-
   - key: ingest.records_per_s.conns96
     value: 1136941
     unit: records/s
@@ -117,12 +127,12 @@ measurements:
       - as: "1,136,941"
         sites:
           [
-            docs/architecture.md,
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
           ]
-
   - key: ingest.cores.conns1
     value: 0.71
     unit: cores
@@ -134,7 +144,12 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "0.71"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.cores.conns4
     value: 1.75
@@ -143,7 +158,13 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "1.75"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/not-here.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.cores.conns32
     value: 2.23
@@ -157,12 +178,13 @@ measurements:
       - as: "2.23"
         sites:
           [
+            docs/architecture/performance-ingest.md,
+            docs/architecture/performance.md,
+            docs/architecture/replicas-scaling.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/internals/e2e.md,
           ]
-
   - key: ingest.per_core.conns1
     value: 886147
     unit: records/s/core
@@ -179,12 +201,11 @@ measurements:
       - as: "886k"
         sites:
           [
+            docs/architecture/performance.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/internals/e2e.md,
           ]
-
   - key: ingest.per_core.conns96
     value: 515288
     unit: records/s/core
@@ -218,7 +239,13 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "8.5 ms"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.ack_p99_ms.conns4
     value: 55
@@ -227,7 +254,13 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "55 ms"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: ingest.ack_p99_ms.conns96
     value: 2661
@@ -253,7 +286,13 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "657"
-        sites: [docs/architecture.md, docs/market.md, CHANGELOG.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            CHANGELOG.md,
+          ]
 
   - key: ingest.ack_p99_ms.logoff
     value: 2647
@@ -262,7 +301,11 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "2,647"
-        sites: [docs/architecture.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+          ]
 
   # ---------------------------------------------------------------------------
   # Resident footprint. Sampled from outside, because Mira reads through mmap
@@ -280,7 +323,13 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "232 MiB"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   - key: rss_mib.conns4
     value: 689
@@ -291,12 +340,12 @@ measurements:
       - as: "689 MiB"
         sites:
           [
-            docs/architecture.md,
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
           ]
-
   - key: rss_mib.conns96
     value: 1648
     unit: MiB
@@ -306,7 +355,13 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "1,648 MiB"
-        sites: [docs/architecture.md, docs/market.md, docs/internals/e2e.md]
+        sites:
+          [
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            docs/internals/e2e.md,
+          ]
 
   # ---------------------------------------------------------------------------
   # Query. The section 11 table, read back from the corpus above after a
@@ -325,7 +380,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "2.6 ms"
-        sites: [README.md, docs/architecture.md]
+        sites: [docs/architecture/performance.md, README.md]
 
   - key: query.attr_absent.first_ms
     value: 8.3
@@ -337,7 +392,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "8.3 ms"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance.md]
 
   - key: query.attr_match.first_ms
     value: 4.1
@@ -348,7 +403,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "4.1 ms"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance.md]
 
   - key: query.unfiltered_100.first_ms
     value: 29.1
@@ -359,7 +414,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "29.1"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance.md]
 
   - key: query.trace_by_id.steady_ms
     value: 4.7
@@ -371,7 +426,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "4.7 ms"
-        sites: [README.md, docs/architecture.md, docs/agents.md]
+        sites: [docs/architecture/performance.md, README.md, docs/agents.md]
 
   - key: query.metric_names.first_ms
     value: 8.9
@@ -382,7 +437,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "8.9 ms"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance.md]
 
   - key: query.substring_scan.steady_ms
     value: 885
@@ -395,7 +450,13 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "885 ms"
-        sites: [docs/architecture.md, docs/market.md, CHANGELOG.md]
+        sites:
+          [
+            docs/architecture/performance-query.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+            CHANGELOG.md,
+          ]
 
   - key: query.substring_scan.first_ms
     value: 1441
@@ -404,7 +465,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "1,441"
-        sites: [docs/architecture.md, docs/market.md]
+        sites: [docs/architecture/performance.md, docs/market.md]
 
   # ---------------------------------------------------------------------------
   # Cost per GB, and the durability floor under the ack.
@@ -421,7 +482,11 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "1.20"
-        sites: [docs/architecture.md]
+        sites:
+          [
+            docs/architecture/performance-cost.md,
+            docs/architecture/performance.md,
+          ]
 
   - key: cost.compacted_bytes_per_byte
     value: 0.14
@@ -435,12 +500,12 @@ measurements:
       - as: "0.14"
         sites:
           [
+            docs/architecture/performance-cost.md,
+            docs/architecture/performance.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/internals/e2e.md,
           ]
-
   - key: wal.append_p50_us
     value: 7
     unit: us
@@ -452,7 +517,13 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "7 µs"
-        sites: [README.md, docs/architecture.md, CHANGELOG.md]
+        sites:
+          [
+            docs/architecture/ingest.md,
+            docs/architecture/performance-durability.md,
+            README.md,
+            CHANGELOG.md,
+          ]
 
   - key: fsync.full_us
     value: 4230
@@ -464,7 +535,11 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "4,230"
-        sites: [docs/architecture.md]
+        sites:
+          [
+            docs/architecture/not-here.md,
+            docs/architecture/performance-ingest.md,
+          ]
 
   # ---------------------------------------------------------------------------
   # What a log fix is worth. section 11 diagnosed the ingest plateau as one mutex
@@ -490,7 +565,12 @@ measurements:
     provenance: scripts/measure/wal-volume.sh
     quoted:
       - as: "1.096x"
-        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            docs/market.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.ramdisk.records_per_s_ratio.conns96
     value: 1.005
@@ -502,7 +582,12 @@ measurements:
     provenance: scripts/measure/wal-volume.sh
     quoted:
       - as: "1.005x"
-        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            docs/market.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.ramdisk.submit_admit_share
     value: 92
@@ -517,7 +602,12 @@ measurements:
     provenance: scripts/measure/wal-volume.sh
     quoted:
       - as: "92%"
-        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            docs/market.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.split.write_ratio.conns32
     value: 1.943
@@ -531,7 +621,12 @@ measurements:
     provenance: scripts/measure/wal-split-ab.sh
     quoted:
       - as: "1.94x"
-        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            docs/market.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.split.write_ratio.conns96
     value: 2.394
@@ -540,7 +635,12 @@ measurements:
     provenance: scripts/measure/wal-split-ab.sh
     quoted:
       - as: "2.39x"
-        sites: [docs/architecture.md, docs/market.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            docs/market.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.split.records_per_s_ratio.conns32
     value: 1.039
@@ -554,7 +654,7 @@ measurements:
     provenance: scripts/measure/wal-split-ab.sh
     quoted:
       - as: "1.039"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance-ingest.md]
 
   - key: wal.concurrent_appenders.bandwidth_ratio.two
     value: 0.98
@@ -569,7 +669,11 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "0.98x"
-        sites: [docs/architecture.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   - key: wal.concurrent_appenders.bandwidth_ratio.three
     value: 0.86
@@ -580,7 +684,11 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "0.86x"
-        sites: [docs/architecture.md, crates/mira-core/src/wal.rs]
+        sites:
+          [
+            docs/architecture/performance-ingest.md,
+            crates/mira-core/src/wal.rs,
+          ]
 
   # ---------------------------------------------------------------------------
   # `mira proxy` against one node. Every one of these is two replicas, a proxy
@@ -600,7 +708,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "0.767x"
-        sites: [docs/architecture.md, docs/market.md]
+        sites: [docs/architecture/replicas.md, docs/market.md]
 
   - key: proxy.records_per_s_ratio.conns32
     value: 0.973
@@ -612,7 +720,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "0.973"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/replicas.md]
 
   - key: proxy.records_per_s_ratio.conns96
     value: 1.044
@@ -624,7 +732,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "1.044"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/replicas.md]
 
   - key: proxy.read_us_ratio.conns4
     value: 3.886
@@ -640,7 +748,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "3.89x"
-        sites: [docs/architecture.md, docs/market.md]
+        sites: [docs/architecture/replicas.md, docs/market.md]
 
   - key: proxy.read_us_ratio.conns32
     value: 2.757
@@ -651,7 +759,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "2.76x"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/replicas.md]
 
   - key: proxy.read_us_ratio.conns96
     value: 3.882
@@ -663,7 +771,7 @@ measurements:
     provenance: scripts/measure/proxy-ab.sh
     quoted:
       - as: "3.882"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/replicas.md]
 
   # ---------------------------------------------------------------------------
   # The corpus itself. These are the denominators every query row divides by, so
@@ -680,17 +788,17 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "27,066,368"
-        sites: [docs/architecture.md, docs/market.md]
+        sites: [docs/architecture/performance.md, docs/market.md]
       - as: "27.1"
         sites:
           [
+            docs/architecture/performance-query.md,
+            docs/architecture/performance.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/agents.md,
             CHANGELOG.md,
           ]
-
   - key: corpus.records.points
     value: 39648
     unit: points
@@ -701,7 +809,7 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "39,648"
-        sites: [docs/architecture.md]
+        sites: [docs/architecture/performance.md]
 
   - key: corpus.gib
     value: 8.33
@@ -710,7 +818,12 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "8.33 GiB"
-        sites: [docs/architecture.md, docs/market.md]
+        sites:
+          [
+            docs/architecture/performance-cost.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+          ]
 
   - key: corpus.tables
     value: 1652
@@ -722,7 +835,12 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "1,652"
-        sites: [docs/architecture.md, docs/market.md]
+        sites:
+          [
+            docs/architecture/performance-cost.md,
+            docs/architecture/performance.md,
+            docs/market.md,
+          ]
 
   - key: corpus.blocks.logs
     value: 137
@@ -736,8 +854,12 @@ measurements:
       - as: "137"
         sites:
           [
+            docs/architecture/performance-cost.md,
+            docs/architecture/performance-durability.md,
+            docs/architecture/performance-ingest.md,
+            docs/architecture/performance.md,
+            docs/architecture/principles.md,
             README.md,
-            docs/architecture.md,
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,

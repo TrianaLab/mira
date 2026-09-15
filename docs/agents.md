@@ -55,7 +55,7 @@ anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 ## The eight tools
 
 | tool | answers |
-|---|---|
+| --- | --- |
 | `query_records` | search logs or spans, newest first, attributes merged in |
 | `get_trace` | every span of one trace id, over all of retention |
 | `query_metric` | one metric as time series, grouped by attribute set |
@@ -89,8 +89,9 @@ is the one tool without it, because it reads in-memory rule state and scans noth
 Real output from `make demo`, trimmed to the fields that carry the argument. Four calls,
 57 ms of query time between them, and the answer is the last one.
 
-**1. What is wrong?** The loop starts here whether it was woken by a schedule or by a
-webhook.
+### 1. What is wrong?
+
+The loop starts here whether it was woken by a schedule or by a webhook.
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_alerts"}}
@@ -108,8 +109,10 @@ webhook.
 never has to invent the search that the threshold was counting. `link` opens the same
 records in the UI, which is what to hand a human at the end.
 
-**2. What was the blast radius?** `correlate` is the call that replaces "query, read a
-trace id out of the result, query again".
+### 2. What was the blast radius?
+
+`correlate` is the call that replaces "query, read a trace id out of the result,
+query again".
 
 ```json
 {"name":"correlate","arguments":{
@@ -131,7 +134,9 @@ line is written *after* the request it describes, so the true window is wider th
 one the match fell in; `peers` then adds every service that appears in those traces.
 `truncated: false` says the 93 traces are all of them, not a sample.
 
-**3. Which hop actually failed?** Any trace from the frame, expanded in full.
+### 3. Which hop actually failed?
+
+Any trace from the frame, expanded in full.
 
 ```json
 {"name":"get_trace","arguments":{"trace_id":"0000000000000a4f5555555555555f1a"}}
@@ -151,8 +156,10 @@ this is the call that uses it — 4.6 ms here, and 4.7 ms against 27.1M spans in
 [the query benchmark](market.md#query), opening 2 blocks of 155, because the cost is
 the blocks the Bloom sidecar could not rule out.
 
-**4. What does the service itself say?** Logs are indexed on the same attributes, so this
-is one call, not a jump to another system.
+### 4. What does the service itself say?
+
+Logs are indexed on the same attributes, so this is one call, not a jump to
+another system.
 
 ```json
 {"name":"query_records","arguments":{
@@ -221,7 +228,7 @@ so a second process can map the same directory read-only while the writer keeps 
 mira mira --data-dir ./data     # the same views, no server, no port, no serialisation
 ```
 
-That is [architecture section 8.4](architecture.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
+That is [architecture section 8.4](architecture/read-surfaces.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
 and it is why the co-located case is a different primitive from a managed backend rather
 than a cheaper one. Sandbox, edge node or the pod next door: if the agent can see the
 directory, it can read the memory.

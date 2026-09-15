@@ -1,0 +1,21 @@
+extends: substitution
+message: "Spell it '%s', not '%s'."
+level: error
+ignorecase: false
+# One spelling per thing, in prose. Code spans, fenced blocks and link targets
+# are not prose and Vale does not read them, so `integrations/kubernetes/` and
+# `github.com/...` are untouched — which is the only reason a rule this blunt
+# can be an error.
+swap:
+  '\bk8s\b': Kubernetes
+  '\bK8s\b': Kubernetes
+  '\bkubernetes\b': Kubernetes
+  '\bOpen Telemetry\b': OpenTelemetry
+  '\bOtel\b': OTel
+  '\bKyaml\b': KYAML
+  '\bKYaml\b': KYAML
+  '\bkyaml\b': KYAML
+  '\bGithub\b': GitHub
+  '\bGRPC\b': gRPC
+  '\bGrpc\b': gRPC
+  '\botlp\b': OTLP

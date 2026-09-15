@@ -31,7 +31,7 @@ That is the whole configuration. OTLP/gRPC on `4317`, OTLP/HTTP on `4318`, and
 — protobuf or JSON, plain or gzipped. There is no Mira-specific collector
 component.
 
-```
+```text
 --data-dir PATH            where blocks go            (./mira-data)
 --grpc ADDR --http ADDR    listen addresses           (0.0.0.0:4317 / :4318)
 --retention DURATION       TTL: 7d, 12h, 30m, 500ms   (7d)
@@ -87,7 +87,7 @@ which is the sidecar pruning made visible. A response that filled `limit` also
 carries `next`; pass it back as `after` for the following page.
 
 | endpoint | what it answers |
-|---|---|
+| --- | --- |
 | `POST /api/v1/query` | log records and spans, with events and links |
 | `POST /api/v1/metrics/query` | metric series, with the exemplars naming the traces behind them |
 | `POST /api/v1/metrics/names` | which metric names exist; an empty body means "right now" |

@@ -7,7 +7,7 @@
 # wal-split-ab.sh: the proxy is a subcommand, not a rebuild, so there is no
 # preserved-binary dance and no chance of a version skew between the arms. Arm A
 # is one `mira` with the generator pointed straight at it — the shape every
-# number in architecture.md section 11 was taken in. Arm B is REPLICAS nodes and
+# number in docs/architecture/performance.md section 11 was taken in. Arm B is REPLICAS nodes and
 # one `mira proxy`, with the generator pointed at the proxy.
 #
 # What the ratio means, and what it does not. B/A above 1 is not a speedup of

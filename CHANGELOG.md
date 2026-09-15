@@ -19,8 +19,8 @@ the config keys, the `/mcp` tool set.
   row)` where `node` is the block's `node_id` is a total order across every row
   on every replica, so the merge is a sort and a cut and the next page is exact
   with nothing remembered per reader. Zero new dependencies — `hyper`,
-  `hyper-util` and `http-body-util` were already in the tree for webhooks. A
-  replica that fails fails the whole query rather than returning the others'
+  `hyper-util` and `http-body-util` were already in the tree for webhooks. One
+  failed replica fails the whole query rather than returning the others'
   rows, and `correlate`, `map`, `metrics/query`, `metrics/names` and `entities`
   answer **501 naming themselves**: each is built by walking one node's blocks,
   and a plausible subset with nothing in the response saying so is the failure
@@ -130,10 +130,10 @@ the config keys, the `/mcp` tool set.
 - **A block's checksum is verified once per process, not once per open.** A
   published block never changes, so a scan that reopens the same corpus
   re-hashes bytes this process already hashed. `open_table` now consults a
-  process-scoped map of `path -> (len, mtime, ino)` — the path alone is not
+  process-scoped map of `path -> (len, mtime, ino)`. The path alone is not
   enough, because `compact` renames a new table over an existing name, and the
-  inode is what catches a restore that preserves both other fields — and an
-  entry is only recorded once the file has been untouched for longer than any
+  inode is what catches a restore that preserves both other fields. An entry is
+  only recorded once the file has been untouched for longer than any
   filesystem's mtime granularity, so a corruption that preserves the length
   cannot slip in inside one mtime tick. Worth between a quarter and two fifths
   of a single block's read path and 1.47x on a trace lookup. **The guarantee is
@@ -146,16 +146,16 @@ the config keys, the `/mcp` tool set.
   was a coincidence published as a mechanism. Measured on both sides of one run
   instead, re-verification is between a quarter and two fifths of a single
   block's read path and about 1.1x of a full-corpus scan. What that scan is
-  bound by is whether the corpus fits in page cache: a paired A/B changing only
-  the corpus size puts it at 27-64 ns/row over 9.6 GiB — where one binary ranges
-  2.6x against itself and the two arms are not separable — and **8.9 ns/row over
-  5.01 GiB**, same binary, same predicate, ~187 K rows per block either way. The
+  bound by is whether the corpus fits in page cache. A paired A/B changing only
+  the corpus size puts it at 27-64 ns/row over 9.6 GiB, where one binary ranges
+  2.6x against itself and the two arms are not separable, against **8.9 ns/row
+  over 5.01 GiB** — same binary, same predicate, ~187 K rows per block. The
   change that did move the unpruned scan is the one below it, reading fewer
   bytes rather than hashing them faster: opening the root table alone is
   **1.45x on logs and 1.88x on traces** over nine paired passes, or **1.8x and
   2.6x** for both changes together against 0.0.3. The row is still listed as a
   gap, because a page-cache-bound scan is not something either change fixes.
-  `docs/architecture.md` section 11 now carries a second, named sitting rather
+  `docs/architecture/performance.md` section 11 now carries a second, named sitting rather
   than folding the new numbers into the old table; `scan_cost_per_row` prints
   the checksum's share as a column of its own run so the next such claim is a
   measurement.
@@ -297,7 +297,7 @@ writes is read by 0.0.2.
   `errors`, taking the whole mix from 40 to 50 queries/s. The metrics `series`
   class read slower in the mix and does not share this path at all — see
   **Fixed** below and
-  [architecture section 11](docs/architecture.md#11-performance-model).
+  [architecture section 11](docs/architecture/performance.md).
 - **The WAL watermark is a set, not a high-water mark.** Shards seal out of
   order, so the highest sequence in a block says nothing about the ones below it.
   A block now claims the oldest sequence of its signal that nobody has published
@@ -501,7 +501,7 @@ delta — there is no previous version to have changed from.
 
 Tracked here because they are the difference between what the README promises
 and what a reader might assume;
-[`docs/architecture.md`](docs/architecture.md) section 0.1 is the authoritative
+[`docs/architecture/corrections.md`](docs/architecture/corrections.md) section 0.1 is the authoritative
 list.
 
 - Ingestion is allocation-lean, not zero-copy: `prost` memcpies every string.

@@ -35,7 +35,7 @@ both surfaces rather than copied into each.
 
 `/` opens the filter. The footer is the query plan and the wall clock.
 
-```
+```text
  mira   1 logs    2 traces    3 metrics                                                           http localhost:4318
  filter  severity_text=ERROR                                                                       last 1h  limit 200
  09:56:05.839 ERROR  frontend         POST /checkout failed: upstream returned 503 after 76ms
@@ -73,7 +73,7 @@ matched, blocks touched, wall clock — on every screen, never behind a toggle.
 
 `t` on that row. No trace-id copy-paste, no second tab.
 
-```
+```text
  trace 0000000000000efb5555555555555bae  ·  8 spans  ·  76.08ms
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  POST /checkout                         frontend          █████████████████████████████████████████████████   76.08ms
@@ -107,7 +107,7 @@ offset they happened.
 `m`. The service map is computed from the spans at read time — there is no
 pre-aggregation job, and nothing to be stale.
 
-```
+```text
  map 4 services
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  entry
@@ -148,7 +148,7 @@ a count of seven hundred: they share a time axis and nothing else.
 filter language the query API takes. `enter` on a firing rule opens the records
 that fired it.
 
-```
+```text
  alerts 4 rules  ·  1 firing
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ○      ok      shop-error-rate             0.00% > 2.00%   0 of 0
@@ -175,7 +175,7 @@ query, run on the same blocks the screen above reads.
 `d`. Everything a node knows about itself, with no exporter, no sidecar and no
 `/metrics` scrape.
 
-```
+```text
  node up 1m 05s  ·  peak rss 65.0 MiB  ·  disk 10% free
 ── queries ──────────────────────────────────────────────────────────────────────────────────────────────────────────
   served          17
@@ -272,4 +272,4 @@ handed plausible rows. Wiring, the other seven tools and a worked investigation:
 
 - [Install](install.md) — one script, or a container, or `cargo install`.
 - [Quickstart](quickstart.md) — the manual path, and the query API.
-- [Architecture](architecture.md) — why it is shaped like this.
+- [Architecture](architecture/index.md) — why it is shaped like this.

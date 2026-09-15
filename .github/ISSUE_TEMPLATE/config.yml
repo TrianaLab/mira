@@ -10,7 +10,7 @@ contact_links:
     about: Private, maintainers only. Never open a public issue for one — see SECURITY.md.
 
   - name: Why the tree looks like this
-    url: https://github.com/TrianaLab/mira/blob/main/docs/architecture.md
+    url: https://github.com/TrianaLab/mira/tree/main/docs/architecture
     about: section 0 lists the mechanisms that did not survive contact with the formats, and what replaced them.
 
   - name: Configuration reference

@@ -19,7 +19,7 @@
 //! Principle 4 says *Mira* holds no coordination state — no Raft, no
 //! membership, no external metadata store, the block directory is the manifest.
 //! A controller is not Mira. It is the same delegation the engine already makes
-//! to the platform at `block.rs:402-412` and argues for in architecture.md
+//! to the platform at `block.rs:402-412` and argues for in docs/architecture/not-here.md
 //! section 12.3, moved up one level: Kubernetes already knows the membership,
 //! and reading it from the API server is not a consensus protocol.
 //!

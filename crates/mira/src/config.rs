@@ -146,7 +146,7 @@ pub struct Config {
     pub queue: usize,
     /// How many flushers a signal runs, or 0 for "one per two cores".
     ///
-    /// One shard per core is the sanctioned unit (architecture.md section 4);
+    /// One shard per core is the sanctioned unit (docs/architecture/ingest.md section 4);
     /// this is only here so the number can be pinned when the machine lies
     /// about its core count. `available_parallelism` honours cgroup v1 and v2
     /// CPU quotas, so a container with a quota set needs no help here — but

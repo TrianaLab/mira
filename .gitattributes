@@ -42,7 +42,7 @@ package-lock.json              linguist-generated=true
 package.json     linguist-generated=true
 release/units/** linguist-generated=true
 
-# architecture.md is the reasoning of record and config.md is the whole config
+# docs/architecture/ is the reasoning of record and config.md is the whole config
 # surface — prose, not code. Counting them as a language would misreport the
 # tree in both directions.
 docs/** linguist-documentation=true

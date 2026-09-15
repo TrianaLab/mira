@@ -41,7 +41,7 @@ use crate::util::{Failures, glob, line_of, re, read, read_or_exit, root};
 /// and that sentence move together.
 const WORKSPACE_MEMBERS: usize = 3;
 
-/// docs/architecture.md section 11 scores binary size as one of the four axes
+/// docs/architecture/performance.md section 11 scores binary size as one of the four axes
 /// and sets the target at "<= 20 MB stripped with UI + query + MCP". That is the
 /// contract; the size the README declares is merely where we are against it.
 const SIZE_CEILING_BYTES: u64 = 20 * 1000 * 1000;
@@ -67,6 +67,10 @@ const ALLOWED_CC_DEPENDENTS: [&str; 1] = ["zstd-sys"];
 /// exactly the kind of thing that deserves a name and a sentence.
 const ALLOWED_SYS_CRATES: [&str; 2] = ["zstd-sys", "core-foundation-sys"];
 
+/// The architecture document. One page per section, so the set of section
+/// numbers is the union of their headings rather than one file's.
+const ARCH_PAGES: &str = "docs/architecture/*.md";
+
 /// Every file that quotes the crate count.
 ///
 /// Adding a new mention somewhere is free; *removing* the last mention from a
@@ -74,7 +78,7 @@ const ALLOWED_SYS_CRATES: [&str; 2] = ["zstd-sys", "core-foundation-sys"];
 /// delete the line below, and either way a reviewer sees the decision.
 const CRATE_COUNT_SITES: [&str; 6] = [
     "README.md",
-    "docs/architecture.md",
+    "docs/architecture/performance.md",
     "docs/market.md",
     "docs/index.md",
     "crates/mira/Cargo.toml",
@@ -84,14 +88,14 @@ const CRATE_COUNT_SITES: [&str; 6] = [
 /// Every file that quotes the binary size. See [`CRATE_COUNT_SITES`].
 const BINARY_SIZE_SITES: [&str; 5] = [
     "README.md",
-    "docs/architecture.md",
+    "docs/architecture/performance.md",
     "docs/market.md",
     "docs/index.md",
     "crates/mira/src/term.rs",
 ];
 
-/// The README numbers were measured on an Apple M3 Pro (docs/architecture.md
-/// section 11 says so). A GitHub Linux runner links a measurably different
+/// The README numbers were measured on an Apple M3 Pro
+/// (docs/architecture/performance.md says so). A GitHub Linux runner links a measurably different
 /// binary, so the exact-size gate only runs where the comparison means
 /// something. Everywhere else the ceiling still applies, and the measured size
 /// is printed so a jump is visible in the log even when it is not fatal.
@@ -311,7 +315,7 @@ fn check_crate_count(declared: usize, f: &mut Failures) {
         f.fail(format!(
             "the dependency tree {direction} to {measured} crates but the docs still \
              say {declared}.\n    The count is a product property (README, \
-             docs/architecture.md section 11). Update every site, not just the \
+             docs/architecture/performance.md section 11). Update every site, not just the \
              README:\n{}",
             CRATE_COUNT_SITES.map(|s| format!("      {s}\n")).concat()
         ));
@@ -368,8 +372,8 @@ fn check_c_toolchain(f: &mut Failures) {
             f.fail(format!(
                 "{} build-depends on `{tool}`, so it compiles C at build time.\n    \
                  That makes it a second C dependency, and 'zstd-sys is the only one' \
-                 is a stated property of the product (CLAUDE.md, docs/architecture.md \
-                 section 11). It also breaks the musl and cross-compilation story in \
+                 is a stated property of the product (CLAUDE.md, \
+                 docs/architecture/performance.md). It also breaks the musl and cross-compilation story in \
                  .github/workflows/release.yml.",
                 unexpected.into_iter().collect::<Vec<_>>().join(", ")
             ));
@@ -409,7 +413,7 @@ fn check_binary_size(declared_mib: f64, f: &mut Failures, notes: &mut Vec<String
     if measured > SIZE_CEILING_BYTES {
         f.fail(format!(
             "the binary is {measured_mib:.2} MiB, over the {} MB target in \
-             docs/architecture.md section 11.",
+             docs/architecture/performance.md section 11.",
             SIZE_CEILING_BYTES / 1_000_000
         ));
     }
@@ -604,16 +608,23 @@ fn check_coverage_badge(f: &mut Failures) {
     }
 }
 
-/// The section numbers `rel` declares, closed over prefixes.
+/// The section numbers the pages matching `pattern` declare, closed over
+/// prefixes.
 ///
-/// `## 7. Correlation` declares 7 and `### 7.3 The frame algebra` declares 7.3;
-/// citing the parent is fine wherever a child exists, so 7.3 implies 7.
-fn sections_of(rel: &str) -> std::collections::BTreeSet<String> {
-    let text = read_or_exit(rel);
-    let heading = re(r"(?m)^#{2,4} (?:Annex )?([0-9A-Z][0-9.]*)\.? ");
-    let mut out: std::collections::BTreeSet<String> = heading
-        .captures_iter(&text)
-        .map(|m| m[1].trim_end_matches('.').to_string())
+/// `# 7. Correlation` declares 7 and `## 7.3 The frame algebra` declares 7.3;
+/// citing the parent is fine wherever a child exists, so 7.3 implies 7. The
+/// union is over files rather than one file because the architecture document
+/// is a directory: a section is a page, so its number is that page's `#`.
+fn sections_of(pattern: &str) -> std::collections::BTreeSet<String> {
+    let heading = re(r"(?m)^#{1,4} (?:Annex )?([0-9A-Z][0-9.]*)\.? ");
+    let mut out: std::collections::BTreeSet<String> = glob(pattern)
+        .iter()
+        .flat_map(|rel| {
+            heading
+                .captures_iter(&read_or_exit(rel))
+                .map(|m| m[1].trim_end_matches('.').to_string())
+                .collect::<Vec<_>>()
+        })
         .collect();
     for h in out.clone() {
         let parts: Vec<&str> = h.split('.').collect();
@@ -627,10 +638,10 @@ fn sections_of(rel: &str) -> std::collections::BTreeSet<String> {
 /// A comment saying "section 7.3" is a link with no href: nothing resolves it,
 /// nothing breaks when the section is renumbered, and the reader is left looking
 /// for a heading that no longer exists. There are ~90 of them in the tree, which
-/// is too many to re-check by hand every time architecture.md is edited — and
+/// is too many to re-check by hand every time docs/architecture is edited — and
 /// editing it is precisely when they rot.
 fn check_section_refs(f: &mut Failures) {
-    let arch = sections_of("docs/architecture.md");
+    let arch = sections_of(ARCH_PAGES);
     let cite = re(r"\bsection ([0-9]+(?:\.[0-9]+)*)\b");
 
     // `docs/**` rather than `docs/*`: the contributor pages moved into
@@ -643,10 +654,13 @@ fn check_section_refs(f: &mut Failures) {
 
     let mut dangling: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     for path in files {
-        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        if name == "architecture.md" {
+        // The document does not cite itself: a page saying "section 11" is
+        // pointing at a sibling page, and those are checked by the link gates
+        // that resolve an href rather than by this one, which cannot.
+        if path.starts_with("docs/architecture/") {
             continue;
         }
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let text = read_or_exit(&path);
         for m in cite.captures_iter(&text) {
             if arch.contains(m[1].trim_end_matches('.')) {
@@ -661,8 +675,8 @@ fn check_section_refs(f: &mut Failures) {
 
     for (cite, where_) in dangling {
         f.fail(format!(
-            "\"section {cite}\" is cited in {} and docs/architecture.md has no such \
-             heading.\n    Either the section moved and the citation did not, or the \
+            "\"section {cite}\" is cited in {} and no page under docs/architecture/ has \
+             such a heading.\n    Either the section moved and the citation did not, or the \
              citation is a typo. A cross-reference into a document is a promise about \
              that document.",
             where_.into_iter().collect::<Vec<_>>().join(", ")
@@ -957,7 +971,7 @@ mod tests {
 
     /// The two shapes [`glob`] is allowed to be asked for, against a tree whose
     /// answer is known: this crate's own source is under `crates/*/src/*.rs` and
-    /// the architecture page is under `docs/**/*.md`.
+    /// the architecture pages are under `docs/**/*.md`.
     #[test]
     fn the_two_globs_find_what_the_section_check_walks() {
         let rs = glob("crates/*/src/*.rs");
@@ -968,7 +982,10 @@ mod tests {
         assert!(rs.iter().all(|p| p.ends_with(".rs")), "{rs:?}");
 
         let md = glob("docs/**/*.md");
-        assert!(md.contains(&"docs/architecture.md".to_string()), "{md:?}");
+        assert!(
+            md.contains(&"docs/architecture/index.md".to_string()),
+            "{md:?}"
+        );
         assert!(
             md.contains(&"docs/internals/releases.md".to_string()),
             "the `**` did not recurse: {md:?}"
@@ -976,11 +993,17 @@ mod tests {
     }
 
     /// Section citations close over their prefixes, so citing `7` is fine
-    /// wherever only `7.3` is declared.
+    /// wherever only `7.3` is declared — and they close over *pages*, so a
+    /// number declared on one page resolves for a citation resolved against
+    /// all of them.
     #[test]
     fn a_cited_parent_section_resolves_through_its_children() {
-        let arch = sections_of("docs/architecture.md");
+        let arch = sections_of(ARCH_PAGES);
+        // 11 is its own page; 12.4 is a subsection on a continuation page, and
+        // 12 is only declared on the page before it.
         assert!(arch.contains("11"), "{arch:?}");
+        assert!(arch.contains("12.4"), "{arch:?}");
+        assert!(arch.contains("12"), "{arch:?}");
         assert!(!arch.contains("99"));
     }
 }

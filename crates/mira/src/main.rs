@@ -409,7 +409,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// than proxied because splitting an export by entity means decoding it, and a
 /// tonic service that decodes in order to re-encode to three HTTP clients is a
 /// second transport to keep in step for a hop that is inside one deployment.
-/// Point collectors at 4318; see `docs/architecture.md` section 12.
+/// Point collectors at 4318; see `docs/architecture/replicas.md` section 12.
 async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let p = proxy::Proxy::new(cfg.replicas.clone(), cfg.max_request_bytes)
@@ -1318,8 +1318,15 @@ mod tests {
         assert_eq!(std::fs::read(remote.join("logs.arrow")).unwrap(), b"bytes");
         assert!(local.exists(), "push copies the block, it does not move it");
 
-        std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
+        // The same block again: already archived, so a no-op rather than a
+        // re-copy, and the verb still succeeds.
         offload_cmd(&argv(&push)).unwrap();
+
+        // Different bytes under the same name is the collision, not a no-op —
+        // reporting it as archived is what would let a scale-in delete the
+        // volume holding the only copy.
+        std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
+        offload_cmd(&argv(&push)).unwrap_err();
         assert_eq!(
             std::fs::read(remote.join("logs.arrow")).unwrap(),
             b"bytes",

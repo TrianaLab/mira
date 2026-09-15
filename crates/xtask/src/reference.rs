@@ -274,7 +274,7 @@ const SIGNAL_SCHEMA: [(&str, &str); 2] = [("logs", "LOGS"), ("traces", "SPANS")]
 /// which is the property that makes it droppable in front of one. Scraping it
 /// would give every one of those routes two rows with two summaries. What is
 /// specific to that mode — which reads it refuses, and why — is
-/// `docs/architecture.md` section 12 and `mira proxy --help`.
+/// `docs/architecture/replicas.md` section 12 and `mira proxy --help`.
 const NOT_A_SURFACE: [&str; 2] = ["e2e.rs", "proxy.rs"];
 
 /// Routes are grouped the way a reader meets them, not the way the files happen

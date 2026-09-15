@@ -1,0 +1,46 @@
+# Markdown structure. `make docs-check` runs this, `ci-docs` runs that.
+#
+# What this gate is *not*: a style opinion about prose. That is Vale's job
+# (.vale.ini) and the section limits are `xtask prose`. This one only asserts
+# that the markup is well formed and spelled one way, because a document whose
+# lists switch bullet character halfway down is a document nobody proofread.
+#
+# Which files it runs over is not here: the Makefile's `PROSE` list is the one
+# definition of that, because all three gates need the same answer and a scope
+# written out three times is a scope that disagrees with itself by the third
+# release. This file is rule configuration only.
+
+config:
+  # Off, and this is the only rule here disabled on taste. Hard-wrapping prose
+  # makes every edit a reflow and every diff a paragraph, and the rendered page
+  # is identical either way. Sentence length is a reader problem, and `xtask
+  # prose` measures that directly.
+  MD013: false
+
+  # Off because the pages use it deliberately: <details> for the long outputs
+  # in the internals pages, <img> where a caption or width is needed.
+  MD033: false
+
+  # A duplicate heading is only ambiguous when it collides in the same
+  # anchor namespace, which is per section, not per page.
+  MD024:
+    siblings_only: true
+
+  # Off: the README opens with the project banner and the pull request template
+  # opens with the first field of a form. Neither is a document with a title.
+  MD041: false
+
+  # Named rather than left on "consistent", which only asks each file to agree
+  # with itself — so two pages can settle on two styles and both pass, and the
+  # generated registry table in the measurement contract would be a third.
+  # `xtask measurements render` emits this spelling.
+  MD060:
+    style: compact
+
+  # Off, and not on taste: this rule cannot see mkdocs-material. The body of an
+  # `!!! note` admonition and of a `=== "Tab"` content tab is indented four
+  # spaces, so every one of them reads to markdownlint as an indented code
+  # block — including the fenced blocks nested inside them. Ten findings, all
+  # of them the same false positive. MD040 still holds every real fence to
+  # naming its language, which is the half that was worth having.
+  MD046: false

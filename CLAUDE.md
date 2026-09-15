@@ -2,7 +2,8 @@
 
 Mira is an OTLP-native telemetry storage engine in a single binary: OTLP in,
 immutable Arrow IPC blocks out, queried straight from `mmap`. Read
-[docs/architecture.md](docs/architecture.md) section 0 and section 1 before any
+[docs/architecture/corrections.md](docs/architecture/corrections.md) and
+[principles.md](docs/architecture/principles.md) before any
 structural change — section 0 lists the mechanisms from the original brief that
 do not survive contact with the formats, and re-proposing one is the most common
 way to waste a session.
@@ -40,8 +41,8 @@ cargo fmt --all
 CARGO_TARGET_DIR=/tmp/mira-cov cargo llvm-cov --workspace --summary-only
 ```
 
-Use a separate `CARGO_TARGET_DIR` for coverage — it takes the same target-dir
-lock as a normal build, so it will block anything running in parallel.
+Use a separate `CARGO_TARGET_DIR` for coverage: it takes the same target-dir
+lock as a normal build, so it blocks anything running in parallel.
 
 The package names are `miradb`, `miradb-core` and `miradb-proto`, because `mira`
 on crates.io is an unrelated crate from 2024. Nothing else moved: the binary is
@@ -64,7 +65,7 @@ Under `docs/internals/`: [testing.md](docs/internals/testing.md) maps the nine
 test levels and which one a new test belongs at, [e2e.md](docs/internals/e2e.md)
 is end-to-end testing against a live instance with synthetic data,
 [releases.md](docs/internals/releases.md) is how a release is cut and what is
-signed. Those three plus `architecture.md` are the site's "Project internals" tab.
+signed.
 
 ## The dependency budget is a product property
 
@@ -83,7 +84,7 @@ and the drift gate fires on the runner rather than on a real change.
 `crates/xtask` pins the same triple.
 
 That count includes the three workspace members, so it is three above the number
-the README states. If it moves, update the README bullet, `docs/architecture.md`
+the README states. If it moves, update the README bullet, `docs/architecture/performance.md`
 section 11's table, and the "against a tree of N" comments. `zstd-sys` is the
 only C dependency and that is a stated property — keep new crates pure-Rust.
 
@@ -91,8 +92,8 @@ only C dependency and that is a stated property — keep new crates pure-Rust.
 
 - **The README** is a promise. Every bullet must be true of the committed code,
   every number measured on this machine. Anything not yet true belongs in
-  `docs/architecture.md` section 0.1, summarised under the README's "Scope".
-- **docs/architecture.md** is the reasoning, not a plan. When you make a
+  `docs/architecture/corrections.md` section 0.1, summarised under the README's "Scope".
+- **docs/architecture/** is the reasoning, not a plan. When you make a
   non-obvious choice, the section explaining *why* is part of the diff.
 - Comments explain **why**, not what. A deliberate simplification with a known
   ceiling gets a `ponytail:` comment naming the ceiling and the upgrade path.

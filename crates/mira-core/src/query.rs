@@ -908,7 +908,7 @@ struct Child {
 /// the whole table per emitted row per level — on a 330 K-row logs block that
 /// is 66 million comparisons to render a hundred records, and it measured as
 /// *most* of an unfiltered `limit 100`, more than the scan and more than the
-/// paging docs/architecture.md section 11 attributes it to. Same shape
+/// paging docs/architecture/performance.md section 11 attributes it to. Same shape
 /// [`Block::emit_children`] already fixed for the child tables; this is the
 /// other half of it.
 ///
@@ -1061,7 +1061,7 @@ impl Block {
         // buys it back for one realloc.
         let mut sel: Vec<u32> = (0..n as u32).collect();
         if !(q.from <= bref.min_ts && q.to >= bref.max_ts) {
-            // The `&[i64]` loop docs/architecture.md section 10 names as what
+            // The `&[i64]` loop docs/architecture/not-here.md section 10 names as what
             // replaces intrinsics on the scan, and the one column every query
             // has a predicate on. `None` for the validity because the time
             // column is non-nullable in every signal's schema — and the scan it
@@ -1490,7 +1490,7 @@ pub(crate) fn dict_index(values: &StringArray, needle: &str) -> Option<u16> {
 ///
 /// One monomorphic loop per column type, where this used to build a
 /// `Box<dyn Fn(u32) -> bool>` and pay an indirect call per row.
-/// docs/architecture.md section 10 rejects hand-written intrinsics on the scan
+/// docs/architecture/not-here.md section 10 rejects hand-written intrinsics on the scan
 /// and names what replaces them: "a tight loop over `&[i64]` with no bounds
 /// checks and no branches, which LLVM turns into NEON unasked". That is what
 /// [`keep`] is; this function's only job is to hand it a values slice and a
@@ -3138,7 +3138,7 @@ mod tests {
         // Everything outside it — the mmap's minor faults, the CRC32 of every
         // table body, the dictionary scan, `Block::open`'s two child indexes,
         // the cursor filter and the JSON of `limit` rows — is the "no term"
-        // line, and that is the claim in docs/architecture.md section 11 that
+        // line, and that is the claim in docs/architecture/performance.md section 11 that
         // the per-block cost is paging rather than scanning.
         //
         // Measured twice, because the CRC is the larger half and it is paid

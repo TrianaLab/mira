@@ -260,7 +260,7 @@ build: ## Release binary and the load harness (the artifact; see `make drift`)
 	@# `dist-tarball` depends on this target, so that is the artifact that ships.
 	@# Nothing in `mira` calls any of what the wider resolutions drag in. The
 	@# cost is a second compile of the dev-unified tokio; binary size is a scored
-	@# axis (docs/architecture.md section 11), so the trade is not close.
+	@# axis (docs/architecture/performance.md section 11), so the trade is not close.
 	$(CARGO) build --release --locked -p miradb --bin mira
 	$(CARGO) build --release --locked -p miradb --example loadgen
 
@@ -774,15 +774,24 @@ docs-check: node_modules ## Markdown structure, prose style, and the shape of a 
 	@#   markdownlint   the markup — one table style, every fence labelled
 	@#   vale           the words — marketing, filler, terminology
 	@#   xtask prose    the shape — page, section and sentence length, depth
+	@#   xtask links    the cross-references, on the half of the tree
+	@#                  `make docs` cannot reach
 	@#
 	@# The split is not arbitrary. markdownlint cannot see a word and Vale
 	@# cannot see a page, and the thing this repository actually kept getting
 	@# wrong was the page: eight thousand words under one heading passes both.
 	@# Rule configuration lives in .markdownlint-cli2.yaml and .vale/styles/Mira.
+	@#
+	@# `links` takes the pages outside docs/ and nothing else, because
+	@# `mkdocs build --strict` already resolves every link and anchor on the
+	@# site and a second opinion on the same file is a second place to suppress
+	@# something. What it leaves uncovered is README.md and its neighbours,
+	@# which link into docs/ constantly with nothing resolving them.
 	$(call need_bin,vale,brew install vale   (see https://vale.sh/docs/install))
 	npx markdownlint-cli2 $(PROSE)
 	vale $(PROSE)
 	$(XTASK) prose $(filter-out $(GENERATED),$(PROSE))
+	$(XTASK) links $(filter-out docs/%,$(PROSE))
 
 # markdownlint is pinned in package.json beside @changesets/cli, which is the
 # only reason there is a package.json at the root at all. A stamp target rather
@@ -842,6 +851,33 @@ docs: $(VENV)/bin/mkdocs ## Build the docs site; --strict, so a dead link fails
 		exit 1; \
 	fi
 	$(VENV)/bin/mkdocs build --strict
+	@# The other other half: an absolute URL into a page mkdocs *did* build.
+	@# Splitting `architecture.md` into a directory moved every anchor on it, and
+	@# one spelled out in full in a Rust doc comment turned into a 404 that
+	@# --strict cannot see, because that URL is external as far as it is
+	@# concerned. Resolved against the HTML just built rather than against a
+	@# slugifier of our own: python-markdown's rules are the only ones that
+	@# decide what an anchor is, and a second implementation of them is a second
+	@# thing to be wrong.
+	@# `api/`, `play/` and `coverage.json` are not mkdocs pages — `make site` and
+	@# `make coverage-json` write those, after this target has run.
+	@bad=$$(for u in $$(git grep -hoE --untracked 'https://miradb\.dev/[A-Za-z0-9_./#-]*' \
+	    | sed -e 's#https://miradb\.dev/##' -e 's/\.$$//' \
+	    | grep -vE '^(api$$|api/|play/|coverage\.json$$)' | sort -u); do \
+		frag=$${u#*\#}; [ "$$frag" = "$$u" ] && frag=; \
+		page=site/$${u%%\#*}; page=$${page%/}; \
+		[ -d "$$page" ] && page=$$page/index.html; \
+		[ -f "$$page" ] || { echo "$$u -- no $$page"; continue; }; \
+		if [ -n "$$frag" ] && ! grep -q "id=\"$$frag\"" "$$page"; then \
+			echo "$$u -- $$page has no anchor $$frag"; \
+		fi; \
+	done); \
+	if [ -n "$$bad" ]; then \
+		echo "error: these absolute site URLs resolve to nothing:"; \
+		printf '%s\n' "$$bad" | sed 's/^/    /'; \
+		echo "  \`git grep -n <url>\` finds every one."; \
+		exit 1; \
+	fi
 
 .PHONY: docs-serve
 docs-serve: $(VENV)/bin/mkdocs ## Serve the docs site with live reload
@@ -1081,7 +1117,7 @@ dist-tarball: build glibc-floor ## Tarball the $(TARGET) binary into dist/
 #   * COPYFILE_DISABLE, because macOS tar otherwise writes ._ AppleDouble
 #     sidecars into the archive and they surface as junk on a Linux extract.
 # The size line goes to the run summary as well as stdout: README and
-# docs/architecture.md section 11 both quote a binary size, and a release that
+# docs/architecture/performance.md section 11 both quote a binary size, and a release that
 # quietly doubles it should be visible without opening a log.
 
 .PHONY: dist-sbom

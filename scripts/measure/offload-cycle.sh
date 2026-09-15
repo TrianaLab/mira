@@ -1,6 +1,6 @@
 #!/bin/sh
 # ingest -> offload -> list -> restore -> read back. Produces the numbers in
-# architecture.md section 11 under "`--offload` costs the retention sweep and
+# docs/architecture/performance.md section 11 under "`--offload` costs the retention sweep and
 # nothing else".
 #
 # The corpus is settled *and drained* before anything is measured. Settling is

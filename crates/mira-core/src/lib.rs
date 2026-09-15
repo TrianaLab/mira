@@ -13,7 +13,7 @@
 //! * [`block`] — atomic publish of immutable block directories and zero-copy
 //!   mmap reads back out of them.
 //!
-//! See `docs/architecture.md` for why each of those is shaped the way it is.
+//! See `docs/architecture/` for why each of those is shaped the way it is.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -118,7 +118,7 @@ mod sync_tests {
     /// `cargo test` runs a crate's tests on many threads: three tests each
     /// asserting a delta on one counter is a race, and the first draft of this
     /// module was exactly that. No `tempfile` either — the dependency budget is
-    /// a product property (`docs/architecture.md` section 11) for one file.
+    /// a product property (`docs/architecture/performance.md` section 11) for one file.
     #[test]
     fn the_barrier_runs_and_only_enotsup_degrades() {
         let path = std::env::temp_dir().join(format!("mira-sync-{}", std::process::id()));

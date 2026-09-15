@@ -25,6 +25,9 @@
 //! | [`measurements`](mod@measurements) | nothing — the numbers were loose | every site still quotes the figure the last run measured |
 //! | `measurements render` | — | rewrite the registry table on the contract page |
 //! | `measurements ingest RUN.json` | — | fold a load test's output back into the registry |
+//! | [`links`](mod@links) | nothing — mkdocs saw half the tree | every cross-reference outside `docs/` resolves |
+//! | [`market`](mod@market) | nothing — the tally was hand-counted | the claim tally on the market page is what its tables say |
+//! | [`prose`](mod@prose) | nothing — verbosity was a review comment | no page runs past a structural limit |
 //! | [`reference`](mod@reference) | `scripts/gen_reference.py` | regenerate the reference pages from the code |
 //! | [`coverage_json`] | a `python -c` in the Makefile | the badge's figure, floored |
 //! | `parse-json` | a `python -c` in the Makefile | a JSON file parses |
@@ -35,7 +38,10 @@
 mod ci;
 mod coverage_json;
 mod drift;
+mod links;
+mod market;
 mod measurements;
+mod prose;
 mod reference;
 mod release;
 mod util;
@@ -54,6 +60,10 @@ fn main() -> ExitCode {
         (Some("measurements"), ["render"]) => measurements::render(),
         (Some("measurements"), ["ingest", run]) => measurements::ingest(run, false),
         (Some("measurements"), ["ingest", run, "--write"]) => measurements::ingest(run, true),
+        (Some("links"), paths) if !paths.is_empty() => links::check(paths),
+        (Some("market"), []) => market::check(),
+        (Some("market"), ["render"]) => market::render(),
+        (Some("prose"), paths) if !paths.is_empty() => prose::check(paths),
         (Some("reference"), []) => reference::run(),
         (Some("coverage-json"), [out, commit]) => coverage_json::run(out, commit),
         // Not a check of anything clever: `helm template` loads
@@ -82,6 +92,10 @@ fn main() -> ExitCode {
                  \x20 measurements render       rewrite the registry table\n\
                  \x20 measurements ingest RUN.json [--write]\n\
                  \x20                           fold a load test back into the registry\n\
+                 \x20 links PATH...             every cross-reference on those pages resolves\n\
+                 \x20 market                    the claim tally on the market page is current\n\
+                 \x20 market render             rewrite that tally from the tables\n\
+                 \x20 prose PATH...             those pages are within the structural limits\n\
                  \x20 reference                 regenerate the reference pages\n\
                  \x20 coverage-json OUT COMMIT  llvm-cov JSON on stdin -> the badge's file\n\
                  \x20 parse-json PATH           that file is valid JSON"

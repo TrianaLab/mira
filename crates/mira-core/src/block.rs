@@ -101,7 +101,7 @@ const LEGACY_VERSION: u32 = 1;
 /// The ZSTD level every compressed table is written at.
 ///
 /// The same as arrow-ipc's default, and set explicitly anyway: the ratio in
-/// `docs/architecture.md` section 11 is a published number, and an upstream
+/// `docs/architecture/performance.md` section 11 is a published number, and an upstream
 /// default that moved would move it without anything in this tree changing.
 ///
 /// 3 and not higher, which was measured and rejected. Over 8 real blocks per
@@ -227,7 +227,7 @@ pub fn write_table_zstd(path: &Path, batch: &RecordBatch) -> Result<()> {
 
 /// The same again as LZ4_FRAME, so the `tier` example can price the pure-Rust
 /// alternative against the C one on real blocks. Nothing in the engine writes
-/// LZ4; see the decisions table in `docs/architecture.md`.
+/// LZ4; see the decisions table in `docs/architecture/data-layout.md`.
 pub fn write_table_lz4(path: &Path, batch: &RecordBatch) -> Result<()> {
     write_table_with(
         path,
@@ -1248,7 +1248,7 @@ fn message_at(path: &Path, buffer: &Buffer, offset: usize, body_len: usize) -> R
 /// this. The "35-39%, a median of 1.55x" this comment used to carry was three
 /// samples of a quantity that moves between 1.14x and 2.21x, and is withdrawn
 /// as a median. `scan_cost_per_row` in `query.rs` is the run; section 11 of
-/// `docs/architecture.md` is the write-up.
+/// `docs/architecture/performance-query.md` is the write-up.
 ///
 /// The identity is the path *plus* [`FileId`], never the path alone, because a
 /// name in this tree is not a file for life: [`compact`] renames a new table

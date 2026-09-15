@@ -14,21 +14,18 @@ curl -fsSL https://miradb.dev/install.sh | bash
 
 It resolves the latest release, picks the tarball for your platform, checks it
 against the published `SHA256SUMS`, and — if `gh` is on the path — verifies the
-SLSA provenance attestation before moving the binary into place. That last step
-is the one worth having: a checksum beside an artifact proves the two match, not
-that either came from this repository.
+SLSA provenance attestation before moving the binary into place.
 
 | | |
-|---|---|
+| --- | --- |
 | `--version v0.0.4` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the attestation check (the checksum is still enforced) |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
 | `GH_TOKEN` | avoids the anonymous 60-requests-an-hour limit on the version lookup |
 
-Piping a script from the internet into a shell is a decision, not a default.
 [Read it first](https://miradb.dev/install.sh) — that URL is not a copy of the
-script, it *is* the script, so what you read is byte-for-byte what runs.
+script, it *is* the script.
 
 ## Updating
 
@@ -38,17 +35,15 @@ mira update --dry-run    # print the command it would run, and stop
 mira update --version v0.0.4
 ```
 
-This runs the installer above rather than re-implementing it, so the checksum and
-the attestation are checked by the same code path as a first install, not by a
-second one that drifts. The difference is where it lands: `mira update` installs
-over **this binary's own directory**, not `/usr/local/bin`, so a mira in
-`~/.local/bin` is replaced rather than shadowed by a second copy whose precedence
-depends on `PATH` order. `MIRA_INSTALL_DIR` still wins if it is set.
+This runs the installer above, so the checksum and the attestation take the same
+code path as a first install. It installs over **this binary's own
+directory**, not `/usr/local/bin`, so a mira in `~/.local/bin` is replaced
+rather than shadowed. `MIRA_INSTALL_DIR` still wins if it is set.
 
-There is no `--check`: the installer stops with `mira vX is already installed`
-when the running version is the one that would be installed, so running it *is*
-the check. If you installed from a package manager or from source, keep using
-that instead — this replaces a file, and it does not know what put it there.
+The installer stops with `mira vX is already installed` when the running version
+is the one that would be installed. If you installed from a package manager or
+from source, keep using that: this replaces a file and does not know what put it
+there.
 
 ## With cargo
 
@@ -57,19 +52,18 @@ cargo install --locked miradb                    # -> ~/.cargo/bin/mira
 ```
 
 The crate is `miradb` and the binary it installs is `mira`: `mira` on crates.io
-is an unrelated crate that has been there since 2024. Two libraries are published
-beside it for anyone embedding the engine rather than running it —
-[`miradb-core`](https://docs.rs/miradb-core) is the encoder, block writer and
-mmap reader, [`miradb-proto`](https://docs.rs/miradb-proto) is the OTLP bindings.
+is an unrelated crate from 2024. Two libraries are published beside it for
+embedding the engine — [`miradb-core`](https://docs.rs/miradb-core) is the
+encoder, block writer and mmap reader,
+[`miradb-proto`](https://docs.rs/miradb-proto) is the OTLP bindings.
 
 ## From source
 
-The whole prerequisite list is **Rust 1.85 or newer** and a `cc`, which
-`zstd-sys` needs to compile the C source it vendors — the linker already required
-one, so the practical delta is a vendored compile rather than a new thing to
-install. Nothing else: no `protoc`, because the OTLP protos are compiled by
-`protox` in a build script, and no node toolchain, because the browser UI is
-built and committed under `crates/mira/ui/dist`.
+The prerequisites are **Rust 1.85 or newer** and a `cc`, which
+`zstd-sys` needs to compile the C source it vendors. Nothing else: no `protoc`,
+because the OTLP protos are compiled by `protox` in a build script, and no node
+toolchain, because the browser UI is built and committed under
+`crates/mira/ui/dist`.
 
 ```sh
 git clone https://github.com/TrianaLab/mira && cd mira
@@ -79,9 +73,9 @@ cargo build --release                            # or: ./target/release/mira
 
 ## From a release
 
-From the first tag on, the release workflow publishes a stripped binary for
-linux and macOS on x86_64 and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one
-SLSA provenance attestation covering every file in it.
+The release workflow publishes a stripped binary for linux and macOS on x86_64
+and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one SLSA provenance attestation
+covering every file in it.
 
 ```sh
 V=0.0.4; T=x86_64-unknown-linux-gnu
@@ -96,30 +90,24 @@ gh attestation verify mira --repo TrianaLab/mira
 verify` proves those bytes came out of a workflow run in this repository.
 
 The linux builds come off `ubuntu-22.04`, so the glibc floor is **2.34** — RHEL
-9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+ and the
-`distroless/base-nossl-debian12` base the image uses. That is a measurement, not
-a hope: `make glibc-floor` reads the highest `GLIBC_` symbol version the binary
-references and fails the build above 2.34, so a runner image that moves under us
-is a red pull request rather than a binary that will not start. There is no musl
-build: it compiles, but musl's mallocng costs the ingest path more than the
-Alpine coverage is worth, and fixing that means linking jemalloc and giving up
-"`zstd-sys` is the one C dependency". On Alpine, build from source.
+9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+. `make glibc-floor` reads the
+highest `GLIBC_` symbol version the binary references and fails the build above
+it. There is no musl build: it compiles, but musl's mallocng costs the
+ingest path more than the Alpine coverage is worth. On Alpine, build from source.
 
 ## Docker
 
 **8.6 MB compressed** (`linux/arm64`, measured off the OCI export), of which
-2.9 MB is Mira's own layer — a 6.6 MB binary, and the one thing here that has a
-reason to grow. The base is `distroless/base-nossl-debian12:nonroot` plus one
-copied `libgcc_s.so.1`, the complete set of things the binary's three `NEEDED`
-entries require — no OpenSSL, no libstdc++, no shell, no package manager.
-Published images carry the same bytes as the tarball rather than a second
-compile, so the digest `gh attestation verify` checks is about one artifact.
+2.9 MB is Mira's own layer — a 6.6 MB binary. The base is
+`distroless/base-nossl-debian12:nonroot` plus one copied `libgcc_s.so.1` — no
+OpenSSL, no libstdc++, no shell, no package manager. Published images carry the
+same bytes as the tarball rather than a second compile.
 
 ```sh
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
 ```
 
-Or build it locally, to run a commit that has not been released:
+Or build it locally:
 
 ```sh
 docker build -t mira .
@@ -132,15 +120,14 @@ docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data mira
     an I/O hiccup arrives as `SIGBUS`, a signal rather than an error, with
     nothing to catch.
 
-    The image declares no `VOLUME`, deliberately: Kubernetes ignores the
-    directive, and on Docker it silently creates an anonymous volume on every
-    `docker run` without `-v`. Mount one explicitly and you know what you have.
+    The image declares no `VOLUME`: Kubernetes ignores the directive, and on
+    Docker it silently creates an anonymous volume on every `docker run`
+    without `-v`.
 
 ### Health checks
 
-The image has no `HEALTHCHECK` — distroless carries no shell and no `curl`, and
-adding either to run a probe would roughly double it. Mira answers both probes
-itself on 4318:
+The image has no `HEALTHCHECK` — distroless carries no shell and no `curl`.
+Mira answers both probes itself on 4318:
 
 ```yaml
 readinessProbe:
@@ -154,9 +141,14 @@ Neither touches the block directory, so a slow disk does not fail a probe.
 
 ## Kubernetes
 
-There is one chart, [`charts/mira-operator`](reference/chart.md), and it installs
-a **controller** rather than Mira. Published to the same registry as the image,
-as an OCI artifact:
+One Mira needs no chart. The [container above](#docker) is the whole deployment:
+one image, one volume, two ports. On Kubernetes that is a Deployment — or a
+StatefulSet, if the volume is to outlive a reschedule.
+
+What has no hand-written answer is a **tier**: several storage nodes, a volume
+each, a `mira proxy` in front of them, and the decision of when there should be
+one more. That is what the operator is for: the only chart here installs a
+**controller** rather than Mira, from the same registry as the image:
 
 ```sh
 helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
@@ -164,8 +156,9 @@ helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
 ```
 
 That is a Deployment of exactly one, a ServiceAccount, a ClusterRole with no
-wildcards, and the `MiraCluster` CRD — nothing that stores anything. The tier
-comes next, and it is a document:
+wildcards, and the `MiraCluster` CRD.
+
+### The tier
 
 ```yaml
 apiVersion: mira.miradb.dev/v1alpha1
@@ -183,45 +176,40 @@ spec:
   proxy: { replicas: 2 }
 ```
 
-`offload` and `coldStorageClaim` are a pair, and the operator refuses a spec with
-one and not the other. `file://` is the only scheme Mira's offload target parses,
-so on Kubernetes the archive is a *mount*: a drain Job with no claim mounted at
-`/cold` writes the archive into its own container filesystem, exits 0, and the
-operator then deletes the volume it believes it archived. Refusing the spec makes
-that unrepresentable rather than merely discouraged. Both are optional together —
-a tier with neither still scales out, and never in.
+`offload` and `coldStorageClaim` are a pair: the operator refuses a spec with
+one and not the other, and a tier with neither still scales out, and never in.
+`file://` is the only scheme Mira's offload target parses, so on Kubernetes the
+archive is a *mount* — a drain Job with no claim at `/cold` writes it into its
+own container filesystem, and the operator deletes the volume it believes it
+archived.
 
-`kubectl apply` that and the operator builds what the old chart made you size by
-hand — a StatefulSet, a PVC per replica, the governing headless Service which
-publishes not-ready addresses so a pod whose volume has filled is still reachable
-by name, and a `mira proxy` Deployment with a ClusterIP Service in front of it.
-The ConfigMap each mounts is the same KYAML document as everywhere else, but the
-operator writes it: the node's is `node`, `listen`, `storage.dir` and
-`storage.offload`, the proxy's is the replica list, regenerated on every reconcile
-so a scale event reaches the proxy at all. How much CPU, memory and disk to give
-a replica is [Configuration's sizing table](config.md#sizing), every row anchored
-to a measured point.
+`kubectl apply` that and the operator builds a StatefulSet, a PVC per replica,
+the governing headless Service, which publishes not-ready addresses so a pod
+whose volume has filled stays reachable by name, and a `mira proxy`
+Deployment with a ClusterIP Service in front of it. It writes both ConfigMaps —
+the node's `node`, `listen`, `storage.dir` and `storage.offload`, the proxy's
+replica list — on every reconcile, and a PodDisruptionBudget of
+`maxUnavailable: 1`, because a replica's blocks are the only copy and a drain
+would otherwise evict every replica on the node at once. How much CPU,
+memory and disk to give a replica is
+[Configuration's sizing table](config.md#sizing).
 
 !!! note "A chart that installed a StatefulSet used to exist"
 
-    It was removed rather than kept beside this one: two charts is two answers
-    to "how do I run Mira on Kubernetes", and the one that cannot scale, cannot
-    drain and cannot be told a ceiling is the wrong default. Three things it
-    could do have **no `MiraCluster` equivalent yet**: an Ingress, a
-    ServiceAccount per tier, and arbitrary `config.*` keys. Write the Ingress
-    yourself against the proxy Service; the tier's pods run as `default`, and
-    the config is whatever the operator generates, until the CRD grows fields
-    for them.
+    Three things it could do have **no `MiraCluster` equivalent yet**: an
+    Ingress, a ServiceAccount per tier, and arbitrary `config.*` keys. Write the
+    Ingress yourself against the proxy Service; the tier's pods run as
+    `default`.
 
-The controller does not make Mira stateful. Principle 4 says *Mira* holds no
-coordination state, and the test is what happens when you delete the operator's
-Deployment: every Mira pod keeps ingesting, keeps serving and keeps its blocks
-readable, because none of them ever asked it anything. Only the scaling stops.
+The controller does not make Mira stateful: delete the operator's Deployment and
+every Mira pod keeps ingesting and serving. Only the scaling stops.
 
-The chart is signed, but not the same way the binaries are — it carries a cosign
-signature over its digest and no SLSA provenance, where the tarballs carry
-`SHA256SUMS` with one provenance attestation over that file and no cosign
-signature ([releases.md](internals/releases.md#what-is-signed-and-what-is-not) has the
+### What the chart carries
+
+The chart carries a cosign signature over its digest and no SLSA provenance,
+where the tarballs carry `SHA256SUMS` with one provenance attestation and no
+cosign signature
+([releases.md](internals/releases.md#what-is-signed-and-what-is-not) has the
 per-artifact table):
 
 ```sh
@@ -233,39 +221,32 @@ cosign verify \
 ```
 
 The [chart reference](reference/chart.md) has every value, how a scale-in is
-sequenced, and why there is no leader election. It is also listed on [Artifact
-Hub](https://artifacthub.io/packages/search?repo=mira), which renders that
-README, the signature above and the image's current CVE report against the same
-coordinate. Every value the chart itself owns — `image`, `rbac`,
-`serviceAccount`, `replicaCount`, `logLevel` — is covered by a
-`values.schema.json` closed at each of those levels, so `helm install` rejects a
-typo'd key before the cluster sees it, the same rule Mira's own config file
-follows. The Kubernetes pass-throughs (`resources`, `securityContext`,
-`podSecurityContext`, `nodeSelector`, `tolerations`, `affinity`) stay open: the
-API server owns those schemas, and a copy here would go stale against it.
+sequenced, and what the operator's lease guarantees. Every value the chart
+itself owns — `image`, `rbac`, `serviceAccount`, `replicaCount`, `logLevel` — is
+covered by a `values.schema.json` closed at each of those levels, so `helm
+install` rejects a typo'd key. The Kubernetes
+pass-throughs (`resources`, `securityContext`, `podSecurityContext`,
+`nodeSelector`, `tolerations`, `affinity`) stay open.
 
-The `MiraCluster` fields get the same treatment one level up, and there the
-stakes are higher: the API server **prunes** a field the CRD does not name rather
-than rejecting it, so a stale CRD is silent data loss with no error. That is why
-the CRD is generated from the Rust types and `make operator-crd-check` fails the
-build when the two disagree — and why a chart upgrade that changes the schema
-needs the CRD applied by hand first, since Helm installs `crds/` once and never
-upgrades it.
+The `MiraCluster` fields get the same treatment, and the stakes are higher: the
+API server **prunes** a field the CRD does not name rather than rejecting it, so
+a stale CRD is silent data loss. So the CRD is
+generated from the Rust types and `make operator-crd-check` fails the build when
+the two disagree — and a chart upgrade that changes the schema needs the CRD
+applied by hand first, since Helm installs `crds/` once and never upgrades it.
 
 ## Where it will refuse to start
 
-For the same reason, Mira `statfs`es its data directory at startup and **refuses
-to start on a network filesystem** — NFS, SMB, CephFS and friends. The error
-names the filesystem it found and says what to point `--data-dir` at instead.
+Mira `statfs`es its data directory at startup and **refuses to start on a
+network filesystem** — NFS, SMB, CephFS and friends. The error names the
+filesystem and what to point `--data-dir` at instead.
 FUSE is a warning rather than a refusal, because the magic number cannot tell
 `gcsfuse` from a local one.
 
-That rules out an RWX PVC on Kubernetes, which is why the operator's volume claim
-template is hard-coded to `ReadWriteOnce` with no field to change it, and why
-`spec.storage.className` should name a block-backed class;
-[Configuration](config.md) has the topology that works instead. The same
-constraint forces the order of a scale-in: the drain Job cannot attach the claim
-until the pod holding it is gone.
+That rules out an RWX PVC on Kubernetes: the operator's volume claim template is
+hard-coded to `ReadWriteOnce` with no field to change it, and
+`spec.storage.className` should name a block-backed class.
+[Configuration](config.md) has the topology that works instead.
 
 ## Check it runs
 

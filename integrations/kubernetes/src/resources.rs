@@ -239,7 +239,7 @@ pub fn proxy_service(c: &MiraCluster) -> Service {
 /// What a node drain is allowed to take from the tier at once.
 ///
 /// One replica. Its volume holds blocks no other replica has, nothing
-/// replicates and nothing rebalances (architecture.md section 12.4), so an
+/// replicates and nothing rebalances (docs/architecture/replicas-scaling.md section 12.4), so an
 /// eviction is a hole in the corpus until the claim rebinds and the pod
 /// replays. Two at once is two holes, and a node running two of the tier's
 /// pods is the normal case rather than an unlucky one.
@@ -449,7 +449,7 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
                         // `push` copies and unlinks nothing. The volume it runs
                         // against is about to be deleted, so freeing space on
                         // it buys nothing, and an emptied directory walks two
-                        // derived numbers backwards — see architecture.md 6.1.
+                        // derived numbers backwards — see docs/architecture/retention.md 6.1.
                         "args": [
                             "offload", "push",
                             "--data-dir", "/data",

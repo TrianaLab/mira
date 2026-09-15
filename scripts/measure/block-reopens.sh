@@ -1,6 +1,6 @@
 #!/bin/sh
 # Does one process open the same block more than once? The access-pattern
-# measurement architecture.md section 3.3 links: it is the gate on whether a
+# measurement docs/architecture/data-layout.md section 3.3 links: it is the gate on whether a
 # per-process verification cache can save anything at all.
 #
 # No instrumentation needed. Every response already carries `blocks_scanned`,

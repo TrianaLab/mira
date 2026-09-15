@@ -1,6 +1,6 @@
 #!/bin/sh
 # Where an export's milliseconds go, at three points of the connection sweep,
-# plus the worker-count A/B. Produces the numbers in architecture.md section 11
+# plus the worker-count A/B. Produces the numbers in docs/architecture/performance.md section 11
 # under "the ceiling is one mutex" and "each obvious suspect is ruled out".
 #
 # `mira::probe` at DEBUG is what turns the two diagnostic tasks on; the dump is

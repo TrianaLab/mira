@@ -1,5 +1,5 @@
 #!/bin/sh
-# The connection sweep behind architecture.md section 11: ingest rate, consumed
+# The connection sweep behind docs/architecture/performance.md section 11: ingest rate, consumed
 # CPU, per-core ceiling, ack latency, peak RSS and hot-tier cost, at four
 # connection counts, three passes each. It is the script named as `provenance`
 # by most of measurements.kyaml, and its output feeds straight back in:
