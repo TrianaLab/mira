@@ -18,19 +18,18 @@ stops it; `make demo-clean` deletes the directory, which is the entire uninstall
 
 Everything below is that run — most of it twice, first as the terminal capture
 from `mira mira --addr localhost:4318` and then as the browser at
-`http://localhost:4318/`. One binary, one set of blocks, one query path: the
-two surfaces read it, they do not each keep a copy.
+`http://localhost:4318/`. One binary, one set of blocks, one query path, read by
+both surfaces rather than copied into each.
 
 !!! tip "Or click through it now, without installing anything"
 
     [**Open the recorded UI**](https://miradb.dev/play/) — the same bundle that
     ships inside the binary, answering from responses a real Mira gave over this
-    generator. Every part of the interface is live: the tables, the waterfall,
-    the service map, the chart, the alerts, paging, routing. What is recorded is
-    the *query* — typing a filter re-renders the captured rows rather than
-    reading blocks, because there are no blocks in a browser tab. The page says
-    so in a banner, and the timings it shows are the ones the real instance
-    measured when the snapshot was taken.
+    generator. Every part of the interface is live: tables, waterfall, service
+    map, chart, alerts, paging, routing. What is recorded is the *query* —
+    typing a filter re-renders the captured rows rather than reading blocks,
+    because there are no blocks in a browser tab. The page says so in a banner,
+    and its timings are the ones the real instance measured at snapshot time.
 
 ## 1. Find the errors
 
@@ -124,16 +123,14 @@ pre-aggregation job, and nothing to be stale.
 checkout and inventory, checkout feeding payments, with per-service span and
 error counts and red edges where errors flow.](assets/ui/map.png)
 
-Clicking a service takes you to its logs, which is the whole point of the
-screen: from "checkout is red" to the lines that say why, without composing a
-second query.
+Clicking a service takes you to its logs: from "checkout is red" to the lines
+that say why, without composing a second query.
 
 ## 4. A metric, and the traces underneath it
 
 `http.server.request.duration` is a histogram, so it arrives as two derived
-series — `.count` and `.sum`. Those are not the same quantity, and a sum thirty
-times larger than its count flattens the count onto the axis, so each gets an
-axis of its own.
+series, `.count` and `.sum`. A sum thirty times larger than its count flattens
+the count onto a shared axis, so each gets its own.
 
 ![The metrics view: two stacked charts, http.server.request.duration.count
 ranging 179 to 716 and .sum ranging 5.8k to 23.4k, twelve pod series each, with
@@ -141,10 +138,9 @@ a rug of coloured exemplar diamonds along both baselines.](assets/ui/metrics.png
 
 The rug along each baseline is exemplars — one diamond per request the SDK
 sampled and stamped with a trace id. Clicking one opens that trace: the
-metric-to-trace edge OTLP defines, walked in one click. It sits on the
-baseline rather than at its value because an exemplar is one 50ms request and
-the line above it is a count of seven hundred: they share a time axis and
-nothing else.
+metric-to-trace edge OTLP defines, in one click. It sits on the baseline rather
+than at its value because an exemplar is one 50ms request and the line above is
+a count of seven hundred: they share a time axis and nothing else.
 
 ## 5. Alerting, evaluated in-process
 
@@ -266,12 +262,11 @@ The same object comes back unwrapped from `POST /api/v1/query`.
 ```
 
 That is the same trace the waterfall above opened, reached from the other
-direction — and `stats` tells the model what the answer cost, so it can widen or
-narrow the next question instead of guessing.
-
-An unknown argument is refused by name rather than ignored, so a model that
-invents a field is told so instead of handed plausible rows. Wiring, the other
-seven tools and a worked investigation: [Connect an agent](agents.md).
+direction, and `stats` tells the model what the answer cost, so it can widen or
+narrow the next question instead of guessing. An unknown argument is refused by
+name rather than ignored, so a model that invents a field is told so instead of
+handed plausible rows. Wiring, the other seven tools and a worked investigation:
+[Connect an agent](agents.md).
 
 ## Next
 

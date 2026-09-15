@@ -45,7 +45,7 @@ command — 45 minutes of a four-service shop, one of which is failing.
 
 **No session id.** Streamable HTTP lets a server issue an `Mcp-Session-Id` and require it
 on every later request; Mira issues none. Every request carries everything it needs, so
-any replica can answer any call and a load balancer needs no affinity. Killing a replica
+any replica can answer any call, a load balancer needs no affinity, and killing a replica
 mid-conversation loses nothing.
 
 **No authentication either** — see the [security policy](security.md).
@@ -222,7 +222,6 @@ mira mira --data-dir ./data     # the same views, no server, no port, no seriali
 ```
 
 That is [architecture section 8.4](architecture.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
-and it is the reason the co-located
-case is a different primitive from a managed backend rather than a cheaper one. Sandbox,
-edge node or the pod next door: if the agent can see the directory, it can read the
-memory.
+and it is why the co-located case is a different primitive from a managed backend rather
+than a cheaper one. Sandbox, edge node or the pod next door: if the agent can see the
+directory, it can read the memory.

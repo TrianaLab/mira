@@ -1,10 +1,9 @@
 # Testing Mira end to end
 
 **For:** contributors, and anyone who wants to reproduce the published numbers
-rather than trust them.
-
-Every command here has been run against a live instance. To just *look* at Mira
-working, `make demo` is one command — [See it work](../demo.md).
+rather than trust them. Every command here has been run against a live instance.
+To just *look* at Mira working, `make demo` is one command —
+[See it work](../demo.md).
 
 `cargo` is not on `PATH` in a non-login shell:
 
@@ -40,13 +39,13 @@ make build      # two `cargo build --release --locked -p miradb` runs: --bin mir
 ./target/release/mira --data-dir /tmp/mira-dev
 ```
 
-Name the example: `cargo build --release` on its own does **not** build one, and
-`target/release/examples/loadgen` — which every command below runs — is simply
-absent afterwards. Name it in a *second* invocation, too: an example compiles
-against the dev-dependencies, so selecting both in one command unifies their
-features into the binary's own graph and links 371 KiB of `tokio/test-util` and
-`tower` middleware into the shipped artifact. `make build` is the one-liner that
-gets this right; the reasoning is in the target's own comment.
+Name the example: `cargo build --release` alone does **not** build one, and the
+`target/release/examples/loadgen` every command below runs is then absent. Name
+it in a *second* invocation too: an example compiles against the
+dev-dependencies, so selecting both in one command unifies their features into
+the binary's own graph and links 371 KiB of `tokio/test-util` and `tower`
+middleware into the shipped artifact. `make build` gets this right; the
+reasoning is in its comment.
 
 `4317` is OTLP/gRPC, `4318` is OTLP/HTTP plus the query API, MCP and the UI.
 
@@ -59,13 +58,13 @@ curl -s localhost:4318/health
 then NACKed: a node that is up and losing data is what an up/down probe cannot
 report.
 
-`/readyz` answers a different question and is **not** the same handler.
-Liveness is a constant 200 — a flusher that stops takes the process with it, so
-answering at all is the answer, and restarting a node whose volume is full fixes
-nothing. Readiness asks whether an export can still be made *durable*, so it
-turns 503 once publishes have been failing for `pipeline::UNREADY_AFTER` — 120
-seconds — which is the state that should take a node out of a Service's
-endpoints. `stalled_s` appears only in that body, so it is never below 120:
+`/readyz` is **not** the same handler. Liveness is a constant 200 — a flusher
+that stops takes the process with it, so answering at all is the answer, and
+restarting a node whose volume is full fixes nothing. Readiness asks whether an
+export can still be made *durable*, so it turns 503 once publishes have been
+failing for `pipeline::UNREADY_AFTER` — 120 seconds — the state that should take
+a node out of a Service's endpoints. `stalled_s` appears only in that body, so
+it is never below 120:
 
 ```json
 {"status":"unavailable","signal":"logs","stalled_s":180,
@@ -208,7 +207,7 @@ whole claim of a keyset cursor; `series` is the metrics route.
 The `matched` column is `rows_matched` from each response. A query mix that
 matches nothing measures the empty path and reports beautiful numbers.
 
-### Five things this harness teaches
+### What this harness teaches
 
 **With the log off, use enough connections or you measure the timer.** A block
 seals on size *or* age, so a run that never reaches the size threshold sits at
@@ -300,15 +299,13 @@ cpu      1.31 cores busy   912891 records/s/core
 
 Do not check that division to two decimals: the per-core figure divides by the
 *unrounded* core count, so `1199561 / 1.31` is 915,695 and the line says 912,891.
-An earlier version of this page printed a pair that could not be reconciled at
-any rounding, which is how the habit of checking started.
 
 The aggregate rate is a property of the offered load — raise `--conns` and it
-moves without a line of the server changing. The per-core rate is a property of
-the engine, and it is the one to quote. It is also the column that behaves: it
-falls across the whole sweep, from 886k at one connection to 515k
-at 96, while the aggregate rises and then falls. Ten of twelve cores are idle at
-the plateau, so what the added connections buy is contention, not work.
+moves without a line of the server changing. Quote the per-core rate: it is a
+property of the engine, and the column that behaves, falling across the whole
+sweep from 886k at one connection to 515k at 96 while the aggregate
+rises and then falls. Ten of twelve cores are idle at the plateau, so the added
+connections buy contention.
 
 **Check what else is running before you believe a run.** An earlier pass of this
 same sweep, taken with a 294%-CPU virtual machine and a `go build` on the box,
@@ -349,11 +346,10 @@ seconds of waiting does not belong in the normal suite.
 2.21× pass to pass on this box; nine paired passes put the median at 1.37× and
 1.47× on two binaries whose ranges overlap almost entirely. A three-pass median
 off that spread is a number with one significant figure wearing two, and section
-11 withdrew one for exactly that reason. Note also what this harness cannot see:
-every case it times asserts `hit > 0`, so every case returns rows, and a query
-that returns rows reads the attribute tables to render them. A change to *which*
-tables an open reads is invisible here by construction —
-`scripts/measure/lazy-detail.sh` is the instrument for that.
+11 withdrew one for that reason. Every case it times asserts `hit > 0`, so every
+case returns rows, and a query that returns rows reads the attribute tables to
+render them: a change to *which* tables an open reads is invisible here by
+construction, and `scripts/measure/lazy-detail.sh` is the instrument for it.
 
 The metrics route has the same instrument, per point rather than per row:
 
@@ -364,27 +360,19 @@ series: 50000 points in 53.905708ms  1.078 us/point  60 series
 
 Both are scaled tests rather than `#[ignore]`d benchmarks, so the default size
 runs in `make test` as a correctness check and the same code is the measurement
-at a real one. That matters here: the metrics attribute join stayed quadratic
-through the release that removed the same shape from the log path, and it stayed
-quadratic because nothing priced it. At 50,000 points in a block it was 1,582 ms
-before the run search and 53.9 after. The load harness does not show it — its
-metrics blocks hold ~1,600 points, where the join is about 7% of the query —
-which is the general lesson: **a mix measures the mix. Price the term you
-changed separately, or a 29× fix reads as noise.**
+at a real one. The metrics attribute join stayed quadratic through the release
+that removed the same shape from the log path because nothing priced it: at
+50,000 points in a block it was 1,582 ms before the run search and 53.9 after.
+The load harness does not show it — its metrics blocks hold ~1,600 points, where
+the join is about 7% of the query — which is the general lesson: **a mix
+measures the mix. Price the term you changed separately, or a 29× fix reads as
+noise.**
 
-**Do not compare a mixed run's query numbers to a read-only run's.** In a mixed
-run the store grows underneath the readers. On a *fresh* store the paging class
-reports ~1.9 pages/walk rather than 10 — not a bug, just most walks running out
-of rows. Build the store first, then measure reads on it.
-
-**The storage line is a delta.** `+N GiB this run` and `B/record` are computed
-against a `du` taken before the run, so a store that already has blocks in it
-still gives a true cost per record. The total on the same line is not a delta.
-
-**Every number here is a floor.** The generator runs on the same 12 cores as the
-server — `--conns 64 --readers 8` is 72 client threads competing with the thing
-they measure. A `--conns 0` run reports no ingest section and its storage line
-is the total only.
+| | |
+|---|---|
+| **Do not compare a mixed run's query numbers to a read-only run's.** | In a mixed run the store grows underneath the readers. On a *fresh* store the paging class reports ~1.9 pages/walk rather than 10 — not a bug, just most walks running out of rows. Build the store first, then measure reads on it. |
+| **The storage line is a delta.** | `+N GiB this run` and `B/record` are computed against a `du` taken before the run, so a store that already has blocks in it still gives a true cost per record. The total on the same line is not a delta. |
+| **Every number here is a floor.** | The generator runs on the same 12 cores as the server — `--conns 64 --readers 8` is 72 client threads competing with the thing they measure. A `--conns 0` run reports no ingest section and its storage line is the total only. |
 
 ### The one-off scripts
 
@@ -402,20 +390,16 @@ quotes:
 | `block-reopens.sh` | how many times one process opens the same block, which is the input to the verification-cache decision |
 | `restart-replay.sh` | how many rows a corpus gains across a restart, on each of two binaries |
 
-Three habits are worth stealing. The three that compare two corpora or two
-binaries — `lazy-detail.sh`, `offload-cycle.sh`, `restart-replay.sh` — grep the
-server log for `nearly full` and abort if the free-space reclaimer fired,
-because a reclaimed corpus is a faster scan and the A/B then reports the volume
-rather than the code. `ingest-probe.sh` and `block-reopens.sh` have no such
-guard and do not need one: neither compares two corpora, and both report a ratio
-taken inside a single run. Every one that publishes a median asserts the sample count
-first: a response body has no trailing newline, so a capture that forgets to
-re-line-break them silently "medians" one value, and only the count catches it.
-And `lazy-detail.sh` fingerprints the corpus — table count and total bytes —
-before the run and after every pass, and stops the moment it moves.
+Three habits are worth stealing:
 
-That last one is not defensive programming, it is a bug that shipped. **A corpus
-is not a constant while a server is running on it.** The cold tier compacts
+| | |
+|---|---|
+| **Abort if the reclaimer fired.** | The three that compare two corpora or two binaries — `lazy-detail.sh`, `offload-cycle.sh`, `restart-replay.sh` — grep the server log for `nearly full`, because a reclaimed corpus is a faster scan and the A/B then reports the volume rather than the code. `ingest-probe.sh` and `block-reopens.sh` have no such guard and do not need one: neither compares two corpora, and both report a ratio taken inside a single run. |
+| **Assert the sample count before publishing a median.** | A response body has no trailing newline, so a capture that forgets to re-line-break them silently "medians" one value, and only the count catches it. |
+| **Fingerprint the corpus.** | `lazy-detail.sh` takes table count and total bytes before the run and after every pass, and stops the moment it moves. |
+
+That last one is a bug that shipped, not defensive programming. **A corpus is
+not a constant while a server is running on it.** The cold tier compacts
 blocks that have aged out of their partition hour, eight per signal per sweep,
 from inside the server the harness keeps starting — so a run over freshly
 written blocks begins on a plain corpus and ends on a compacted one, both arms
@@ -584,8 +568,7 @@ It replaced a docker compose file that put that same collector in front of one
 Mira container. Everything that one asserted is asserted here, through a tier
 the operator built, so there is one end-to-end suite rather than two.
 
-`integrations/kubernetes/e2e/run.sh`
-is the whole thing. In order:
+`integrations/kubernetes/e2e/run.sh` is the whole thing. In order:
 
 | | |
 |---|---|
@@ -597,36 +580,19 @@ is the whole thing. In order:
 | D | `spec.replicas: 2`, and the drained replica's blocks are on the cold volume before its claim is deleted |
 | E | `helm uninstall` the operator, and the tier still ingests and serves |
 
-E is the assertion the architecture rests on. Principle 4 says Mira holds no
+E is the assertion the architecture rests on: principle 4 says Mira holds no
 coordination state, and the whole defence of shipping a controller is that a
-controller is not Mira. That is a testable claim, so it is tested.
+controller is not Mira — a testable claim, so it is tested.
 
 Five things about the setup that are not obvious:
 
-- **The generators use three different services.** Ingest routes on
-  `hash(resource) % n`, so one `--service` for all four puts the entire corpus
-  on one replica — C's merge assertion then passes against a proxy that is only
-  forwarding, and D archives an empty volume. C's fifth generator goes straight
-  at `tel-2.tel-headless:4317` for the same reason: a row that provably lives on
-  exactly one replica is the only honest test of a merge.
-- **Metrics are asked of the replicas, not of the proxy.**
-  `/api/v1/metrics/names` is built by walking one node's blocks and there is no
-  cursor to merge two nodes' answers on, so a proxy answers `501` and says so.
-  `scripts/wait-for-signals.sh 240 assert traces logs` covers the two a proxy
-  can merge; an in-cluster Pod asks both replicas for the third.
-- **The scale thresholds are set so `Down` always wins**, which is the opposite
-  of what it looks like it should be. `spec.replicas` is a floor: raising it
-  grows the tier outright, lowering it only *permits* a shrink, because a drain
-  archives a volume and then deletes it and the operator wants the replicas to
-  agree the data fits first. So D cannot patch the floor and wait — it has to
-  make that agreement unconditional, and `downWhenFreeAbove: 0.002` is true on
-  any node this suite could run on at all. The scale decision itself belongs to
-  the request-log tests; what D tests is floor, drain, archive, claim, in order.
-- **Both images are built inside Docker**, not copied in from the host. A
-  Mach-O binary in a Linux image fails four minutes later as silence.
-- **The forward is on `14318`.** `make demo` binds `4318`, and a port-forward
-  that cannot bind is a failure fifteen minutes into a run that had nothing
-  wrong with it.
+| | |
+|---|---|
+| **The generators use three different services.** | Ingest routes on `hash(resource) % n`, so one `--service` for all four puts the entire corpus on one replica — C's merge assertion then passes against a proxy that is only forwarding, and D archives an empty volume. C's fifth generator goes straight at `tel-2.tel-headless:4317` for the same reason: a row that provably lives on exactly one replica is the only honest test of a merge. |
+| **Metrics are asked of the replicas, not of the proxy.** | `/api/v1/metrics/names` is built by walking one node's blocks and there is no cursor to merge two nodes' answers on, so a proxy answers `501` and says so. `scripts/wait-for-signals.sh 240 assert traces logs` covers the two a proxy can merge; an in-cluster Pod asks both replicas for the third. |
+| **The scale thresholds are set so `Down` always wins**, the opposite of what it looks like it should be. | `spec.replicas` is a floor: raising it grows the tier outright, lowering it only *permits* a shrink, because a drain archives a volume and then deletes it and the operator wants the replicas to agree the data fits first. So D cannot patch the floor and wait — it has to make that agreement unconditional, and `downWhenFreeAbove: 0.002` is true on any node this suite could run on at all. The scale decision itself belongs to the request-log tests; what D tests is floor, drain, archive, claim, in order. |
+| **Both images are built inside Docker**, not copied in from the host. | A Mach-O binary in a Linux image fails four minutes later as silence. |
+| **The forward is on `14318`.** | `make demo` binds `4318`, and a port-forward that cannot bind is a failure fifteen minutes into a run that had nothing wrong with it. |
 
 Debugging one:
 
@@ -640,9 +606,8 @@ kind delete cluster --name mira-operator-e2e
 
 The run exports `KUBECONFIG` to a temp file of its own and never calls
 `kubectl config use-context`, so it can neither be redirected by the machine's
-current context nor leave your shell pointed at Kind. It is not tidiness: a
-context that moved mid-run once had a suite that deletes volumes talking to a
-GKE cluster.
+current context nor leave your shell pointed at Kind. A context that moved
+mid-run once had a suite that deletes volumes talking to a GKE cluster.
 
 On failure the script prints the objects, the last thirty events and the
 operator's last hundred log lines before it deletes anything — a cluster torn

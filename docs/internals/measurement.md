@@ -15,16 +15,11 @@ comparison themselves rather than take ours.
 
 Three claims it is built on, in order of how much they matter:
 
-1. **Every published figure is in one file.** `measurements.kyaml` at the root
-   of the repository. The number lives there once; every document that quotes it
-   is listed beside it; and `make measurements-check` fails the build the day a
-   document and the registry disagree. The table at the bottom of this page is
-   generated from it.
-2. **Every figure names the command that produces it again** — or says
-   `unscripted`, which is a gap admitted rather than a gap hidden.
-3. **Nothing here is a vendor benchmark.** One laptop, one process, the
-   generator on the same twelve cores as the thing it measures. That is a
-   weakness and it is priced below rather than apologised for.
+| | |
+|---|---|
+| 1 | **Every published figure is in one file.** `measurements.kyaml` at the root of the repository. The number lives there once; every document that quotes it is listed beside it; and `make measurements-check` fails the build the day a document and the registry disagree. The table at the bottom of this page is generated from it. |
+| 2 | **Every figure names the command that produces it again** — or says `unscripted`, which is a gap admitted rather than a gap hidden. |
+| 3 | **Nothing here is a vendor benchmark.** One laptop, one process, the generator on the same twelve cores as the thing it measures. That is a weakness and it is priced below rather than apologised for. |
 
 ## 1. What a run is
 
@@ -192,29 +187,15 @@ Apple M3 Pro, 12 cores, 18 GiB, macOS, release build, generator co-resident.
 idle-before baseline swung between 6% and 81% busy across consecutive runs, and
 two runs of an identical 96-connection configuration minutes apart returned
 1,814,829 and 2,229,315 records/s — a 23% spread. That is larger than several of
-the effects this project has published, which is why the rules below are rules
-and not advice:
+the effects this project has published, which is why the rules below are rules:
 
-- **Medians over passes, never one run.** The published sweep is the median of
-  three full passes and prints the individual passes beside it, because on some
-  rows they disagree by more than the medians do.
-- **Paired, alternating, inside one sitting.** Every A/B in
-  `scripts/measure/` runs both arms in each pass, B then A, and reports the
-  median of the per-pass deltas rather than the delta of the pooled medians. The
-  box drifts across a run; a per-pass delta cancels the drift and a pooled one
-  measures it.
-- **Check the sign of every pass, not just the median.** A control whose median
-  is small but whose per-pass deltas all point one way is a real effect being
-  called noise. That distinction is the only thing separating the two treatment
-  rows of the lazy-open A/B from its two controls.
-- **Fingerprint the corpus.** A corpus is not a constant while a server is
-  running on it: the cold tier compacts blocks from inside the server the harness
-  keeps restarting, so a long A/B over fresh blocks starts plain and finishes
-  compacted. `lazy-detail.sh` refuses to continue if the table count or byte
-  total moves.
-- **Look at what else is running.** An earlier pass of the published sweep, taken
-  with a 294%-CPU virtual machine and a `go build` on the box, read 14% under the
-  median on the same binary and the same command. Nothing in the output says so.
+| Rule | Why |
+|---|---|
+| **Medians over passes, never one run.** | The published sweep is the median of three full passes and prints the individual passes beside it, because on some rows they disagree by more than the medians do. |
+| **Paired, alternating, inside one sitting.** | Every A/B in `scripts/measure/` runs both arms in each pass, B then A, and reports the median of the per-pass deltas rather than the delta of the pooled medians. The box drifts across a run; a per-pass delta cancels the drift and a pooled one measures it. |
+| **Check the sign of every pass, not just the median.** | A control whose median is small but whose per-pass deltas all point one way is a real effect being called noise. That distinction is the only thing separating the two treatment rows of the lazy-open A/B from its two controls. |
+| **Fingerprint the corpus.** | A corpus is not a constant while a server is running on it: the cold tier compacts blocks from inside the server the harness keeps restarting, so a long A/B over fresh blocks starts plain and finishes compacted. `lazy-detail.sh` refuses to continue if the table count or byte total moves. |
+| **Look at what else is running.** | An earlier pass of the published sweep, taken with a 294%-CPU virtual machine and a `go build` on the box, read 14% under the median on the same binary and the same command. Nothing in the output says so. |
 
 A figure taken on a noisy day is left as it was measured rather than restated
 from a quieter one, and where a re-measurement disagrees the disagreement is
@@ -227,25 +208,15 @@ retracted measurement is more useful to a reader than a quiet edit.
 
 [Market position](../market.md) footnotes every competitor figure and marks each
 one `yes`, `no` or `~` for whether it can honestly sit in the same row. These are
-the five reasons a row gets `no`, and they are worth knowing whoever you are
-comparing:
+the five reasons a row gets `no`, worth knowing whoever you are comparing:
 
-1. **Provisioned CPU against consumed CPU.** The commonest one. Their vCPU column
-   is a purchase order; Mira's core count is a meter reading. A run that is
-   explicitly unsaturated — 17% CPU — has a denominator measuring an offered load
-   rather than a ceiling.
-2. **Offered load against a ceiling.** "X records/s at 4 vCPU" usually means the
-   generator was configured to send X and the engine kept up. It is an upper
-   bound on nothing.
-3. **Cluster sums.** Four nodes and twelve generators produce a number that is
-   not a per-node figure and does not divide into one, because the network and
-   the coordination are in it.
-4. **A different record.** 137 bytes against 872 against 1.2 KiB. Record size
-   moves a records/s figure by an order of magnitude and moves a MiB/s figure the
-   other way. Compare one or the other, having checked both.
-5. **A different amount of engine.** Transport-only, collector-plus-store,
-   indexing-only, whole-VM. Several published figures include no storage at all
-   and several include three processes.
+| | Why a row gets `no` |
+|---|---|
+| 1 | **Provisioned CPU against consumed CPU.** The commonest one. Their vCPU column is a purchase order; Mira's core count is a meter reading. A run that is explicitly unsaturated — 17% CPU — has a denominator measuring an offered load rather than a ceiling. |
+| 2 | **Offered load against a ceiling.** "X records/s at 4 vCPU" usually means the generator was configured to send X and the engine kept up. It is an upper bound on nothing. |
+| 3 | **Cluster sums.** Four nodes and twelve generators produce a number that is not a per-node figure and does not divide into one, because the network and the coordination are in it. |
+| 4 | **A different record.** 137 bytes against 872 against 1.2 KiB. Record size moves a records/s figure by an order of magnitude and moves a MiB/s figure the other way. Compare one or the other, having checked both. |
+| 5 | **A different amount of engine.** Transport-only, collector-plus-store, indexing-only, whole-VM. Several published figures include no storage at all and several include three processes. |
 
 The only fair reading of a row marked `no` is order-of-magnitude. A row marked
 `no` for the wrong axis is not a reading at all.
@@ -281,9 +252,9 @@ here and is wrong. Naming the sites is the part a machine can do correctly.
 **What is not scripted yet.** The rows marked "no script" below are reproducible
 in method and not in corpus: the section 11 query table was read back by hand
 from a restarted process, and the log-off acknowledgement pair came from a
-configuration the sweep does not run. Both are fixable and neither is fixed. The
-honest consequence is that re-measuring them is a morning's work rather than one
-command, and that is exactly the reason a figure drifts.
+configuration the sweep does not run. Both are fixable and neither is fixed;
+re-measuring them is a morning's work rather than one command, which is exactly
+how a figure drifts.
 
 ## The registry
 

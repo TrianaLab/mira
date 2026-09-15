@@ -18,8 +18,7 @@ down 45 minutes of backdated telemetry for a four-service shop, waits for the
 first block of each signal to seal, and prints where to look. Ctrl-C stops it;
 `make demo-clean` deletes the directory. No Docker, no second terminal, nothing
 to install beyond a Rust toolchain. [See it work](demo.md) is what comes out.
-
-The rest of this page is the manual path — your own data, and the query API.
+The rest of this page is the manual path: your own data, and the query API.
 
 ## Run it
 

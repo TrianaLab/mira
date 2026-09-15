@@ -7,10 +7,14 @@ description: Where Mira actually sits against Loki, Tempo, VictoriaLogs, Quickwi
 **For:** anyone comparing Mira against something they already run.
 
 **How to read this.** Every competitor number below is published by its vendor or
-a third party, on *their* hardware and *their* workload. Nobody ran Mira's
+a third party, on *their* hardware and *their* workload; nobody ran Mira's
 workload and Mira ran nobody else's. Mira's own figures are single-machine
 measurements on one Apple M3 Pro (12 cores, 18 GiB), one process, generator
 co-resident — reproduce them with [the load harness](internals/e2e.md#3-the-load-harness).
+What each of Mira's own numbers means — the denominator, what is inside the
+measurement and what is outside it — is
+[the measurement contract](internals/measurement.md). Read that before dividing
+any row here by any other.
 
 The `=` column says whether a claim can honestly sit in the same row as Mira's.
 <!-- BEGIN GENERATED: market-claim-tally -->
@@ -20,16 +24,9 @@ is `~`.
 <!-- END GENERATED: market-claim-tally -->
 The four-word reason beside each says why. The only fair reading of a row marked
 `no` is order-of-magnitude, and a row marked `no` for *wrong axis* is not a
-reading at all.
-
-What each of Mira's own numbers means — the denominator, what is inside the
-measurement and what is outside it — is
-[the measurement contract](internals/measurement.md). Read that before dividing
-any row here by any other.
-
-Tables are per axis rather than one row per competitor, because no competitor
-publishes the same axis as its neighbour and a row per engine would be a column
-of blanks.
+reading at all. Tables are per axis rather than one row per competitor, because
+no competitor publishes the same axis as its neighbour and a row per engine
+would be a column of blanks.
 
 ## Who else is in this space
 
@@ -44,18 +41,17 @@ of blanks.
 ## Ingest, one node
 
 Mira's row is a **consumed-CPU** measurement and most other rows are
-**provisioned-CPU** ones. That is the whole difficulty of this table: 1.75 cores
-is CPU-seconds the server actually burned over the wall clock of the run, so for
-most of these rows their vCPU column is a purchase order and Mira's is a meter
-reading. Both bases are given below rather than picking the flattering one.
+**provisioned-CPU** ones: 1.75 cores is CPU-seconds the server actually burned
+over the wall clock of the run, so their vCPU column is a purchase order and
+Mira's is a meter reading. Both bases are given below rather than the flattering
+one.
 
 **Two rows are the exception and it matters.** Loki's 2.75 and Quickwit's 2.2
 come from the same benchmark [^q2], whose "Mean vCPU" row is a meter reading on a
-16-vCPU `n2-standard-16` — consumed, not provisioned, and published alongside
-total CPU-minutes. Those two are the only competitor figures on this page that
-are the same *kind* of quantity as Mira's 1.75, and they are still not the same
-*measurement*: that run is explicitly unsaturated at 17% CPU, so its meter reads
-an offered load rather than a ceiling.
+16-vCPU `n2-standard-16`, published alongside total CPU-minutes. They are the
+only competitor figures here of the same *kind* as Mira's 1.75, and still not the
+same *measurement*: that run is unsaturated at 17% CPU, so its meter reads an
+offered load rather than a ceiling.
 
 | Engine | Published | Their hardware | = | Reason |
 |---|---|---|---|---|
@@ -80,14 +76,14 @@ an offered load rather than a ceiling.
 Per core, on the basis the peers publish: 176.5 MiB/s across the 12 cores the
 process was given is **14.7 MiB/s per provisioned core**, against Quickwit's
 6.75 MB/s/vCPU on a c5.xlarge [^q1] and Parseable's ~8.3 MiB/s/vCPU [^p1] —
-2.2x and 1.8x. Ahead, but on a different record and a different workload, so
-read it as an ordering rather than a ratio.
+2.2x and 1.8x, on a different record and a different workload, so read it as an
+ordering rather than a ratio.
 
 On consumed CPU it is 100.9 MiB/s per core, a 15x gap, and that number should
-not be quoted against these rows. Only the two [^q2] rows report utilisation at
-all, so for the rest the gap it measures is partly Mira's and partly the fact
-that a benchmark rig provisions headroom it does not use. The reason to record it at all is what it says about
-Mira rather than about them: at the operating point the engine leaves ten of
+not be quoted against these rows: only the two [^q2] rows report utilisation at
+all, so for the rest the gap is partly Mira's and partly a benchmark rig
+provisioning headroom it does not use. It is recorded for what it says about
+Mira rather than about them — at the operating point the engine leaves ten of
 twelve cores idle, so the ingest ceiling on this box is not the engine's
 arithmetic.
 
@@ -114,24 +110,23 @@ partly consumed rather than an intrinsic floor; Mira's is an uncapped laptop
 process. The load-bearing column is the operating point, not the megabytes:
 Mira's 232 MiB is at 629,384 records/s, the peers' at 10,000–20,000.
 
-One caveat that belongs next to the number rather than in a footnote, because it
-is the row's weakness: Mira's RSS is **not flat in connection count**, and 232
-MiB is the one-connection row, not the throughput headline. The same process
-reaches 689 MiB at the four connections that produce 1,350,502 records/s, 1,243
-MiB at eight and 1,648 MiB at ninety-six, so past four connections Mira sits
-above ClickHouse's 1.12 GiB rather than below it.
+The caveat belongs next to the number rather than in a footnote, because it is
+the row's weakness: Mira's RSS is **not flat in connection count**, and 232 MiB
+is the one-connection row, not the throughput headline. The same process reaches
+689 MiB at the four connections that produce 1,350,502 records/s, 1,243 MiB at
+eight and 1,648 MiB at ninety-six, so past four connections Mira sits above
+ClickHouse's 1.12 GiB rather than below it.
 
-The term that scales is **decoded exports, not mapped block pages** — the open
+The term that scales is **decoded exports, not mapped block pages**; the open
 block count is a constant. `pipeline` runs `(cores / 2).clamp(1, 16)` flushers
 per signal whatever the connection count, and each holds exactly one builder, so
 this box has eighteen open blocks at one connection and eighteen at ninety-six.
 What grows is `ingest.queue`: 128 slots per signal, each able to hold a decoded
-export at ~1.29 MiB, plus every decode in flight. Sharding the flusher is what
-pulled the four-connection figure from 1,366 MiB to 689 at the same throughput,
-and for that reason — six flushers drain their slots where one left them full,
-so the exports that used to sit in the queue are not resident at all. Six open
-blocks per signal is *more* block state than one, and the number still fell. The
-same A/B is written up in
+export at ~1.29 MiB, plus every decode in flight. Sharding the flusher pulled the
+four-connection figure from 1,366 MiB to 689 at the same throughput for that
+reason — six flushers drain their slots where one left them full, so the exports
+that used to sit in the queue are not resident at all. Six open blocks per signal
+is *more* block state than one, and the number still fell. The same A/B is in
 [architecture section 11](architecture.md#11-performance-model) and
 [e2e section 3](internals/e2e.md#3-the-load-harness).
 
@@ -230,22 +225,18 @@ This table shows what the axis looks like; it is not one Mira wins.
 signals, query API, MCP surface and two UIs. The nearest peer is VictoriaLogs at
 16.26 MiB — 2.8x — and that binary covers logs only; matching Mira's signal
 coverage takes VictoriaLogs plus VictoriaTraces, two processes and 32.44 MiB.
-Everything else surveyed is 94–153 MiB, 17x to 28x. This is the strongest claim
-in the document precisely because it is a byte count and not a measurement: no
-hardware, no workload, no denominator to argue about. Every correction applied
-while verifying it — zip to binary, tarball to binary, image layer to executable
-— moved the gap wider.
+Everything else surveyed is 94–153 MiB, 17x to 28x. It is the strongest claim
+here because it is a byte count and not a measurement: no hardware, no workload,
+no denominator to argue about. Every correction applied while verifying it — zip
+to binary, tarball to binary, image layer to executable — moved the gap wider.
 
 **2. Resident set at the operating point.** 232 MiB peak RSS for the whole
-process at 629,384 records/s. The peers that publish RSS do it at 10,000–20,000
-records or spans per second: Tempo 4.26 GiB then OOM, VictoriaLogs 1.15 GiB,
-ClickHouse 1.12 GiB, Quickwit's indexer 4.9 GB average. GreptimeDB's 408 MB is
-at 30x less load. The claim that survives scrutiny is the ratio of footprint to
-offered rate, not the absolute figure — at the 1,350,502 records/s four-connection
-row the same process is 689 MiB, and by eight connections it is 1,243 MiB, above
-ClickHouse. The mechanism behind the ratio
-is in the code rather than in a tuning flag: the flusher's refusal to
-`concat_batches`.
+process at 629,384 records/s, against peers who publish theirs at 10,000–20,000
+records or spans per second, and GreptimeDB's 408 MB at 30x less load. What
+survives scrutiny is the ratio of footprint to offered rate, not the absolute
+figure: at four connections the same process is 689 MiB, and by eight it is above
+ClickHouse. The mechanism behind the ratio is in the code rather than in a tuning
+flag — the flusher's refusal to `concat_batches`.
 
 **3. Pruned-query latency.** 2.56 ms for an attribute value present in none of
 137 blocks, 0 blocks opened; 4.49 ms for one present in exactly one of them, a
@@ -259,17 +250,17 @@ file — and it is defensible at two orders of magnitude.
 target triple, with `zstd-sys` as the only C dependency. Parseable, measured with
 the identical command, is 462 (3.9x); Quickwit is 1,171 lockfile entries against
 Mira's 209 (5.6x — `Cargo.lock` has 213 `[[package]]` stanzas, four of which are
-the workspace's own crates); the Go stacks carry 331–425 modules. The honest exception is
-VictoriaLogs at 98 vendored packages, which is parity and also one C dependency.
+the workspace's own crates); the Go stacks carry 331–425 modules. The honest
+exception is VictoriaLogs at 98 vendored packages, which is parity and also one C
+dependency.
 
 ## Where Mira is not ahead
 
 Seven rows, and they do not have one answer. Two name a cause inside this
 repository and a path to closing it; five are what the design costs, and no
-amount of work closes them without giving up the thing that makes the rest of
-this page true. Both kinds are listed, each with which kind it is, because a
-comparison page on which the author wins everything is a page nobody finishes
-reading.
+amount of work closes them without giving up what makes the rest of this page
+true. Both kinds are listed as what they are, because a comparison page on which
+the author wins everything is a page nobody finishes reading.
 
 ### Gaps with a cause and a path
 
@@ -278,99 +269,88 @@ records/s at four connections beats GreptimeDB's 621,367 on smaller hardware,
 but their record is not this record and neither party ran the other's workload,
 so the ordering survives and the ratio does not. On the per-provisioned-core
 basis the peers publish, 14.7 MiB/s against Quickwit's 6.75 and Parseable's ~8.3
-is 2.2x and 1.8x on a different record — an ordering, not a result. That half of
-the row is where it was, and nothing but somebody running both engines on one
-box will move it.
+is 2.2x and 1.8x on a different record — an ordering, not a result. Nothing but
+somebody running both engines on one box will move that half of the row.
 
-The other half moved. What this page used to record was a curve that peaked at
-four connections and fell to 55% of that by 96, an operator whose collector
-fleet opens many connections therefore getting less than the headline, and no
-knob to tune it back; the cause was one bounded channel and one flusher task
-*per signal*, so ninety-six connections sending logs were ninety-six producers
-against one consumer and the curve was that consumer's service time. The flusher
-is now sharded within a signal — N tasks per signal, each owning its own block
-sequence, which the block directory already tolerated since it is the manifest
-and a sequence is just a filename — with dispatch first fit from shard 0, so a
-light load still seals one block per window rather than N thin ones. **The curve
-now climbs to a plateau at 16 to 32 connections, and 96 connections holds 84.2%
-of the four-connection rate and 73.9% of peak where it used to hold 55%.** Six
-shards against one is 1.19x at eight connections, 1.24x at 16, 1.41x at 32 and
-1.55x at 96. The knob the previous version of this paragraph said did not exist
-is `ingest.shards`, `(cores / 2).clamp(1, 16)` by default, six on this box.
+The other half moved. The curve used to peak at four connections and fall to 55%
+of that by 96, so an operator whose collector fleet opens many connections got
+less than the headline and had no knob to tune it back; the cause was one bounded
+channel and one flusher task *per signal*, ninety-six producers against one
+consumer. The flusher is now sharded within a signal — N tasks, each owning its
+own block sequence, which the block directory already tolerated since it is the
+manifest and a sequence is just a filename — dispatching first fit from shard 0,
+so a light load still seals one block per window rather than N thin ones. **The
+curve now climbs to a plateau at 16 to 32 connections, and 96 connections holds
+84.2% of the four-connection rate and 73.9% of peak.** Six shards against one is
+1.19x at eight connections, 1.24x at 16, 1.41x at 32 and 1.55x at 96. The knob
+that did not exist is `ingest.shards`, `(cores / 2).clamp(1, 16)`, six here.
 
-What is still open is latency and headroom rather than shape, and both are worse
-than the throughput curve makes them look. Ack p99 is 2,661 ms at 96 connections
-against 55 ms at four: a full queue waits for a slot instead of returning a 503,
-so nothing is shed on any row of the sweep and the backpressure is paid in wait
-time, which is the trade and not a free win. And the server is not CPU-bound at
-any shape it was offered — 2.23 of twelve cores at the 1,537,875 records/s peak,
-and the same 2.23 at the 96-connection row that is 26% slower.
+Latency and headroom are still open, and both are worse than the curve makes them
+look. Ack p99 is 2,661 ms at 96 connections against 55 ms at four: a full queue
+waits for a slot instead of returning a 503, so nothing is shed on any row of the
+sweep and the backpressure is paid in wait time, which is the trade and not a
+free win. And the server is not CPU-bound at any shape it was offered — 2.23 of
+twelve cores at the 1,537,875 records/s peak, and the same 2.23 at the
+96-connection row that is 26% slower.
 
-The previous version of this paragraph said the sweep could not see what set
-that ceiling. It can now, from inside the process rather than off the curve:
-**it is the write-ahead log's single mutex, held across the `write(2)` rather
-than around a queue push.** One `Wal` serves all three signals and every shard.
-`wal.lock_wait` is 82% and 84% of total submit time at 32 and 96 connections;
-the mutex is occupied 74% to 93% of a run's wall clock, and 90–98% of what it is
-held for is the write itself; and its in-flight high-water mark equals the tokio
-worker count *exactly* — 12 of 12, 47 of 48 — which is every runtime worker
-parked in the kernel on one lock, and is why ten cores sit idle while ack
-latency climbs. A task that asks to sleep 50 ms and does no work at all returns
-80 ms late at 96 connections against 9.7 ms at four, which is the same finding
-with nothing borrowed from the client. Adding runtime workers makes it worse: 12
-against 48 at 96 connections, same binary back to back, is 2,229,315 against
-1,675,695 records/s with 6.4x the lock wait and the same total time under the
-lock.
+The sweep could not see what set that ceiling; from inside the process it can.
+**It is the write-ahead log's single mutex, held across the `write(2)` rather
+than around a queue push** — one `Wal` for all three signals and every shard.
+`wal.lock_wait` is 82% and 84% of total submit time at 32 and 96 connections; the
+mutex is occupied 74% to 93% of a run's wall clock, and 90–98% of that is the
+write itself; and its in-flight high-water mark equals the tokio worker count
+*exactly* — 12 of 12, 47 of 48 — every runtime worker parked in the kernel on one
+lock, which is why ten cores sit idle while ack latency climbs. A task that asks
+to sleep 50 ms and does no work at all returns 80 ms late at 96 connections
+against 9.7 ms at four, the same finding with nothing borrowed from the client.
+Adding runtime workers makes it worse: 12 against 48 at 96 connections, same
+binary back to back, is 2,229,315 against 1,675,695 records/s with 6.4x the lock
+wait and the same total time under the lock.
 
-An earlier version of this paragraph went one step further and said that at
-2.2–2.9 ms an append the log serialises 345–440 appends/s, so "the ceiling is 1.7
-to 2.6 M records/s whatever the connection count". **That step is withdrawn.** It
-reads a rate off the largest term in a latency budget, and a queue forms at
-whatever is slowest to *acquire*, which need not be what is slowest to finish.
-Both named fixes were then built or priced and both are rejected. One log per
-signal is implemented and measured — nine paired passes at 4/32/96 connections
-over three sittings, **records/s signs split at every shape**, because
-`wal.lock_wait` falls 0.63–0.795x and `wal.write` takes all of it back at
-1.94x and 2.39x on all nine passes: three mutexes are free, a second appender on one
-volume is not. And the envelope both fixes share was measured directly by putting
-the log on a RAM disk, which deletes the serialised section rather than
-shortening it — `wal.write` −89%, `wal.lock_wait` −93% — for **1.096x at
-thirty-two connections and 1.005x with signs split at ninety-six**. A perfect log
-fix is worth ten percent at one shape and nothing at the other.
+An earlier version went further: at 2.2–2.9 ms an append the log serialises
+345–440 appends/s, so "the ceiling is 1.7 to 2.6 M records/s whatever the
+connection count". **That step is withdrawn** — it reads a rate off the largest
+term in a latency budget, and a queue forms at whatever is slowest to *acquire*,
+which need not be what is slowest to finish. Both named fixes were then built or
+priced and both are rejected. One log per signal is implemented and measured —
+nine paired passes at 4/32/96 connections over three sittings, **records/s signs
+split at every shape**, because `wal.lock_wait` falls 0.63–0.795x and `wal.write`
+takes all of it back at 1.94x and 2.39x on all nine passes: three mutexes are
+free, a second appender on one volume is not. And the envelope both fixes share
+was measured by putting the log on a RAM disk, which deletes the serialised
+section rather than shortening it — `wal.write` −89%, `wal.lock_wait` −93% — for
+**1.096x at thirty-two connections and 1.005x with signs split at ninety-six**. A
+perfect log fix is worth ten percent at one shape and nothing at the other.
 
-What that run also shows is the constraint the log was standing in front of.
-`submit.admit` is 0.000–0.002 ms in every disk-backed dump and was ruled out on
-that reading; with the log free it is 92% of submit time. Admission blocks on a
-flusher queue slot, so ingest is bounded by the rate blocks seal and publish, and
-the log was the louder constraint rather than the binding one. Whether the
-flusher is bound by its own CPU or by the volume it shares with the log is the
-next thing to measure and is not claimed here. Which is the
-second thing to report: two runs of the identical 96-connection configuration
-minutes apart returned 1,814,829 and 2,229,315 records/s, and **the 26% fall
-from 32 to 96 connections that the table above publishes did not reproduce on
-the day the diagnosis was measured — the fall was 5%.** The table's rates were
-taken on a quieter day and are left as they were rather than restated from a
-noisier one; the ratios in this paragraph are all taken inside one process
-during one run and do not depend on what else the machine was doing.
-[Architecture section 11](architecture.md#11-performance-model) has the probe
-table, the three hypotheses it rules out and the one-line command that prints
-it.
+That run also shows the constraint the log stood in front of. `submit.admit` is
+0.000–0.002 ms in every disk-backed dump and was ruled out on that reading; with
+the log free it is 92% of submit time. Admission blocks on a flusher queue slot,
+so ingest is bounded by the rate blocks seal and publish, and the log was the
+louder constraint rather than the binding one. Whether the flusher is bound by
+its own CPU or by the volume it shares with the log is the next thing to measure
+and is not claimed here. Second thing to report: two runs of the identical
+96-connection configuration minutes apart returned 1,814,829 and 2,229,315
+records/s, and **the 26% fall from 32 to 96 connections that the table above
+publishes did not reproduce on the day the diagnosis was measured — the fall was
+5%.** The table's rates were taken on a quieter day and are left as they were
+rather than restated from a noisier one; the ratios in this paragraph are all
+taken inside one process during one run and do not depend on what else the
+machine was doing. [Architecture section
+11](architecture.md#11-performance-model) has the probe table, the three
+hypotheses it rules out and the one-line command that prints it.
 
-**Query at scale.** This row opens with a correction. The figure it used to
-carry — 175 ms steady over 24.0M rows, 137M rows/s — does not reproduce: four
-different full-scan predicates were run over a fresh 27.07M-row corpus on both
-the previous binary and this one, and every one of them landed between 0.96 s
-and 1.6 s, which is what architecture.md section 11's own arithmetic predicted
-for that row all along. **The honest figure for an unpruned scan is 885 ms
-steady over 27,066,368 rows, 30.6M rows/s**, against 1,163 ms and 23.3M rows/s
-on the pre-release binary, and 1,441 ms on the first call after a restart
-against 2,431 ms. Better than it was, and much worse than this page claimed.
-
-It is also more a figure about this machine's memory than about the engine, and
-that took two revisions of this entry to notice. 885 ms over 27,066,368 rows is
-32.7 ns/row; the same scan over a corpus small enough to stay resident is
-**8.9 ns/row**. The paragraphs below are how the difference was found and what
-was wrongly blamed for it on the way.
+**Query at scale.** A correction first. The figure this row used to carry — 175
+ms steady over 24.0M rows, 137M rows/s — does not reproduce: four full-scan
+predicates over a fresh 27.07M-row corpus, on both the previous binary and this
+one, all landed between 0.96 s and 1.6 s, which is what architecture.md section
+11's own arithmetic predicted for that row all along. **The honest figure for an
+unpruned scan is 885 ms steady over 27,066,368 rows, 30.6M rows/s**, against
+1,163 ms and 23.3M rows/s on the pre-release binary, and 1,441 ms on the first
+call after a restart against 2,431 ms. Better than it was, and much worse than
+this page claimed. It is also more a figure about this machine's memory than
+about the engine, and that took two revisions to notice: 885 ms over 27,066,368
+rows is 32.7 ns/row, and the same scan over a corpus small enough to stay
+resident is **8.9 ns/row**.
 
 ClickHouse answers nine heterogeneous queries in 0.68 s hot over 1 billion rows
 and 642 GiB uncompressed, roughly 37x the rows on 2.7x the cores. Per row
@@ -380,46 +360,38 @@ and either way not the order of magnitude this page used to claim. A cold Mira
 call adds another 1.6x on top. Mira's query numbers are a pruning result, not a
 scan result, and when pruning does not fire it does not win.
 
-What changed underneath is the diagnosis, twice, and the second time it was this
-page that was wrong. The row-wise scan this entry originally blamed is gone:
-predicates are evaluated over contiguous binary-searched parent runs with a
-`Vec<bool>` scatter over root rows and no hash set anywhere. Over two million
-rows that costs 0.047 ns/row for no term at all, 0.485 for a dictionary
-equality, 1.064 for a resource attribute, 2.402 for a record attribute and 5.586
-for the worst case, a UTF-8 `contains`. The same block through the whole read
-path costs 16 to 17 ns/row. **The scan is a third of what the dearest predicate
-pays and under 3% of what the cheap ones do; the rest is `Block::open`** —
-`mmap` minor faults, the dictionary scan and the two child indexes. A `limit 1`
-and a whole-block scan cost the same per row, which is the same fact from the
-other side: the block had to be opened either way.
+The row-wise scan this entry originally blamed is gone: predicates are evaluated
+over contiguous binary-searched parent runs with a `Vec<bool>` scatter over root
+rows and no hash set anywhere. Over two million rows that costs 0.047 ns/row for
+no term at all, 0.485 for a dictionary equality, 1.064 for a resource attribute,
+2.402 for a record attribute and 5.586 for the worst case, a UTF-8 `contains`;
+the same block through the whole read path costs 16 to 17 ns/row. **The scan is a
+third of what the dearest predicate pays and under 3% of what the cheap ones do;
+the rest is `Block::open`** — `mmap` minor faults, the dictionary scan and the
+two child indexes. A `limit 1` and a whole-block scan cost the same per row: the
+block had to be opened either way.
 
-What this page then got wrong was which term inside `Block::open` dominates. It
-said the CRC32 of every table body did, and closed the arithmetic like this: the
-full scan CRCs 4,380 MiB of log blocks in 885 ms, which is about 5 GB/s, which
-is what `crc32fast` does on this machine. It is not. Warm on this machine
-`crc32fast` is nearer **27 GB/s**, so 5 GB/s was some other term's rate and the
-agreement was a coincidence read as a proof. One number matching another number
-is not a mechanism, and this page published it as one.
+Which term inside `Block::open` dominates is what this page then got wrong. It
+said the CRC32 of every table body did, on this arithmetic: the full scan CRCs
+4,380 MiB of log blocks in 885 ms, about 5 GB/s, which is what `crc32fast` does
+on this machine. Warm it is nearer **27 GB/s**, so 5 GB/s was some other term's
+rate, and this page published a coincidence as a mechanism.
 
-The patch it named is still the right patch, and it has shipped here rather than
-being named again: a published block never changes, so re-hashing it on every
-open is waste, and it is now verified once per file per process. What that is
-worth was measured on both sides of one run instead of inferred: on a single
+The patch it named is still right and has shipped: a published block never
+changes, so it is now verified once per file per process rather than re-hashed on
+every open. Measured on both sides of one run instead of inferred, on a single
 386.1 MiB block the checksum is **between a quarter and two fifths** of the read
 path, **1.47x** on a trace lookup, and **1.1x to 1.3x** on an unpruned scan
-depending on how much of the corpus the page cache is holding. Worth taking, and
-nowhere near what "integrity-check-bound" promises, because the premise was the
-coincidence above.
+depending on how much of the corpus the page cache is holding — worth taking, and
+nowhere near what "integrity-check-bound" promises. An earlier draft of that
+sentence read "35 to 39%, a median of 1.55x"; nine paired passes put the
+whole-block case at 1.37x and 1.47x on two binaries whose per-pass values range
+1.14x to 2.21x, and three samples of a quantity that moves that much do not carry
+two digits, so **the 1.55x median is withdrawn** in favour of the range.
 
-An earlier draft of that sentence read "35 to 39%, a median of 1.55x". Nine
-paired passes of the same harness put the whole-block case at 1.37x and 1.47x on
-two binaries whose per-pass values range 1.14x to 2.21x; three samples of a
-quantity that moves that much do not carry two digits, and **the 1.55x median is
-withdrawn** in favour of the range.
-
-The unpruned scan is bound by whether the corpus fits in page cache. A paired
-A/B that changes only the corpus size says so: both binaries, same predicate,
-~187 K rows per block either way, back to back. Over **9.6 GiB** and 31.2 M rows
+What the scan is really bound by is whether the corpus fits in page cache, and a
+paired A/B that changes only the corpus size says so: both binaries, same
+predicate, ~187 K rows per block either way, back to back. Over **9.6 GiB** and 31.2 M rows
 the scan runs 847 ms on this binary against 981 ms and then 1,992 ms on two
 passes of the pre-fix one — 27 to 64 ns/row, with one binary ranging 570 ms to
 1,469 ms against *itself* over five consecutive calls, which makes the two arms
@@ -428,76 +400,68 @@ each, it is 79.8 ms against 89.1 — **8.9 against 9.9 ns/row**, medians that
 separate, and a spread of 1.5x rather than 2.6x. Three times cheaper per row on
 the corpus that stays resident, on the same binaries. The OS compressor grew by
 1.6 GiB during the large run: what the wide numbers time is eviction. The 885 ms
-at the top of this entry is 32.7 ns/row, which is the first regime — the
-headline is a page-cache result that this page reported as a checksum result.
+at the top of this entry is 32.7 ns/row, the first regime — a page-cache result
+that this page reported as a checksum result.
 
-Which is the sentence that says what to do about it: read fewer bytes. The scan
-in that row has no attribute predicate and emits no rows, so it never looks at an
-attribute table — and opening a block used to map and hash every one of them.
-They are **42.9%** of a plain logs block and **45.7%** of a plain traces block.
-This release opens the root tables alone and the attribute tables on demand, and
-on 2.93 GiB of plain blocks over nine paired passes that is **1.45x on logs and
-1.88x on traces** on top of the checksum cache, or **1.8x and 2.6x** for the two
-together against 0.0.3: 68,869 to 40,806 µs, and 48,425 to 18,625. Two controls
-that must not move — the same scan with the predicate on an attribute instead of
-a field, and an ordinary `limit 100` page — came out at −2.3% and +2.0% and
-changed sign from pass to pass, which is the check that the run measured the
-change rather than the box. On a compacted corpus, where the attribute tables are
-6% of the bytes instead of 43%, it is still 1.5x and 2.3x, because what is being
-skipped there is decompression: those tables compress 66x against the root
-table's 5x.
+Which says what to do about it: read fewer bytes. The scan in that row has no
+attribute predicate and emits no rows, so it never looks at an attribute table —
+and opening a block used to map and hash every one of them. They are **42.9%** of
+a plain logs block and **45.7%** of a plain traces block. This release opens the
+root tables alone and the attribute tables on demand: on 2.93 GiB of plain blocks
+over nine paired passes, **1.45x on logs and 1.88x on traces** on top of the
+checksum cache, or **1.8x and 2.6x** for the two together against 0.0.3 — 68,869
+to 40,806 µs, and 48,425 to 18,625. Two controls that must not move, the same
+scan with the predicate on an attribute instead of a field and an ordinary `limit
+100` page, came out at −2.3% and +2.0% and changed sign from pass to pass, which
+is the check that the run measured the change rather than the box. On a compacted
+corpus, where the attribute tables are 6% of the bytes instead of 43%, it is
+still 1.5x and 2.3x, because what is skipped there is decompression: those tables
+compress 66x against the root table's 5x.
 
 Where vectorising did pay is everything that filters. An attribute value that
 matches went from 30.2 ms to 4.49 ms, 6.7x; an unfiltered `limit 100` from 24.4
 to 4.61, 5.3x; a substring that fills the limit from 26.6 to 7.62, 3.5x. On the
 eight-reader read mix `attr` p50 improved 5.1x and `errors` p50 4.6x, taking the
-whole mix from 40 to 50 queries/s. Two classes did not move and belong in the
-same sentence as the ones that did: `trace`, which is a `trace.idx` lookup with
-almost no rows left to filter, and `series`, whose p50 went from 575–616 ms to
-686–702. A third class, `tail`, matched nothing on this corpus — the data is
-older than the window it asks for — so its numbers time the empty path and are
-quoted in neither direction.
+whole mix from 40 to 50 queries/s. Two classes did not move: `trace`, a
+`trace.idx` lookup with almost no rows left to filter, and `series`, whose p50
+went from 575–616 ms to 686–702. A third, `tail`, matched nothing on this corpus
+— the data is older than the window it asks for — so its numbers time the empty
+path and are quoted in neither direction.
 
-The `series` figure was first written up here as a regression, and it is not
-one. The metrics module is byte-identical across the change, and the one
-vectorised function it can reach is called from inside `q.terms.iter()`, which
-is empty for a query with no `where` — the harness's is. Two binaries differing
-only in the read path, on a fresh store each, put it at 449.7 ms against 445.1
-and 524.5 against 608.7: 43.6, 42.5, 47.6 and 47.5 µs per matched row, in both
-directions and inside the pass-to-pass spread of one binary against itself. What
-moved is the mix around it — the same eight readers issue `series` 25% more
-often once the other five classes are five times cheaper.
+The `series` figure was first written up here as a regression, and it is not one:
+the metrics module is byte-identical across the change, and the one vectorised
+function it can reach is called from inside `q.terms.iter()`, which is empty for
+a query with no `where` — the harness's is. Two binaries differing only in the
+read path, on a fresh store each, put it at 449.7 ms against 445.1 and 524.5
+against 608.7: 43.6, 42.5, 47.6 and 47.5 µs per matched row, in both directions
+and inside the pass-to-pass spread of one binary against itself. What moved is
+the mix around it — the same eight readers issue `series` 25% more often once the
+other five classes are five times cheaper.
 
-Diagnosing it did find something real, one layer down and nothing to do with
-vectorising. Metric attributes were joined by scanning the whole table per data
-point, which is the quadratic the same release removed from the log path and
-missed here. Fixed by reusing that path's run search: `series_cost_per_point`
-now prices it at a flat ~1 µs/point instead of one rising with the point count,
-which at 50,000 points in a block is 1,582 ms against 53.9. It is neutral on the
-harness because the harness's metrics blocks hold ~1,600 points against ~2,000
-attribute rows, where the join is about 7% of the query — the other ~93% is
-twenty-two blocks × ten tables of opening them, which is the same finding as the
-paragraph above, reached from the metrics side.
+Diagnosing it did find something real one layer down, nothing to do with
+vectorising: metric attributes were joined by scanning the whole table per data
+point, the quadratic the same release removed from the log path and missed here.
+Fixed by reusing that path's run search, `series_cost_per_point` now prices it at
+a flat ~1 µs/point instead of one rising with the point count, which at 50,000
+points in a block is 1,582 ms against 53.9. It is neutral on the harness, whose
+metrics blocks hold ~1,600 points against ~2,000 attribute rows, where the join
+is about 7% of the query — the other ~93% is twenty-two blocks × ten tables of
+opening them, the same finding as above from the metrics side.
 
-It stays in this section, and the cause named has changed three times. The first
-entry set the path at twenty years of SIMD kernels and called it a programme
-rather than a patch. The second called it re-verification and called it a patch;
-that patch is applied and the guarantee is intact, because verifying once per
-process is not the same as not verifying, but it was worth 1.1x on the row it was
-supposed to fix. The third is the one that moved the row, and it is the dullest
-of the three: the open was reading tables the query never names. Neither of the
-first two would have been found without measuring the third, and none of them
-makes an unpruned scan fast.
-
-The honest version is shorter. A scan over a corpus larger than the page cache
-pays for paging, so the only levers are how much of it you read and whether you
-read it at all, and Mira ships three: prune, so the corpus is not the working
-set; compact, so the working set is 8.4x smaller; and open the tables a query
-names rather than all of them, which is 1.8x to 2.6x on the row above. None of
-the three helps a query that genuinely has to read every byte, and nothing here
-should be read as a promise that anything will. Mira's query numbers are a
-pruning result. That was true before the diagnosis changed twice and it is what
-this row is.
+It stays in this section, and the cause named has changed three times: twenty
+years of SIMD kernels, called a programme rather than a patch; re-verification,
+which did ship and was worth 1.1x on the row it was supposed to fix, with the
+guarantee intact because verifying once per process is not the same as not
+verifying; and the dullest, the one that moved the row — the open was reading
+tables the query never names. Neither of the first two would have been found
+without measuring the third, and none makes an unpruned scan fast. The honest
+version is shorter: a scan over a corpus larger than the page cache pays for
+paging, so the only levers are how much of it you read and whether you read it at
+all, and Mira ships three — prune, so the corpus is not the working set; compact,
+so the working set is 8.4x smaller; and open the tables a query names rather than
+all of them, 1.8x to 2.6x on the row above. None of the three helps a query that
+genuinely has to read every byte, and nothing here should be read as a promise
+that anything will.
 
 ### Gaps that are what the design costs
 
@@ -508,19 +472,18 @@ they actually print — uncompressed engine-internal columns to compressed — M
 is 8.8x on logs and 7.9x on traces against ClickHouse's 14.1x and VictoriaLogs'
 11.2x. That is a loss, and it is the like-for-like comparison.
 
-The cause is that rows land in arrival order and are compressed in arrival
-order, so ZSTD sees interleaved services where ClickHouse's `ORDER BY` has
-handed its codec long runs of one value. The obvious answer is to apply the same
-trick — sort a block by its low-cardinality columns before the flush,
-dictionary-encode the string columns — and this entry sits in *this* section
-rather than the previous one because both were measured on real blocks and both
-lost. Every sort key tried came out at or below the unsorted ratio, because
-arrival order is time order and time already carries the locality; the attribute
-values that do repeat are dictionary-encoded already, and encoding the rest
-makes logs *worse*. architecture.md's ["What compresses and what does
-not"](architecture.md#what-compresses-and-what-does-not) has the numbers. Mira
-loses this row to a schema an operator declares up front and Mira, being
-OTLP-native, does not get to ask for.
+The cause is that rows land in arrival order and are compressed in arrival order,
+so ZSTD sees interleaved services where ClickHouse's `ORDER BY` has handed its
+codec long runs of one value. The obvious answer — sort a block by its
+low-cardinality columns before the flush, dictionary-encode the string columns —
+puts this entry in *this* section rather than the previous one, because both were
+measured on real blocks and both lost. Every sort key tried came out at or below
+the unsorted ratio, because arrival order is time order and time already carries
+the locality; the attribute values that do repeat are dictionary-encoded already,
+and encoding the rest makes logs *worse*. architecture.md's ["What compresses and
+what does not"](architecture.md#what-compresses-and-what-does-not) has the
+numbers. Mira loses this row to a schema an operator declares up front and Mira,
+being OTLP-native, does not get to ask for.
 
 **Full-text search.** No inverted index, so no term query, so no row. Quickwit's
 0.6 s for a 3%-selectivity term across 212 GB on one 16-vCPU node — the only
@@ -529,83 +492,80 @@ Mira counterpart at all.
 
 Building one is possible and it is not planned, and the reason is who is asking.
 A term query is a human's interface: you do not know the shape of what you are
-looking for, so you type a word and read what comes back. An agent does not work
-that way. It arrives with a structured hypothesis — this service, this severity,
-this attribute, this window — and what it needs is for that filter to prune, not
-for a word to rank. Mira is a short-term memory for agents before it is a search
-box for people, so an inverted index would be a second file per block, a term
-dictionary and a posting-list format spent on the reader this engine is not for.
-Losing the row is the correct outcome, not a deferral.
+looking for, so you type a word and read what comes back. An agent arrives with a
+structured hypothesis instead — this service, this severity, this attribute, this
+window — and needs that filter to prune, not a word to rank. Mira is a short-term
+memory for agents before it is a search box for people, so an inverted index
+would be a second file per block, a term dictionary and a posting-list format
+spent on the reader this engine is not for. Losing the row is the correct
+outcome, not a deferral.
 
-**Horizontal scale.** A storage node answers only from its own blocks, by
-design; the cross-replica merge is a separate process, `mira proxy`. Quickwit at
-Binance reports 1.6 PB a day — 18.5 GB/s — across 2,800 vCPU [^qb], which this
-page rejects below as a *rate* because the denominator is requested vCPU rather
-than observed CPU, and cites here only as evidence that the deployment is that
-wide; Datadog and Honeycomb operate fleets whose size they decline to publish. Mira's answer is independent replicas
-behind an L4 balancer and a replication factor of one — a lost disk is lost data
-for that node's share. A scope decision, not a benchmark result, but a buyer
-reads it as a loss and should hear it here rather than discover it.
+**Horizontal scale.** A storage node answers only from its own blocks, by design;
+the cross-replica merge is a separate process, `mira proxy`. Quickwit at Binance
+reports 1.6 PB a day — 18.5 GB/s — across 2,800 vCPU [^qb], rejected below as a
+*rate* because the denominator is requested vCPU rather than observed CPU, and
+cited here only as evidence that the deployment is that wide; Datadog and
+Honeycomb operate fleets whose size they decline to publish. Mira's answer is
+independent replicas behind an L4 balancer and a replication factor of one — a
+lost disk is lost data for that node's share. A scope decision, not a benchmark
+result, but a buyer reads it as a loss and should hear it here rather than
+discover it.
 
 The hot half cannot be closed *inside the node*. Fan-out from a replica needs
-that replica to know which replicas exist and which of them holds what, and that
-is membership and a shared catalogue, which is coordination state — the one thing
-the stateless principle spends everything else to avoid. Winning this row that
-way means becoming the thing every other row on this page is winning against.
-The answer is not a better implementation, it is a second process in front, and
-Mira now ships one — see below, including the part of the case for it that is
-still not measured.
+that replica to know which replicas exist and which holds what, and that is
+membership and a shared catalogue, which is coordination state — the one thing
+the stateless principle spends everything else to avoid. The answer is not a
+better implementation, it is a second process in front, and Mira now ships one.
 
 The cold half is closed, and this release closes it. `--offload <uri>` copies a
 sealed block to an object store immediately before retention unlinks it, under
-the same time-range-encoded directory name it had locally — so the store's own
+the same time-range-encoded directory name it had locally, so the store's own
 list API is the catalogue and Mira builds nothing extra. Measured on one corpus
 of 137 blocks and 3.35 GiB: **14.2 s of retention-thread time to upload
 (241.2 MiB/s), a median 16.6 s to restore, 50 ms to list all 137**[^m4], a second
 restore copying nothing, and the restored directories byte-identical to the
-store's under `diff -r`. The restore figure is a median of three runs that
-spread from 12.8 s to 19.5 s, so read it as bracketing the upload rather than
-confirming it; an earlier draft of this paragraph claimed the two directions
-agreed within 6% and that claim was withdrawn when the second and third samples
-arrived. It is deliberately not a tier — reads never consult the store,
-`mira offload restore` is the whole retrieval path, and `file://` is the only
-scheme, which means a mounted bucket rather than a signing library.
+store's under `diff -r`. The restore figure is a median of three runs spread from
+12.8 s to 19.5 s, so read it as bracketing the upload rather than confirming it;
+an earlier draft claimed the two directions agreed within 6% and that claim was
+withdrawn when the second and third samples arrived. It is deliberately not a
+tier — reads never consult the store, `mira offload restore` is the whole
+retrieval path, and `file://` is the only scheme, which means a mounted bucket
+rather than a signing library.
 
 The hot half is now closed mechanically, and the case for it is still not
 measured. `mira proxy` is a stateless merging proxy in front of N replicas —
-static config, no membership, no catalogue, nothing to reconcile after a
-restart — and it is cheaper than the sketch this paragraph used to carry,
-because the keyset cursor Mira already returns is `(ts, node, seq, row)` and is
-therefore *already* a total order across replicas. Merging pages is a sort and a
-cut; paging needs no per-reader position anywhere, so the proxy holds no state
-even in memory. Hash-based ingest routing on the 64-bit entity identity hash
-ships with it, never before it, which is what keeps one replica's answer
-*complete* for one entity. Zero new dependencies: the HTTP client was already in
-the tree for webhooks.
+static config, no membership, no catalogue, nothing to reconcile after a restart
+— and it is cheaper than the sketch this paragraph used to carry, because the
+keyset cursor Mira already returns is `(ts, node, seq, row)` and is therefore
+*already* a total order across replicas. Merging pages is a sort and a cut;
+paging needs no per-reader position anywhere, so the proxy holds no state even in
+memory. Hash-based ingest routing on the 64-bit entity identity hash ships with
+it, never before it, which is what keeps one replica's answer *complete* for one
+entity. Zero new dependencies: the HTTP client was already in the tree for
+webhooks.
 
 What it costs is measured; what it buys is not. Two replicas and a proxy against
 one node, everything on the same twelve cores, nine paired passes a shape across
 three sittings: ingest through the proxy runs at **0.767x** the single node at
 four connections, every one of nine passes, and the wide unfiltered read costs
 **3.89x** the single node's `elapsed_us`, also nine of nine — the proxy's clock
-starts before the fan-out and stops after the merge, so it carries both
-replicas' reads plus the hop. At thirty-two and ninety-six connections the
-ingest ratio splits sign and is not quotable in either direction[^m5]. None of
-that is a scaling number and it cannot be: on one box there is no second disk,
-no second page cache and no second set of cores for fan-out to buy.
+starts before the fan-out and stops after the merge, so it carries both replicas'
+reads plus the hop. At thirty-two and ninety-six connections the ingest ratio
+splits sign and is not quotable in either direction[^m5]. None of that is a
+scaling number and it cannot be: on one box there is no second disk, no second
+page cache and no second set of cores for fan-out to buy.
 
-What has **not** changed is the reason this was not recommended. Nothing has
-measured a single node's ceiling to be the binding constraint. The attempt is
-the plateau work above — it rejected both of the log fixes that were supposed to
-raise the ceiling and found the queue re-forming at block seal and publish, on a
+What has **not** changed is the reason this was not recommended: nothing has
+measured a single node's ceiling to be the binding constraint. The attempt is the
+plateau work above, which rejected both of the log fixes that were supposed to
+raise the ceiling and found the queue re-forming at block seal and publish — on a
 laptop, which is not the same as finding a node saturated at a rate a real
-workload reaches. This page's query finding also stands: an unpruned scan is
-bound by whether the corpus fits page cache, and fan-out does not change that,
-since each replica still scans its own share off its own disk. So read the proxy
-as capacity — more disks, more page cache, more cores — and not as a faster
-answer to the same query. The full reasoning, including what it refuses to merge
-and why, is [architecture section
-12.2](architecture.md#122-query-mira-proxy).
+workload reaches. The query finding also stands: an unpruned scan is bound by
+whether the corpus fits page cache, and fan-out does not change that, since each
+replica still scans its own share off its own disk. So read the proxy as capacity
+— more disks, more page cache, more cores — and not as a faster answer to the
+same query. The full reasoning, including what it refuses to merge and why, is
+[architecture section 12.2](architecture.md#122-query-mira-proxy).
 
 **Cost per GB.** No measured dollar figure, only bytes on disk. Quickwit's $8.4
 per ingested TB per month is structurally unreachable for any engine *serving
@@ -632,69 +592,38 @@ number in a comparison table without misleading someone.
 **Vendor scale claims with no methodology.** No hardware, no denominator, no
 measurement.
 
-- Jaeger, "several billion spans per day" at Uber [^j2]. Cluster-wide,
-  post-sampling, unstated span size, no node count. The arithmetic is the danger:
-  2–5e9/day is 23k–58k spans/s, *lower* than a laptop, while the phrase reads a
-  thousand times higher.
-- Datadog Husky, "more than 100 trillion events" per day [^dd3]. Fleet aggregate
-  over an unpublished machine count, and the same page uses 100 trillion for the
-  *stored corpus* too, so the number is not pinned to one meaning.
-- Honeycomb, "on the order of 100,000 events per second" [^hc3]. An incidental
-  descriptor of a customer environment on a page whose only measured result is
-  query latency.
-- Quickwit, "1 PB per day / 14 million docs/s" [^q6]. A user's screenshot the
-  vendor is relaying; Quickwit's own reproducible ceiling on the same page is
-  400 MB/s.
-- Quickwit at Binance, "1.6 PB per day" [^qb]. The denominator is Kubernetes
-  *requests*, not observed CPU.
-- VictoriaLogs, "absorb around a GiB of logs per second even on slow, low-IOPS
-  HDDs" [^v3]. Prose on an internals page, no hardware, no record size.
-- Parseable, "up to 90% and average 75%" compression [^p2]. No dataset, no codec,
-  no before/after byte counts, and it contradicts the same vendor's "~10:1"
-  elsewhere.
+| Claim | Why it cannot sit in a row |
+|---|---|
+| Jaeger, "several billion spans per day" at Uber [^j2] | Cluster-wide, post-sampling, unstated span size, no node count. The arithmetic is the danger: 2–5e9/day is 23k–58k spans/s, *lower* than a laptop, while the phrase reads a thousand times higher. |
+| Datadog Husky, "more than 100 trillion events" per day [^dd3] | Fleet aggregate over an unpublished machine count, and the same page uses 100 trillion for the *stored corpus* too, so the number is not pinned to one meaning. |
+| Honeycomb, "on the order of 100,000 events per second" [^hc3] | An incidental descriptor of a customer environment on a page whose only measured result is query latency. |
+| Quickwit, "1 PB per day / 14 million docs/s" [^q6] | A user's screenshot the vendor is relaying; Quickwit's own reproducible ceiling on the same page is 400 MB/s. |
+| Quickwit at Binance, "1.6 PB per day" [^qb] | The denominator is Kubernetes *requests*, not observed CPU. |
+| VictoriaLogs, "absorb around a GiB of logs per second even on slow, low-IOPS HDDs" [^v3] | Prose on an internals page, no hardware, no record size. |
+| Parseable, "up to 90% and average 75%" compression [^p2] | No dataset, no codec, no before/after byte counts, and it contradicts the same vendor's "~10:1" elsewhere. |
 
 **Numbers that are not the axis they are labelled as.**
 
-- VictoriaLogs ClickBench "44,266 rows/s" [^v4]. Derived from a `load_time` whose
-  timed region includes a 23.7 GB `wget` and a gunzip to ~75 GB. It is a download
-  speed with an engine attached.
-- TrueFoundry's "VictoriaLogs 318 GiB vs Loki 501 GiB" filed as compression
-  [^v5]. A storage delta between two competitors with no raw baseline; the
-  methodology contradicts itself by ~78x and Loki's figure exceeds the stated
-  corpus.
-- Datadog Husky's "1 GiB to process the column" filed as resident memory [^dd4].
-  It is 15,000 x 75 KiB — arithmetic on a field cap, describing the design Husky
-  *rejected* in the next sentence. A footnote does not repair that; readers
-  compare cells.
-- Elastic APM's "100 unsampled transactions/sec" [^ea2] and Elastic's "15 nodes x
-  64 GB" [^e2]. Both are inputs to, or outputs of, a provisioning formula. 34 of
-  those 64 GB is explicitly OS page cache.
-- Honeycomb's "20 s to 0.2 s" [^hc] and Datadog's "a few hundred milliseconds
-  increase in the median" [^dd5]. Self-relative deltas with no absolute baseline
-  on either side.
-- Husky's fragment p50 of 2.01 ms [^dd]. Per 1,000 fragment queries, 300 are
-  pruned at the metadata service and 560 by the result cache; 3.4% scan data at
-  all. It is a cache lookup, and a user query is the fan-out envelope over
-  hundreds of fragments.
-- Quickwit Lambda's "less than 100 ms" [^q7]. The authors' own words: the
-  function "only checks that the metastore didn't change and serves back the
-  earlier results". They call it unfair and exclude it.
-- Quickwit's "1 indexer, 236 h, 27 MB/s" [^q1]. 236 h is exactly 23 TB / 27 MB/s;
-  the post performs that division itself. No 236-hour run happened.
+| Claim | Why it cannot sit in a row |
+|---|---|
+| VictoriaLogs ClickBench "44,266 rows/s" [^v4] | Derived from a `load_time` whose timed region includes a 23.7 GB `wget` and a gunzip to ~75 GB. It is a download speed with an engine attached. |
+| TrueFoundry's "VictoriaLogs 318 GiB vs Loki 501 GiB" filed as compression [^v5] | A storage delta between two competitors with no raw baseline; the methodology contradicts itself by ~78x and Loki's figure exceeds the stated corpus. |
+| Datadog Husky's "1 GiB to process the column" filed as resident memory [^dd4] | It is 15,000 x 75 KiB — arithmetic on a field cap, describing the design Husky *rejected* in the next sentence. A footnote does not repair that; readers compare cells. |
+| Elastic APM's "100 unsampled transactions/sec" [^ea2] and Elastic's "15 nodes x 64 GB" [^e2] | Both are inputs to, or outputs of, a provisioning formula. 34 of those 64 GB is explicitly OS page cache. |
+| Honeycomb's "20 s to 0.2 s" [^hc] and Datadog's "a few hundred milliseconds increase in the median" [^dd5] | Self-relative deltas with no absolute baseline on either side. |
+| Husky's fragment p50 of 2.01 ms [^dd] | Per 1,000 fragment queries, 300 are pruned at the metadata service and 560 by the result cache; 3.4% scan data at all. It is a cache lookup, and a user query is the fan-out envelope over hundreds of fragments. |
+| Quickwit Lambda's "less than 100 ms" [^q7] | The authors' own words: the function "only checks that the metastore didn't change and serves back the earlier results". They call it unfair and exclude it. |
+| Quickwit's "1 indexer, 236 h, 27 MB/s" [^q1] | 236 h is exactly 23 TB / 27 MB/s; the post performs that division itself. No 236-hour run happened. |
 
 **Benchmarks against a straw configuration.**
 
-- OpenObserve's ClickHouse at 2.14x [^oo] — admittedly untuned, so kept in the
-  table labelled as a floor.
-- VictoriaMetrics' log-collector benchmark [^vl]: vlagent's vendor benchmarking
-  vlagent, every competitor at Helm-chart defaults, two collectors dropped from
-  the tables for losing logs.
-- ClickHouse vs Elasticsearch at 4.95x storage [^c3]: the page itself notes a
-  tuned ES config was ~20% smaller, and ES OSS cannot disable `_source`.
-- TrueFoundry's Loki [^v1]: reported at "4 vCPUs (100% throttled)" against a
-  65 MB/s generator, so the two systems did not store the same bytes.
-- Elastic's own 220,000 docs/s [^e1]: pure indexing, zero query load; the same
-  post drops to 173,000 under 1,000 ops/s of search.
+| Benchmark | Why it cannot sit in a row |
+|---|---|
+| OpenObserve's ClickHouse at 2.14x [^oo] | Admittedly untuned, so kept in the table labelled as a floor. |
+| VictoriaMetrics' log-collector benchmark [^vl] | vlagent's vendor benchmarking vlagent, every competitor at Helm-chart defaults, two collectors dropped from the tables for losing logs. |
+| ClickHouse vs Elasticsearch at 4.95x storage [^c3] | The page itself notes a tuned ES config was ~20% smaller, and ES OSS cannot disable `_source`. |
+| TrueFoundry's Loki [^v1] | Reported at "4 vCPUs (100% throttled)" against a 65 MB/s generator, so the two systems did not store the same bytes. |
+| Elastic's own 220,000 docs/s [^e1] | Pure indexing, zero query load; the same post drops to 173,000 under 1,000 ops/s of search. |
 
 **Wrong artifact.** Rejected as published, corrected and kept. Loki's release zip
 is 40.6 MiB and the binary inside it is 138.34 MiB (`__gopclntab` alone is
@@ -725,7 +654,7 @@ sprint; each one buys something in the tables above.
 | **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 117-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
 | **Per-record deletion (GDPR erasure)** | This one hurts: it breaks block immutability, which is what reader safety rests on. The answer is tenant-as-path-prefix so deletion stays an unlink of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
 | **SAML** | "Put an OIDC bridge in front of Mira." SAML needs a certificate and a metadata store; OIDC needs a JWKS fetch. |
-| **A Kubernetes operator / CRDs** | A controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile. |
+| **A Kubernetes operator / CRDs** | Was refused — "a controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile." Now shipped, because the refusal named the wrong subject: scaling the tier *in* has state — which replica is draining, whether its volume has been archived — and `mira-operator` is a separate binary holding it. Mira itself still coordinates nothing, and `spec.replicas` is a floor rather than a desired count, so the controller can permit a drain and never order one. |
 | **Iceberg / a catalog** | Catalog, manifests and snapshots are coordination state and a second product. Parquet *export* is revisited when someone names Athena or Trino with a workload attached; it costs ~20 crates. |
 | **Profiles as a fourth signal** | Deferred, not refused, and the gate is external: the signal is Alpha and the proto is still removing fields. No placeholder table in the schema. |
 

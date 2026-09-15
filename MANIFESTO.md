@@ -12,7 +12,7 @@ last few minutes of what the system actually did — which is exactly what telem
 
 **Telemetry is not the audit log of an autonomous system. It is its short-term memory.**
 
-That reframing has consequences, and they are architectural rather than rhetorical.
+The consequences are architectural rather than rhetorical.
 
 ---
 
@@ -29,9 +29,8 @@ different clock rate.
 | **Act** | a runbook | an API call, a reroute, a rollback | nothing — this is not storage's job |
 
 Three of those four are storage problems. The fourth is not, and Mira does not pretend
-otherwise: it has no actuator, no remediation engine and no opinion about your control
-plane. It is the memory the loop reads from, and it is built to be read from at that
-rate.
+otherwise: no actuator, no remediation engine, no opinion about your control plane. It
+is the memory the loop reads from, built to be read from at that rate.
 
 ---
 
@@ -43,14 +42,14 @@ Not because they are badly built. Because they were built for the other loop.
 two-second dashboard because they look at it four times an hour. An agent reasoning
 towards a conclusion issues twenty queries to get there. At two seconds each that is
 most of a minute before the first hypothesis, per attempt — and a loop that slow gets
-replaced by a static alert rule. The unit that matters is not "fast enough to watch",
-it is "fast enough to iterate on".
+replaced by a static alert rule. The unit is not "fast enough to watch", it is "fast
+enough to iterate on".
 
 **Proving something is *absent* is the operation nobody optimises, and half of an
 agent's queries are hypotheses it is about to discard.** Ruling things out is how
 reasoning narrows. A store that has to read everything to establish a negative makes
-elimination the most expensive step in the loop, which is exactly backwards. Answering
-"no" should be cheaper than answering "yes", not dearer.
+elimination the most expensive step in the loop. Answering "no" should be cheaper than
+answering "yes", not dearer.
 
 **Cost decides the retention window, and the retention window decides whether the memory
 exists at all.** Per-gigabyte-ingested pricing turns "keep everything at full fidelity
@@ -62,9 +61,8 @@ was dropped, and it has no way to know it is reasoning over a subset.
 languages, four sets of failure modes, and a generated query that is syntactically valid
 and semantically wrong returns a confident answer to a question nobody asked. The
 interface an agent uses should be small enough to get right on the first try, and it
-should refuse what it does not understand instead of guessing. A model that invents a
-field name needs to be *told*; handing it plausible-looking rows teaches it the wrong
-thing.
+should refuse what it does not understand: a model that invents a field name needs to be
+*told*, and plausible-looking rows teach it the wrong thing.
 
 **A network hop is a design decision, and for a local agent it is the wrong one.** The
 managed stacks have no in-process mode because they cannot have one. An agent that lives
@@ -83,16 +81,16 @@ Mira speaks the Model Context Protocol natively, over the same code path the UI 
 because a second surface with its own query path is a second surface with its own bugs.
 The tools are written to be read by a model rather than by someone who already knows the
 schema: each answer says what to feed it into next, and a question with no answer comes
-back as an empty result rather than a transport error, because "no rows for that service"
-and "malformed request" mean different things and a model that sees both as a failure
+back as an empty result rather than a transport error. "No rows for that service" and
+"malformed request" mean different things, and a model that sees both as a failure
 learns nothing from either.
 
 ### Reading is cheap enough to do in a loop
 
 Recent data is held in a form a query can read directly, with no decoding step between
-the bytes on disk and the answer. That is what makes the difference between an
-interactive latency and a conversational one, and it is the reason a hypothesis is
-cheap to discard: eliminating a possibility usually means opening nothing at all.
+the bytes on disk and the answer. That is the difference between an interactive latency
+and a conversational one, and the reason a hypothesis is cheap to discard: eliminating a
+possibility usually means opening nothing at all.
 
 ### Correlation is one call, not a plan the agent has to make
 
@@ -116,8 +114,8 @@ you query over the network with a token.
 
 ## What the loop looks like in practice
 
-Concretely, with an agent connected: one line of client configuration, and it can run an
-investigation a human would recognise.
+One line of client configuration, and an agent can run an investigation a human would
+recognise.
 
 1. **Something is wrong.** The agent asks what is firing and gets back the rule, its
    state, the numbers behind it, and — this is the part that matters — *the search the
@@ -168,12 +166,10 @@ thing asking.
 
 That store did not exist. Mira is an attempt at it.
 
-<!-- Absolute URLs, not repository-relative ones: this file is read both on GitHub
-     and published at /manifesto/ on the docs site, and no relative path is correct
-     in both places at once. -->
+<!-- Absolute URLs: this file is read on GitHub and published at /manifesto/ on the
+     docs site, and no relative path is correct in both places at once. -->
 
 *How it is built, and why each choice:
-[the architecture document](https://miradb.dev/architecture/). The
-numbers behind every claim here, with the machine they were taken on and what
-every other engine publishes beside them:
-[where Mira sits in the market](https://miradb.dev/market/).*
+[the architecture document](https://miradb.dev/architecture/). The numbers behind every
+claim here, with the machine they were taken on and what every other engine publishes
+beside them: [where Mira sits in the market](https://miradb.dev/market/).*

@@ -33,11 +33,10 @@ is the only state there is.
 | **0.14** | bytes on disk per byte on the wire, once compacted |
 | **5.76 MiB stripped, 117 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
-Apple M3 Pro, one process, reproducible with the load harness in this
-repository. What each number measures — the numerator, the denominator, and what
-is outside the measurement:
-**[the measurement contract](docs/internals/measurement.md)**, which also carries
-every published figure in one generated table. The full sweep:
+Apple M3 Pro, one process, reproducible with the load harness in this repository.
+What each number measures — the numerator, the denominator, and what is outside
+the measurement — is **[the measurement contract](docs/internals/measurement.md)**,
+which also carries every published figure in one generated table. The full sweep:
 **[end-to-end testing](docs/internals/e2e.md)**. Why they land there:
 **[architecture section 11](docs/architecture.md#11-performance-model)**. How
 they read against the market, including where Mira is behind:
@@ -102,9 +101,8 @@ make check      # fmt, clippy, tests, rustdoc, UI, supply chain, drift, docs, co
 
 Read [architecture section 0](docs/architecture.md#0-corrections-to-the-original-brief)
 first if the change is structural — it lists the mechanisms that do not survive
-contact with the formats, and re-proposing one is the most common way to waste
-an afternoon. [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough, with
-[the test levels](docs/internals/testing.md) and
+contact with the formats. [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough,
+with [the test levels](docs/internals/testing.md) and
 [how a release is cut](docs/internals/releases.md) behind it. Vulnerabilities go
 to [SECURITY.md](SECURITY.md), not to an issue.
 

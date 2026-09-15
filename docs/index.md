@@ -1,11 +1,10 @@
 ---
-# Page notes live in the front matter, not in an HTML comment: an HTML comment is
-# served to every visitor.
+# Page notes live in the front matter: an HTML comment is served to every visitor.
 #
 # `template` opts this page into the landing hero in overrides/home.html — the
-# wordmark, headline, tagline and the three buttons all live there, not here. The
-# <h1 hidden> below suppresses the meaningless "<h1>Home</h1>" Material injects
-# into any page whose markdown has no h1; the hero carries the real one.
+# wordmark, headline, tagline and the three buttons all live there. The <h1 hidden>
+# below suppresses the "<h1>Home</h1>" Material injects into any page whose markdown
+# has no h1; the hero carries the real one.
 template: home.html
 description: An OTLP-native telemetry storage engine and short-term memory layer for AI agents. OTLP in, immutable Arrow IPC blocks out, queried straight from mmap or over MCP.
 ---
@@ -26,8 +25,8 @@ firing alert, and what the whole run cost in memory and disk.
 Other backends treat OTLP as an ingestion format and transform it into something
 else — ClickHouse rows, Parquet files, a TSDB — and every transformation is a
 place fidelity can go missing. Mira's storage layout *is* the OpenTelemetry
-Resource-Scope-Signal model, stored as Apache Arrow IPC, so there is no
-transformation step for a field to fall out of.
+Resource-Scope-Signal model in Apache Arrow IPC, so there is no transformation
+step for a field to fall out of.
 
 | | |
 |---|---|
@@ -51,10 +50,9 @@ transformation step for a field to fall out of.
 - **Not tunable.** There is no block size, flush interval or cache size to set,
   and there will not be. The config file describes *where the process runs* —
   thirteen keys — and the three that reach the engine do not tune it:
-  `ingest.queue` buys burst room with memory, `ingest.shards` is there to pin a
-  core count the runtime reads wrong, and `ingest.wal` is not a number to guess
-  but a choice between two durability promises, acked in the log or acked at
-  block publication.
+  `ingest.queue` buys burst room with memory, `ingest.shards` pins a core count
+  the runtime reads wrong, and `ingest.wal` is a choice between two durability
+  promises, acked in the log or acked at block publication.
 
 ## Where to go next
 
