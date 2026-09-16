@@ -553,16 +553,21 @@ jobs:
   tag:
     name: tag
     needs: [required, security-required]
-    # `always()` is what makes this job reachable at all. A skip propagates down
-    # the whole dependency chain, not just one edge: `ui` is path-filtered and
-    # skips on nearly every push, and although the gates above survive it with
-    # their own `always()`, anything downstream of them inherits the skip unless
-    # its `if` names a status function. Without this the job was skipped on
-    # every push to main since it was written, and v0.0.1..v0.0.4 were tagged by
-    # hand. So `always()`, and then the two results spelled out — `always()`
-    # alone would also run it on a red or cancelled main.
+    # A status function is what makes this job reachable at all. A skip
+    # propagates down the whole dependency chain, not just one edge: `ui` is
+    # path-filtered and skips on nearly every push, and although the gates above
+    # survive it with their own `always()`, anything downstream of them inherits
+    # the skip unless its `if` names a status function too. Without one the job
+    # was skipped on every push to main since it was written, and
+    # v0.0.1..v0.0.4 were tagged by hand.
+    #
+    # `!cancelled()` rather than `always()`, because the gates are `always()` and
+    # will report success on a cancelled run — so `always()` here would let a
+    # cancelled main push still cut a tag. Naming a status function also turns
+    # off the implicit `success()`, which is why the two results are then spelled
+    # out by hand.
     if: >-
-      always()
+      !cancelled()
       && github.event_name == 'push'
       && github.ref == 'refs/heads/main'
       && needs.required.result == 'success'

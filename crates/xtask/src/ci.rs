@@ -363,8 +363,9 @@ fn check_skip_propagation(name: &str, jobs: &BTreeMap<String, Yaml>, f: &mut Fai
              dependency by naming a status function. `{id}` does not, so it inherits \
              the skip the gate was written to absorb and never runs — a green run \
              with a job that silently did nothing. Name a status function in its \
-             `if:` too, and spell out the `needs.*.result` values the implicit \
-             `success()` used to check."
+             `if:` too — `!cancelled()`, not `always()`, because an `always()` gate \
+             reports success on a cancelled run — and spell out the `needs.*.result` \
+             values the implicit `success()` used to check."
         ));
     }
 }

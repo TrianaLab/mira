@@ -1016,8 +1016,14 @@ jobs:
           # assertion that an install of the chart pulls a manifest that exists.
           # A chart published against an image that never pushed is a
           # CrashLoopBackOff nothing else in this run would notice.
+          #
+          # Quotes stripped first, and `-F`: the template renders the reference
+          # as a quoted scalar, so the obvious grep matched the value it wanted
+          # against a line that does not contain it — v0.1.0 published correctly
+          # and then failed here. The repository is a hostname, so the dots in
+          # it are regex metacharacters too; a fixed string has neither problem.
           helm template probe "oci://${CHARTS}/mira-operator" --version "${VERSION}" \
-            | grep -q "image: ${OPERATOR_IMAGE}:${VERSION}"
+            | tr -d '"' | grep -qF "image: ${OPERATOR_IMAGE}:${VERSION}"
           echo "the published chart installs the published image"
 
       - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
