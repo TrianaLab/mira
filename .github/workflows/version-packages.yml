@@ -54,6 +54,12 @@ jobs:
           # One click per Version PR is what keeps a PAT off the release path;
           # see docs/internals/releases.md.
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # The default commits over the GitHub API, which signs with GitHub's
+          # key and cannot represent mode 100755 — `scripts/get-mira.sh` is a
+          # version site, so every bump died on "Unexpected executable file".
+          # Nothing here needs a signed commit: main's ruleset carries no
+          # `required_signatures`, and what a release signs is the artefacts.
+          push-with-git-cli: true
           # Not `changeset version`: that writes the two stub package.json files
           # and stops. This is the whole bump — both Cargo.tomls, both
           # Cargo.locks, the chart, the docs and the changelog promotion.
