@@ -15,8 +15,8 @@ type: application
 # image annotation below, which are the same number twice more and had no local
 # gate at all until then. `operator-meta` in release.yml still reads it; it is
 # just no longer the first thing that does.
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.1
+appVersion: "0.1.1"
 # `apiextensions.k8s.io/v1` CRDs and server-side apply are both far older, but
 # the operator patches with `fieldManager` + `force`, which is 1.22+. 1.25 is
 # where `PodSecurity` went stable, which is what the pod's securityContext is
@@ -57,4 +57,4 @@ annotations:
       url: https://miradb.dev/
   artifacthub.io/images: |
     - name: mira-operator
-      image: ghcr.io/trianalab/mira-operator:0.1.0
+      image: ghcr.io/trianalab/mira-operator:0.1.1
