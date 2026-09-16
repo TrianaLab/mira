@@ -9,6 +9,8 @@ One binary. `mira` is the server, `mira mira` is the terminal UI
 over the same blocks, `mira update` replaces the binary — and there
 is no daemon, agent or sidecar to run alongside any of them.
 
+## `mira`
+
 ```console
 $ mira --help
 OTLP in, immutable Arrow blocks out, one binary.
@@ -45,6 +47,8 @@ Flags override the config file, which overrides the defaults. Every value
 can also come from the file via ${env:VAR} — see https://miradb.dev/config/.
 ```
 
+## `mira mira`
+
 ```console
 $ mira mira --help
 open the terminal UI over the same blocks
@@ -60,6 +64,8 @@ Options:
 With --data-dir it reads a block directory in-process and needs no
 server running; with --addr it queries one over HTTP.
 ```
+
+## `mira proxy`
 
 ```console
 $ mira proxy --help
@@ -80,6 +86,8 @@ cursor order. The reads it cannot merge — correlate, map, metrics
 and entities — answer 501 naming themselves rather than returning
 one node's share of the answer.
 ```
+
+## `mira offload`
 
 ```console
 $ mira offload --help
@@ -108,6 +116,8 @@ its own — file:///archive/${node} — so the restore pulls back one
 node's blocks rather than the whole archive.
 ```
 
+### `mira offload list`
+
 ```console
 $ mira offload list --help
 list what the store holds
@@ -119,6 +129,8 @@ Options:
       --offload <URI>  where a block goes before retention unlinks it
   -h, --help           Print help
 ```
+
+### `mira offload restore`
 
 ```console
 $ mira offload restore --help
@@ -133,6 +145,8 @@ Options:
   -h, --help             Print help
 ```
 
+### `mira offload push`
+
 ```console
 $ mira offload push --help
 copy this node's blocks into the store
@@ -145,6 +159,8 @@ Options:
       --data-dir <PATH>  the block directory, which is the whole manifest
   -h, --help             Print help
 ```
+
+## `mira update`
 
 ```console
 $ mira update --help
@@ -169,6 +185,8 @@ than carrying an HTTPS client. The container image has none of them;
 upgrade that by pulling a newer tag.
 ```
 
+## `mira completion`
+
 ```console
 $ mira completion --help
 print a shell completion script
@@ -188,6 +206,8 @@ completes exactly the flags this version accepts:
   mira completion zsh  > "${fpath[1]}/_mira"
   mira completion fish > ~/.config/fish/completions/mira.fish
 ```
+
+## Flags and config keys
 
 Every flag on the server line is also a config-file key:
 [Configuration](../config.md) is the table, with the type, the

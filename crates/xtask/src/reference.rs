@@ -1380,11 +1380,19 @@ fn subcommands(help: &str) -> Vec<String> {
         .collect()
 }
 
-/// One fenced block per `--help` in the tree, each verb's own after its parent.
+/// One headed section per `--help` in the tree, each verb's own after its
+/// parent.
 ///
 /// Depth-first, so `offload list` follows `offload` rather than the last
 /// top-level command, and driven off the help text rather than a list here —
 /// the binary is the source, which is the whole point of a generated page.
+///
+/// The heading is what makes the page navigable: mkdocs builds the table of
+/// contents from it, so `mira offload push` is one click from the sidebar and
+/// has an anchor to link at, where nine unlabelled fences had neither. Its
+/// level is the depth, so a verb nests under the command it belongs to —
+/// `## mira offload` then `### mira offload push` — and the root sits at `##`
+/// beside the verbs rather than under the page title twice.
 fn help_blocks(
     bin: &std::path::Path,
     path: &[String],
@@ -1394,13 +1402,27 @@ fn help_blocks(
     let Some(help) = mira_help(bin, path, f) else {
         return false;
     };
-    out.push(format!(
-        "```console\n$ mira {}--help\n{help}\n```\n",
-        path.iter().map(|p| format!("{p} ")).collect::<String>()
-    ));
+    out.push(section(path, &help));
     subcommands(&help)
         .into_iter()
         .all(|c| help_blocks(bin, &[path, &[c]].concat(), out, f))
+}
+
+/// One command's section: the heading it is filed under, then its help verbatim.
+///
+/// Split from [`help_blocks`] so the level arithmetic has a seam a test can
+/// reach — the rest of that function needs a built binary, and an off-by-one
+/// here is a table of contents that reads as one flat list or as a page whose
+/// every command hides under `mira`.
+fn section(path: &[String], help: &str) -> String {
+    let spelling = format!(
+        "mira{}",
+        path.iter().map(|p| format!(" {p}")).collect::<String>()
+    );
+    format!(
+        "{} `{spelling}`\n\n```console\n$ {spelling} --help\n{help}\n```\n",
+        "#".repeat((path.len() + 1).max(2))
+    )
 }
 
 /// Every `--help` the binary can print, root first, each subcommand after it.
@@ -1432,6 +1454,11 @@ fn cli_page(f: &mut Failures) -> String {
         "is no daemon, agent or sidecar to run alongside any of them.",
         "",
         &out.join("\n"),
+        // Headed like the commands above it, because the section that follows a
+        // heading belongs to it: unheaded, this closing paragraph reads as part
+        // of `mira completion` and is filed under it in the table of contents.
+        "## Flags and config keys",
+        "",
         // The help text above already states the precedence rule, so this
         // closing line points at the page that expands it rather than saying
         // the same sentence a second line down.
@@ -1539,6 +1566,23 @@ mod tests {
         ] {
             assert_eq!(humanize(expr), want, "{expr}");
         }
+    }
+
+    /// The root shares a level with the verbs it lists; a verb's own verbs nest
+    /// under it. Both ends matter: the first is what keeps the page's table of
+    /// contents one list rather than a single `mira` everything hides inside.
+    #[test]
+    fn a_command_is_headed_at_its_depth() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            section(&[], "usage").starts_with("## `mira`\n\n```console\n$ mira --help\nusage\n"),
+            "{}",
+            section(&[], "usage")
+        );
+        assert!(section(&path(&["proxy"]), "u").starts_with("## `mira proxy`\n"));
+        let deep = section(&path(&["offload", "push"]), "u");
+        assert!(deep.starts_with("### `mira offload push`\n"), "{deep}");
+        assert!(deep.contains("$ mira offload push --help\n"), "{deep}");
     }
 
     #[test]
