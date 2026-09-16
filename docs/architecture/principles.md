@@ -55,14 +55,14 @@ The mechanism is section 3.2 — the filesystem is the manifest. It also rules o
 DataFusion *from the default build*: SQL for free at a cost of 47 direct
 dependencies and a ~1.5M SLoC transitive tree. The binary cost was estimated here
 at 68–92 MB, too pessimistic — at Mira's release profile it is **50.0 MiB and 271
-crates**, against 6.18 MiB and 148, and an order of magnitude is still an order
+crates**, against 6.20 MiB and 148, and an order of magnitude is still an order
 of magnitude. There is no `--features sql` in the tree: `crates/mira` declares
 `default = []` and `webhook-tls` and nothing else. The feature is the *shape* a
 SQL surface would take if one is ever asked for, and section 10 keeps it on the
 not-built list until someone asks. What DataFusion would not displace either way
 is the hand-rolled ~2,000 LOC fast path: a 4.5 ms point lookup that already
 prunes to one block of 137 has nothing to gain from a planner. With traces,
-metrics, query, MCP and both UIs in it, the default build is **6.18 MiB
+metrics, query, MCP and both UIs in it, the default build is **6.20 MiB
 stripped, 148 crates** — the scale the design is defending.
 
 ## KYAML-first, everywhere

@@ -68,7 +68,7 @@ This section used to argue for no framework, on an unmeasured estimate of 35
 crates. It was wrong: the hand-rolled renderer clipped at `max` rather than
 overflowing, so layout bugs lost content while its unit tests stayed green.
 Measured against the prior binary on this laptop, the port costs **+26 crates
-and +145 KiB** (122 → 148 crates, 6.06 → 6.18 MiB) and an MSRV of 1.88.
+and +145 KiB** (122 → 148 crates) and an MSRV of 1.88.
 
 Most of that gap is the backend: `CrosstermBackend` would pull crossterm, mio,
 signal-hook and parking_lot in to do what `term.rs` already does.

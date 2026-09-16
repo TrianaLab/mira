@@ -9,5 +9,5 @@ so lost content while its unit tests stayed green. No backend is linked:
 `term.rs` keeps the pty, the raw mode, the resize handling and the key decoding.
 
 **This raises the minimum supported Rust version from 1.85 to 1.88**, which
-ratatui 0.30 requires. The binary grows 145 KiB (6.06 MiB to 6.18 MiB) and the
-dependency tree 26 crates (122 to 148).
+ratatui 0.30 requires. The port costs 145 KiB and 26 crates (122 to 148); the
+release ships at 6.20 MiB.

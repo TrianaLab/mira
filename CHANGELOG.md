@@ -32,8 +32,8 @@ the config keys, the `/mcp` tool set.
   `CrosstermBackend` would add crossterm, mio, signal-hook and parking_lot to do
   what `term.rs` already does, so `term.rs` keeps the pty, the raw mode, the
   resize handling and the key decoding, and its `Row` builder is deleted rather
-  than wrapped. The binary grows 145 KiB, 6.06 MiB to 6.18 MiB, and the
-  dependency tree 26 crates, 122 to 148.
+  than wrapped. The port costs 145 KiB and 26 crates, 122 to 148; the release
+  ships at 6.20 MiB.
 - **The minimum supported Rust version is 1.88**, up from 1.85, which
   ratatui 0.30 requires.
 - **The terminal UI says where the keys go.** The key bar names the pane `esc`

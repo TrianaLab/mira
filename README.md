@@ -31,7 +31,7 @@ is the only state there is.
 | **4.7 ms** | every span of one trace, out of 27.1M spans on disk |
 | **7 µs** | the durable log append inside an acknowledgement |
 | **0.14** | bytes on disk per byte on the wire, once compacted |
-| **6.18 MiB stripped, 148 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
+| **6.20 MiB stripped, 148 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 Apple M3 Pro, one process, reproducible with the load harness in this repository.
 What each number measures — the numerator, the denominator, and what is outside

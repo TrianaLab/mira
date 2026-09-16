@@ -92,16 +92,16 @@ are unpacked figures; the vendors' zips, tarballs and image layers all move
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 | --- | --- | --- | --- | --- |
-| **Mira** | **6.18 MiB** (arm64 macOS) | 1.0x | 148 crates | — |
+| **Mira** | **6.20 MiB** (arm64 macOS) | 1.0x | 148 crates | — |
 | VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.6x | 98 Go packages | yes |
 | VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.2x | — | yes |
 | Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 15.2x | 425 modules | yes |
 | otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 16.7x | — | yes |
 | Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 16.9x | 331 modules | yes |
-| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 22.4x | 407 modules | yes |
+| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 22.3x | 407 modules | yes |
 | Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 23.3x | 1,171 lock entries | yes |
-| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 24.7x | 462 crates | yes |
-| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 24.9x | — | yes |
+| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 24.6x | 462 crates | yes |
+| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 24.8x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
 The dependency column is directional: VictoriaLogs' 98 against Mira's 148
@@ -160,7 +160,7 @@ Mira publishes no dollar figure, so there is no Mira row.
 
 ## Where Mira is ahead
 
-**1. Artifact size.** 6.18 MiB stripped, against 94–153 MiB for everything else
+**1. Artifact size.** 6.20 MiB stripped, against 94–153 MiB for everything else
 surveyed.
 
 **2. Resident set at the operating point.** 232 MiB at 629,384 records/s against
@@ -307,7 +307,7 @@ Each refusal with the sentence a user gets.
 | Refused | What the user is told |
 | --- | --- |
 | **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice.** |
-| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 6.18 MiB. |
+| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 6.20 MiB. |
 | **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
 | **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
 | **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
