@@ -9,6 +9,16 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A release verified everything and then failed on the last line.** The
+  operator chart renders `image: "ghcr.io/trianalab/mira-operator:X.Y.Z"` with
+  the quotes, and the step that proves a published chart names a published image
+  looked for that line without them. Every artefact of `v0.1.0` shipped and was
+  checked; only the check itself was wrong. Quotes are stripped before the match
+  now, and it is a fixed string — the repository is a hostname, so its dots were
+  metacharacters as well.
+
 ## [0.1.0] - 2026-09-16
 
 ### Added
