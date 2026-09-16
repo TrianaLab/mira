@@ -1,6 +1,6 @@
 {
   "name": "@mira/operator",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Not a package. The operator's version line, in the one file `changeset version` knows how to write. `make version` copies this number into charts/mira-operator/Chart.yaml (version, appVersion and the Artifact Hub image annotation), integrations/kubernetes/Cargo.toml and the two install commands in docs/install.md, and `make drift` fails while any of them disagree."
 }
