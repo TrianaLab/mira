@@ -29,6 +29,12 @@ A Mira storage tier and the proxy in front of it.
 | `proxy.resources` | ResourceRequirements | unset | CPU and memory for one proxy pod. |
 | `replicas` | integer ≥ 1 | `1` | Replica floor. The tier never shrinks below this. |
 | `resources` | ResourceRequirements | unset | CPU and memory for one storage replica, and for the drain Job that archives its volume. |
+| `route` | object | unset | An `HTTPRoute` in front of the tier, attached to Gateways you already run. |
+| `route.hostnames` | array | unset | Hostnames the route answers on. Unset answers on every hostname its listener accepts. |
+| `route.parentRefs` | array | required | The Gateways to attach to. At least one, or the route binds to nothing and the apiserver accepts it anyway. |
+| `route.parentRefs[].name` | string | required | `metadata.name` of the Gateway. |
+| `route.parentRefs[].namespace` | string | unset | The Gateway's namespace. Unset is this `MiraCluster`'s own. |
+| `route.parentRefs[].sectionName` | string | unset | `spec.listeners[].name` to attach to. Unset attaches to every listener that will have it. |
 | `scaling` | object | — | When to add a replica, and when to take one away. |
 | `scaling.cooldownSeconds` | integer | `600` | Seconds after any scaling action before another may be considered. |
 | `scaling.downWhenFreeAbove` | number | `0.6` | Remove a replica when *every* replica's `free_fraction` is above this. |

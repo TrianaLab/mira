@@ -1141,6 +1141,13 @@ fn schema_fields(node: &Yaml, prefix: &str, out: &mut Vec<Field>, hit: &mut Vec<
         });
         if opaque.is_none() {
             schema_fields(p, &path, out, hit);
+            // An array of objects, whose element fields are the whole answer:
+            // `route.parentRefs` documented as "array" tells a reader nothing
+            // about the `name` they have to put in it. Opaque types never
+            // reach here, so this only ever descends into a struct this
+            // repository wrote, and a scalar array's `items` has no
+            // `properties` and returns immediately.
+            schema_fields(&p["items"], &format!("{path}[]"), out, hit);
         }
     }
 }

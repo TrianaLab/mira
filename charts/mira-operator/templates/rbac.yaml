@@ -7,12 +7,12 @@ toolchain is genuinely ahead, and the mitigation is that the list is short
 enough to read: every verb here is reachable from controller.rs, and nothing in
 controller.rs needs a verb that is not here.
 
-Scoped down twice over. No wildcard on any resource, and no delete on anything
-except the two objects a scale-in must remove: a PersistentVolumeClaim and the
-Job that drained it. In particular there is deliberately no delete on pods,
-statefulsets or deployments — the controller shrinks a tier by patching the
-scale subresource, and a bug that reached for delete should fail with a 403
-rather than succeed.
+Scoped down twice over. No wildcard on any resource, and delete only where
+removing the object is the feature: the PersistentVolumeClaim and Job a
+scale-in must remove, and the HTTPRoute that has to close when `spec.route`
+does. In particular there is deliberately no delete on pods, statefulsets or
+deployments — the controller shrinks a tier by patching the scale subresource,
+and a bug that reached for delete should fail with a 403 rather than succeed.
 */}}
 {{- define "mira-operator.rules" -}}
 # The custom resource itself. The status subresource needs its own rule;
@@ -47,6 +47,14 @@ rather than succeed.
 - apiGroups: ["batch"]
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete"]
+# The route in front of the tier, for a cluster that set `spec.route`. Granted
+# unconditionally and not behind a value: a rule naming a resource the cluster
+# does not have is inert, where a chart value would be a second switch to get
+# wrong beside the one on the MiraCluster itself. `delete` is here because
+# removing `spec.route` has to close the route rather than orphan it.
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["httproutes"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 {{- end }}
 {{/*
 One writer. The operator holds a Lease in the *release* namespace for as long

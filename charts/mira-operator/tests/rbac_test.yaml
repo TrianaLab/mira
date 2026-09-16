@@ -77,11 +77,12 @@ tests:
           content: patch
 
   # The blast-radius assertion. `delete` is the one irreversible verb here, and
-  # it must reach exactly two kinds: the claim a drained replica leaves behind
-  # and the Job that drained it. A `delete` that reached statefulsets, pods or
+  # it must reach exactly three kinds: the claim a drained replica leaves
+  # behind, the Job that drained it, and the HTTPRoute that has to close when
+  # `spec.route` is removed. A `delete` that reached statefulsets, pods or
   # deployments would let a controller bug remove a running tier rather than
   # scale it.
-  - it: can delete only claims and jobs
+  - it: can delete only claims, jobs and the route
     documentIndex: 2
     asserts:
       - notContains:
@@ -113,6 +114,12 @@ tests:
           value: jobs
       - contains:
           path: rules[7].verbs
+          content: delete
+      - equal:
+          path: rules[8].resources[0]
+          value: httproutes
+      - contains:
+          path: rules[8].verbs
           content: delete
 
   # The assertions above name the rules that matter; this one freezes the rest.

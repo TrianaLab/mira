@@ -156,7 +156,8 @@ helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
 ```
 
 That is a Deployment of exactly one, a ServiceAccount, a ClusterRole with no
-wildcards, and the `MiraCluster` CRD.
+wildcards, and the `MiraCluster` CRD. [See it on Kubernetes](demo-cluster.md)
+puts all of this on a laptop in one command.
 
 ### The tier
 
@@ -176,33 +177,38 @@ spec:
   offload: "file:///cold/${node}"
   coldStorageClaim: mira-cold   # must already exist; see below
   proxy: { replicas: 2, resources: { requests: { cpu: 500m, memory: 512Mi } } }
+  route:                        # optional; needs the Gateway API CRDs
+    parentRefs: [{ name: edge }]
+    hostnames: [mira.example.com]
 ```
 
 `offload` and `coldStorageClaim` are a pair: the operator refuses a spec with
 one and not the other, and a tier with neither still scales out, and never in.
 `file://` is the only scheme Mira's offload target parses, so the archive is a
-*mount* — a drain Job with no claim at `/cold` writes it into its own container,
-and the operator deletes the volume it believes it archived.
+*mount*.
 
 `kubectl apply` that and the operator builds a StatefulSet, a PVC per replica, a
-headless Service publishing not-ready addresses so a replica whose volume filled
-stays reachable by name, a `mira proxy` Deployment behind a ClusterIP, both
+headless Service publishing not-ready addresses so a full replica stays
+reachable by name, a `mira proxy` Deployment behind a ClusterIP, both
 ConfigMaps on every reconcile, and a PodDisruptionBudget of `maxUnavailable: 1`,
 because a replica's blocks are the only copy. What to put in `resources` is
 [Configuration's sizing table](config.md#sizing).
 
+`route` adds an `HTTPRoute`, where the Gateway API CRDs exist. All it
+takes is the Gateway to attach to, because the paths are derived: ingest and the
+merged read go to the proxy, everything else to the headless Service, where the
+UI and `/mcp` are answered. Removing the field removes the route.
+
 Every pod it builds satisfies the `restricted` Pod Security Standard unmodified:
 uid 65532, `fsGroup` set, no service-account token, `seccompProfile:
 RuntimeDefault`. A replica gets 60 seconds to seal on SIGTERM and a startup
-probe worth five minutes, because it replays its log before it answers anything
-and a liveness probe alone would kill it part-way through, for ever.
+probe worth five minutes, because it replays its log before it answers anything.
 
 !!! note "A chart that installed a StatefulSet used to exist"
 
-    Three things it could do have **no `MiraCluster` equivalent yet**: an
-    Ingress, a ServiceAccount per tier, and arbitrary `config.*` keys. Write the
-    Ingress yourself against the proxy Service; the tier's pods run as
-    `default`.
+    Two things it could do have **no `MiraCluster` equivalent yet**: a
+    ServiceAccount per tier, and arbitrary `config.*` keys. Its Ingress now has
+    one in `spec.route`, on the Gateway API.
 
 ### What the chart carries
 

@@ -371,6 +371,18 @@ demo-clean: ## Delete the demo's scratch data directory and its log
 	@echo "removed $(DEMO_DIR) — a data directory is the whole of Mira's state,"
 	@echo "so that is a complete uninstall of this demo."
 
+# The same demo with Kubernetes on the path. Not a gate and not in `make check`:
+# it builds two images and a cluster, it asserts nothing, and it deliberately
+# leaves everything running. `make operator-e2e` is the gate for the same
+# machinery.
+.PHONY: demo-cluster
+demo-cluster: ## Kind + the operator + Envoy Gateway on http://localhost:8080, with data
+	$(OPERATOR)/demo/run.sh
+
+.PHONY: demo-cluster-down
+demo-cluster-down: ## Delete the demo cluster
+	DOWN=1 $(OPERATOR)/demo/run.sh
+
 .PHONY: ui
 ui: ## Build the Svelte UI into the committed crates/mira/ui/dist
 	cd $(UI_DIR) && npm ci && npm test && npm run build

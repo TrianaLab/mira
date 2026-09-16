@@ -270,6 +270,8 @@ handed plausible rows. Wiring, the other seven tools and a worked investigation:
 
 ## Next
 
+- [See it on Kubernetes](demo-cluster.md) — the same run with the operator,
+  a proxy and an ingress on the path.
 - [Install](install.md) — one script, or a container, or `cargo install`.
 - [Quickstart](quickstart.md) — the manual path, and the query API.
 - [Architecture](architecture/index.md) — why it is shaped like this.

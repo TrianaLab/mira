@@ -42,11 +42,13 @@ use std::time::Duration;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Namespace, ResourceRequirements, Service};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams,
+};
 use kube::runtime::wait::{await_condition, conditions};
 use kube::{Api, Client, CustomResourceExt, ResourceExt};
 use mira_operator::controller::{Ctx, reconcile};
-use mira_operator::crd::{MiraCluster, MiraClusterSpec, Proxy, Scaling, Storage};
+use mira_operator::crd::{MiraCluster, MiraClusterSpec, ParentRef, Proxy, Route, Scaling, Storage};
 use serde_json::json;
 
 /// The cluster, or `None` when this suite is not meant to run.
@@ -167,6 +169,14 @@ fn spec() -> MiraClusterSpec {
                 ..Default::default()
             }),
         },
+        route: Some(Route {
+            parent_refs: vec![ParentRef {
+                name: "edge".into(),
+                namespace: Some("gateways".into()),
+                section_name: Some("http".into()),
+            }],
+            hostnames: vec!["mira.example.com".into()],
+        }),
     }
 }
 
@@ -311,7 +321,31 @@ async fn a_reconcile_against_a_real_api_server_builds_the_whole_tier() {
     );
     svcs.get("tel-proxy").await.expect("no proxy Service");
 
+    // The route, which is the one object here the operator writes untyped. A
+    // `DynamicObject` is whatever serde produced — there is no compile-time
+    // schema to disagree with — so this is the only place a misspelled field
+    // in the `HTTPRoute` body shows up as anything other than a route that
+    // silently routes nothing.
+    let routes: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &http_routes());
+    let route = routes.get("tel").await.expect("no HTTPRoute");
+    assert_eq!(
+        route.data["spec"]["parentRefs"][0]["name"], "edge",
+        "{:?}",
+        route.data["spec"]
+    );
+    assert_eq!(route.owner_references().len(), 1, "{route:?}");
+
     drop_namespace(&client, ns).await;
+}
+
+/// The Gateway API kind the operator writes, resolved the same way it resolves
+/// it: from the group-version-kind, because `k8s-openapi` has no type for a CRD.
+fn http_routes() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "gateway.networking.k8s.io",
+        "v1",
+        "HTTPRoute",
+    ))
 }
 
 /// Everything the operator is answerable for, and nothing anyone else writes.

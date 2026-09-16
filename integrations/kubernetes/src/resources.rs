@@ -19,11 +19,11 @@ use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
-use kube::api::ObjectMeta;
+use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use kube::{Resource, ResourceExt};
 use serde_json::json;
 
-use crate::crd::MiraCluster;
+use crate::crd::{MiraCluster, Route};
 
 /// Ports, named once. The engine hardcodes them in the chart too.
 pub const GRPC: i32 = 4317;
@@ -225,7 +225,12 @@ pub fn headless_service(c: &MiraCluster) -> Service {
             // the one whose name has to resolve so the read can fail honestly
             // as Unreachable rather than as NXDOMAIN.
             "publishNotReadyAddresses": true,
-            "selector": selector(c),
+            // `storage_selector` and not `selector`: the narrow one matches
+            // every pod the cluster owns, so the proxy landed in this Service's
+            // endpoints too. `tel-0.tel-headless` comes from the StatefulSet's
+            // `serviceName` and so kept resolving correctly, which is why it
+            // took an `HTTPRoute` aimed at the Service name to see it.
+            "selector": storage_selector(c),
             "ports": [
                 {"name": "otlp-grpc", "port": GRPC, "targetPort": GRPC, "protocol": "TCP"},
                 {"name": "otlp-http", "port": HTTP, "targetPort": HTTP, "protocol": "TCP"},
@@ -247,6 +252,72 @@ pub fn proxy_service(c: &MiraCluster) -> Service {
         },
     }))
     .expect("proxy service is well-formed")
+}
+
+/// The `HTTPRoute` in front of the tier, if the spec asked for one.
+///
+/// A [`DynamicObject`] and not a typed struct, because Gateway API is a CRD
+/// rather than core Kubernetes and k8s-openapi therefore does not carry it. The
+/// alternative is the `gateway-api` crate: a dependency, a second Kubernetes
+/// type tree to keep in step, and a second spelling of the four fields this
+/// function writes by hand anyway.
+///
+/// `v1` and not `v1beta1`: the kinds have shared a storage version since
+/// Gateway API 1.0, and `v1` is the one every cluster that has the CRDs at all
+/// will serve.
+///
+/// # What it routes where
+///
+/// Two backends, because the tier has two kinds of address and they answer
+/// different questions. `/v1/*` is OTLP ingest and `/api/v1/query` is the read
+/// a proxy merges across replicas, so both go to the proxy. The UI, `/mcp` and
+/// the reads built by walking one node's blocks are answered by a storage node
+/// and 501 by the proxy, so everything else goes to the headless Service.
+///
+/// Rules are matched most-specific-first by the Gateway API rather than in
+/// order, so the catch-all being last is documentation.
+///
+/// With `proxy.replicas: 0` there is no proxy to send anything to and the
+/// catch-all is the whole route. That tier ingests through the headless Service
+/// — round-robin across replicas, which is what `route` on each node already
+/// assumes.
+pub fn http_route(c: &MiraCluster, r: &Route) -> DynamicObject {
+    let merged = json!({
+        "matches": [
+            {"path": {"type": "PathPrefix", "value": "/v1/"}},
+            {"path": {"type": "Exact", "value": "/api/v1/query"}},
+        ],
+        "backendRefs": [{"name": proxy_name(c), "port": HTTP}],
+    });
+    let everything_else = json!({
+        "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+        "backendRefs": [{"name": headless_name(c), "port": HTTP}],
+    });
+    let rules: Vec<_> = (c.spec.proxy.replicas > 0)
+        .then_some(merged)
+        .into_iter()
+        .chain([everything_else])
+        .collect();
+
+    let mut spec = json!({
+        // Serialised straight from the CRD type: `ParentRef`'s three fields are
+        // already the Gateway API's spelling, and mapping them by hand here
+        // would be a second place for `sectionName` to be wrong.
+        "parentRefs": r.parent_refs,
+        "rules": rules,
+    });
+    if !r.hostnames.is_empty() {
+        spec["hostnames"] = json!(r.hostnames);
+    }
+
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "gateway.networking.k8s.io/v1".into(),
+            kind: "HTTPRoute".into(),
+        }),
+        metadata: meta(c, c.name_any(), "route"),
+        data: json!({ "spec": spec }),
+    }
 }
 
 /// What a node drain is allowed to take from the tier at once.
@@ -553,7 +624,7 @@ pub fn drain_job(c: &MiraCluster, ordinal: i32, offload: &str) -> Job {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{MiraClusterSpec, Proxy, Scaling, Storage};
+    use crate::crd::{MiraClusterSpec, ParentRef, Proxy, Scaling, Storage};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
@@ -573,11 +644,88 @@ mod tests {
                 offload: Some("file:///cold/${node}".into()),
                 cold_storage_claim: Some("mira-cold".into()),
                 proxy: Proxy::default(),
+                route: None,
             },
         );
         c.metadata.namespace = Some("obs".into());
         c.metadata.uid = Some("uid-1".into());
         c
+    }
+
+    fn route() -> Route {
+        Route {
+            parent_refs: vec![ParentRef {
+                name: "edge".into(),
+                namespace: Some("gateways".into()),
+                section_name: Some("http".into()),
+            }],
+            hostnames: vec!["mira.example.com".into()],
+        }
+    }
+
+    /// The route is the one object here with no k8s-openapi type behind it, so
+    /// nothing at all is checked at compile time: `sectionName` spelled
+    /// `section_name`, `backendRefs` spelled `backendRef`, a port as a string —
+    /// every one of those applies cleanly and routes nothing, because the
+    /// apiserver prunes what the Gateway API schema does not describe.
+    #[test]
+    fn the_route_is_the_gateway_api_spelling() {
+        let r = http_route(&cluster(), &route());
+        let t = r.types.expect("typeMeta");
+        assert_eq!(t.api_version, "gateway.networking.k8s.io/v1");
+        assert_eq!(t.kind, "HTTPRoute");
+        assert_eq!(r.metadata.name.as_deref(), Some("tel"));
+        assert_eq!(r.metadata.namespace.as_deref(), Some("obs"));
+
+        let spec = &r.data["spec"];
+        assert_eq!(spec["hostnames"][0], "mira.example.com");
+        assert_eq!(spec["parentRefs"][0]["name"], "edge");
+        assert_eq!(spec["parentRefs"][0]["namespace"], "gateways");
+        assert_eq!(spec["parentRefs"][0]["sectionName"], "http");
+    }
+
+    /// Ingest and the merged read go to the proxy; everything else goes to a
+    /// storage node.
+    ///
+    /// Not a preference. The proxy answers `/v1/*` and `/api/v1/query` and
+    /// named-501s the rest, and the UI, `/mcp` and the block-walking reads live
+    /// only on a node — so a route that sent the catch-all to the proxy would
+    /// serve a browser nothing but 501s.
+    #[test]
+    fn the_route_sends_ingest_to_the_proxy_and_the_rest_to_a_node() {
+        let rules = http_route(&cluster(), &route()).data["spec"]["rules"].clone();
+        assert_eq!(rules[0]["backendRefs"][0]["name"], "tel-proxy");
+        assert_eq!(rules[0]["backendRefs"][0]["port"], HTTP);
+        assert_eq!(rules[0]["matches"][0]["path"]["value"], "/v1/");
+        assert_eq!(rules[0]["matches"][1]["path"]["type"], "Exact");
+        assert_eq!(rules[0]["matches"][1]["path"]["value"], "/api/v1/query");
+
+        assert_eq!(rules[1]["matches"][0]["path"]["value"], "/");
+        assert_eq!(rules[1]["backendRefs"][0]["name"], "tel-headless");
+    }
+
+    /// `proxy.replicas: 0` is a supported tier, and a route that still named
+    /// the proxy would send every ingest to a Service with no endpoints.
+    #[test]
+    fn a_tier_with_no_proxy_routes_everything_to_the_nodes() {
+        let mut c = cluster();
+        c.spec.proxy.replicas = 0;
+        let rules = http_route(&c, &route()).data["spec"]["rules"].clone();
+        assert_eq!(rules.as_array().expect("rules").len(), 1);
+        assert_eq!(rules[0]["backendRefs"][0]["name"], "tel-headless");
+    }
+
+    /// No `hostnames` key rather than an empty list: an `HTTPRoute` with
+    /// `hostnames: []` matches no hostname at all, where an absent one matches
+    /// every hostname the listener accepts.
+    #[test]
+    fn no_hostnames_is_absent_rather_than_empty() {
+        let c = cluster();
+        let r = Route {
+            hostnames: vec![],
+            ..route()
+        };
+        assert!(http_route(&c, &r).data["spec"]["hostnames"].is_null());
     }
 
     /// The fields whose loss would be *silent*. `json!` into a type that
@@ -631,12 +779,46 @@ mod tests {
             proxy_config_map(&c, 1).metadata.owner_references,
             drain_job(&c, 2, "file:///cold").metadata.owner_references,
             pod_disruption_budget(&c).metadata.owner_references,
+            http_route(&c, &route()).metadata.owner_references,
         ];
         for o in owners {
             let o = o.expect("ownerReferences");
             assert_eq!(o[0].uid, "uid-1");
             assert_eq!(o[0].controller, Some(true));
         }
+    }
+
+    /// The headless Service is the storage tier's address and must not answer
+    /// for the proxy as well.
+    ///
+    /// It used to, because it selected on [`selector`] — the immutable subset,
+    /// which every pod under the cluster carries. The per-pod names the
+    /// operator and the proxy use (`tel-0.tel-headless`) come from the
+    /// StatefulSet's `serviceName`, so they kept working and nothing noticed;
+    /// what broke was resolving the *Service* name, where a client got the
+    /// proxy every other connection. Both answer `/api/v1/query`, so the
+    /// symptom was a read that silently alternated between merged and
+    /// node-local results — found by pointing an `HTTPRoute` at it.
+    #[test]
+    fn the_headless_service_addresses_storage_and_not_the_proxy() {
+        let c = cluster();
+        let sel = headless_service(&c)
+            .spec
+            .expect("spec")
+            .selector
+            .expect("selector");
+
+        assert_eq!(sel, storage_selector(&c));
+        assert_ne!(
+            sel.get("app.kubernetes.io/component"),
+            proxy_deployment(&c, 1)
+                .spec
+                .expect("spec")
+                .selector
+                .match_labels
+                .expect("matchLabels")
+                .get("app.kubernetes.io/component"),
+        );
     }
 
     /// The selector must not carry anything that changes on an upgrade. A

@@ -9,6 +9,20 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **`spec.route` on a `MiraCluster`** writes an `HTTPRoute` in front of the tier,
+  attached to Gateways you already run. It names the parents and, optionally, the
+  hostnames; the paths are derived — OTLP ingest and the merged read go to the
+  proxy, everything else to a storage node, which is the only place the UI and
+  `/mcp` are answered. Removing the field removes the route, and leaving it unset
+  creates nothing, so a cluster without the Gateway API CRDs is unaffected.
+- **`make demo-cluster`** — Kind, Envoy Gateway, the operator and a `MiraCluster`
+  on `http://localhost:8080`, with an hour of seeded telemetry and a generator
+  still producing. The UI, the query API and the MCP endpoint are all on that one
+  address, behind the `HTTPRoute` the operator writes from `spec.route`.
+  `make demo-cluster-down` deletes the cluster.
+
 ### Changed
 
 - **The terminal UI is drawn by ratatui.** Every pane — list, detail, waterfall,
@@ -32,6 +46,11 @@ the config keys, the `/mcp` tool set.
   the server log. The floor is now a ratio *and* a byte count, both of which
   have to agree before anything is unlinked. Small volumes behave exactly as
   before — the ratio is still the binding term there.
+- **The operator's headless Service selected every pod under a `MiraCluster`**
+  rather than the storage ones, so the proxy was in its endpoints. A client
+  resolving the Service name — an `HTTPRoute` backend, say — reached the proxy on
+  some connections and a storage node on others, and both answer
+  `/api/v1/query`. The per-pod names (`tel-0.tel-headless`) were never affected.
 
 ## [0.2.0] - 2026-09-16
 

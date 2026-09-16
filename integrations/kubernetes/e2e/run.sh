@@ -32,6 +32,8 @@ NS=${NS:-mira-e2e}
 KEEP=${KEEP:-}
 ENGINE_IMAGE=mira:e2e
 OPERATOR_IMAGE=mira-operator:e2e
+# What Envoy Gateway v1.9.1 bundles, which is what `demo/run.sh` installs.
+GWAPI_VERSION=${GWAPI_VERSION:-v1.6.1}
 HTTP=4318
 # Not 4318 locally: `make demo` binds that, and a port-forward that cannot bind
 # is a failure fifteen minutes into a run that had nothing wrong with it.
@@ -152,6 +154,18 @@ kind get clusters 2>/dev/null | grep -qx "$CLUSTER" \
 # Writes the context into this run's own kubeconfig. Needed even right after a
 # create, because `--name` on an existing cluster skips the create entirely.
 kind export kubeconfig --name "$CLUSTER" >/dev/null
+
+# The Gateway API CRDs, and only the CRDs: `spec.route` writes an `HTTPRoute`,
+# which the API server rejects with a 404 on the resource path if the kind is
+# not registered. No controller is installed with them — nothing here asks for
+# the route to be *programmed*, only for the API server to accept and store it.
+# Same bundle version Envoy Gateway ships in `demo/run.sh`, so the two clusters
+# validate against the same schema.
+kubectl apply --server-side -f \
+	"https://github.com/kubernetes-sigs/gateway-api/releases/download/${GWAPI_VERSION}/standard-install.yaml" \
+	>/dev/null
+kubectl wait --for=condition=established --timeout=60s \
+	crd/httproutes.gateway.networking.k8s.io >/dev/null
 
 # ---------------------------------------------------------------------------
 say "reconcile against the API server"

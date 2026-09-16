@@ -1,0 +1,18 @@
+# The Gateway the demo's tier attaches to. Applied into the demo's namespace;
+# `gatewayclass.yaml` is the cluster-wide half, and the `GatewayClass` named
+# below comes from there.
+#
+# There is no `HTTPRoute` here. The operator writes it, from `spec.route` on the
+# `MiraCluster` — which is the thing worth seeing, because it is what a real
+# cluster does rather than what a demo hand-writes.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: mira
+spec:
+  gatewayClassName: mira
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80

@@ -219,6 +219,57 @@ spec:
                     description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
+              route:
+                description: |-
+                  An `HTTPRoute` in front of the tier, attached to Gateways you already
+                  run.
+
+                  Unset creates nothing, which is the right default: the Gateway API CRDs
+                  are not part of Kubernetes, and an operator that reached for a kind the
+                  cluster has never heard of would fail every reconcile on a tier that is
+                  otherwise healthy.
+                nullable: true
+                properties:
+                  hostnames:
+                    description: |-
+                      Hostnames the route answers on. Unset answers on every hostname its
+                      listener accepts.
+                    items:
+                      type: string
+                    type: array
+                  parentRefs:
+                    description: |-
+                      The Gateways to attach to. At least one, or the route binds to nothing
+                      and the apiserver accepts it anyway.
+                    items:
+                      description: One Gateway, and optionally one listener on it.
+                      properties:
+                        name:
+                          description: '`metadata.name` of the Gateway.'
+                          type: string
+                        namespace:
+                          description: |-
+                            The Gateway's namespace. Unset is this `MiraCluster`'s own.
+
+                            A Gateway in another namespace also needs a `ReferenceGrant` there, or
+                            its controller refuses the attachment — the route is created either way
+                            and says so in `status.parents`.
+                          nullable: true
+                          type: string
+                        sectionName:
+                          description: |-
+                            `spec.listeners[].name` to attach to. Unset attaches to every listener
+                            that will have it.
+                          nullable: true
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    minItems: 1
+                    type: array
+                required:
+                - parentRefs
+                type: object
               scaling:
                 default:
                   cooldownSeconds: 600

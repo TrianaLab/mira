@@ -62,6 +62,7 @@ step for a field to fall out of.
 | | |
 | --- | --- |
 | [See it work](demo.md) | one command, then the screens and the numbers |
+| [See it on Kubernetes](demo-cluster.md) | the same run, with the operator and an ingress on the path |
 | [Install](install.md) | one script, a container, or `cargo install` |
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
 | [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
