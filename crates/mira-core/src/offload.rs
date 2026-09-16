@@ -220,10 +220,10 @@ fn copy_block(
     // an immutable sealed block and the destination name is derived from it, so
     // a directory left by a killed copy of *this* block can only hold a prefix
     // of the bytes about to be written again.
-    if let Err(e) = fs::remove_dir_all(&tmp) {
-        if e.kind() != io::ErrorKind::NotFound {
-            return Err(e).ctx(tmp);
-        }
+    if let Err(e) = fs::remove_dir_all(&tmp)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e).ctx(tmp);
     }
     fs::create_dir(&tmp).ctx(&tmp)?;
 

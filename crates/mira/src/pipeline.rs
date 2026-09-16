@@ -936,9 +936,7 @@ async fn wal_maintenance(cfg: Arc<Config>) {
     loop {
         tick.tick().await;
         ticks += 1;
-        // `u64::is_multiple_of` reads better but is stable since 1.87, and the
-        // workspace MSRV is 1.85.
-        wal_sweep(wal.clone(), cfg.data_dir.clone(), ticks % 240 == 0).await;
+        wal_sweep(wal.clone(), cfg.data_dir.clone(), ticks.is_multiple_of(240)).await;
     }
 }
 

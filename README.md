@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/miradb?label=crates.io&color=2D4857)](https://crates.io/crates/miradb)
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/mira)](https://artifacthub.io/packages/search?repo=mira)
 [![Coverage](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fmiradb.dev%2Fcoverage.json&query=%24.line&suffix=%25&label=coverage&color=brightgreen)](docs/internals/testing.md)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://github.com/TrianaLab/mira/blob/main/Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://github.com/TrianaLab/mira/blob/main/Cargo.toml)
 [![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
 **Logs, traces and metrics in. A web UI, a terminal UI and an MCP server out.
@@ -31,7 +31,7 @@ is the only state there is.
 | **4.7 ms** | every span of one trace, out of 27.1M spans on disk |
 | **7 µs** | the durable log append inside an acknowledgement |
 | **0.14** | bytes on disk per byte on the wire, once compacted |
-| **6.06 MiB stripped, 122 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
+| **6.18 MiB stripped, 148 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 Apple M3 Pro, one process, reproducible with the load harness in this repository.
 What each number measures — the numerator, the denominator, and what is outside

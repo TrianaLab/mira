@@ -9,6 +9,20 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **The terminal UI is drawn by ratatui.** Every pane — list, detail, waterfall,
+  service map, alerts, node and help — renders through a widget and a layout
+  solver instead of the hand-rolled row writer, which clipped columns at `max`
+  and so lost content while its unit tests stayed green. No backend is linked:
+  `CrosstermBackend` would add crossterm, mio, signal-hook and parking_lot to do
+  what `term.rs` already does, so `term.rs` keeps the pty, the raw mode, the
+  resize handling and the key decoding, and its `Row` builder is deleted rather
+  than wrapped. The binary grows 145 KiB, 6.06 MiB to 6.18 MiB, and the
+  dependency tree 26 crates, 122 to 148.
+- **The minimum supported Rust version is 1.88**, up from 1.85, which
+  ratatui 0.30 requires.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added

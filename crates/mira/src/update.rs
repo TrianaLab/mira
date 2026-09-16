@@ -135,10 +135,10 @@ pub fn run(m: &clap::ArgMatches) -> Result<(), String> {
 fn installer(line: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("bash");
     cmd.arg("-c").arg(line);
-    if std::env::var_os("MIRA_INSTALL_DIR").is_none() {
-        if let Some(dir) = install_dir(std::env::current_exe().ok().as_deref()) {
-            cmd.env("MIRA_INSTALL_DIR", dir);
-        }
+    if std::env::var_os("MIRA_INSTALL_DIR").is_none()
+        && let Some(dir) = install_dir(std::env::current_exe().ok().as_deref())
+    {
+        cmd.env("MIRA_INSTALL_DIR", dir);
     }
     cmd
 }

@@ -1,5 +1,5 @@
 ---
-description: Build Mira from source with cargo, or run the container. Rust 1.85 and a cc — no protoc, no node toolchain.
+description: Build Mira from source with cargo, or run the container. Rust 1.88 and a cc — no protoc, no node toolchain.
 ---
 
 # Install
@@ -59,7 +59,7 @@ encoder, block writer and mmap reader,
 
 ## From source
 
-The prerequisites are **Rust 1.85 or newer** and a `cc`, which
+The prerequisites are **Rust 1.88 or newer** and a `cc`, which
 `zstd-sys` needs to compile the C source it vendors. Nothing else: no `protoc`,
 because the OTLP protos are compiled by `protox` in a build script, and no node
 toolchain, because the browser UI is built and committed under

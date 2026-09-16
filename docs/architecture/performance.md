@@ -86,7 +86,7 @@ row. Treat the pruning rows as warm and the last row as partly not.
 | Query: metric names | — | **8.9 ms** first, **4.7 ms** steady, 24 of 24 blocks | — |
 | Query: substring, no time bound, prunes nothing | — | **1,441 ms** first, **885 ms** steady, 137 of 137 blocks, 27.1 M rows — first sitting, and the row the second sitting has the most to say about | [see below](performance-query.md#the-unpruned-row-is-bound-by-what-the-first-column-is-bound-by) |
 | Cost per GB ingested | ≤ 0.35 B/B | **1.20 B/B** hot, **0.14 B/B** compacted | ✓ |
-| Binary size | ≤ 20 MB stripped with UI + query + MCP | **6.06 MiB** / 122 crates | ✓ |
+| Binary size | ≤ 20 MB stripped with UI + query + MCP | **6.18 MiB** / 148 crates | ✓ |
 
 ## The ingest row is per core, and that is the denominator to argue with
 

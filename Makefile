@@ -105,11 +105,11 @@ LOADGEN := target/release/examples/loadgen
 # the drift's direction from here.
 COVERAGE_MIN ?= 99.23
 
-# MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
-# count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor
-# old enough that nobody is forced onto a newer toolchain to use Mira). A
-# declared MSRV that is never compiled against is a wish, so `make msrv` builds
-# with exactly it.
+# MSRV. Declared in Cargo.toml as rust-version and a published property: it is
+# the toolchain a user needs to compile Mira at all, so it moves only when a
+# dependency forces it (ratatui 0.30 is what put it at 1.88). A declared MSRV
+# that is never compiled against is a wish, so `make msrv` builds with exactly
+# it.
 MSRV := $(shell sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 
 export CARGO_TERM_COLOR ?= always

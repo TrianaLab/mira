@@ -1,13 +1,12 @@
 //! A terminal, hand-rolled on `libc`.
 //!
-//! ratatui is the obvious answer, and adding it to this workspace resolves 35
-//! crates that are not already here — a 29% increase on a tree whose size (122
-//! crates, 6.06 MiB) is a stated property of the product.
-//! What it buys over this file is a constraint-solving layout engine and a
-//! damage-tracked cell buffer; the TUI here has fixed panes and redraws one
-//! screenful per keystroke. So: `termios` for raw mode, `TIOCGWINSZ` for the
-//! size, `poll(2)` for input, three `sigaction`s to survive a resize and a
-//! `kill`, ANSI for the rest. `libc` is already in the tree for `statfs`.
+//! The syscall half only. ratatui draws every row (see `tui::rata`),
+//! but none of its backends are linked: `CrosstermBackend` would add crossterm,
+//! mio, signal-hook and parking_lot to do what is already here, on a tree whose
+//! size (148 crates, 6.18 MiB) is a stated property of the product. So
+//! `termios` for raw mode, `TIOCGWINSZ` for the size, `poll(2)` for input,
+//! three `sigaction`s to survive a resize and a `kill`, and `Term::draw` to put
+//! the rows on the screen. `libc` is already in the tree for `statfs`.
 //!
 //! Unix only, which is the same bet `mmap`, `SIGTERM` and the filesystem guard
 //! already make.
@@ -401,168 +400,9 @@ pub const BLUE: &str = "\x1b[34m";
 pub const MAGENTA: &str = "\x1b[35m";
 pub const CYAN: &str = "\x1b[36m";
 
-/// One line of the frame, built left to right with its visible width tracked
-/// separately from its bytes.
-///
-/// Styling is inline ANSI, so `buf.len()` says nothing about how wide the line
-/// renders; every truncation and every pad has to go through `width`. That is
-/// the entire reason this type exists rather than a `String`.
-pub struct Row {
-    buf: String,
-    width: usize,
-    max: usize,
-}
-
-impl Row {
-    pub fn new(max: usize) -> Row {
-        Row {
-            buf: String::with_capacity(max + 32),
-            width: 0,
-            max,
-        }
-    }
-
-    pub fn left(&self) -> usize {
-        self.max.saturating_sub(self.width)
-    }
-
-    /// Move the right edge, so a right-aligned field can reserve its space
-    /// before the left-hand side is written and be clipped away by it.
-    pub fn cap(&mut self, max: usize) -> &mut Row {
-        self.max = max;
-        self
-    }
-
-    /// Append text, truncated to what is left of the line.
-    ///
-    /// ponytail: one column per `char`. A CJK log body renders one cell wide per
-    /// character here and will run past the right edge; the fix is a
-    /// `unicode-width` table, which is a crate, and the payload this reads is
-    /// attribute keys and metric names. Revisit if a user shows up with a
-    /// wide-character body.
-    pub fn put(&mut self, style: &str, s: &str) -> &mut Row {
-        let left = self.left();
-        if left == 0 {
-            return self;
-        }
-        if !style.is_empty() {
-            self.buf.push_str(style);
-        }
-        let mut n = 0;
-        for c in s.chars() {
-            if n == left {
-                break;
-            }
-            // A raw control byte in a log body would move the cursor.
-            self.buf.push(if (c as u32) < 0x20 { '·' } else { c });
-            n += 1;
-        }
-        if !style.is_empty() {
-            self.buf.push_str(RESET);
-        }
-        self.width += n;
-        self
-    }
-
-    pub fn plain(&mut self, s: &str) -> &mut Row {
-        self.put("", s)
-    }
-
-    /// Append an already-rendered line of known visible `width`, byte for byte.
-    ///
-    /// [`put`](Row::put) would rewrite its ESC bytes to `·` and count each one
-    /// as a column, which is right for a log body and wrong for a line that came
-    /// out of another `Row`. Nothing here can recover the width from the bytes,
-    /// so the caller states it — pass a line finished with [`done`](Row::done),
-    /// which pads to exactly the width it was built for.
-    pub fn raw(&mut self, s: &str, width: usize) -> &mut Row {
-        self.buf.push_str(s);
-        self.width += width;
-        self
-    }
-
-    /// Pad with spaces until the cursor sits at `col`. Never truncates: a
-    /// column that overflowed its slot pushes the next one right rather than
-    /// losing it.
-    pub fn pad_to(&mut self, col: usize) -> &mut Row {
-        while self.width < col.min(self.max) {
-            self.buf.push(' ');
-            self.width += 1;
-        }
-        self
-    }
-
-    /// Repeat `c` `n` times, clipped to the line.
-    pub fn repeat(&mut self, style: &str, c: char, n: usize) -> &mut Row {
-        let n = n.min(self.left());
-        if n == 0 {
-            return self;
-        }
-        if !style.is_empty() {
-            self.buf.push_str(style);
-        }
-        for _ in 0..n {
-            self.buf.push(c);
-        }
-        if !style.is_empty() {
-            self.buf.push_str(RESET);
-        }
-        self.width += n;
-        self
-    }
-
-    /// Finish the line, padded to full width so a selected row's reverse-video
-    /// background reaches the right edge.
-    pub fn fill(mut self, style: &str) -> String {
-        if !style.is_empty() {
-            // Re-open the style over the padding only; the text has already
-            // closed its own.
-            self.buf.push_str(style);
-        }
-        while self.width < self.max {
-            self.buf.push(' ');
-            self.width += 1;
-        }
-        self.buf.push_str(RESET);
-        self.buf
-    }
-
-    pub fn done(self) -> String {
-        self.fill("")
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// Width accounting has to ignore the escape sequences, or every styled
-    /// line silently truncates early.
-    #[test]
-    fn styling_does_not_count_against_the_width() {
-        let mut r = Row::new(10);
-        r.put(RED, "abc").plain("de");
-        assert_eq!(r.left(), 5);
-        let s = r.done();
-        assert!(s.contains(RED));
-        // 10 visible columns, whatever the byte length.
-        let visible: String = strip(&s);
-        assert_eq!(visible, "abcde     ");
-    }
-
-    #[test]
-    fn text_is_clipped_at_the_edge_and_control_bytes_are_defanged() {
-        let mut r = Row::new(6);
-        r.plain("a\nb").plain("xxxxxxxx");
-        assert_eq!(strip(&r.done()), "a·bxxx");
-    }
-
-    #[test]
-    fn pad_to_never_moves_backwards() {
-        let mut r = Row::new(12);
-        r.plain("overlong").pad_to(4).plain("|");
-        assert_eq!(strip(&r.done()), "overlong|   ");
-    }
 
     /// The sequences the app actually binds, including the ones that arrive
     /// split across two reads.
@@ -664,47 +504,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The three things `Row` does that `put` does not: reserve space from the
-    /// right, re-emit an already-rendered line without re-counting its escapes,
-    /// and pad under a style so a selected row's background reaches the edge.
-    #[test]
-    fn a_row_composes_out_of_other_rows_without_recounting_their_escapes() {
-        // A right-aligned field reserves its space by moving the right edge in,
-        // writing the left side, then letting it back out.
-        let mut r = Row::new(20);
-        r.plain("left").cap(20).pad_to(12).plain("right");
-        assert_eq!(strip(&r.done()), "left        right   ");
-
-        // `raw` takes the caller's word for the width. `put` would have counted
-        // the 4 escape bytes of RED as 4 columns and rewritten them to `·`.
-        let inner = {
-            let mut i = Row::new(5);
-            i.put(RED, "ab");
-            i.done()
-        };
-        let mut outer = Row::new(10);
-        outer.raw(&inner, 5).plain("xy");
-        let s = outer.done();
-        assert!(s.contains(RED), "the inner styling survived byte for byte");
-        assert_eq!(strip(&s), "ab   xy   ");
-
-        // `repeat` clips like `put` does, and a zero-width repeat writes nothing
-        // at all — not an empty style pair, which would still be bytes.
-        let mut r = Row::new(4);
-        r.repeat(DIM, '-', 99);
-        assert_eq!(strip(&r.done()), "----");
-        let mut r = Row::new(0);
-        r.repeat(DIM, '-', 3).put(RED, "x");
-        assert_eq!(r.done(), RESET, "nothing fits, so nothing is written");
-
-        // `fill` re-opens the style over the padding: the highlight on a selected
-        // row has to reach the right edge, not stop where the text does.
-        let mut r = Row::new(6);
-        r.plain("ab");
-        let s = r.fill(REV);
-        assert!(s.ends_with(&format!("{REV}    {RESET}")), "{s:?}");
-    }
-
     /// The branch that fires in anger: `mira mira` in a pipeline, in CI, or
     /// under a process supervisor. The rest of the syscall half runs on a real
     /// pty in [`the_terminal_half_runs_against_a_real_pty`].
@@ -790,23 +589,6 @@ pub(crate) mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &orig) }, 0);
         assert_eq!(got.unwrap_err().raw_os_error(), Some(libc::EINVAL));
-    }
-
-    fn strip(s: &str) -> String {
-        let mut out = String::new();
-        let mut it = s.chars();
-        while let Some(c) = it.next() {
-            if c == '\x1b' {
-                for c in it.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 
     /// The name of the test below, as `--exact` wants it.

@@ -873,7 +873,7 @@ fn humanize(expr: &str) -> String {
             })
             .sum();
         for (unit, n) in [("d", 86400), ("h", 3600), ("m", 60)] {
-            if secs % n == 0 {
+            if secs.is_multiple_of(n) {
                 return format!("{}{unit}", secs / n);
             }
         }

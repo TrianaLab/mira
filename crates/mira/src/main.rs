@@ -39,7 +39,7 @@ use config::Config;
 /// `--help`, `mira completion` and the parser now all read, so a flag is
 /// accepted, documented and completed in the same edit.
 ///
-/// Five crates against a tree of 122: `clap`, `clap_builder`, `clap_lex`,
+/// Five crates against a tree of 148: `clap`, `clap_builder`, `clap_lex`,
 /// `anstyle` and `clap_complete`. `derive` is off because it costs `syn` and
 /// its tree to generate a struct this file would rather write out, and `color`
 /// is off because everything else this binary prints already decides its own

@@ -13,13 +13,16 @@
 //! *before* the query runs, so the freeze always has a "running" on it rather
 //! than a stale screen.
 
+mod rata;
 mod source;
 
 use std::time::Instant;
 
+use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::text::Span;
 use yaml_rust2::Yaml;
 
-use crate::term::{self, Key, Row, Term};
+use crate::term::{self, Key, Term};
 use mira_core::json::Json;
 
 pub use source::{Source, parse_addr};
@@ -941,9 +944,7 @@ impl App {
         // cursor addressing, so every over-wide row wraps and the top of the
         // frame scrolls off for good, with nothing on screen saying why.
         if w < 40 || h < 8 {
-            let mut r = Row::new(w);
-            r.put(term::RED, "terminal too small — need 40x8");
-            return vec![r.done()];
+            return vec![rata::row(w, vec!["terminal too small — need 40x8".red()])];
         }
         let mut out = Vec::with_capacity(h);
         out.push(self.tabbar(w));
@@ -980,8 +981,7 @@ impl App {
     }
 
     fn tabbar(&self, w: usize) -> String {
-        let mut r = Row::new(w);
-        r.put(term::BOLD, " mira ");
+        let mut left = vec![" mira ".bold()];
         for (i, (n, t)) in [
             ("1 logs", Tab::Logs),
             ("2 traces", Tab::Traces),
@@ -990,16 +990,13 @@ impl App {
         .iter()
         .enumerate()
         {
-            r.plain(if i == 0 { " " } else { "  " });
-            match *t == self.tab {
-                true => r.put(term::REV, &format!(" {n} ")),
-                false => r.put(term::DIM, &format!(" {n} ")),
-            };
+            left.push(Span::raw(if i == 0 { " " } else { "  " }));
+            left.push(match *t == self.tab {
+                true => format!(" {n} ").reversed(),
+                false => format!(" {n} ").dim(),
+            });
         }
-        let label = self.src.label();
-        r.pad_to(w.saturating_sub(label.len() + 1));
-        r.put(term::DIM, &label).plain(" ");
-        r.done()
+        rata::bar(w, left, vec![self.src.label().dim(), Span::raw(" ")])
     }
 
     fn filterbar(&self, w: usize) -> String {
@@ -1012,54 +1009,42 @@ impl App {
             WINDOWS[self.win],
             self.limit
         );
-        let keep = w.saturating_sub(right.len() + 2);
-        let mut r = Row::new(keep);
         let editing = self.mode == Mode::Filter;
-        r.put(
-            if editing { term::BOLD } else { term::DIM },
-            if editing { " filter> " } else { " filter  " },
-        );
+        let mut left = vec![match editing {
+            true => " filter> ".bold(),
+            false => " filter  ".dim(),
+        }];
         match (self.filter.is_empty(), editing) {
             (true, false) => {
-                r.put(
-                    term::DIM,
-                    "(none) — press / to add one, e.g. service.name=checkout",
-                );
+                left.push("(none) — press / to add one, e.g. service.name=checkout".dim());
             }
             _ => {
-                r.plain(&self.filter);
+                left.push(Span::raw(self.filter.clone()));
                 if editing {
                     // A block where the cursor would be. The real cursor is
                     // hidden for the whole session, so drawing one is cheaper
                     // than showing and positioning it every frame.
-                    r.put(term::REV, " ");
+                    left.push(" ".reversed());
                 }
             }
         }
-        r.cap(w).pad_to(w.saturating_sub(right.len() + 1));
-        r.put(term::DIM, &right).plain(" ");
-        r.done()
+        rata::bar(w, left, vec![right.dim(), Span::raw(" ")])
     }
 
     fn statusbar(&self, w: usize) -> String {
-        let mut r = Row::new(w);
-        r.plain(" ");
+        let mut spans = vec![Span::raw(" ")];
         match self.status.is_empty() {
-            false => {
-                r.put(
-                    if self.err { term::RED } else { term::YELLOW },
-                    &self.status,
-                );
-            }
-            true => {
-                r.put(term::DIM, &self.stats);
-            }
+            false => spans.push(match self.err {
+                true => self.status.clone().red(),
+                false => self.status.clone().yellow(),
+            }),
+            true => spans.push(self.stats.clone().dim()),
         }
         if !self.status.is_empty() && !self.stats.is_empty() {
-            r.plain("  ");
-            r.put(term::DIM, &self.stats);
+            spans.push(Span::raw("  "));
+            spans.push(self.stats.clone().dim());
         }
-        r.done()
+        rata::row(w, spans)
     }
 
     fn hints(&self, w: usize) -> String {
@@ -1080,9 +1065,7 @@ impl App {
                 "↑↓ move  enter detail  t trace  c frame  m map  a alerts  d node  f follow  / filter  ? help"
             }
         };
-        let mut r = Row::new(w);
-        r.put(term::DIM, &format!(" {keys}"));
-        r.done()
+        rata::row(w, vec![format!(" {keys}").dim()])
     }
 
     /// Logs and traces: a list on top, the selection's detail below.
@@ -1102,17 +1085,20 @@ impl App {
             _ => 1,
         };
 
-        let mut out: Vec<String> = self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(top)
-            .take(list_h)
-            .map(|(i, row)| match self.tab {
-                Tab::Traces => span_row(row, w, i == self.sel, scale),
-                _ => log_row(row, w, i == self.sel),
-            })
-            .collect();
+        // Traces are rows, not a `Table`: the duration bar is sized from what
+        // is left of the line after the fixed columns, which a table's own
+        // width solver is not told about.
+        let mut out: Vec<String> = match self.tab {
+            Tab::Traces => self
+                .rows
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(list_h)
+                .map(|(i, row)| span_row(row, w, i == self.sel, scale))
+                .collect(),
+            _ => rata::log_list(&self.rows, w, list_h, self.sel, top),
+        };
         while out.len() < list_h {
             out.push(String::new());
         }
@@ -1129,22 +1115,18 @@ impl App {
             ),
             None => " nothing selected ".into(),
         };
-        out.push(rule(w, &title));
+        out.push(rata::rule(w, &title));
         let left = h - out.len();
         if let Some(row) = self.selected() {
-            out.extend(detail(row, w).into_iter().take(left));
+            out.extend(rata::detail(row, w).into_iter().take(left));
         }
         out
     }
 
     fn detail_full(&self, w: usize) -> Vec<String> {
         match self.selected() {
-            Some(row) => detail(row, w),
-            None => {
-                let mut r = Row::new(w);
-                r.put(term::DIM, "  nothing selected");
-                vec![r.done()]
-            }
+            Some(row) => rata::detail(row, w),
+            None => vec![rata::row(w, vec!["  nothing selected".dim()])],
         }
     }
 
@@ -1159,26 +1141,34 @@ impl App {
         let rtop = window_start(self.ssel * 3, h, right.len());
 
         for i in 0..h {
-            let mut r = Row::new(w);
-            if let Some(n) = self.names.get(top + i) {
-                let sel = top + i == self.nsel;
-                let style = match (sel, self.on_series) {
-                    (true, false) => term::REV,
-                    (true, true) => term::BOLD,
-                    _ => "",
-                };
-                let name = clip(n["name"].as_str().unwrap_or("?"), nw.saturating_sub(9));
-                r.put(style, &format!(" {name}"));
-                r.pad_to(nw.saturating_sub(8));
-                r.put(term::DIM, &clip(n["kind"].as_str().unwrap_or(""), 8));
-            }
-            r.pad_to(nw);
-            r.put(term::DIM, " │ ");
-            if let Some(line) = right.get(rtop + i) {
-                // Already styled and already padded to `chart_w` by `done`.
-                r.raw(line, chart_w);
-            }
-            out.push(r.done());
+            let cells = match self.names.get(top + i) {
+                Some(n) => {
+                    let style = match (top + i == self.nsel, self.on_series) {
+                        (true, false) => Style::default().add_modifier(Modifier::REVERSED),
+                        (true, true) => Style::default().add_modifier(Modifier::BOLD),
+                        _ => Style::default(),
+                    };
+                    let name = clip(n["name"].as_str().unwrap_or("?"), nw.saturating_sub(9));
+                    vec![
+                        (
+                            nw.saturating_sub(8) as u16,
+                            vec![Span::styled(format!(" {name}"), style)],
+                        ),
+                        (8, vec![clip(n["kind"].as_str().unwrap_or(""), 8).dim()]),
+                    ]
+                }
+                None => vec![(nw as u16, Vec::new())],
+            };
+            // The chart half arrives already styled and already `chart_w` wide,
+            // so it is concatenated rather than re-rendered: pushing ANSI back
+            // through a `Buffer` would mean parsing the escapes out again.
+            out.push(format!(
+                "{}{} │ {}{}",
+                rata::columns(nw, Style::default(), cells),
+                term::DIM,
+                term::RESET,
+                right.get(rtop + i).map_or("", String::as_str)
+            ));
         }
         out
     }
@@ -1189,13 +1179,15 @@ impl App {
     /// the vertical scroll is over series and each one is a fixed three rows.
     fn series_lines(&self, w: usize) -> Vec<String> {
         if self.series.is_empty() {
-            // Through a `Row` even when it is one word, so the caller's promise
-            // that every line here is exactly `w` wide holds for this one too.
-            let mut r = Row::new(w);
-            if !self.names.is_empty() {
-                r.put(term::DIM, " enter to load this metric");
-            }
-            return vec![r.done()];
+            // Rendered even when it is one word, so the caller's promise that
+            // every line here is exactly `w` wide holds for this one too.
+            return vec![rata::row(
+                w,
+                match self.names.is_empty() {
+                    true => Vec::new(),
+                    false => vec![" enter to load this metric".dim()],
+                },
+            )];
         }
         let mut out = Vec::with_capacity(self.series.len() * 3);
         for (i, s) in self.series.iter().enumerate() {
@@ -1207,21 +1199,27 @@ impl App {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let mut r = Row::new(w);
-            r.plain(mark);
-            r.put(if sel { term::BOLD } else { "" }, &attrs);
-            out.push(r.done());
+            out.push(rata::row(
+                w,
+                vec![
+                    Span::raw(mark),
+                    Span::styled(
+                        attrs,
+                        match sel {
+                            true => Style::default().add_modifier(Modifier::BOLD),
+                            false => Style::default(),
+                        },
+                    ),
+                ],
+            ));
 
             let pts: Vec<f64> = s["points"]
                 .as_vec()
                 .map(|v| v.iter().filter_map(|p| num(&p[1])).collect())
                 .unwrap_or_default();
-            let mut r = Row::new(w);
-            r.plain(mark);
+            let mut spans = vec![Span::raw(mark)];
             match pts.is_empty() {
-                true => {
-                    r.put(term::DIM, "no points");
-                }
+                true => spans.push("no points".dim()),
                 false => {
                     let (lo, hi) = (
                         pts.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -1230,7 +1228,7 @@ impl App {
                     // `max_points` truncation is newest-wins, so a capped
                     // sparkline is the tail of the window drawn under a filter
                     // bar that still says `last 24h`. Its width is taken out of
-                    // the bar rather than appended, because `Row` clips at the
+                    // the bar rather than appended, because the row clips at the
                     // edge and the one thing that must not be clipped is the
                     // line saying the picture is incomplete. The browser legend
                     // carries the same badge, for the same reason.
@@ -1239,30 +1237,29 @@ impl App {
                         n => format!("  +{n} dropped"),
                     };
                     let bars = w.saturating_sub(28 + badge.len()).max(8);
-                    r.put(term::CYAN, &spark(&pts, bars));
-                    r.plain("  ");
-                    r.put(term::DIM, &format!("{} → {}", g(lo), g(hi)));
+                    spans.push(spark(&pts, bars).cyan());
+                    spans.push(Span::raw("  "));
+                    spans.push(format!("{} → {}", g(lo), g(hi)).dim());
                     if !badge.is_empty() {
-                        r.put(term::YELLOW, &badge);
+                        spans.push(badge.yellow());
                     }
                 }
             }
             let ex = s["exemplars"].as_vec().map_or(0, Vec::len);
             if ex > 0 {
-                r.plain(" ");
-                r.put(term::MAGENTA, &format!("◆{ex}"));
+                spans.push(Span::raw(" "));
+                spans.push(format!("◆{ex}").magenta());
             }
-            out.push(r.done());
+            out.push(rata::row(w, spans));
 
-            let mut r = Row::new(w);
-            r.plain(mark);
+            let mut spans = vec![Span::raw(mark)];
             if let Some(id) = s["exemplars"][0]["trace_id"].as_str() {
-                r.put(term::MAGENTA, "◆ ");
-                r.put(term::DIM, "trace ");
-                r.plain(&clip(id, 32));
-                r.put(term::DIM, "  t to open");
+                spans.push("◆ ".magenta());
+                spans.push("trace ".dim());
+                spans.push(Span::raw(clip(id, 32)));
+                spans.push("  t to open".dim());
             }
-            out.push(r.done());
+            out.push(rata::row(w, spans));
         }
         out
     }
@@ -1273,43 +1270,41 @@ impl App {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(h);
-        let mut head = Row::new(w);
-        head.put(term::BOLD, " frame ");
-        head.put(
-            term::DIM,
-            &format!(
-                "{} → {}  ·  {}",
-                stamp(f.from),
-                stamp(f.to),
-                dur((f.to - f.from).max(0))
-            ),
-        );
-        out.push(head.done());
+        out.push(rata::row(
+            w,
+            vec![
+                " frame ".bold(),
+                format!(
+                    "{} → {}  ·  {}",
+                    stamp(f.from),
+                    stamp(f.to),
+                    dur((f.to - f.from).max(0))
+                )
+                .dim(),
+            ],
+        ));
         if f.truncated {
             // A capped frame is a sample, and a sample read as a census is the
             // one way this pane can be confidently wrong.
-            let mut r = Row::new(w);
-            r.put(
-                term::YELLOW,
-                " sample — narrow the filter before concluding",
-            );
-            out.push(r.done());
+            out.push(rata::row(
+                w,
+                vec![" sample — narrow the filter before concluding".yellow()],
+            ));
         }
 
-        out.push(rule(w, &format!(" {} services ", f.services.len())));
+        out.push(rata::rule(w, &format!(" {} services ", f.services.len())));
         for (i, (name, n)) in f.services.iter().enumerate() {
-            let sel = i == self.psel;
-            let mut r = Row::new(w);
-            r.put(if sel { term::REV } else { "" }, &format!("  {name}"));
+            let hl = rata::hl(i == self.psel);
+            let mut spans = vec![Span::raw(format!("  {name}"))];
             if *n > 1 {
                 // Three replicas of one service are three entities and one
                 // name. The count is the only thing on screen that says so.
-                r.put(term::DIM, &format!("  ×{n}"));
+                spans.push(format!("  ×{n}").dim());
             }
-            out.push(r.fill(if sel { term::REV } else { "" }));
+            out.push(rata::row_styled(w, hl, spans));
         }
 
-        out.push(rule(w, &format!(" {} traces ", f.traces.len())));
+        out.push(rata::rule(w, &format!(" {} traces ", f.traces.len())));
         let head = h.saturating_sub(out.len());
         let top = window_start(
             self.psel.saturating_sub(f.services.len()),
@@ -1317,11 +1312,8 @@ impl App {
             f.traces.len(),
         );
         for (i, id) in f.traces.iter().enumerate().skip(top).take(head) {
-            let sel = f.services.len() + i == self.psel;
-            let style = if sel { term::REV } else { "" };
-            let mut r = Row::new(w);
-            r.put(style, &format!("  {id}"));
-            out.push(r.fill(style));
+            let hl = rata::hl(f.services.len() + i == self.psel);
+            out.push(rata::row_styled(w, hl, vec![Span::raw(format!("  {id}"))]));
         }
         out
     }
@@ -1332,23 +1324,24 @@ impl App {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(h);
-        let mut head = Row::new(w);
-        head.put(term::BOLD, " map ");
-        head.put(term::DIM, &format!("{} services", m.rows.len() - 1));
+        let mut head = vec![
+            " map ".bold(),
+            format!("{} services", m.rows.len() - 1).dim(),
+        ];
         if m.unresolved > 0 {
             // Every edge on screen is a lower bound without this: an unresolved
             // span is one whose parent was not in the sample, so its call was
             // never counted against anything.
-            head.put(
-                term::YELLOW,
-                &format!(
+            head.push(
+                format!(
                     "  ·  {} spans with a parent outside the sample",
                     m.unresolved
-                ),
+                )
+                .yellow(),
             );
         }
-        out.push(head.done());
-        out.push(rule(w, ""));
+        out.push(rata::row(w, head));
+        out.push(rata::rule(w, ""));
 
         let vis = h.saturating_sub(2);
         let top = window_start(self.psel, vis, m.rows.len());
@@ -1371,15 +1364,18 @@ impl App {
             .iter()
             .filter(|a| a["state"].as_str() == Some("firing"))
             .count();
-        let mut head = Row::new(w);
-        head.put(term::BOLD, " alerts ");
-        head.put(term::DIM, &format!("{} rules  ·  ", self.alerts.len()));
-        head.put(
-            if firing > 0 { term::RED } else { term::DIM },
-            &format!("{firing} firing"),
-        );
-        out.push(head.done());
-        out.push(rule(w, ""));
+        out.push(rata::row(
+            w,
+            vec![
+                " alerts ".bold(),
+                format!("{} rules  ·  ", self.alerts.len()).dim(),
+                match firing > 0 {
+                    true => format!("{firing} firing").red(),
+                    false => format!("{firing} firing").dim(),
+                },
+            ],
+        ));
+        out.push(rata::rule(w, ""));
 
         // Two lines each, so the selected rule's predicate is on screen without
         // a keystroke: the filter *is* the explanation of the number.
@@ -1387,50 +1383,39 @@ impl App {
         let top = window_start(self.psel, vis.max(1), self.alerts.len());
         for (i, a) in self.alerts.iter().enumerate().skip(top).take(vis) {
             let sel = i == self.psel;
-            let style = if sel { term::REV } else { "" };
             let state = a["state"].as_str().unwrap_or("?");
-            let mut r = Row::new(w);
-            r.put(
-                style,
-                &format!(
-                    "  {:<7}",
-                    match state {
-                        "firing" => "●",
-                        "pending" => "◐",
-                        _ => "○",
-                    }
-                ),
-            );
-            r.put(
-                if sel {
-                    style
-                } else {
-                    match state {
-                        "firing" => term::RED,
-                        "pending" => term::YELLOW,
-                        _ => term::GREEN,
-                    }
-                },
-                &format!("{state:<8}"),
-            );
-            r.put(
-                style,
-                &format!("{:<28}", clip(a["name"].as_str().unwrap_or("?"), 27)),
-            );
-            r.put(style, &alert_value(a));
-            out.push(r.fill(style));
+            let dot = match state {
+                "firing" => "●",
+                "pending" => "◐",
+                _ => "○",
+            };
+            let word = format!("{state:<8}");
+            out.push(rata::row_styled(
+                w,
+                rata::hl(sel),
+                vec![
+                    Span::raw(format!("  {dot:<7}")),
+                    match (sel, state) {
+                        (true, _) => Span::raw(word),
+                        (_, "firing") => word.red(),
+                        (_, "pending") => word.yellow(),
+                        _ => word.green(),
+                    },
+                    Span::raw(format!(
+                        "{:<28}",
+                        clip(a["name"].as_str().unwrap_or("?"), 27)
+                    )),
+                    Span::raw(alert_value(a)),
+                ],
+            ));
 
-            let mut r = Row::new(w);
-            match a["error"].as_str() {
-                // An unevaluated rule is not a quiet one, and the pane says
-                // which it is: the state above reads "ok" either way.
-                Some(e) => r.put(
-                    term::RED,
-                    &format!("          {}", clip(e, w.saturating_sub(11))),
-                ),
-                None => r.put(
-                    term::DIM,
-                    &format!(
+            out.push(rata::row(
+                w,
+                vec![match a["error"].as_str() {
+                    // An unevaluated rule is not a quiet one, and the pane says
+                    // which it is: the state above reads "ok" either way.
+                    Some(e) => format!("          {}", clip(e, w.saturating_sub(11))).red(),
+                    None => format!(
                         "          {}  ·  over {}",
                         clip(
                             match a["filter"].as_str().unwrap_or_default() {
@@ -1440,10 +1425,10 @@ impl App {
                             w.saturating_sub(30)
                         ),
                         dur(i64_of(&a["over_nano"]))
-                    ),
-                ),
-            };
-            out.push(r.done());
+                    )
+                    .dim(),
+                }],
+            ));
         }
         out
     }
@@ -1462,45 +1447,42 @@ impl App {
             return Vec::new();
         };
         let mut out = Vec::new();
-        let mut head = Row::new(w);
-        head.put(term::BOLD, " node ");
-        head.put(
-            term::DIM,
-            &format!(
+        // The one number on this screen that is a reason to wake someone up.
+        let free = num(&d["free_fraction"]);
+        let disk = match free {
+            Some(f) => format!("disk {:.0}% free", f * 100.0),
+            None => "disk unreadable".to_owned(),
+        };
+        let mut head = vec![
+            " node ".bold(),
+            format!(
                 "up {}  ·  peak rss {}  ·  ",
                 since(i64_of(&d["uptime_s"])),
                 bytes(i64_of(&d["peak_rss_bytes"]) as f64)
-            ),
-        );
-        // The one number on this screen that is a reason to wake someone up.
-        let free = num(&d["free_fraction"]);
-        head.put(
+            )
+            .dim(),
             match free {
-                Some(f) if f < 0.1 => term::RED,
-                Some(f) if f < 0.2 => term::YELLOW,
-                _ => term::DIM,
+                Some(f) if f < 0.1 => disk.red(),
+                Some(f) if f < 0.2 => disk.yellow(),
+                _ => disk.dim(),
             },
-            &match free {
-                Some(f) => format!("disk {:.0}% free", f * 100.0),
-                None => "disk unreadable".into(),
-            },
-        );
+        ];
         // Only when it has happened. On every volume Mira is meant to run on
         // this is zero, and a permanent "degraded syncs 0" would train the eye
         // to skip the line on the one node where it is not.
         if i64_of(&d["degraded_syncs"]) > 0 {
-            head.put(
-                term::YELLOW,
-                &format!(
+            head.push(
+                format!(
                     "  ·  degraded syncs {}",
                     tally(i64_of(&d["degraded_syncs"]) as f64)
-                ),
+                )
+                .yellow(),
             );
         }
-        out.push(head.done());
+        out.push(rata::row(w, head));
 
         let q = &d["queries"];
-        out.push(rule(w, " queries "));
+        out.push(rata::rule(w, " queries "));
         out.push(kv(w, "served", &tally(num(&q["count"]).unwrap_or(0.0))));
         out.push(kv(
             w,
@@ -1518,7 +1500,7 @@ impl App {
             if s.is_badvalue() {
                 continue;
             }
-            out.push(rule(w, &format!(" {signal} ")));
+            out.push(rata::rule(w, &format!(" {signal} ")));
             let (rows, on_disk) = (i64_of(&s["rows"]) as f64, i64_of(&s["bytes"]) as f64);
             out.push(kv(w, "rows written", &tally(rows)));
             out.push(kv(
@@ -1554,30 +1536,31 @@ impl App {
                 i64_of(&s["failed"]),
                 i64_of(&s["refused"]),
             );
-            let mut r = Row::new(w);
-            r.put(term::DIM, &format!("  {:<16}", "rejected"));
-            r.put(
-                if shed + failed + refused > 0 {
-                    term::YELLOW
-                } else {
-                    ""
-                },
-                &format!("{shed} shed  ·  {failed} failed  ·  {refused} refused"),
-            );
-            out.push(r.done());
+            let counts = format!("{shed} shed  ·  {failed} failed  ·  {refused} refused");
+            out.push(rata::row(
+                w,
+                vec![
+                    format!("  {:<16}", "rejected").dim(),
+                    match shed + failed + refused > 0 {
+                        true => counts.yellow(),
+                        false => Span::raw(counts),
+                    },
+                ],
+            ));
             // Stalled is the readiness condition, so it is the one line here
             // that is never printed as a zero and never left off when set.
             if let Some(secs) = num(&s["stalled_s"]) {
-                let mut r = Row::new(w);
-                r.put(term::RED, &format!("  {:<16}", "stalled"));
-                r.put(
-                    term::RED,
-                    &format!(
-                        "{} — this node cannot store this signal",
-                        since(secs as i64)
-                    ),
-                );
-                out.push(r.done());
+                out.push(rata::row(
+                    w,
+                    vec![
+                        format!("  {:<16}", "stalled").red(),
+                        format!(
+                            "{} — this node cannot store this signal",
+                            since(secs as i64)
+                        )
+                        .red(),
+                    ],
+                ));
             }
         }
         out
@@ -1588,14 +1571,15 @@ impl App {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(h);
-        let mut head = Row::new(w);
-        head.put(term::BOLD, " trace ").plain(&t.id);
-        head.put(
-            term::DIM,
-            &format!("  ·  {} spans  ·  {}", t.spans.len(), dur(t.span_ns.max(0))),
-        );
-        out.push(head.done());
-        out.push(rule(w, ""));
+        out.push(rata::row(
+            w,
+            vec![
+                " trace ".bold(),
+                Span::raw(t.id.clone()),
+                format!("  ·  {} spans  ·  {}", t.spans.len(), dur(t.span_ns.max(0))).dim(),
+            ],
+        ));
+        out.push(rata::rule(w, ""));
 
         // Where each column ends: the tree, the service, the bar, the duration.
         // Ends rather than widths because every write is "fill up to here", and
@@ -1611,23 +1595,30 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(i, (s, depth))| {
+                let indent = " ".repeat((depth + 2).min(namew));
                 let mut rows = vec![span_bar(s, *depth, i == t.sel, ends, t)];
                 for e in s["events"].as_vec().into_iter().flatten() {
-                    let mut r = Row::new(w);
                     let at = i64_of(&e["time_unix_nano"]) - t.t0;
-                    r.plain(&" ".repeat((depth + 2).min(namew)));
-                    r.put(term::YELLOW, "● ");
-                    r.plain(e["name"].as_str().unwrap_or("event"));
-                    r.put(term::DIM, &format!("  +{}", dur(at.max(0))));
-                    rows.push(r.done());
+                    rows.push(rata::row(
+                        w,
+                        vec![
+                            Span::raw(indent.clone()),
+                            "● ".yellow(),
+                            Span::raw(e["name"].as_str().unwrap_or("event").to_owned()),
+                            format!("  +{}", dur(at.max(0))).dim(),
+                        ],
+                    ));
                 }
                 for l in s["links"].as_vec().into_iter().flatten() {
-                    let mut r = Row::new(w);
-                    r.plain(&" ".repeat((depth + 2).min(namew)));
-                    r.put(term::BLUE, "↗ ");
-                    r.put(term::DIM, "trace ");
-                    r.plain(l["trace_id"].as_str().unwrap_or("?"));
-                    rows.push(r.done());
+                    rows.push(rata::row(
+                        w,
+                        vec![
+                            Span::raw(indent.clone()),
+                            "↗ ".blue(),
+                            "trace ".dim(),
+                            Span::raw(l["trace_id"].as_str().unwrap_or("?").to_owned()),
+                        ],
+                    ));
                 }
                 rows
             })
@@ -1831,90 +1822,55 @@ impl Trace {
 
 // ---- row renderers --------------------------------------------------------
 
-fn log_row(row: &Yaml, w: usize, sel: bool) -> String {
-    let style = if sel { term::REV } else { "" };
-    let sev = row["severity_number"].as_i64().unwrap_or(0);
-    let mut r = Row::new(w);
-    r.put(style, &format!(" {} ", hms(i64_of(&row["time_unix_nano"]))));
-    r.put(
-        if sel { style } else { sev_style(sev) },
-        &format!(
-            "{:<6}",
-            clip(row["severity_text"].as_str().unwrap_or("-"), 6)
-        ),
-    );
-    r.plain(" ");
-    r.put(
-        if sel { style } else { term::DIM },
-        &format!("{:<16}", clip(service(row), 16)),
-    );
-    r.plain(" ");
-    r.put(style, row["body"].as_str().unwrap_or(""));
-    r.fill(style)
-}
-
 fn span_row(row: &Yaml, w: usize, sel: bool, scale: i64) -> String {
-    let style = if sel { term::REV } else { "" };
     let d = i64_of(&row["duration_nano"]);
     let error = row["status_code"].as_i64() == Some(2);
-    let mut r = Row::new(w);
-    r.put(
-        style,
-        &format!(" {} ", hms(i64_of(&row["start_time_unix_nano"]))),
-    );
-    r.put(style, &format!("{:>9} ", dur(d)));
-    r.put(
-        if sel { style } else { term::DIM },
-        &format!("{:<16}", clip(service(row), 16)),
-    );
-    r.plain(" ");
-    let name_style = match (sel, error) {
-        (true, _) => style,
-        (_, true) => term::RED,
-        _ => "",
-    };
-    r.put(
-        name_style,
-        &format!("{:<30}", clip(row["name"].as_str().unwrap_or(""), 30)),
-    );
+    let name = format!("{:<30}", clip(row["name"].as_str().unwrap_or(""), 30));
+    let mut spans = vec![
+        Span::raw(format!(" {} ", hms(i64_of(&row["start_time_unix_nano"])))),
+        Span::raw(format!("{:>9} ", dur(d))),
+        match sel {
+            true => Span::raw(format!("{:<16}", clip(service(row), 16))),
+            false => format!("{:<16}", clip(service(row), 16)).dim(),
+        },
+        Span::raw(" "),
+        match (sel, error) {
+            (false, true) => name.red(),
+            _ => Span::raw(name),
+        },
+    ];
     if error {
-        r.put(if sel { style } else { term::RED }, " ERROR");
+        spans.push(match sel {
+            true => Span::raw(" ERROR"),
+            false => " ERROR".red(),
+        });
     }
     // A bar against the widest span in the result, so the outliers in a page of
     // results are visible without opening any of them.
-    let bar = (d as f64 / scale as f64 * r.left().saturating_sub(2) as f64) as usize;
-    r.plain(" ");
-    r.repeat(if sel { style } else { term::BLUE }, '▂', bar.max(1));
-    r.fill(style)
+    let used: usize = spans.iter().map(Span::width).sum();
+    let bar = (d as f64 / scale as f64 * w.saturating_sub(used + 2) as f64) as usize;
+    spans.push(Span::raw(" "));
+    spans.push(match sel {
+        true => Span::raw("▂".repeat(bar.max(1))),
+        false => "▂".repeat(bar.max(1)).blue(),
+    });
+    rata::row_styled(w, rata::hl(sel), spans)
 }
 
 #[allow(clippy::too_many_arguments)]
 /// One span's row: name, service, bar, duration, each clipped to its column.
 ///
-/// `ends` is the column boundaries from [`App::waterfall`]. Every write caps the
-/// row at its own end before writing, so an over-long span name eats into its
-/// own column and nothing else — without the cap it would push the bar right and
-/// shove the duration off the screen.
+/// `ends` is the column boundaries from [`App::waterfall`]. Each cell is clipped
+/// to its own column, so an over-long span name eats into its own column and
+/// nothing else — without that it would push the bar right and shove the
+/// duration off the screen.
 fn span_bar(s: &Yaml, depth: usize, sel: bool, ends: [usize; 4], t: &Trace) -> String {
-    let style = if sel { term::REV } else { "" };
     let start = i64_of(&s["start_time_unix_nano"]) - t.t0;
     let d = i64_of(&s["duration_nano"]);
     let error = s["status_code"].as_i64() == Some(2);
-    let text = match (sel, error) {
-        (true, _) => style,
-        (_, true) => term::RED,
-        _ => "",
-    };
 
-    let mut r = Row::new(ends[0]);
     let indent = " ".repeat(depth.min(ends[0] / 2));
-    r.put(
-        text,
-        &format!(" {indent}{}", s["name"].as_str().unwrap_or("")),
-    );
-    r.cap(ends[1]).pad_to(ends[0]);
-    r.put(term::DIM, &format!(" {}", service(s)))
-        .pad_to(ends[1]);
+    let name = format!(" {indent}{}", s["name"].as_str().unwrap_or(""));
 
     // Both offset and length come from the same scale, so a zero-duration span
     // still gets one cell and lands in the right place rather than vanishing.
@@ -1922,68 +1878,40 @@ fn span_bar(s: &Yaml, depth: usize, sel: bool, ends: [usize; 4], t: &Trace) -> S
     let scale = |ns: i64| (ns as f64 / t.span_ns.max(1) as f64 * barw as f64) as usize;
     let off = scale(start).min(barw.saturating_sub(1));
     let len = scale(d).clamp(1, barw - off);
-    r.cap(ends[2]).repeat("", ' ', off);
-    r.repeat(if text.is_empty() { term::GREEN } else { text }, '█', len);
-    r.pad_to(ends[2]);
 
     let durw = ends[3] - ends[2] - 1;
-    r.cap(ends[3]);
-    r.put(term::DIM, &format!("{:>durw$} ", dur(d)));
-    r.fill(style)
-}
-
-/// The selected record, field by field, then its attributes.
-fn detail(row: &Yaml, w: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let line = |k: &str, v: &str, style: &str| {
-        let mut r = Row::new(w);
-        r.put(term::DIM, &format!("  {k:<26}"));
-        r.put(style, v);
-        r.done()
-    };
-    for (k, v) in pairs(row) {
-        if k == "attributes" || k == "events" || k == "links" || k == "points" {
-            continue;
-        }
-        let pretty = match k.as_str() {
-            "time_unix_nano" | "observed_time_unix_nano" | "start_time_unix_nano" => {
-                v.parse::<i64>().map(stamp).unwrap_or(v.clone())
-            }
-            "duration_nano" => v.parse::<i64>().map(dur).unwrap_or(v.clone()),
-            "kind" => v
-                .parse::<i64>()
-                .map(|k| kind(k).to_owned())
-                .unwrap_or(v.clone()),
-            _ => v.clone(),
-        };
-        out.push(line(&k, &pretty, ""));
-    }
-    let attrs = pairs(&row["attributes"]);
-    if !attrs.is_empty() {
-        out.push(rule(w, " attributes "));
-        for (k, v) in attrs {
-            out.push(line(&k, &v, term::CYAN));
-        }
-    }
-    for (label, key) in [(" events ", "events"), (" links ", "links")] {
-        let items = row[key].as_vec().map_or(&[][..], |v| v.as_slice());
-        if items.is_empty() {
-            continue;
-        }
-        out.push(rule(w, label));
-        for it in items {
-            for (k, v) in pairs(it) {
-                if k == "attributes" {
-                    continue;
-                }
-                out.push(line(&k, &v, ""));
-            }
-            for (k, v) in pairs(&it["attributes"]) {
-                out.push(line(&format!("  {k}"), &v, term::CYAN));
-            }
-        }
-    }
-    out
+    rata::columns(
+        ends[3],
+        rata::hl(sel),
+        vec![
+            (
+                ends[0] as u16,
+                vec![match (sel, error) {
+                    (false, true) => name.red(),
+                    _ => Span::raw(name),
+                }],
+            ),
+            (
+                (ends[1] - ends[0]) as u16,
+                vec![format!(" {}", service(s)).dim()],
+            ),
+            (
+                barw as u16,
+                vec![
+                    Span::raw(" ".repeat(off)),
+                    match (sel, error) {
+                        (true, _) => Span::raw("█".repeat(len)),
+                        (_, true) => "█".repeat(len).red(),
+                        _ => "█".repeat(len).green(),
+                    },
+                ],
+            ),
+            (
+                (ends[3] - ends[2]) as u16,
+                vec![format!("{:>durw$} ", dur(d)).dim()],
+            ),
+        ],
+    )
 }
 
 fn help(w: usize) -> Vec<String> {
@@ -2044,12 +1972,7 @@ fn help(w: usize) -> Vec<String> {
         ),
     ];
     TEXT.iter()
-        .map(|(k, v)| {
-            let mut r = Row::new(w);
-            r.put(term::BOLD, &format!("  {k:<28}"));
-            r.put(term::DIM, v);
-            r.done()
-        })
+        .map(|(k, v)| rata::row(w, vec![format!("  {k:<28}").bold(), (*v).dim()]))
         .collect()
 }
 
@@ -2065,17 +1988,6 @@ fn window_start(sel: usize, height: usize, len: usize) -> usize {
         return 0;
     }
     sel.saturating_sub(height / 2).min(len - height)
-}
-
-fn rule(w: usize, title: &str) -> String {
-    let mut r = Row::new(w);
-    r.put(term::DIM, "──");
-    if !title.is_empty() {
-        r.put(term::DIM, title);
-    }
-    let left = r.left();
-    r.repeat(term::DIM, '─', left);
-    r.done()
 }
 
 fn array(y: &Yaml) -> Vec<Yaml> {
@@ -2163,7 +2075,6 @@ fn service_term(name: &str) -> String {
 
 /// One service in the map: where it sits in the call tree, and what it did.
 fn map_row(n: &Yaml, depth: usize, sel: bool, w: usize) -> String {
-    let style = if sel { term::REV } else { "" };
     let entry = n["key"].as_str() == Some(ENTRY_KEY);
     let errors = n["errors"].as_i64().unwrap_or(0);
     // The three count columns are 44 wide together, and they are the point of
@@ -2171,40 +2082,38 @@ fn map_row(n: &Yaml, depth: usize, sel: bool, w: usize) -> String {
     // at 80 columns.
     let namew = w.saturating_sub(44).clamp(16, 40);
 
-    let mut r = Row::new(namew);
     // Two columns a level, capped so a deep chain eats its own column rather
     // than pushing the counts off the right-hand edge.
     let indent = "  ".repeat(depth.min(namew / 4));
-    r.put(
-        match (sel, entry, errors > 0) {
-            (true, ..) => style,
-            (_, true, _) => term::DIM,
-            (_, _, true) => term::RED,
-            _ => "",
-        },
-        &format!(" {indent}{}", n["name"].as_str().unwrap_or("?")),
-    );
-    r.cap(w).pad_to(namew);
+    let name = format!(" {indent}{}", n["name"].as_str().unwrap_or("?"));
+    let mut counts = Vec::new();
     if !entry {
-        r.put(
-            term::DIM,
-            &format!("{:>9} spans  ", n["spans"].as_i64().unwrap_or(0)),
-        );
-        match errors {
+        counts.push(format!("{:>9} spans  ", n["spans"].as_i64().unwrap_or(0)).dim());
+        counts.push(match errors {
             // The dash sits in the count column and the word is dropped, so a
             // clean service lines its zero up under the counts above it.
-            0 => r.put(term::DIM, &format!("{:>5}{:9}", "-", "")),
-            e => r.put(
-                if sel { style } else { term::RED },
-                &format!("{e:>5} errors  "),
-            ),
-        };
-        r.put(
-            term::DIM,
-            &format!("{:>9} avg", dur(i64_of(&n["avg_nano"]))),
-        );
+            0 => format!("{:>5}{:9}", "-", "").dim(),
+            e if sel => Span::raw(format!("{e:>5} errors  ")),
+            e => format!("{e:>5} errors  ").red(),
+        });
+        counts.push(format!("{:>9} avg", dur(i64_of(&n["avg_nano"]))).dim());
     }
-    r.fill(style)
+    rata::columns(
+        w,
+        rata::hl(sel),
+        vec![
+            (
+                namew as u16,
+                vec![match (sel, entry, errors > 0) {
+                    (true, ..) => Span::raw(name),
+                    (_, true, _) => name.dim(),
+                    (_, _, true) => name.red(),
+                    _ => Span::raw(name),
+                }],
+            ),
+            (w.saturating_sub(namew) as u16, counts),
+        ],
+    )
 }
 
 fn num(y: &Yaml) -> Option<f64> {
@@ -2221,15 +2130,6 @@ fn num(y: &Yaml) -> Option<f64> {
 
 fn service(row: &Yaml) -> &str {
     row["attributes"]["service.name"].as_str().unwrap_or("-")
-}
-
-fn sev_style(n: i64) -> &'static str {
-    match n {
-        17.. => term::RED,
-        13..=16 => term::YELLOW,
-        9..=12 => term::GREEN,
-        _ => term::DIM,
-    }
 }
 
 fn kind(k: i64) -> &'static str {
@@ -2327,10 +2227,7 @@ fn g(v: f64) -> String {
 
 /// One `label   value` line of the diagnostics pane.
 fn kv(w: usize, k: &str, v: &str) -> String {
-    let mut r = Row::new(w);
-    r.put(term::DIM, &format!("  {k:<16}"));
-    r.plain(v);
-    r.done()
+    rata::row(w, vec![format!("  {k:<16}").dim(), Span::raw(v.to_owned())])
 }
 
 /// An age in seconds, at the precision someone reading it cares about.
@@ -2352,17 +2249,15 @@ fn since(secs: i64) -> String {
 /// Binary units, because every other tool an operator has open uses them.
 fn bytes(b: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut b = b;
-    for (i, u) in UNITS.iter().enumerate() {
-        if b < 1024.0 || i == UNITS.len() - 1 {
-            return match i {
-                0 => format!("{b:.0} {u}"),
-                _ => format!("{b:.1} {u}"),
-            };
-        }
+    let (mut b, mut i) = (b, 0);
+    while b >= 1024.0 && i < UNITS.len() - 1 {
         b /= 1024.0;
+        i += 1;
     }
-    unreachable!()
+    match i {
+        0 => format!("{b:.0} {}", UNITS[0]),
+        _ => format!("{b:.1} {}", UNITS[i]),
+    }
 }
 
 /// The right-hand side of an alert row: where the number sits against the line.
@@ -2833,10 +2728,11 @@ mod tests {
         );
 
         // Severity bands are the OTLP numbers, not a guess at `severity_text`.
-        assert_eq!(sev_style(21), term::RED);
-        assert_eq!(sev_style(13), term::YELLOW);
-        assert_eq!(sev_style(9), term::GREEN);
-        assert_eq!(sev_style(1), term::DIM);
+        use ratatui::style::Color;
+        assert_eq!(rata::sev(21).fg, Some(Color::Red));
+        assert_eq!(rata::sev(13).fg, Some(Color::Yellow));
+        assert_eq!(rata::sev(9).fg, Some(Color::Green));
+        assert_eq!(rata::sev(1).add_modifier, Modifier::DIM);
     }
 
     #[test]
@@ -2932,7 +2828,8 @@ mod tests {
         .unwrap();
 
         // Not 00:00:00 in UTC nor 01:00:00 in CET — the epoch under either.
-        let clock = strip(&log_row(row, 60, false));
+        let list = rata::log_list(std::slice::from_ref(row), 60, 1, 1, 0);
+        let clock = strip(&list[0]);
         assert!(!clock.contains(&hms(0)), "{clock:?}");
         assert!(clock.contains(&hms(1_788_877_362_987_743_417)), "{clock:?}");
 
@@ -3543,7 +3440,7 @@ mod tests {
         out
     }
 
-    fn strip(s: &str) -> String {
+    pub(super) fn strip(s: &str) -> String {
         let mut out = String::new();
         let mut it = s.chars();
         while let Some(c) = it.next() {
@@ -3938,7 +3835,14 @@ mod tests {
             app.diag = Some(crate::api::parse(doc).unwrap());
             let head = app.diag_pane(W).remove(0);
             assert!(strip(&head).contains(text), "{head:?}");
-            assert!(head.contains(&format!("{style}{text}")), "{head:?}");
+            // The style in force over the figure, not the bytes immediately
+            // before it: runs that share a style are coalesced into one escape,
+            // so a grey figure after grey text carries no escape of its own.
+            let run = head
+                .split(term::RESET)
+                .find(|r| r.contains(text))
+                .unwrap_or_default();
+            assert!(run.starts_with(style), "{head:?}");
         }
     }
 
@@ -4027,7 +3931,7 @@ mod tests {
         let t = Trace::new("ab".into(), &rows);
         let ends = [16, 24, W - 11, W];
         let bar = span_bar(bad, 1, false, ends, &t);
-        assert!(bar.starts_with(term::RED), "{bar:?}");
+        assert!(bar.contains(&format!("{}  POST", term::RED)), "{bar:?}");
         assert!(strip(&bar).contains("POST /pay"), "{bar:?}");
         assert!(bar.contains(&format!("{}█", term::RED)), "{bar:?}");
         let bar = span_bar(ok, 0, false, ends, &t);
@@ -4048,7 +3952,7 @@ mod tests {
                 "links":[{"trace_id":"abab","attributes":{"rel":"follows"}}]}"#,
         )
         .unwrap();
-        let text = detail(&row, 80)
+        let text = rata::detail(&row, 80)
             .iter()
             .map(|l| strip(l))
             .collect::<Vec<_>>()
