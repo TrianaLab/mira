@@ -3,7 +3,7 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 427 cargo tests — 369 across levels 1–5, plus 58 in `xtask` that test
+Mira has 428 cargo tests — 369 across levels 1–5, plus 59 in `xtask` that test
 the gates rather than the engine — 22 UI tests, 26 chart tests, and 67 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and

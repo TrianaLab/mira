@@ -85,7 +85,14 @@ else
   # release note for a CI edit is a gate people learn to route around.
   # `.changeset/` itself is absent for the same reason: a changeset is the
   # declaration, not a thing to declare.
-  changeset=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|integrations/kubernetes/|charts/)")
+  #
+  # `crates/xtask/` is dropped before the match, and for the same reason again:
+  # it is `publish = false`, the build's own tooling, and a stranger never sees
+  # it. `^crates/` alone made every gate fix ask for a release note, which is
+  # how a release ends up carrying a version whose only change was CI.
+  changeset=$(printf '%s\n' "${files}" | grep -v '^crates/xtask/' \
+    | grep -qE "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|Dockerfile\$|integrations/kubernetes/|charts/)" \
+    && echo true || echo false)
 fi
 
 out=$(printf 'code=%s\ndocs=%s\nui=%s\nimage=%s\nchart=%s\noperator=%s\nchangeset=%s\n' \

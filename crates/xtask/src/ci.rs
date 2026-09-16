@@ -21,6 +21,8 @@
 //!   * the allowlist is bidirectional — an entry that is stale, or that names a
 //!     job which is in fact reachable, fails just as loudly as a missing one;
 //!   * every job in a publishing workflow is reachable from its terminal job;
+//!   * a job downstream of an `if: always()` gate names a status function too,
+//!     because the skip that gate absorbs keeps travelling down the chain;
 //!   * the gate job itself is `if: always()` and actually inspects every leg,
 //!     rather than passing because its dependencies were skipped;
 //!   * no required workflow carries a trigger-level `paths:` filter, because a
@@ -176,6 +178,7 @@ fn check_workflow(path: &Path, f: &mut Failures) {
 
     check_pins(name, &text, f);
     check_terminal(name, &jobs, f);
+    check_skip_propagation(name, &jobs, f);
     check_make_dispatch(name, &jobs, f);
 
     let on = triggers(&doc);
@@ -327,6 +330,41 @@ fn check_terminal(name: &str, jobs: &BTreeMap<String, Yaml>, f: &mut Failures) {
              reads its result, so it can go red — or be skipped by an `if:` nobody \
              re-read — and the release still reports success. Add it to \
              `{terminal}`'s `needs:`, directly or through a job that is already there."
+        ));
+    }
+}
+
+/// A skip runs the length of the chain, not one edge of it.
+///
+/// An aggregate gate carries `if: always()` precisely because legs upstream of
+/// it are skipped — but that only rescues the gate. GitHub keeps propagating the
+/// skip past it, so the job *after* the gate inherits it and never runs. Naming
+/// a status function is the only thing that stops the propagation, and doing so
+/// also turns off the implicit `success()`, which is why the results then have
+/// to be spelled out by hand.
+///
+/// `ci.yml`'s `tag` job was skipped on every push to main from the day it was
+/// written: green run, green gates, four releases tagged by hand.
+fn check_skip_propagation(name: &str, jobs: &BTreeMap<String, Yaml>, f: &mut Failures) {
+    let status_fn = re(r"\b(always|cancelled|failure|success)\(\)");
+    let survivors: BTreeSet<String> = jobs
+        .iter()
+        .filter(|(_, job)| status_fn.is_match(job["if"].as_str().unwrap_or_default()))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in jobs.keys().filter(|id| !survivors.contains(*id)) {
+        let mut ancestors = closure(jobs, &BTreeSet::from([id.clone()]));
+        ancestors.remove(id);
+        let Some(gate) = ancestors.iter().find(|a| survivors.contains(*a)) else {
+            continue;
+        };
+        f.fail(format!(
+            "{name}:{id}: `needs:` reaches `{gate}`, which survives a skipped \
+             dependency by naming a status function. `{id}` does not, so it inherits \
+             the skip the gate was written to absorb and never runs — a green run \
+             with a job that silently did nothing. Name a status function in its \
+             `if:` too, and spell out the `needs.*.result` values the implicit \
+             `success()` used to check."
         ));
     }
 }
@@ -636,6 +674,31 @@ mod tests {
         let mut f = Failures::default();
         check_gates("t.yml", &jobs_of(&doc), &triggers(&doc), &mut f);
         assert!(f.0.iter().any(|m| m.contains("path filter")), "{:?}", f.0);
+    }
+
+    /// The shape of the `tag` outage, reduced: a leg that skips, a gate that
+    /// survives it, and a job after the gate. Run on GitHub, `after` is skipped
+    /// and `after_ok` is not — so the gate's `always()` has to be repeated.
+    #[test]
+    fn a_job_after_an_always_gate_must_say_always_itself() {
+        let doc = yaml(
+            "jobs:\n\
+             \x20 leg:\n\
+             \x20   if: needs.changes.outputs.code == 'true'\n\
+             \x20 gate:\n\
+             \x20   if: always()\n\
+             \x20   needs: [leg]\n\
+             \x20 after:\n\
+             \x20   if: github.ref == 'refs/heads/main'\n\
+             \x20   needs: [gate]\n\
+             \x20 after_ok:\n\
+             \x20   if: always() && needs.gate.result == 'success'\n\
+             \x20   needs: [gate]\n",
+        );
+        let mut f = Failures::default();
+        check_skip_propagation("t.yml", &jobs_of(&doc), &mut f);
+        assert_eq!(f.0.len(), 1, "{:?}", f.0);
+        assert!(f.0[0].contains("t.yml:after:"), "{:?}", f.0);
     }
 
     /// The tree's own workflows, checked by the checker. If this fails, `make
