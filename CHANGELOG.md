@@ -9,6 +9,8 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
 ### Added
 
 - **`mira completion <shell>`**, for bash, zsh, fish, PowerShell and elvish.
@@ -548,7 +550,8 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/TrianaLab/mira/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/TrianaLab/mira/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TrianaLab/mira/compare/v0.0.4...v0.1.0
 [0.0.4]: https://github.com/TrianaLab/mira/compare/v0.0.3...v0.0.4
