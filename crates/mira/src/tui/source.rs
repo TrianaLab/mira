@@ -495,7 +495,7 @@ mod tests {
         // failure moves to the read. So grow the body until it cannot fit.
         // ponytail: `SO_SNDBUF` would answer directly instead of doubling, and
         // reading it means `libc` — a dependency for one `getsockopt`, against
-        // a tree of 122.
+        // a tree of 148.
         let mut e = String::new();
         for mib in [1usize, 8, 64] {
             let body = format!(r#"{{"signal":"logs","q":"{}"}}"#, "x".repeat(mib << 20));

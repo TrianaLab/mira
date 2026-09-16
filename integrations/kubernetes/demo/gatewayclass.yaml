@@ -1,0 +1,48 @@
+# How Envoy Gateway is configured for this demo. Installed once, beside the
+# controller; `gateway.yaml` is the per-namespace half.
+#
+# Gateway API, implemented by Envoy Gateway, because that is the ingress a
+# Kubernetes user is most likely to already have — and because the split the
+# demo needs is exactly what an `HTTPRoute` is for.
+---
+# Kind has no load balancer, so a `Gateway` left to itself gets a Service that
+# stays `<pending>` for ever. NodePort with the port pinned is what makes the
+# address predictable: `kind.yaml` forwards the node's 30080 to the host's 8080,
+# and both numbers have to agree with this one.
+#
+# The strategic-merge patch is the only way to fix the number. Envoy Gateway
+# allocates the nodePort otherwise, and an address you have to look up is not a
+# demo. `http-80` is the port name it derives from the listener below — rename
+# the listener or move it off 80 and this patch silently stops applying.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: mira-nodeport
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - name: http-80
+                  port: 80
+                  protocol: TCP
+                  nodePort: 30080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: mira
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: mira-nodeport
+    namespace: envoy-gateway-system

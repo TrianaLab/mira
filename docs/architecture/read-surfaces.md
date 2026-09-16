@@ -62,25 +62,28 @@ machine.
 trace waterfall in the terminal, plus the frame algebra on `c` and `m` and a live
 tail on `f`.
 
-### No TUI framework
+### ratatui, and no backend
 
-ratatui is the obvious answer and costs **35 crates that are not already here** —
-a 29% increase on a tree of 122, whose size is a stated property of the product
-(section 1). What it buys is a constraint-solving layout engine and a
-damage-tracked cell buffer; this UI has fixed panes and repaints one screenful per
-keystroke. So `termios`, `TIOCGWINSZ`, `poll(2)`, three `sigaction`s and ANSI, on
-`libc` — already in the tree for section 9's `statfs` guard. Net crates added:
-**zero**.
+This section used to argue for no framework, on an unmeasured estimate of 35
+crates. It was wrong: the hand-rolled renderer clipped at `max` rather than
+overflowing, so layout bugs lost content while its unit tests stayed green.
+Measured against the prior binary on this laptop, the port costs **+26 crates
+and +145 KiB** (122 → 148 crates) and an MSRV of 1.88.
+
+Most of that gap is the backend: `CrosstermBackend` would pull crossterm, mio,
+signal-hook and parking_lot in to do what `term.rs` already does.
+`Term::draw(&[String])` is the seam — `tui::rata`
+flattens a rendered `Buffer` into those rows — so `term.rs` keeps the syscall
+half: `termios`, `TIOCGWINSZ`, `poll(2)`, three `sigaction`s, on `libc`, already
+in the tree for section 9's `statfs` guard. Its `Row` builder is deleted rather
+than wrapped: 909 lines, from 1,127.
 
 SIGWINCH's default disposition is to *discard* it, so without a handler a resize
 repainted nothing; the handler itself does nothing, because the delivery is the
 message — the `EINTR` that sends the loop round to re-read the size. SIGTERM and
 SIGHUP hand the terminal back rather than leaving a shell in raw mode on the
-alternate screen, so `restore()` is async-signal-safe `libc::write`.
-
-The cost is `crates/mira/src/term.rs`: 1,127 lines, and a `Row` type that tracks
-visible width separately from bytes, because inline ANSI makes `len()` a lie. Unix
-only, the same bet `mmap` already makes.
+alternate screen, so `restore()` is async-signal-safe `libc::write`. Unix only,
+the same bet `mmap` already makes.
 
 ### Two transports, one code path
 
@@ -128,10 +131,10 @@ having made them:
 - `mira-core` is a library crate, so any Rust program can do the same; the CLI has
   no privileged path into the data.
 
-An agent co-located with its telemetry pays three costs to read over HTTP that are
-pure loss at that distance: a serialise/deserialise round trip per result, a port
-and its lifecycle, and a process to keep alive between questions. The in-process
-path removes all three.
+An agent co-located with its telemetry pays three costs to read over HTTP: a
+serialise/deserialise round trip per result, a port and its lifecycle, and a
+process to keep alive between questions. All three are pure loss at that
+distance.
 
 It deliberately does not write: two writers against one directory is the
 staging-path collision of section 12.6.

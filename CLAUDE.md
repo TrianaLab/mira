@@ -118,8 +118,9 @@ printf ']q' | script -q /dev/null ./target/release/mira mira --data-dir ./data 2
 ```
 
 Force a size with `sh -c 'stty rows 50 cols 200; ...'`. The layout unit tests
-pass even when content is being *lost*, because `Row` clips at `max` rather than
-overflowing — so a layout change is not verified until you have looked at it.
+pass even when content is being *lost*, because ratatui truncates at the area
+width rather than overflowing — so a layout change is not verified until you
+have looked at it.
 
 ## Pushing
 

@@ -158,10 +158,16 @@ would mean taking a healthy replica down to grow it.
 
 ## Permissions
 
-One `ClusterRole`, no wildcards, and `delete` on exactly two kinds — the claim a
-drained replica leaves behind and the Job that drained it. There is deliberately
-no `delete` on pods, statefulsets or deployments: a tier is resized through
+One `ClusterRole`, no wildcards, and `delete` on exactly three kinds — the claim
+a drained replica leaves behind, the Job that drained it, and the `HTTPRoute`
+that has to close when `spec.route` is removed. There is deliberately no
+`delete` on pods, statefulsets or deployments: a tier is resized through
 `statefulsets/scale`, and a bug that reached for `delete` should get a 403.
+
+`gateway.networking.k8s.io` is granted whether or not the cluster has the
+Gateway API installed, because a rule naming a resource that does not exist
+authorises nothing. The switch is `spec.route` on the `MiraCluster` rather than
+a chart value.
 
 Set `rbac.namespaces` to a list to get a `Role` in each instead of one
 `ClusterRole`; the operator then watches only those namespaces, because a `Role`

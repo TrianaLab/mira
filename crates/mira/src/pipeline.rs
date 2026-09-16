@@ -936,9 +936,7 @@ async fn wal_maintenance(cfg: Arc<Config>) {
     loop {
         tick.tick().await;
         ticks += 1;
-        // `u64::is_multiple_of` reads better but is stable since 1.87, and the
-        // workspace MSRV is 1.85.
-        wal_sweep(wal.clone(), cfg.data_dir.clone(), ticks % 240 == 0).await;
+        wal_sweep(wal.clone(), cfg.data_dir.clone(), ticks.is_multiple_of(240)).await;
     }
 }
 
@@ -1345,21 +1343,49 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// sweep room to act before `publish` starts failing.
 const MIN_FREE: f64 = 0.10;
 
-/// Drop the oldest blocks, across every signal, until the volume is back above
-/// `min_free`. Returns what was unlinked, oldest first.
+/// Free space below which the margin above stops being a margin, in bytes.
 ///
-/// `min_free` is a parameter only so a test can say "pretend the volume is
-/// full" without one; the sweep passes [`MIN_FREE`] and nothing else ever will.
+/// [`MIN_FREE`] on its own is a ratio, and a ratio does not know how big the
+/// volume is. On a 1 TB disk shared with everything else on the machine, 10% is
+/// 100 GB: a developer sitting at 45 GB free is under the floor, so every block
+/// is deleted within a sweep of being written, and the only sign is a warning in
+/// a log nobody is reading. The disk was never in danger — 45 GB is more than
+/// Mira had ever asked for.
+///
+/// So both have to say "full" before anything is deleted, and this is the term
+/// that has to be true in bytes. It covers what can actually be lost: the blocks
+/// in flight are three signals' `target_block_bytes` plus their staging copies,
+/// 192 MiB at the default, and retention sweeps on a 60s interval, so the floor
+/// also has to absorb whatever lands between two sweeps — a minute of a
+/// saturated gigabit link is about 7.5 GB. 8 GiB clears both with the margin the
+/// ratio was there to provide, and stays far under any volume where the ratio is
+/// the binding term.
+const MIN_FREE_BYTES: u64 = 8 << 30;
+
+/// Drop the oldest blocks, across every signal, until the volume is back above
+/// `min_free` — the ratio and the byte floor both. Returns what was unlinked,
+/// oldest first.
+///
+/// Deleting data the operator did not ask to lose needs both terms to agree: a
+/// small volume trips the ratio first and a large one trips the bytes first, and
+/// either alone is wrong somewhere. See [`MIN_FREE_BYTES`].
+///
+/// They are parameters only so a test can say "pretend the volume is full"
+/// without one; the sweep passes the two constants and nothing else ever will.
 ///
 /// ponytail: one `statfs` per unlink and one full `scan` per sweep that trips.
 /// Both are O(blocks) on a path that only runs when the volume is nearly full,
 /// where the unlink dominates anyway. If a volume ever spends long enough down
 /// here for that to matter, the fix is to stop after freeing a target fraction
 /// in one pass rather than re-measuring per block.
-fn reclaim(dir: &Path, min_free: f64) -> mira_core::error::Result<Vec<PathBuf>> {
+fn reclaim(
+    dir: &Path,
+    min_free: f64,
+    min_free_bytes: u64,
+) -> mira_core::error::Result<Vec<PathBuf>> {
     let mut dropped = Vec::new();
-    let mut free = block::free_fraction(dir)?;
-    if free >= min_free {
+    let (mut free, mut free_bytes) = block::free(dir)?;
+    if free >= min_free || free_bytes >= min_free_bytes {
         return Ok(dropped);
     }
     // Oldest first across all three signals at once, not one signal at a time:
@@ -1372,7 +1398,7 @@ fn reclaim(dir: &Path, min_free: f64) -> mira_core::error::Result<Vec<PathBuf>> 
     }
     blocks.sort_by_key(|b| (b.max_ts, b.seq));
     for b in blocks {
-        if free >= min_free {
+        if free >= min_free || free_bytes >= min_free_bytes {
             break;
         }
         // The unlink `block::expire` does, read the same way: another replica
@@ -1400,7 +1426,7 @@ fn reclaim(dir: &Path, min_free: f64) -> mira_core::error::Result<Vec<PathBuf>> 
         }
         // Re-read rather than subtracting the block's size: compaction, another
         // replica and everything else on this volume are all moving it too.
-        free = block::free_fraction(dir)?;
+        (free, free_bytes) = block::free(dir)?;
     }
     if !dropped.is_empty() {
         // One line for the whole burst above it, carrying the thing the operator
@@ -1409,6 +1435,7 @@ fn reclaim(dir: &Path, min_free: f64) -> mira_core::error::Result<Vec<PathBuf>> 
         tracing::warn!(
             blocks = dropped.len(),
             free = format!("{free:.3}"),
+            free_bytes,
             "dropped blocks ahead of their retention to keep the volume writable; \
              retention is longer than this disk can hold at the current ingest rate"
         );
@@ -1465,7 +1492,7 @@ async fn retention(cfg: Arc<Config>) {
             // and the disk fills, which is the failure the floor exists to
             // prevent. So a block dropped by the floor is gone, and the WARN it
             // already logs per block is the record of it.
-            (results, reclaim(&dir, MIN_FREE))
+            (results, reclaim(&dir, MIN_FREE, MIN_FREE_BYTES))
         })
         .await;
         match swept {
@@ -2119,14 +2146,14 @@ mod tests {
 
         // The TTL is the policy and free space is only the floor under it, so a
         // volume with room loses nothing whatever its blocks' ages.
-        assert!(reclaim(&dir, 0.0).unwrap().is_empty());
+        assert!(reclaim(&dir, 0.0, 0).unwrap().is_empty());
 
-        // A margin no real volume can satisfy stands in for a full disk: every
+        // Margins no real volume can satisfy stand in for a full disk: every
         // block goes, oldest first, and the returned order is that order.
         let mut want = block::scan(&dir, "logs").unwrap();
         want.sort_by_key(|b| b.max_ts);
         let want: Vec<PathBuf> = want.into_iter().map(|b| b.dir).collect();
-        assert_eq!(reclaim(&dir, 2.0).unwrap(), want);
+        assert_eq!(reclaim(&dir, 2.0, u64::MAX).unwrap(), want);
         assert_eq!(blocks(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2537,7 +2564,10 @@ mod tests {
         // back above it after exactly one unlink.
         let floor = (full + empty) / 2.0;
 
-        let dropped = listening(|| reclaim(&dir, floor).unwrap());
+        // `u64::MAX` so the byte floor is never satisfied and the ratio is the
+        // binding term — this test is about where the sweep stops, not which
+        // term started it.
+        let dropped = listening(|| reclaim(&dir, floor, u64::MAX).unwrap());
         assert_eq!(
             dropped,
             vec![oldest],
@@ -2547,6 +2577,35 @@ mod tests {
             newer.exists() && newest.exists(),
             "nothing else was touched"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ratio alone deleted a developer's whole data directory on a 1 TB disk
+    /// sitting at 45 GB free, because 45 GB is under 10% — and 45 GB was never
+    /// a disk in trouble. Both terms have to agree before anything is unlinked.
+    ///
+    /// The ratio here is one no real volume satisfies, so it stands in for
+    /// "95% full" without needing a 95%-full volume; the byte floor is read off
+    /// this machine so the test means the same thing on any runner.
+    #[test]
+    fn reclaim_keeps_blocks_when_the_volume_is_proportionally_full_but_roomy() {
+        let dir = std::env::temp_dir().join(format!("mira-pipe-roomy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = fake_block(&dir, "logs", 1_000, 0);
+        let b = fake_block(&dir, "traces", 2_000, 1);
+
+        let (_, free_bytes) = block::free(&dir).unwrap();
+        assert!(free_bytes > 0, "the volume reports some free space");
+
+        let kept = listening(|| reclaim(&dir, 1.0, free_bytes / 2).unwrap());
+        assert!(kept.is_empty(), "bytes to spare, so nothing went: {kept:?}");
+        assert!(a.exists() && b.exists(), "both blocks are still there");
+
+        // And the guard still fires when the bytes agree: same ratio, a floor
+        // above what the volume has.
+        let gone = listening(|| reclaim(&dir, 1.0, free_bytes.saturating_mul(2)).unwrap());
+        assert_eq!(gone.len(), 2, "both terms said full, so both blocks went");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2570,7 +2629,7 @@ mod tests {
         std::fs::write(&impostor, b"not a block").unwrap();
 
         // A margin no volume can satisfy: the sweep tries everything it can see.
-        let dropped = listening(|| reclaim(&dir, 2.0).unwrap());
+        let dropped = listening(|| reclaim(&dir, 2.0, u64::MAX).unwrap());
         assert!(
             dropped.is_empty() && impostor.exists(),
             "nothing was dropped, and the sweep still returned"
@@ -2581,7 +2640,7 @@ mod tests {
         // tree under two signals.
         let real = fake_block(&dir, "traces", 5_000, 3);
         std::os::unix::fs::symlink(dir.join("traces"), dir.join("metrics")).unwrap();
-        let dropped = listening(|| reclaim(&dir, 2.0).unwrap());
+        let dropped = listening(|| reclaim(&dir, 2.0, u64::MAX).unwrap());
         assert_eq!(
             dropped,
             vec![real.clone()],

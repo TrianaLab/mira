@@ -1,0 +1,48 @@
+# A stock OTLP producer, exporting into the tier for as long as the cluster
+# lives.
+#
+# The OpenTelemetry project's own `telemetrygen`, aimed at the proxy Service
+# over OTLP/HTTP — the address the operator publishes and the one a real
+# exporter would be given. Nothing Mira-specific is configured anywhere: if
+# this works, a stock exporter works.
+#
+# It is not the interesting data. `make demo-cluster` also seeds an hour of a
+# four-service shop through the Gateway with `loadgen --demo`, which is what
+# there is to ask questions about; this is what keeps arriving afterwards, so
+# the UI's follow mode has something to follow and `/api/v1/stats` moves.
+#
+# `--duration 720h` rather than a record count, because a demo that stops
+# producing an hour in looks like a broken ingest path. A Deployment, not a
+# Job, for the same reason: if it exits, the kubelet starts it again.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetrygen
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: telemetrygen }
+  template:
+    metadata:
+      labels: { app: telemetrygen }
+    spec:
+      containers:
+        # One container per signal. telemetrygen emits one signal per process,
+        # and three Deployments to say that would be two more objects than the
+        # difference is worth.
+        - name: traces
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["traces", "--otlp-endpoint", "tel-proxy:4318", "--otlp-http",
+                 "--otlp-insecure", "--duration", "720h", "--rate", "2",
+                 "--child-spans", "3", "--service", "live-checkout"]
+        - name: logs
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["logs", "--otlp-endpoint", "tel-proxy:4318", "--otlp-http",
+                 "--otlp-insecure", "--duration", "720h", "--rate", "5",
+                 "--service", "live-ingest"]
+        - name: metrics
+          image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.142.0
+          args: ["metrics", "--otlp-endpoint", "tel-proxy:4318", "--otlp-http",
+                 "--otlp-insecure", "--duration", "720h", "--rate", "2",
+                 "--service", "live-billing"]

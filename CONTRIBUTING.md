@@ -20,7 +20,7 @@ parser in the tree.
 
 ## Setting up
 
-Rust **1.85** or newer — the `rust-version` in `Cargo.toml`, and CI holds it. A
+Rust **1.88** or newer — the `rust-version` in `Cargo.toml`, and CI holds it. A
 working `cc` for `zstd-sys`, which vendors its own source. No `protoc`: the OTLP
 protos are compiled by `protox` in a build script. Node only for a UI change or
 `make changeset`.

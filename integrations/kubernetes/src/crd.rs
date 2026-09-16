@@ -165,6 +165,60 @@ pub struct MiraClusterSpec {
     /// The `mira proxy` tier that fans out across the replicas.
     #[serde(default)]
     pub proxy: Proxy,
+
+    /// An `HTTPRoute` in front of the tier, attached to Gateways you already
+    /// run.
+    ///
+    /// Unset creates nothing, which is the right default: the Gateway API CRDs
+    /// are not part of Kubernetes, and an operator that reached for a kind the
+    /// cluster has never heard of would fail every reconcile on a tier that is
+    /// otherwise healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Route>,
+}
+
+/// The Gateway binding for the tier's `HTTPRoute`.
+///
+/// What the route *says* is not configurable, and that is the point of having
+/// the operator write it. The split between the two backends is a property of
+/// which surface can answer what — `/v1/*` and `/api/v1/query` are the two the
+/// proxy merges, and the UI, `/mcp` and the reads built by walking one node's
+/// blocks are answered by a storage node and nothing else. A field for it would
+/// be a field for getting it wrong. What no operator can know is which Gateway
+/// you run, so that is what this is.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Route {
+    /// The Gateways to attach to. At least one, or the route binds to nothing
+    /// and the apiserver accepts it anyway.
+    #[schemars(length(min = 1))]
+    pub parent_refs: Vec<ParentRef>,
+
+    /// Hostnames the route answers on. Unset answers on every hostname its
+    /// listener accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hostnames: Vec<String>,
+}
+
+/// One Gateway, and optionally one listener on it.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentRef {
+    /// `metadata.name` of the Gateway.
+    pub name: String,
+
+    /// The Gateway's namespace. Unset is this `MiraCluster`'s own.
+    ///
+    /// A Gateway in another namespace also needs a `ReferenceGrant` there, or
+    /// its controller refuses the attachment — the route is created either way
+    /// and says so in `status.parents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
+    /// `spec.listeners[].name` to attach to. Unset attaches to every listener
+    /// that will have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
 }
 
 /// Per-replica persistent volume.
@@ -415,6 +469,7 @@ mod tests {
             offload: None,
             cold_storage_claim: None,
             proxy: Proxy::default(),
+            route: None,
         }
     }
 

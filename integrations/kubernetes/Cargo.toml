@@ -1,6 +1,6 @@
 # The operator is its own workspace, not a member of the root one, and the
 # reason is the root's gates rather than taste. `make msrv` runs
-# `cargo +1.85 check --workspace`; kube-rs declares 1.89. `deny.toml` sets
+# `cargo +1.88 check --workspace`; kube-rs declares 1.89. `deny.toml` sets
 # `multiple-versions = "deny"` and a licence allow-list that is "exactly what
 # the tree contains today"; the Kubernetes client tree is ~220 crates with a
 # TLS stack and would rewrite both. The coverage ratchet is at 99.23 with no
@@ -25,7 +25,7 @@ name = "mira-operator"
 # `operator_sites()` in crates/xtask/src/release.rs.
 version = "0.1.1"
 edition = "2024"
-# kube 4.x floor. Deliberately not the engine's 1.85: a user compiling Mira is
+# kube 4.x floor. Deliberately not the engine's 1.88: a user compiling Mira is
 # not compiling this.
 rust-version = "1.89"
 license = "Apache-2.0"

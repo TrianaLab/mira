@@ -144,8 +144,8 @@ sh -c 'stty rows 50 cols 200; printf "2t\rqqq" | script -q /dev/null ./target/re
 ```
 
 Count the `q`s: each leaves one mode. The layout unit tests pass even when
-content is being *lost* — `Row` clips at `max` — so a layout change is not
-verified until you have looked at it.
+content is being *lost* — ratatui truncates at the area width — so a layout
+change is not verified until you have looked at it.
 
 ## 3. The load harness
 

@@ -51,7 +51,9 @@ use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams,
+};
 use kube::runtime::Controller;
 use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
@@ -316,7 +318,50 @@ async fn ensure(ctx: &Ctx, c: &MiraCluster, ns: &str, replicas: i32) -> Result<(
     pdbs.patch(&name, &params(), &apply(&res::pod_disruption_budget(c)))
         .await?;
 
-    ensure_proxy(ctx, c, ns, replicas).await
+    ensure_proxy(ctx, c, ns, replicas).await?;
+    ensure_route(ctx, c, ns).await
+}
+
+/// Apply the `HTTPRoute`, or take it away again.
+///
+/// Last, and after the Services it names as backends: a route applied before
+/// them lands `ResolvedRefs: False` on the Gateway until the next reconcile,
+/// which is a frightening thing to leave in a fresh cluster's events for no
+/// reason.
+///
+/// Dynamically typed for the reason [`res::http_route`] gives — Gateway API is
+/// a CRD, so there is no k8s-openapi type and no compile-time guarantee the
+/// cluster serves the kind at all. A `spec.route` on a cluster without the
+/// Gateway API CRDs is therefore a reconcile error rather than a silent
+/// no-op, which is the honest direction: the object asked for something the
+/// cluster cannot do.
+async fn ensure_route(ctx: &Ctx, c: &MiraCluster, ns: &str) -> Result<(), Error> {
+    let ar = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "gateway.networking.k8s.io",
+        "v1",
+        "HTTPRoute",
+    ));
+    let routes: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &ar);
+    let name = c.name_any();
+
+    let Some(route) = &c.spec.route else {
+        // Removing `spec.route` closes the route. Leaving it standing would be
+        // a tier that stays reachable after the field that exposed it was
+        // deleted, and the owner reference only collects it when the whole
+        // `MiraCluster` goes.
+        //
+        // The result is dropped on purpose and this is the one place it can be:
+        // the overwhelmingly common case is a cluster that never asked for a
+        // route and has no Gateway API CRDs, where this is a 404 on the
+        // resource path rather than on an object. Neither that nor a genuine
+        // absence is a reconcile failure.
+        let _ = routes.delete(&name, &DeleteParams::default()).await;
+        return Ok(());
+    };
+    routes
+        .patch(&name, &params(), &apply(&res::http_route(c, route)))
+        .await?;
+    Ok(())
 }
 
 /// Apply the proxy's view of the tier: the replica list, and the Deployment
@@ -728,7 +773,9 @@ pub(crate) fn chrono_parse(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{MiraClusterSpec, MiraClusterStatus, Proxy, Scaling, Storage};
+    use crate::crd::{
+        MiraClusterSpec, MiraClusterStatus, ParentRef, Proxy, Route, Scaling, Storage,
+    };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
     use crate::fake::{Fake, not_found};
@@ -834,6 +881,7 @@ mod tests {
                 offload: None,
                 cold_storage_claim: None,
                 proxy: Proxy::default(),
+                route: None,
             },
         );
         c.status = Some(MiraClusterStatus {
@@ -920,6 +968,9 @@ mod tests {
                 "PATCH /api/v1/namespaces/ns/configmaps/tel-proxy",
                 "PATCH /api/v1/namespaces/ns/services/tel-proxy",
                 "PATCH /apis/apps/v1/namespaces/ns/deployments/tel-proxy",
+                // No `spec.route`, so the route is taken away rather than left
+                // standing. See `ensure_route`.
+                "DELETE /apis/gateway.networking.k8s.io/v1/namespaces/ns/httproutes/tel",
             ]
         );
 
@@ -938,8 +989,63 @@ mod tests {
         c.spec.proxy.replicas = 0;
         ensure(&f.ctx(), &c, "ns", 1).await.unwrap();
 
-        assert_eq!(f.log().len(), 4, "{:?}", f.log());
+        let applied: Vec<_> = f
+            .log()
+            .into_iter()
+            .filter(|l| l.starts_with("PATCH"))
+            .collect();
+        assert_eq!(applied.len(), 4, "{applied:?}");
         assert!(!f.log().iter().any(|l| l.contains("proxy")));
+    }
+
+    /// `spec.route` is a toggle in both directions.
+    ///
+    /// The off arm is the one worth a test. An operator that only ever *created*
+    /// the route would leave a tier reachable through a Gateway after the field
+    /// that put it there was deleted, and the owner reference does not help:
+    /// it collects the route when the whole `MiraCluster` goes, which is not
+    /// what removing one field asked for.
+    #[tokio::test]
+    async fn the_route_follows_the_field_that_asks_for_it() {
+        let route = "/apis/gateway.networking.k8s.io/v1/namespaces/ns/httproutes/tel";
+
+        let f = Fake::ok();
+        let mut c = drainable();
+        c.spec.route = Some(Route {
+            parent_refs: vec![ParentRef {
+                name: "edge".into(),
+                namespace: None,
+                section_name: None,
+            }],
+            hostnames: vec![],
+        });
+        ensure(&f.ctx(), &c, "ns", 1).await.unwrap();
+        assert!(f.log().contains(&format!("PATCH {route}")), "{:?}", f.log());
+
+        let f = Fake::ok();
+        c.spec.route = None;
+        ensure(&f.ctx(), &c, "ns", 1).await.unwrap();
+        assert!(
+            f.log().contains(&format!("DELETE {route}")),
+            "{:?}",
+            f.log()
+        );
+    }
+
+    /// A cluster with no Gateway API CRDs is the common case, and the delete
+    /// above is then a 404 on a resource path the API server has never heard
+    /// of. That must not fail a reconcile of a tier that is otherwise healthy
+    /// and never asked for a route.
+    #[tokio::test]
+    async fn a_cluster_without_the_gateway_api_still_reconciles() {
+        let f = Fake::new(|m, p| {
+            if m == "DELETE" && p.contains("httproutes") {
+                (StatusCode::NOT_FOUND, not_found())
+            } else {
+                (StatusCode::OK, json!({}))
+            }
+        });
+        ensure(&f.ctx(), &drainable(), "ns", 1).await.unwrap();
     }
 
     /// An unsatisfiable spec is reported and then left alone. It must not reach

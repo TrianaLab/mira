@@ -3,8 +3,8 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 429 cargo tests — 369 across levels 1–5, plus 60 in `xtask` that test
-the gates rather than the engine — 22 UI tests, 26 chart tests, and 67 more in
+Mira has 432 cargo tests — 372 across levels 1–5, plus 60 in `xtask` that test
+the gates rather than the engine — 22 UI tests, 26 chart tests, and 74 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
 both targets are in [Contributing](../contributing.md).
@@ -16,7 +16,7 @@ the industry's least agreed label, so it is absent.
 
 | # | Level | Count | Lives in | Runs from |
 | --- | --- | --- | --- | --- |
-| 1 | Unit, in-source | 145 core + 183 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 146 core + 185 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
@@ -133,15 +133,15 @@ one.
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it. `make operator` is its
-whole gate — fmt, clippy, 62 unit tests, a coverage floor and the CRD drift
+whole gate — fmt, clippy, 69 unit tests, a coverage floor and the CRD drift
 check — and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
 deliberately not in it.
 
 The separation is not about testing: kube-rs declares Rust 1.89 against the
-engine's 1.85 floor and brings ~160 crates and a TLS stack, against a README
+engine's 1.88 floor and brings ~160 crates and a TLS stack, against a README
 crate count that is a published product property.
 
-Its 62 unit tests are level 1 in shape and almost all about **arithmetic that
+Its 69 unit tests are level 1 in shape and almost all about **arithmetic that
 decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
 a spec whose thresholds would oscillate.

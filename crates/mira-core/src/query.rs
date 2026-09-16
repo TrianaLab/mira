@@ -1647,7 +1647,7 @@ fn keep_by(
 /// Decode hex, either case. `None` on an odd length or any non-hex byte, so a
 /// malformed trace id matches nothing rather than matching a truncated prefix.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let b = s.as_bytes();

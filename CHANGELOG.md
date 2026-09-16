@@ -9,6 +9,56 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **`spec.route` on a `MiraCluster`** writes an `HTTPRoute` in front of the tier,
+  attached to Gateways you already run. It names the parents and, optionally, the
+  hostnames; the paths are derived — OTLP ingest and the merged read go to the
+  proxy, everything else to a storage node, which is the only place the UI and
+  `/mcp` are answered. Removing the field removes the route, and leaving it unset
+  creates nothing, so a cluster without the Gateway API CRDs is unaffected.
+- **`make demo-cluster`** — Kind, Envoy Gateway, the operator and a `MiraCluster`
+  on `http://localhost:8080`, with an hour of seeded telemetry and a generator
+  still producing. The UI, the query API and the MCP endpoint are all on that one
+  address, behind the `HTTPRoute` the operator writes from `spec.route`.
+  `make demo-cluster-down` deletes the cluster.
+
+### Changed
+
+- **The terminal UI is drawn by ratatui.** Every pane — list, detail, waterfall,
+  service map, alerts, node and help — renders through a widget and a layout
+  solver instead of the hand-rolled row writer, which clipped columns at `max`
+  and so lost content while its unit tests stayed green. No backend is linked:
+  `CrosstermBackend` would add crossterm, mio, signal-hook and parking_lot to do
+  what `term.rs` already does, so `term.rs` keeps the pty, the raw mode, the
+  resize handling and the key decoding, and its `Row` builder is deleted rather
+  than wrapped. The port costs 145 KiB and 26 crates, 122 to 148; the release
+  ships at 6.20 MiB.
+- **The minimum supported Rust version is 1.88**, up from 1.85, which
+  ratatui 0.30 requires.
+- **The terminal UI says where the keys go.** The key bar names the pane `esc`
+  returns to rather than saying `esc back`, drops the second rank of keys when
+  the terminal is too narrow to hold them, and tells a scrollable pane that it
+  scrolls. An empty pane now explains itself: a directory with no blocks in it
+  points at `--data-dir` and `make demo`, and a window with no matching rows
+  points at `]` and `/`. Help is grouped under six headings by what a reader is
+  trying to do.
+
+### Fixed
+
+- **Retention emptied a data directory on a volume that had room to spare.**
+  The free-space floor under the TTL was a bare ratio, so 10% of a 1 TB disk is
+  100 GB and a machine sitting at 45 GB free was "nearly full": every block was
+  dropped within a sweep of being written, and the only sign was a warning in
+  the server log. The floor is now a ratio *and* a byte count, both of which
+  have to agree before anything is unlinked. Small volumes behave exactly as
+  before — the ratio is still the binding term there.
+- **The operator's headless Service selected every pod under a `MiraCluster`**
+  rather than the storage ones, so the proxy was in its endpoints. A client
+  resolving the Service name — an `HTTPRoute` backend, say — reached the proxy on
+  some connections and a storage node on others, and both answer
+  `/api/v1/query`. The per-pod names (`tel-0.tel-headless`) were never affected.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added

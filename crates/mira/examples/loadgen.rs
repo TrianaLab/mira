@@ -753,19 +753,11 @@ fn peak_memory(pid: u32, deadline: Instant) -> (f64, f64) {
     let mut peak_anon = 0u64;
     let mut next_anon = Instant::now();
     while Instant::now() < deadline && WRITING.load(Ordering::Relaxed) {
-        // Not a `let` chain: those are stable since 1.88 and the workspace
-        // MSRV is 1.85.
-        let sample = std::process::Command::new("ps")
+        if let Ok(out) = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &pid.to_string()])
             .output()
-            .ok()
-            .and_then(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            });
-        if let Some(kib) = sample {
+            && let Ok(kib) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>()
+        {
             peak_rss = peak_rss.max(kib);
         }
         if Instant::now() >= next_anon {
@@ -1103,7 +1095,7 @@ fn logs_batch(i: u64, ts: u64) -> ExportLogsServiceRequest {
                         let k = i.wrapping_mul(batch() as u64) + n as u64;
                         // One in fifty is an error: rare enough that a severity
                         // filter is worth typing, common enough to see.
-                        let err = k % 50 == 0;
+                        let err = k.is_multiple_of(50);
                         let route = ROUTES[(k % 5) as usize];
                         LogRecord {
                             time_unix_nano: ts + n as u64 * 1_000,
@@ -1168,12 +1160,12 @@ fn spans_batch(i: u64, ts: u64) -> ExportTraceServiceRequest {
                                 kv("net.peer.name", SERVICES[((k + 1) % 4) as usize]),
                             ],
                             status: Some(mira_proto::trace::v1::Status {
-                                code: if k % 50 == 0 {
+                                code: if k.is_multiple_of(50) {
                                     status::StatusCode::Error
                                 } else {
                                     status::StatusCode::Ok
                                 } as i32,
-                                message: if k % 50 == 0 {
+                                message: if k.is_multiple_of(50) {
                                     "timeout".into()
                                 } else {
                                     String::new()
@@ -1578,7 +1570,7 @@ fn demo_spans(first: u64, traces: u64, t0: u64, slot: u64) -> ExportTraceService
 fn demo_span(trace: u64, hop: usize, t0: u64) -> Span {
     let (_, name, kind, parent, off, dur) = GRAPH[hop];
     let start = t0 + scaled(off, trace);
-    let broken = trace % DEMO_BROKEN == 0;
+    let broken = trace.is_multiple_of(DEMO_BROKEN);
     let failed = broken && DEMO_ERROR_PATH.contains(&hop);
 
     let attributes = if hop == DEMO_DB_HOP {
@@ -1651,7 +1643,7 @@ fn demo_span(trace: u64, hop: usize, t0: u64) -> Span {
 /// the query that proves it works end to end — there is no existence operator,
 /// so the value has to be one this file actually emits.
 fn demo_events(trace: u64, hop: usize, start: u64, dur: u64) -> Vec<span::Event> {
-    let broken = trace % DEMO_BROKEN == 0;
+    let broken = trace.is_multiple_of(DEMO_BROKEN);
     let mut out = Vec::new();
 
     // Raised where it happens — the payments handler — not where it is reported.
@@ -1687,7 +1679,7 @@ fn demo_events(trace: u64, hop: usize, start: u64, dur: u64) -> Vec<span::Event>
         });
     }
     // Something ordinary, so the waterfall is not only decorated where it broke.
-    if hop == 2 && trace % 3 == 0 {
+    if hop == 2 && trace.is_multiple_of(3) {
         out.push(span::Event {
             time_unix_nano: start + scaled(dur, trace) / 5,
             name: "cache.miss".into(),
@@ -1701,7 +1693,7 @@ fn demo_events(trace: u64, hop: usize, start: u64, dur: u64) -> Vec<span::Event>
 /// Span links. A retried checkout points at the attempt it is retrying, which is
 /// the commonest real link there is and the one a waterfall can show.
 fn demo_links(trace: u64, hop: usize) -> Vec<span::Link> {
-    if hop != 0 || trace == 0 || trace % 5 != 0 {
+    if hop != 0 || trace == 0 || !trace.is_multiple_of(5) {
         return Vec::new();
     }
     vec![span::Link {
@@ -1771,12 +1763,12 @@ fn demo_log(svc: &str, hop: usize, trace: u64, start: u64) -> LogRecord {
     // its span in the waterfall rather than at the left of every span at once.
     let ts = start + scaled(off + dur, trace);
     let ms = dur * jitter(trace) / 1_000_000;
-    let failed = trace % DEMO_BROKEN == 0 && DEMO_ERROR_PATH.contains(&hop);
+    let failed = trace.is_multiple_of(DEMO_BROKEN) && DEMO_ERROR_PATH.contains(&hop);
     let (severity, text) = if failed {
         (17, "ERROR")
-    } else if trace % 7 == 0 {
+    } else if trace.is_multiple_of(7) {
         (13, "WARN")
-    } else if trace % 3 == 0 {
+    } else if trace.is_multiple_of(3) {
         (5, "DEBUG")
     } else {
         (9, "INFO")
@@ -1802,7 +1794,7 @@ fn demo_log(svc: &str, hop: usize, trace: u64, start: u64) -> LogRecord {
                 kv("sku", &format!("SKU-{:04}", trace % 240)),
                 int("qty", (trace % 5) as i64),
                 int("latency_ms", ms as i64),
-                b("in_stock", trace % 11 != 0),
+                b("in_stock", !trace.is_multiple_of(11)),
             ]),
             (_, true) => text_value(&format!(
                 "{name} failed: upstream returned 503 after {ms}ms"
@@ -1841,7 +1833,7 @@ fn demo_assistant(first: u64, traces: u64, t0: u64, slot: u64) -> ScopeLogs {
             ..Default::default()
         }),
         log_records: (0..traces)
-            .filter(|t| (first + t) % 7 == 0)
+            .filter(|t| (first + t).is_multiple_of(7))
             .map(|t| {
                 let trace = first + t;
                 let ts = trace_start(t0, t, traces, slot) + scaled(40_000, trace);
@@ -2013,7 +2005,7 @@ fn demo_exemplars(first: u64, traces: u64, p: u64, ts: u64) -> Vec<Exemplar> {
     }
     let slow = p * 7 % traces;
     let broken = (0..traces)
-        .find(|t| (first + t) % DEMO_BROKEN == 0)
+        .find(|t| (first + t).is_multiple_of(DEMO_BROKEN))
         .unwrap_or(slow);
     [(slow, 180.0), (broken, 820.0)]
         .into_iter()

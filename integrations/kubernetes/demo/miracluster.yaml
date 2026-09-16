@@ -1,0 +1,44 @@
+# The tier the demo runs on: one storage replica and one proxy.
+#
+# One replica, and that is the whole reason the topology is worth stating. The
+# UI, the MCP endpoint and `/api/v1/metrics/names` live on a storage node and
+# not on the proxy — a proxy merges what it can merge, and a page of HTML is not
+# that. So with two replicas the browser would be looking at half the corpus
+# while the query API looked at all of it, and a demo that quietly disagrees
+# with itself is worse than one that is small. `make operator-e2e` is where the
+# multi-replica tier is exercised.
+#
+# The proxy is still here at one replica, because it is the address an exporter
+# is given and the demo's ingest really does go through it. `spec.route` below
+# is what puts both on one address: the operator writes the `HTTPRoute`, sending
+# `/v1/*` and `/api/v1/query` to the proxy and everything a human or an agent
+# reads to the node.
+#
+# Scaling is left at the CRD's defaults on purpose: a demo should show what a
+# user gets. `upWhenFreeBelow: 0.15` against a Kind node with 60% free does
+# nothing, which is the correct amount of nothing.
+---
+apiVersion: mira.miradb.dev/v1alpha1
+kind: MiraCluster
+metadata:
+  name: tel
+spec:
+  # Overwritten by `make demo-cluster` with the tag it just loaded into Kind.
+  image: mira:demo
+  replicas: 1
+  proxy:
+    replicas: 1
+  storage:
+    size: 2Gi
+  # Requests only. A limit on a laptop's Kind node is a pod that does not
+  # schedule, and the first thing a demo must do is come up.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # The operator owns the route. Naming the Gateway is the only part of it a
+  # cluster can know, which is why it is the only part this file writes —
+  # `gateway.yaml` is where that Gateway comes from.
+  route:
+    parentRefs:
+      - name: mira

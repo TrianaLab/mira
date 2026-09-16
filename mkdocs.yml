@@ -156,6 +156,11 @@ nav:
   - Home: index.md
   - Get started:
       - See it work: demo.md
+      # Second, not under Install, and the distinction is the reading order:
+      # this one is still "show me", with Kubernetes on the path. Install is
+      # "now put it somewhere", and a reader who has not decided yet does not
+      # need it.
+      - See it on Kubernetes: demo-cluster.md
       - Install: install.md
       - Quickstart: quickstart.md
   - Guides:

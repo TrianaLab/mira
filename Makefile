@@ -105,11 +105,11 @@ LOADGEN := target/release/examples/loadgen
 # the drift's direction from here.
 COVERAGE_MIN ?= 99.23
 
-# MSRV. Declared in Cargo.toml as rust-version and load-bearing for the crate
-# count (see crates/mira/Cargo.toml: the ratatui-vs-libc trade assumes a floor
-# old enough that nobody is forced onto a newer toolchain to use Mira). A
-# declared MSRV that is never compiled against is a wish, so `make msrv` builds
-# with exactly it.
+# MSRV. Declared in Cargo.toml as rust-version and a published property: it is
+# the toolchain a user needs to compile Mira at all, so it moves only when a
+# dependency forces it (ratatui 0.30 is what put it at 1.88). A declared MSRV
+# that is never compiled against is a wish, so `make msrv` builds with exactly
+# it.
 MSRV := $(shell sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 
 export CARGO_TERM_COLOR ?= always
@@ -370,6 +370,18 @@ demo-clean: ## Delete the demo's scratch data directory and its log
 	rm -rf "$(DEMO_DIR)" "$(DEMO_LOG)"
 	@echo "removed $(DEMO_DIR) — a data directory is the whole of Mira's state,"
 	@echo "so that is a complete uninstall of this demo."
+
+# The same demo with Kubernetes on the path. Not a gate and not in `make check`:
+# it builds two images and a cluster, it asserts nothing, and it deliberately
+# leaves everything running. `make operator-e2e` is the gate for the same
+# machinery.
+.PHONY: demo-cluster
+demo-cluster: ## Kind + the operator + Envoy Gateway on http://localhost:8080, with data
+	$(OPERATOR)/demo/run.sh
+
+.PHONY: demo-cluster-down
+demo-cluster-down: ## Delete the demo cluster
+	DOWN=1 $(OPERATOR)/demo/run.sh
 
 .PHONY: ui
 ui: ## Build the Svelte UI into the committed crates/mira/ui/dist

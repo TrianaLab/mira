@@ -78,3 +78,15 @@ grants exactly this list and nothing more:
         - watch
         - create
         - delete
+    - apiGroups:
+        - gateway.networking.k8s.io
+      resources:
+        - httproutes
+      verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+        - delete
