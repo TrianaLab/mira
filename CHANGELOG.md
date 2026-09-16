@@ -23,6 +23,16 @@ the config keys, the `/mcp` tool set.
 - **The minimum supported Rust version is 1.88**, up from 1.85, which
   ratatui 0.30 requires.
 
+### Fixed
+
+- **Retention emptied a data directory on a volume that had room to spare.**
+  The free-space floor under the TTL was a bare ratio, so 10% of a 1 TB disk is
+  100 GB and a machine sitting at 45 GB free was "nearly full": every block was
+  dropped within a sweep of being written, and the only sign was a warning in
+  the server log. The floor is now a ratio *and* a byte count, both of which
+  have to agree before anything is unlinked. Small volumes behave exactly as
+  before — the ratio is still the binding term there.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
