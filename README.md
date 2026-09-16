@@ -65,7 +65,7 @@ helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
   --namespace mira-system --create-namespace   # then: kubectl apply a MiraCluster
 ```
 
-Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.1.1` pins the
+Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.2.0` pins the
 installer to a release; every one of them ships a CycloneDX SBOM, `SHA256SUMS`,
 a cosign signature and a SLSA provenance attestation.
 
