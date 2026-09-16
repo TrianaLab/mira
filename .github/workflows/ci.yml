@@ -553,7 +553,20 @@ jobs:
   tag:
     name: tag
     needs: [required, security-required]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # `always()` is what makes this job reachable at all. A skip propagates down
+    # the whole dependency chain, not just one edge: `ui` is path-filtered and
+    # skips on nearly every push, and although the gates above survive it with
+    # their own `always()`, anything downstream of them inherits the skip unless
+    # its `if` names a status function. Without this the job was skipped on
+    # every push to main since it was written, and v0.0.1..v0.0.4 were tagged by
+    # hand. So `always()`, and then the two results spelled out — `always()`
+    # alone would also run it on a red or cancelled main.
+    if: >-
+      always()
+      && github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && needs.required.result == 'success'
+      && needs.security-required.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       # To push the tag, and to dispatch release.yml at it. The second is the
