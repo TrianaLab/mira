@@ -226,6 +226,11 @@ struct App {
     tail: bool,
     scroll: usize,
     stats: String,
+    /// `blocks_total` from the last answer that scanned any. An empty pane says
+    /// something different when there is nothing to scan: "no rows in the last
+    /// hour" is a window to widen, and "no blocks at all" is the wrong
+    /// directory, which is the mistake a first run actually makes.
+    blocks: i64,
     status: String,
     err: bool,
     job: Option<Job>,
@@ -298,6 +303,7 @@ impl App {
             tail: false,
             scroll: 0,
             stats: String::new(),
+            blocks: 0,
             status: "loading".into(),
             err: false,
             job: Some(Job::Rows),
@@ -340,7 +346,10 @@ impl App {
             // Neither answers about blocks, so the scan counters would all read
             // zero and look like a query that found nothing.
             Job::Alerts | Job::Diag => ms(t.elapsed()),
-            _ => format!("{} · {}", stats_line(&doc["stats"]), ms(t.elapsed())),
+            _ => {
+                self.blocks = doc["stats"]["blocks_total"].as_i64().unwrap_or(0);
+                format!("{} · {}", stats_line(&doc["stats"]), ms(t.elapsed()))
+            }
         };
         self.status.clear();
 
@@ -362,7 +371,10 @@ impl App {
                     }
                 }
                 if self.rows.is_empty() {
-                    self.status = "no rows in this window".into();
+                    self.status = match self.blocks {
+                        0 => "nothing has been written here".into(),
+                        _ => "no rows in this window".into(),
+                    };
                 }
             }
             Job::Names => {
@@ -1048,28 +1060,113 @@ impl App {
     }
 
     fn hints(&self, w: usize) -> String {
+        // Where Esc goes, not that it goes somewhere. Every pane here was
+        // opened from the list under it, and naming that list is the
+        // difference between one keystroke and pressing `q` until something
+        // familiar comes back.
+        let back = match self.tab {
+            Tab::Logs => "esc → logs",
+            Tab::Traces => "esc → traces",
+            Tab::Metrics => "esc → metrics",
+        };
         let keys = match self.mode {
-            Mode::Filter => "enter apply  esc cancel  ^w word  ^u clear",
-            Mode::Detail => "esc back  ↑↓ scroll  t trace",
-            Mode::Trace => "esc back  ↑↓ span  enter detail",
-            Mode::Span => "esc waterfall  ↑↓ scroll",
-            Mode::Frame => "esc back  ↑↓ move  enter service→filter, trace→waterfall",
-            Mode::Map => "esc back  ↑↓ move  enter filter on this service",
-            Mode::Alerts => "esc back  ↑↓ move  enter show the records that fired  a reload",
-            Mode::Diag => "esc back  ↑↓ scroll  d reload",
-            Mode::Help => "esc back",
-            Mode::List if self.tab == Tab::Metrics => {
-                "↑↓ move  tab pane  enter load  t trace  m map  a alerts  d node  / filter  [] window  ? help"
-            }
+            Mode::Filter => "enter apply  esc cancel  ^w word  ^u clear".into(),
+            Mode::Detail => format!("{back}  ↑↓ scroll  t trace"),
+            Mode::Trace => format!("{back}  ↑↓ span  enter detail"),
+            Mode::Span => "esc → waterfall  ↑↓ scroll".into(),
+            Mode::Frame => format!("{back}  ↑↓ move  enter service→filter, trace→waterfall"),
+            Mode::Map => format!("{back}  ↑↓ move  enter filter on this service"),
+            Mode::Alerts => format!("{back}  ↑↓ move  enter show the records that fired  a reload"),
+            Mode::Diag => format!("{back}  ↑↓ scroll  d reload"),
+            // The list is longer than a short terminal, and a pane that is
+            // cut off at the bottom with no hint that it continues is how a
+            // key ends up looking like it does not exist.
+            Mode::Help => format!("{back}  ↑↓ scroll"),
             Mode::List => {
-                "↑↓ move  enter detail  t trace  c frame  m map  a alerts  d node  f follow  / filter  ? help"
+                let full = match self.tab {
+                    Tab::Metrics => {
+                        "↑↓ move  tab pane  enter load  ·  m map  a alerts  d node  ·  / filter  [] window  ? help  q quit"
+                    }
+                    _ => {
+                        "↑↓ move  enter detail  t trace  c frame  ·  m map  a alerts  d node  ·  / filter  f follow  ? help  q quit"
+                    }
+                };
+                // The full bar does not fit in 80 columns, and what falls off
+                // the end is `? help` and `q quit` — the two a reader who is
+                // stuck needs most. So the narrow terminal drops the panes,
+                // which are what `?` lists.
+                match full.chars().count() + 2 <= w {
+                    true => full.into(),
+                    false => "↑↓ move  enter open  / filter  ? help  q quit".into(),
+                }
             }
         };
         rata::row(w, vec![format!(" {keys}").dim()])
     }
 
+    /// What an empty pane says, instead of nothing at all.
+    ///
+    /// What it replaces was a blank body and one yellow phrase in the footer,
+    /// which reads as a broken pane rather than an empty one — and the footer
+    /// is the last place anyone looks. The two ways to get here want opposite
+    /// advice, so they are answered separately: no blocks at all is a
+    /// `--data-dir` pointed somewhere nothing was ever written, and no rows in
+    /// a directory that has some is a window or a filter to change.
+    fn nothing(&self, w: usize, what: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut say = |s: String, key: bool| {
+            out.push(rata::row(
+                w,
+                vec![match key {
+                    true => s.bold(),
+                    false => s.dim(),
+                }],
+            ));
+        };
+        match self.blocks {
+            0 => {
+                say("   nothing has been written here".into(), true);
+                say(format!("   {} · 0 blocks", self.src.label()), false);
+                say(String::new(), false);
+                say(
+                    "   → --data-dir wants a directory mira has written to, and".into(),
+                    false,
+                );
+                say(
+                    "     --addr a node that is up. `make demo` fills one.".into(),
+                    false,
+                );
+            }
+            _ => {
+                say(format!("   no {what} matched"), true);
+                say(
+                    match self.filter.is_empty() {
+                        true => format!("   last {}, no filter", WINDOWS[self.win]),
+                        false => format!("   last {} · {}", WINDOWS[self.win], self.filter),
+                    },
+                    false,
+                );
+                say(String::new(), false);
+                say(
+                    "   → ] widens the window · / edits the filter · r re-runs".into(),
+                    false,
+                );
+            }
+        }
+        out
+    }
+
     /// Logs and traces: a list on top, the selection's detail below.
     fn records(&self, w: usize, h: usize) -> Vec<String> {
+        if self.rows.is_empty() {
+            return self.nothing(
+                w,
+                match self.tab {
+                    Tab::Traces => "spans",
+                    _ => "records",
+                },
+            );
+        }
         // Two thirds to the list. Below about a quarter the detail pane shows
         // nothing useful, and above about a half the list stops being a list.
         let list_h = (h * 2 / 3).max(1);
@@ -1103,18 +1200,17 @@ impl App {
             out.push(String::new());
         }
 
-        let title = match self.selected() {
-            Some(_) => format!(
-                " {} {} of {} ",
-                match self.tab {
-                    Tab::Traces => "span",
-                    _ => "record",
-                },
-                self.sel + 1,
-                self.rows.len()
-            ),
-            None => " nothing selected ".into(),
-        };
+        // There is always a selection here: the empty case returned above, and
+        // `sel` is clamped to the rows on every move.
+        let title = format!(
+            " {} {} of {} ",
+            match self.tab {
+                Tab::Traces => "span",
+                _ => "record",
+            },
+            self.sel + 1,
+            self.rows.len()
+        );
         out.push(rata::rule(w, &title));
         let left = h - out.len();
         if let Some(row) = self.selected() {
@@ -1132,6 +1228,9 @@ impl App {
 
     /// Metric names on the left, the selected name's series on the right.
     fn metrics(&self, w: usize, h: usize) -> Vec<String> {
+        if self.names.is_empty() {
+            return self.nothing(w, "metrics");
+        }
         let nw = 34.min(w / 3);
         let top = window_start(self.nsel, h, self.names.len());
         let mut out = Vec::with_capacity(h);
@@ -1179,15 +1278,11 @@ impl App {
     /// the vertical scroll is over series and each one is a fixed three rows.
     fn series_lines(&self, w: usize) -> Vec<String> {
         if self.series.is_empty() {
-            // Rendered even when it is one word, so the caller's promise that
-            // every line here is exactly `w` wide holds for this one too.
-            return vec![rata::row(
-                w,
-                match self.names.is_empty() {
-                    true => Vec::new(),
-                    false => vec![" enter to load this metric".dim()],
-                },
-            )];
+            // Rendered even though it is one phrase, so the caller's promise
+            // that every line here is exactly `w` wide holds for this one too.
+            // A pane with no names at all never reaches here — `metrics` says
+            // so itself and returns before splitting the columns.
+            return vec![rata::row(w, vec![" enter to load this metric".dim()])];
         }
         let mut out = Vec::with_capacity(self.series.len() * 3);
         for (i, s) in self.series.iter().enumerate() {
@@ -1914,65 +2009,97 @@ fn span_bar(s: &Yaml, depth: usize, sel: bool, ends: [usize; 4], t: &Trace) -> S
     )
 }
 
+/// The key list, under headings.
+///
+/// Headings rather than one column of thirty rows, because the question this
+/// pane is opened with is never "what does `c` do" — it is "how do I get to
+/// the thing I can see" or "how do I get out", and those are four keys each in
+/// a list where every row looks like every other one.
 fn help(w: usize) -> Vec<String> {
-    const TEXT: &[(&str, &str)] = &[
-        ("", ""),
-        ("1 2 3 / h l", "logs, traces, metrics"),
-        ("↑ ↓ / j k", "move the selection"),
-        ("PgUp PgDn g G", "page, top, bottom"),
-        ("enter", "open the selection (metrics: load the series)"),
-        ("t", "open the trace this row points at"),
-        ("c", "the frame around this filter: its services and traces"),
+    const TEXT: &[(&str, &[(&str, &str)])] = &[
         (
-            "m",
-            "the service map, as a call tree from where traffic arrives",
-        ),
-        ("f", "follow: re-run the query every 3s and keep the cursor"),
-        ("a", "alert rules and what each one is doing right now"),
-        (
-            "d",
-            "node diagnostics: disk, memory, ingest and query counters",
-        ),
-        ("tab", "metrics: switch between names and series"),
-        (
-            "esc",
-            "back out of a detail, trace, frame, map, alert or help view",
-        ),
-        ("/", "edit the filter, enter to apply"),
-        ("[ ]", "shrink or grow the time window"),
-        ("+ -", "halve or double the row limit"),
-        ("r", "re-run the query"),
-        ("q", "quit"),
-        ("", ""),
-        ("filter syntax", "space-separated terms, all AND-ed"),
-        (
-            "  service.name=checkout",
-            "an attribute, matched at all three levels",
+            " move around ",
+            &[
+                ("1 2 3 / h l", "logs, traces, metrics"),
+                ("↑ ↓ / j k", "move the selection"),
+                ("PgUp PgDn g G", "page, top, bottom"),
+                ("tab", "metrics: switch between names and series"),
+            ],
         ),
         (
-            "  severity_number>=17",
-            "a root column: = != < <= > >= and ~ for contains",
+            " open something ",
+            &[
+                ("enter", "open the selection (metrics: load the series)"),
+                ("t", "the trace this row points at"),
+                ("c", "the frame around this filter: its services and traces"),
+                (
+                    "m",
+                    "the service map, as a call tree from where traffic arrives",
+                ),
+                ("a", "alert rules and what each one is doing right now"),
+                (
+                    "d",
+                    "node diagnostics: disk, memory, ingest and query counters",
+                ),
+            ],
         ),
         (
-            "  body~\"connection refused\"",
-            "quote a value that has spaces in it",
+            " get back out ",
+            &[
+                ("esc", "leave the pane you are in, one step at a time"),
+                ("q", "the same, and quit from the list"),
+            ],
         ),
         (
-            "  refused",
-            "a word on its own searches body, or a span's name",
+            " change the question ",
+            &[
+                ("/", "edit the filter, enter to apply"),
+                ("[ ]", "shrink or grow the time window"),
+                ("+ -", "halve or double the row limit"),
+                ("f", "follow: re-run the query every 3s and keep the cursor"),
+                ("r", "re-run the query"),
+            ],
         ),
-        ("", ""),
         (
-            "on a local directory",
-            "queries run in-process; no server needs to be up",
+            " filter syntax ",
+            &[
+                ("", "space-separated terms, all AND-ed"),
+                (
+                    "service.name=checkout",
+                    "an attribute, matched at all three levels",
+                ),
+                (
+                    "severity_number>=17",
+                    "a root column: = != < <= > >= and ~ for contains",
+                ),
+                (
+                    "body~\"connection refused\"",
+                    "quote a value that has spaces in it",
+                ),
+                (
+                    "refused",
+                    "a word on its own searches body, or a span's name",
+                ),
+            ],
         ),
         (
-            "",
-            "a and d need --addr: they report a process, not a directory",
+            " reading a directory ",
+            &[
+                ("", "queries run in-process; no server needs to be up"),
+                (
+                    "",
+                    "a and d need --addr: they report a process, not a directory",
+                ),
+            ],
         ),
     ];
     TEXT.iter()
-        .map(|(k, v)| rata::row(w, vec![format!("  {k:<28}").bold(), (*v).dim()]))
+        .flat_map(|(head, rows)| {
+            std::iter::once(rata::rule(w, head)).chain(
+                rows.iter()
+                    .map(move |(k, v)| rata::row(w, vec![format!("  {k:<28}").bold(), (*v).dim()])),
+            )
+        })
         .collect()
 }
 
@@ -3569,7 +3696,11 @@ mod tests {
         // Help is a toggle, and Esc closes it too.
         let f = strip(&press(&mut app, Key::Char('?')));
         assert_eq!(app.mode, Mode::Help);
-        assert!(f.contains("open the trace this row points at"), "{f}");
+        assert!(f.contains("the trace this row points at"), "{f}");
+        // Under a heading: the keys are grouped by what a reader is trying to
+        // do, not listed alphabetically.
+        assert!(f.contains("open something"), "{f}");
+        assert!(f.contains("get back out"), "{f}");
         press(&mut app, Key::Char('?'));
         assert_eq!(app.mode, Mode::List);
 
@@ -3600,6 +3731,11 @@ mod tests {
         assert_eq!(app.mode, Mode::List);
         assert!(app.rows.is_empty());
         assert!(f.contains("no rows in this window"), "{f}");
+        // The body says it too, and says what to do about it. A blank pane
+        // with one phrase in the footer reads as broken rather than empty.
+        assert!(f.contains("no records matched"), "{f}");
+        assert!(f.contains("last 1h · severity_text=WARN"), "{f}");
+        assert!(f.contains("] widens the window"), "{f}");
 
         // Esc restores the text that was there before `/`, so an abandoned edit
         // leaves the view exactly as it was found.
@@ -3621,6 +3757,72 @@ mod tests {
         typed(&mut app, "checkout");
         let f = strip(&press(&mut app, Key::Enter));
         assert!(f.contains("ignored"), "{f}");
+    }
+
+    /// A directory nothing was ever written to, which is what a first run
+    /// against the wrong `--data-dir` looks like.
+    ///
+    /// It is a different pane from a filter that matched nothing, and the
+    /// advice is the opposite: widening the window here would never help.
+    #[test]
+    fn an_empty_directory_says_it_is_empty_rather_than_drawing_a_blank_pane() {
+        let dir = std::env::temp_dir().join(format!("mira-tui-void-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(Source::Local(dir.clone()));
+        let f = strip(&settle(&mut app));
+        assert_eq!(app.blocks, 0);
+        assert!(f.contains("nothing has been written here"), "{f}");
+        assert!(f.contains("0 blocks"), "{f}");
+        assert!(f.contains("--data-dir"), "{f}");
+        assert!(!f.contains("widens the window"), "{f}");
+
+        // The metrics pane is a different renderer and goes to the same place.
+        let f = strip(&press(&mut app, Key::Char('3')));
+        assert!(f.contains("nothing has been written here"), "{f}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The key bar names the pane Esc goes back to, and sheds the panes — not
+    /// the way out of them — when the terminal is too narrow for all of it.
+    #[test]
+    fn the_key_bar_names_where_esc_goes_and_sheds_keys_when_it_will_not_fit() {
+        let dir = store("hints");
+        let mut app = App::new(Source::Local(dir));
+        settle(&mut app);
+
+        let wide = strip(&app.hints(130));
+        assert!(wide.contains("a alerts"), "{wide}");
+        assert!(wide.trim_end().ends_with("? help  q quit"), "{wide}");
+        // 80 columns cannot hold the whole bar. What has to go is the panes,
+        // which `?` lists anyway — never `? help` or `q quit`.
+        let narrow = strip(&app.hints(80));
+        assert!(narrow.contains("? help  q quit"), "{narrow}");
+        assert!(!narrow.contains("a alerts"), "{narrow}");
+
+        press(&mut app, Key::Enter);
+        assert_eq!(app.mode, Mode::Detail);
+        assert!(strip(&app.hints(W)).contains("esc → logs"));
+        // A trace opened from the logs tab goes back to the logs tab, and the
+        // bar says which one rather than "esc back".
+        press(&mut app, Key::Char('t'));
+        assert_eq!(app.mode, Mode::Trace);
+        assert!(strip(&app.hints(W)).contains("esc → logs"));
+        press(&mut app, Key::Enter);
+        assert_eq!(app.mode, Mode::Span);
+        assert!(strip(&app.hints(W)).contains("esc → waterfall"));
+
+        press(&mut app, Key::Char('q'));
+        press(&mut app, Key::Char('q'));
+        press(&mut app, Key::Char('2'));
+        press(&mut app, Key::Char('?'));
+        let help = strip(&app.hints(W));
+        assert!(help.contains("esc → traces"), "{help}");
+        // The list is longer than a 24-row terminal, so the bar has to say the
+        // pane scrolls.
+        assert!(help.contains("↑↓ scroll"), "{help}");
     }
 
     /// The controls that change the query rather than the view, and the two

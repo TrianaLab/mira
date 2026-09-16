@@ -36,6 +36,13 @@ the config keys, the `/mcp` tool set.
   dependency tree 26 crates, 122 to 148.
 - **The minimum supported Rust version is 1.88**, up from 1.85, which
   ratatui 0.30 requires.
+- **The terminal UI says where the keys go.** The key bar names the pane `esc`
+  returns to rather than saying `esc back`, drops the second rank of keys when
+  the terminal is too narrow to hold them, and tells a scrollable pane that it
+  scrolls. An empty pane now explains itself: a directory with no blocks in it
+  points at `--data-dir` and `make demo`, and a window with no matching rows
+  points at `]` and `/`. Help is grouped under six headings by what a reader is
+  trying to do.
 
 ### Fixed
 
