@@ -24,13 +24,26 @@ axum.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 flate2.workspace = true
+# The command tree (`main::cli`), which `--help`, the parser and `mira
+# completion` all read. Five crates against a tree of 122: clap, clap_builder,
+# clap_lex, anstyle and clap_complete. `derive` is off because it costs `syn`
+# and its tree to generate a struct `main.rs` would rather write out, and
+# `color` is off because everything else this binary prints already decides its
+# own colour from `is_terminal`.
+clap = { version = "4", default-features = false, features = [
+  "std",
+  "help",
+  "usage",
+  "error-context",
+] }
+clap_complete = "4"
 # The webhook dispatcher (`alert.rs`). Both are already in the tree under axum
 # and tonic, so naming them here costs no crates — only the right to call them.
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 # Direct https:// webhook targets. Off by default: this is eleven crates
-# against a tree of 117 and `ring` is a second C dependency, and both of those
+# against a tree of 122 and `ring` is a second C dependency, and both of those
 # numbers are stated product properties (README, section 11). Without it an https
 # target is refused at load with a message naming this feature.
 hyper-rustls = { version = "0.27", default-features = false, optional = true, features = [
@@ -40,7 +53,7 @@ hyper-rustls = { version = "0.27", default-features = false, optional = true, fe
   "tls12",
 ] }
 # The terminal UI's whole backend: termios, TIOCGWINSZ, poll and localtime_r.
-# ratatui is the alternative and costs 35 crates, against a tree of 117.
+# ratatui is the alternative and costs 35 crates, against a tree of 122.
 libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

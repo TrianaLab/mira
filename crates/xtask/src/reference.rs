@@ -960,12 +960,22 @@ fn config_table(f: &mut Failures) -> String {
         })
         .collect();
 
-    // The same field, reached from the command line. `main.rs` writes one match
-    // arm per flag, so the pairing is as readable here as it is to a reviewer.
-    let flags: BTreeMap<String, String> = re(r#""(--[a-z-]+)" => cfg\.([a-z_]+)"#)
-        .captures_iter(&read_or_exit(&format!("{SRC}/main.rs")))
-        .map(|m| (m[2].to_string(), m[1].to_string()))
+    // The same field, reached from the command line. `load_from` names one clap
+    // argument per flag and clap's id is the flag without its dashes, so the id
+    // *is* the flag and all this has to pair is id to field. Two shapes, and
+    // the order of the two is what tells them apart: a flag that takes a value
+    // is tested and then assigned on the next line, and one that does not is a
+    // single line reading `cfg.<field> ... (m, "<id>")`.
+    let main = read_or_exit(&format!("{SRC}/main.rs"));
+    let mut flags: BTreeMap<String, String> = re(r#"\(m, "([a-z-]+)"\)\s*\{\s*cfg\.([a-z_]+)"#)
+        .captures_iter(&main)
+        .map(|m| (m[2].to_string(), format!("--{}", &m[1])))
         .collect();
+    flags.extend(
+        re(r#"cfg\.([a-z_]+)[^\n]*\(m, "([a-z-]+)"\)"#)
+            .captures_iter(&main)
+            .map(|m| (m[1].to_string(), format!("--{}", &m[2]))),
+    );
 
     let mut rows = vec![
         "| Key | Flag | Type | Default | What it sets |".to_string(),
@@ -994,10 +1004,20 @@ fn config_table(f: &mut Failures) -> String {
                 TYPES.iter().find(|(k, _)| k == rust).map(|(_, t)| *t)
             })
             .unwrap_or("?");
+        // Every key has a flag. An em-dash here used to be the fallback, and a
+        // rewrite of `load_from` that this scrape no longer matched filled the
+        // whole column with them without failing anything.
+        let Some(flag) = flags.get(fieldname) else {
+            f.fail(format!(
+                "main.rs: nothing in `load_from` sets `Config::{fieldname}`, so `{key}` \
+                 has no flag. Every key has one — if the pairing moved, move \
+                 `config_table`'s two patterns with it."
+            ));
+            continue;
+        };
         rows.push(format!(
             "| [`{key}`]({RUSTDOC}/mira/config/struct.Config.html#structfield.{fieldname}) \
-             | `{}` | {ty} | `{}` | {doc} |",
-            flags.get(fieldname).map_or("—", String::as_str),
+             | `{flag}` | {ty} | `{}` | {doc} |",
             defaults.get(fieldname).map_or("?", String::as_str),
         ));
     }
@@ -1326,24 +1346,80 @@ pub(crate) fn inject(rel: &str, name: &str, body: &str, f: &mut Failures) -> boo
     true
 }
 
+/// `mira <path…> --help`, or `None` once the failure has been recorded.
+fn mira_help(bin: &std::path::Path, path: &[String], f: &mut Failures) -> Option<String> {
+    let line = format!("mira {} --help", path.join(" "));
+    match Command::new(bin).args(path).arg("--help").output() {
+        Ok(out) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        }
+        Ok(out) => {
+            f.fail(format!("`{line}` exited {}", out.status));
+            None
+        }
+        Err(e) => {
+            f.fail(format!("`{line}`: {e}"));
+            None
+        }
+    }
+}
+
+/// The names listed under a help text's `Commands:` block.
+///
+/// Scraped rather than listed here, because a list is a second place to add a
+/// subcommand to and the gate that would catch a missed one is more code than
+/// the scrape. `help` is clap's own and documents nothing this page does not.
+fn subcommands(help: &str) -> Vec<String> {
+    help.lines()
+        .skip_while(|l| l.trim() != "Commands:")
+        .skip(1)
+        .take_while(|l| l.starts_with("  ") && !l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|n| *n != "help")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One fenced block per `--help` in the tree, each verb's own after its parent.
+///
+/// Depth-first, so `offload list` follows `offload` rather than the last
+/// top-level command, and driven off the help text rather than a list here —
+/// the binary is the source, which is the whole point of a generated page.
+fn help_blocks(
+    bin: &std::path::Path,
+    path: &[String],
+    out: &mut Vec<String>,
+    f: &mut Failures,
+) -> bool {
+    let Some(help) = mira_help(bin, path, f) else {
+        return false;
+    };
+    out.push(format!(
+        "```console\n$ mira {}--help\n{help}\n```\n",
+        path.iter().map(|p| format!("{p} ")).collect::<String>()
+    ));
+    subcommands(&help)
+        .into_iter()
+        .all(|c| help_blocks(bin, &[path, &[c]].concat(), out, f))
+}
+
+/// Every `--help` the binary can print, root first, each subcommand after it.
+///
+/// The whole tree rather than the root alone, because the prose that used to be
+/// one `const USAGE` now hangs off the subcommand it describes: the root help
+/// lists `offload` in a line, and what `offload push` is *for* is only in
+/// `mira offload --help`. A page showing the root would be a page that lost it.
 fn cli_page(f: &mut Failures) -> String {
     let bin = root().join("target/release/mira");
     if !bin.exists() {
         f.fail("target/release/mira is not built. Run `make build` first.");
         return String::new();
     }
-    let out = match Command::new(&bin).arg("--help").output() {
-        Ok(out) if out.status.success() => out.stdout,
-        Ok(out) => {
-            f.fail(format!("`mira --help` exited {}", out.status));
-            return String::new();
-        }
-        Err(e) => {
-            f.fail(format!("`mira --help`: {e}"));
-            return String::new();
-        }
-    };
-    let help = String::from_utf8_lossy(&out).trim_end().to_string();
+    let mut out = Vec::new();
+    if !help_blocks(&bin, &[], &mut out, f) {
+        return String::new();
+    }
+
     let page = [
         STAMP,
         "",
@@ -1355,22 +1431,18 @@ fn cli_page(f: &mut Failures) -> String {
         "over the same blocks, `mira update` replaces the binary — and there",
         "is no daemon, agent or sidecar to run alongside any of them.",
         "",
-        "```console",
-        "$ mira --help",
-        &help,
-        "```",
+        &out.join("\n"),
         // The help text above already states the precedence rule, so this
         // closing line points at the page that expands it rather than saying
         // the same sentence a second line down.
-        "",
         "Every flag on the server line is also a config-file key:",
         "[Configuration](../config.md) is the table, with the type, the",
-        "default and what each one sets. Four here are not, because there is",
-        "nothing for them to persist: `--config` names the file itself,",
-        "`--version` exits, and `--addr` and `--dry-run` belong to `mira mira`",
-        "and `mira update` rather than to the server. The config file is a",
-        "closed set, so writing one of them into it is an `unknown key` at",
-        "boot rather than a setting that is quietly ignored.",
+        "default and what each one sets. The rest are not, because there is",
+        "nothing for them to persist: `--config` names the file itself, a bare",
+        "`--version` exits, and `--addr`, `--dry-run` and `mira update",
+        "--version` belong to a subcommand rather than to the server. The",
+        "config file is a closed set, so writing one of them into it is an",
+        "`unknown key` at boot rather than a setting that is quietly ignored.",
         "",
     ]
     .join("\n");

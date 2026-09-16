@@ -65,7 +65,7 @@ tail on `f`.
 ### No TUI framework
 
 ratatui is the obvious answer and costs **35 crates that are not already here** —
-a 30% increase on a tree of 117, whose size is a stated property of the product
+a 29% increase on a tree of 122, whose size is a stated property of the product
 (section 1). What it buys is a constraint-solving layout engine and a
 damage-tracked cell buffer; this UI has fixed panes and repaints one screenful per
 keystroke. So `termios`, `TIOCGWINSZ`, `poll(2)`, three `sigaction`s and ANSI, on

@@ -29,53 +29,57 @@ const INSTALLER: &str = "https://miradb.dev/install.sh";
 /// Where to go when there is no shell to run the installer with.
 const RELEASES: &str = "https://github.com/TrianaLab/mira/releases";
 
-pub const USAGE: &str = "mira update [--version VERSION] [--dry-run]
-
-Downloads the latest release from GitHub and replaces this binary with it,
-by running the same installer as
-  curl -fsSL https://miradb.dev/install.sh | bash
-
-  --version VERSION  install this tag instead of the latest (e.g. v0.1.0)
-  --dry-run          print the command that would run, and stop
-
-Installs over this binary's own directory, not /usr/local/bin, unless
-MIRA_INSTALL_DIR says otherwise. Nothing happens if the running version is
-already the one that would be installed.
-
-Needs bash and either curl or wget, because it runs the installer rather
-than carrying an HTTPS client. The container image has none of them; upgrade
-that by pulling a newer tag.";
-
-/// What `--version` was given, if anything.
+/// This verb's own place in the tree `main::cli` builds.
 ///
-/// A tag goes into a shell command, so it is checked against a charset rather
-/// than quoted: quoting is a thing to get subtly wrong once, and no real Git
-/// tag needs a character outside this set. Unknown flags are refused instead of
-/// forwarded — the installer's own flag set is not this one's, and silently
-/// passing `--no-sudo` through would make its behaviour depend on a flag this
-/// usage does not document.
-pub fn parse(argv: &[String]) -> Result<(Option<String>, bool), String> {
-    let mut version = None;
-    let mut dry_run = false;
-    let mut it = argv.iter();
-    while let Some(flag) = it.next() {
-        match flag.as_str() {
-            "--version" | "-v" => {
-                let v = it.next().ok_or("--version needs a value")?;
-                if v.is_empty()
-                    || !v
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-                {
-                    return Err(format!("--version: {v:?} is not a release tag"));
-                }
-                version = Some(v.clone());
-            }
-            "--dry-run" => dry_run = true,
-            other => return Err(format!("unknown flag {other:?}\n\n{USAGE}")),
-        }
+/// It declares its own `--version`, which is why the root's `-V` is not
+/// propagated: `mira update --version v0.1.0` has to install that tag rather
+/// than print this binary's own.
+pub fn cli() -> clap::Command {
+    clap::Command::new("update")
+        .about("replace this binary with a release from GitHub")
+        .after_help(
+            "Runs the same installer as\n  \
+             curl -fsSL https://miradb.dev/install.sh | bash\n\n\
+             Installs over this binary's own directory, not /usr/local/bin, unless\n\
+             MIRA_INSTALL_DIR says otherwise. Nothing happens if the running version\n\
+             is already the one that would be installed.\n\n\
+             Needs bash and either curl or wget, because it runs the installer rather\n\
+             than carrying an HTTPS client. The container image has none of them;\n\
+             upgrade that by pulling a newer tag.",
+        )
+        .arg(
+            clap::Arg::new("version")
+                .long("version")
+                .short('v')
+                .value_name("VERSION")
+                .value_parser(tag)
+                .help("install this tag instead of the latest (e.g. v0.1.0)"),
+        )
+        .arg(
+            clap::Arg::new("dry-run")
+                .long("dry-run")
+                .action(clap::ArgAction::SetTrue)
+                .help("print the command that would run, and stop"),
+        )
+}
+
+/// A release tag, checked against a charset rather than quoted.
+///
+/// It goes into a shell command, and quoting is a thing to get subtly wrong
+/// once: no real Git tag needs a character outside this set. Unknown flags are
+/// refused rather than forwarded — that is clap's job now — because the
+/// installer's own flag set is not this one's, and silently passing `--no-sudo`
+/// through would make its behaviour depend on a flag this usage does not
+/// document.
+pub fn tag(v: &str) -> Result<String, String> {
+    if v.is_empty()
+        || !v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    {
+        return Err(format!("{v:?} is not a release tag"));
     }
-    Ok((version, dry_run))
+    Ok(v.to_owned())
 }
 
 /// The shell line that does the update.
@@ -113,14 +117,9 @@ pub fn install_dir(exe: Option<&Path>) -> Option<PathBuf> {
 /// prompt reach the terminal directly. Its exit status becomes this command's:
 /// a failed download must not look like a successful update to whatever ran
 /// `mira update` in a script.
-pub fn run(argv: &[String]) -> Result<(), String> {
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    let (version, dry_run) = parse(argv)?;
-    let line = command(version.as_deref());
-    if dry_run {
+pub fn run(m: &clap::ArgMatches) -> Result<(), String> {
+    let line = command(m.get_one::<String>("version").map(String::as_str));
+    if m.get_flag("dry-run") {
         println!("{line}");
         return Ok(());
     }
@@ -184,13 +183,18 @@ fn start_failed(program: &str, e: &std::io::Error) -> String {
 mod tests {
     use super::*;
 
-    fn args(a: &[&str]) -> Vec<String> {
-        a.iter().map(|s| s.to_string()).collect()
+    /// This verb's own arguments, through the tree it is a part of.
+    fn parse(a: &[&str]) -> Result<clap::ArgMatches, String> {
+        cli()
+            .try_get_matches_from(std::iter::once("update").chain(a.iter().copied()))
+            .map_err(|e| e.to_string())
     }
 
     #[test]
     fn no_flags_installs_the_latest_release() {
-        assert_eq!(parse(&[]).unwrap(), (None, false));
+        let m = parse(&[]).unwrap();
+        assert_eq!(m.get_one::<String>("version"), None);
+        assert!(!m.get_flag("dry-run"));
         let line = command(None);
         assert!(line.ends_with("| bash -s --"), "{line}");
         assert!(line.contains(INSTALLER), "{line}");
@@ -198,29 +202,32 @@ mod tests {
 
     #[test]
     fn a_tag_is_forwarded_to_the_installer() {
-        let (v, dry) = parse(&args(&["--version", "v0.1.0"])).unwrap();
-        assert_eq!(v.as_deref(), Some("v0.1.0"));
-        assert!(!dry);
-        assert!(command(v.as_deref()).ends_with("--version v0.1.0"));
+        let m = parse(&["--version", "v0.1.0"]).unwrap();
+        let v = m.get_one::<String>("version").map(String::as_str);
+        assert_eq!(v, Some("v0.1.0"));
+        assert!(!m.get_flag("dry-run"));
+        assert!(command(v).ends_with("--version v0.1.0"));
     }
 
     #[test]
     fn a_tag_that_could_be_a_shell_command_is_refused_rather_than_quoted() {
         for bad in ["v1; rm -rf /", "$(id)", "`id`", "v1 --no-sudo", ""] {
-            let e = parse(&args(&["--version", bad])).unwrap_err();
-            assert!(e.starts_with("--version:"), "{bad:?} was accepted: {e}");
+            // Through the parser, because the charset check is only a guarantee
+            // if it is the value parser the flag actually carries.
+            let e = parse(&["--version", bad]).unwrap_err();
+            assert!(e.contains("is not a release tag"), "{bad:?}: {e}");
+            assert!(tag(bad).is_err(), "{bad:?} passed the charset check");
         }
-        assert_eq!(
-            parse(&args(&["--version"])).unwrap_err(),
-            "--version needs a value"
-        );
+        assert!(tag("v0.1.0-rc.1").is_ok(), "a real tag was refused");
+        let e = parse(&["--version"]).unwrap_err();
+        assert!(e.contains("a value is required"), "{e}");
     }
 
     #[test]
     fn an_installer_flag_this_command_does_not_document_is_refused() {
-        let e = parse(&args(&["--no-sudo"])).unwrap_err();
-        assert!(e.starts_with("unknown flag \"--no-sudo\""), "{e}");
-        assert!(e.contains(USAGE), "the usage is part of the message");
+        let e = parse(&["--no-sudo"]).unwrap_err();
+        assert!(e.contains("--no-sudo"), "{e}");
+        assert!(e.contains("Usage: update"), "the usage is part of it: {e}");
     }
 
     #[test]
@@ -244,9 +251,12 @@ mod tests {
 
     #[test]
     fn dry_run_prints_the_command_instead_of_running_it() {
-        run(&args(&["--dry-run", "--version", "v9.9.9"])).unwrap();
-        run(&args(&["--help"])).unwrap();
-        assert!(run(&args(&["--nope"])).is_err());
+        run(&parse(&["--dry-run", "--version", "v9.9.9"]).unwrap()).unwrap();
+        // `--help` and `--nope` never reach `run` any more: clap answers both
+        // before the matches exist, which is the whole reason this verb no
+        // longer hand-parses its own argv.
+        assert!(parse(&["--help"]).is_err(), "--help produced matches");
+        assert!(parse(&["--nope"]).is_err());
     }
 
     /// Asserts the child rather than running it: the real one would replace the
@@ -295,11 +305,15 @@ mod tests {
         assert!(e.starts_with("could not run the installer:"), "{e}");
     }
 
+    /// The host requirement is only discoverable from `--help`, so it is the
+    /// one line of that text worth asserting on: [`start_failed`] above can say
+    /// `bash` is missing, but only after the user has already run the verb.
     #[test]
-    fn the_usage_names_what_it_needs_on_the_host() {
+    fn the_help_names_what_it_needs_on_the_host() {
+        let help = cli().render_long_help().to_string();
         assert!(
-            USAGE.contains("Needs bash and either curl or wget"),
-            "{USAGE}"
+            help.contains("Needs bash and either curl or wget"),
+            "{help}"
         );
     }
 }
