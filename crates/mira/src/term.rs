@@ -621,12 +621,9 @@ pub(crate) mod tests {
                 ("mira-pty-down", b"x"),
                 ("mira-pty-x", b"\x1b"),
             ],
-            // The restore sequence is waited for, not snapshotted. The child's
-            // last write and the child's exit are not ordered with each other
-            // from over here: the wait returns on the exit, and the drain thread
-            // can still be one `read` behind on the master. Reading the buffer
-            // right then is a race that a Linux runner loses often enough to be
-            // seen.
+            // The restore sequence, asserted after the drain thread is joined
+            // rather than from inside the script: the child writes it from its
+            // panic hook on the way out, with no marker left to answer after it.
             "\x1b[?25h\x1b[?1049l",
         );
         // The child signs off by panicking on purpose, so any *other* panic is a
@@ -735,7 +732,7 @@ pub(crate) mod tests {
         let sink = screen.clone();
         // Drained on a thread: a child that fills the pty buffer while this side
         // is blocked writing to it is a deadlock, not a slow test.
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = rd.read(&mut buf) {
                 if n == 0 {
@@ -772,6 +769,12 @@ pub(crate) mod tests {
         let _ = stalled.map(|_| child.kill());
 
         let out = child.wait_with_output().unwrap();
+        // The child being gone does not mean its last frame has been read: the
+        // draining thread is still holding bytes the kernel buffered. Joining it
+        // — the read side ends when the slave's last fd closes, which the exit
+        // above did — is what makes `screen` the whole session rather than
+        // however much had arrived by the time `wait` returned.
+        reader.join().unwrap();
         let trailing = arrived(trailing);
         Pty {
             screen: screen.lock().unwrap().clone(),
