@@ -56,7 +56,7 @@ both surfaces rather than copied into each.
   trace_id                  0000000000000efb5555555555555bae
   span_id                   90c7dd5e0d0ce971
  1/1 blocks · 15909 rows scanned · 888 matched · 12.7ms
- ↑↓ move  enter detail  t trace  c frame  m map  a alerts  d node  f follow  / filter  ? help
+ ↑↓ move  enter detail  t trace  c frame  ·  m map  a alerts  d node  ·  / filter  f follow  ? help  q quit
 ```
 
 15,909 rows scanned to 888 matches in **12.7 ms**, over a block the process never
@@ -88,7 +88,7 @@ matched, blocks touched, wall clock — on every screen, never behind a toggle.
      POST /authorize                    payments                                 ████████████████████         31.43ms
       ● exception  +65.50ms
  1/1 blocks · 30720 rows scanned · 8 matched · 7.0ms
- esc back  ↑↓ span  enter detail
+ esc → logs  ↑↓ span  enter detail
 ```
 
 Span events (`● retry`, `● exception`) sit inline at their offset, and `↗` is a
@@ -116,7 +116,7 @@ pre-aggregation job, and nothing to be stale.
        payments                              3840 spans    296 errors    37.97ms avg
      inventory                               3840 spans      -           17.99ms avg
  1/1 blocks · 30720 rows scanned · 4 matched · 6.1ms
- esc back  ↑↓ move  enter filter on this service
+ esc → logs  ↑↓ move  enter filter on this service
 ```
 
 ![The same graph in the browser: entry feeding frontend, frontend feeding
@@ -160,7 +160,7 @@ that fired it.
   ○      ok      inventory-outage            0 >= 1   0 records
           attr:service.name=inventory field:severity_number>=21  ·  over 1m00s
  1.7ms
- esc back  ↑↓ move  enter show the records that fired  a reload
+ esc → logs  ↑↓ move  enter show the records that fired  a reload
 ```
 
 ![The alerts view in the browser: four rules in a table with value, threshold,
@@ -209,6 +209,17 @@ first query of the process: it faults the block in from disk, and every query
 after it is served from the page cache at the 6 ms mean.
 
 ## 7. Hand it to an agent
+
+One line, and the blocks above answer an LLM instead of you:
+
+```sh
+claude mcp add --transport http mira http://localhost:4318/mcp
+```
+
+Asked why checkout is returning 503s, Claude starts at the alert that is firing
+in section 5, walks the service map to `payments`, opens the trace and names the
+exception behind it — seven calls, 136 ms of query time. The prompt, every call
+and the answer: [Connect an agent](agents.md).
 
 The same read path over JSON-RPC. No exporter, no API key, no session id — so
 any replica can answer any call.

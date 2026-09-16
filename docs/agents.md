@@ -86,113 +86,140 @@ is the one tool without it, because it reads in-memory rule state and scans noth
 
 ## A root-cause investigation, end to end
 
-Real output from `make demo`, trimmed to the fields that carry the argument. Four calls,
-57 ms of query time between them, and the answer is the last one.
+The wiring above, a Mira holding `make demo`, and one prompt. No system prompt, no tool
+list in the question, nothing else in the project directory.
 
-### 1. What is wrong?
+```console
+$ claude -p "Checkout is throwing 503s. Use the mira MCP server to find the root
+  cause: start from whatever it is alerting on, then dig until you can name the
+  failing operation and the exception behind it. Show me the trace id you used."
+```
 
-The loop starts here whether it was woken by a schedule or by a webhook.
+Seven calls and 136 ms of query time, inside 40 s of wall clock — the rest is the model
+reading. Below is that session, abridged to the calls and what it said between them.
+
+### 1. Start where the alert is
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_alerts"}}
+{"name":"list_alerts","arguments":{}}
 ```
 
 ```json
-{"name":"card-declines","state":"firing","severity":"warning",
- "metric":"count","op":">","threshold":20,"value":32,"matched":32,
- "signal":"traces","filter":"attr:exception.type=payments.CardDeclined",
+{"name":"card-declines","state":"firing","severity":"warning","metric":"count",
+ "op":">","threshold":20,"value":30,"matched":30,"signal":"traces",
+ "filter":"attr:exception.type=payments.CardDeclined",
  "link":"http://localhost:4318/#/traces?q=attr%3Aexception.type%3Dpayments.CardDeclined&range=-300s"}
 ```
 
-`state` is one of `ok`, `pending` (breaching, but has not held for `for_nano` yet) and
-`firing`. `filter` is the rule's own query, so the next call is a copy of it — the model
-never has to invent the search that the threshold was counting. `link` opens the same
-records in the UI, which is what to hand a human at the end.
+> Two alerts of interest: `shop-error-rate` (pending, 5.4% error) and `card-declines`
+> (firing). Digging into the error spans.
 
-### 2. What was the blast radius?
+`state` is `ok`, `pending` (breaching, but not yet for `for_nano`) or `firing`, and
+`filter` is the rule's own query — the search the threshold was counting, so the model
+copies it instead of inventing one. `link` opens the same records in the UI, which is
+what to hand a human at the end.
 
-`correlate` is the call that replaces "query, read a trace id out of the result,
-query again".
+### 2. Two questions in one turn
 
 ```json
-{"name":"correlate","arguments":{
-  "signal":"traces","from":"-15m",
-  "where":[{"attr":"exception.type","eq":"payments.CardDeclined"}],
-  "expand":["traces","peers"]}}
+{"name":"query_records","arguments":{"signal":"traces","from":"-15m",
+  "where":[{"field":"status_code","eq":2}],"limit":40}}
+{"name":"service_map","arguments":{"from":"-15m"}}
 ```
 
 ```json
-{"frame":{"from":"…404518849000","to":"…304518849000",
-  "entities":[{"name":"payments"},{"name":"frontend"},{"name":"inventory"},{"name":"checkout"}],
-  "traces":["0000000000000a4f5555555555555f1a", … 93 total],
-  "truncated":false},
- "stats":{"blocks_scanned":3,"rows_scanned":92160,"rows_matched":1581,"elapsed_us":10247}}
+{"nodes":[{"name":"frontend","spans":3669,"errors":188},
+          {"name":"checkout","spans":3669,"errors":188},
+          {"name":"payments","spans":1223,"errors":94},
+          {"name":"inventory","spans":1223,"errors":0}]}
 ```
 
-`expand` is an ordered walk and the order is load-bearing. `traces` first, because a log
-line is written *after* the request it describes, so the true window is wider than the
-one the match fell in; `peers` then adds every service that appears in those traces.
-`truncated: false` says the 93 traces are all of them, not a sample.
+Both at once, because no call depends on a session the other opened. `field` is a column
+of the record — `status_code`, `severity_number`, `duration_nano`; `attr` searches the
+record, resource and scope levels together, so the model need not know where the SDK put
+`service.name`. Errors run down one path and stop: `inventory` takes the same 1,223 calls
+with none.
 
-### 3. Which hop actually failed?
-
-Any trace from the frame, expanded in full.
+### 3. The failing hop, and the exception under it
 
 ```json
-{"name":"get_trace","arguments":{"trace_id":"0000000000000a4f5555555555555f1a"}}
+{"name":"get_trace","arguments":{"trace_id":"0000000000000efb5555555555555bae"}}
 ```
 
 ```json
 {"name":"POST /authorize","kind":2,"status_code":2,
  "status_message":"authorization upstream returned 503",
- "duration_nano":"45714000","parent_span_id":"9349cdcc0910b02f", …}
+ "attributes":{"k8s.pod.name":"payments-5d9f7c-0","service.version":"2.7.0"},
+ "events":[{"name":"exception","attributes":{
+   "exception.type":"payments.CardDeclined","exception.escaped":true,
+   "exception.message":"issuer declined authorization: insufficient_funds",
+   "exception.stacktrace":"payments/authorize.go:118 Authorize\npayments/handler.go:64  (*Server).Pay"}}]}
 ```
 
-Eight spans, `parent_span_id` linking them into the tree. The 503 originates at
-`payments`' own `POST /authorize` and propagates up through `POST /pay` to the frontend —
-so `payments` is where the error is *created*, not merely where it is reported. `get_trace`
-rather than `query_records` with a `trace_id` filter: blocks carry a trace-id index, and
-this is the call that uses it — 4.6 ms here, and 4.7 ms against 27.1M spans in
-[the query benchmark](market.md#query), opening 2 blocks of 155, because the cost is
-the blocks the Bloom sidecar could not rule out.
+Eight spans in 6.4 ms, `parent_span_id` linking them into a tree. `get_trace` rather than
+`query_records` with a trace-id filter: blocks carry a trace-id index and this is the call
+that uses it — 4.7 ms against 27.1M spans in [the query benchmark](market.md#query),
+because the cost is the blocks the Bloom sidecar could not rule out.
 
-### 4. What does the service itself say?
-
-Logs are indexed on the same attributes, so this is one call, not a jump to
-another system.
+### 4. A wrong turn, and the field that corrects it
 
 ```json
-{"name":"query_records","arguments":{
-  "signal":"logs","from":"-15m",
-  "where":[{"attr":"service.name","eq":"payments"},{"field":"severity_number","gte":17}],
-  "limit":3}}
+{"name":"correlate","arguments":{"signal":"logs","from":"-15m",
+  "where":[{"attr":"service.name","eq":"payments"}],"expand":["traces","peers"]}}
 ```
 
 ```json
-{"severity_text":"ERROR","body":"POST /authorize failed: upstream returned 503 after 31ms",
- "trace_id":"0000000000000efb5555555555555bae",
- "attributes":{"http.response.status_code":"503","http.route":"/authorize",
-   "k8s.pod.name":"payments-5d9f7c-1","service.instance.id":"payments-1", …}}
+{"frame":{"entities":6,"traces":1000,"truncated":true},
+ "stats":{"blocks_scanned":3,"rows_scanned":77349,"rows_matched":17214,"elapsed_us":108646}}
 ```
 
-`attr` searches the record, resource and scope levels at once, so the model does not need
-to know where the SDK put `service.name`. `field` is for columns of the record itself
-(`severity_number`, `body`, `duration_nano`, `status_code`). The pod name and instance id
-come back merged into `attributes`, which is the identifier an Act step needs.
+> Correlate was too broad. Narrowing to payments error logs.
 
-**Conclusion, with the evidence attached**: `payments` is returning 503 from its
-authorization upstream; 93 traces in 15 minutes, all four services touched, blast radius
-contained to the checkout path. `service_map` is the fifth call if the loop needs the
-edge that is degrading rather than the service that is erroring — it returns per-edge
-call, error and latency counts computed from `parent_span_id` at read time.
+Every payments log, not the failing ones: 17,214 rows and a frame of a thousand traces.
+`truncated: true` says that is a sample rather than the answer, and the model narrowed on
+it — which is the whole reason the field is there.
 
-!!! tip "Give the model the shape of the loop, not the schema"
+### 5. The service's own words, then the falsification
 
-    The tool descriptions already carry the schema, and they are written to be read by a
-    model rather than by someone who knows it. What is worth putting in a system prompt
-    is the sequence: **alerts or a symptom → `correlate` for the frame → `get_trace` for
-    the failing hop → `query_records` for the service's own words**. Two sentences, and it
-    saves the model rediscovering the order on every incident.
+```json
+{"name":"query_records","arguments":{"signal":"logs","from":"-15m","limit":5,
+  "where":[{"attr":"service.name","eq":"payments"},{"field":"severity_number","gte":17}]}}
+
+{"name":"query_records","arguments":{"signal":"traces","from":"-15m","limit":5,
+  "where":[{"attr":"service.name","eq":"payments"},{"field":"status_code","eq":2},
+           {"attr":"exception.type","ne":"payments.CardDeclined"}]}}
+```
+
+93 error logs in 1.0 ms, and then zero rows in 3.2 ms: no payments error carries any other
+exception type. One failure mode, established by asking for the counter-example rather
+than by reading five rows that agreed.
+
+### The answer
+
+```text
+Trace id: 0000000000000efb5555555555555bae
+
+Failing operation: POST /authorize, the server span in payments
+(payments/authorize.go:118 Authorize).
+Exception: payments.CardDeclined — "issuer declined authorization:
+insufficient_funds", exception.escaped: true.
+
+A card decline is a business outcome, not a server fault. payments maps it to
+HTTP 503, and that status propagates unchanged all the way out. Two amplifiers
+riding on that mislabel:
+
+  - checkout's client span carries a retry event, retry.reason: "503" — it
+    retries a decline that will never succeed.
+  - The frontend /checkout span carries a link {link.kind: "retry_of"} to trace
+    0000000000000efa5555555555555baf — the whole checkout gets replayed too.
+
+Fix is in payments' error mapping, not in checkout: return 402 for CardDeclined
+so the retry layers stop treating it as retryable.
+```
+
+Nothing in the prompt named a service, a tool or a field. The retry event and the span
+link are OTLP structures Mira stores rather than flattens, which is why they were still
+there to be read.
 
 ## Waking the loop from an alert
 
