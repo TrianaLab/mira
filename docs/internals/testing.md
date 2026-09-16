@@ -3,7 +3,7 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 429 cargo tests — 369 across levels 1–5, plus 60 in `xtask` that test
+Mira has 431 cargo tests — 371 across levels 1–5, plus 60 in `xtask` that test
 the gates rather than the engine — 22 UI tests, 26 chart tests, and 67 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
@@ -16,7 +16,7 @@ the industry's least agreed label, so it is absent.
 
 | # | Level | Count | Lives in | Runs from |
 | --- | --- | --- | --- | --- |
-| 1 | Unit, in-source | 145 core + 183 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 146 core + 184 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
 | 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |

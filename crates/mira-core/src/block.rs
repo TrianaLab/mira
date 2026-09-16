@@ -896,22 +896,37 @@ fn statfs(path: &Path) -> Result<libc::statfs> {
     Ok(buf)
 }
 
-/// How much of the filesystem holding `path` is still free, as a fraction of
-/// its total size.
+/// How much of the filesystem holding `path` is still free: the fraction of its
+/// total size, and the same quantity in bytes.
+///
+/// Both come off one `statfs` because neither answers the question alone. A
+/// fraction calls 45 GiB free on a 1 TB volume "5% free, nearly full" when that
+/// is more room than most deployments ever use; a byte count cannot tell a
+/// comfortable 64 GB SSD from one about to wedge. Whoever is deciding to delete
+/// data wants both, and wants them from the same instant.
 ///
 /// `f_bavail`, not `f_bfree`: the difference is the root reserve (5% on a
 /// default ext4), which is space the process cannot write into and therefore
 /// not space Mira has. Both terms of the ratio are in blocks of `f_bsize`, so
-/// the block size cancels and is not in the arithmetic.
-pub fn free_fraction(path: &Path) -> Result<f64> {
+/// the block size cancels out of the fraction — it only appears in the bytes.
+pub fn free(path: &Path) -> Result<(f64, u64)> {
     let buf = statfs(path)?;
+    let bytes = (buf.f_bavail as u64).saturating_mul(buf.f_bsize as u64);
     if buf.f_blocks == 0 {
         // A mount that reports no blocks at all — some pseudo-filesystems do —
         // is not a mount that can fill up, and calling it 0% free would stop
         // ingest on a node with nothing wrong with it.
-        return Ok(1.0);
+        return Ok((1.0, bytes));
     }
-    Ok(buf.f_bavail as f64 / buf.f_blocks as f64)
+    Ok((buf.f_bavail as f64 / buf.f_blocks as f64, bytes))
+}
+
+/// How much of the filesystem holding `path` is still free, as a fraction of
+/// its total size. The fraction half of [`free`], for the callers that report
+/// it rather than act on it: `/api/v1/stats`, the TUI header and the operator's
+/// scaling signal all want a number an operator can read at a glance.
+pub fn free_fraction(path: &Path) -> Result<f64> {
+    Ok(free(path)?.0)
 }
 
 /// The mount's filesystem type, if it is one of the ones that matter. `None`
@@ -2382,6 +2397,26 @@ mod tests {
         // A path that is not there is an error, not a zero: "no space" and "no
         // such directory" are different operational answers.
         assert!(free_fraction(&d.join("nope")).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The bytes half, which is the term that decides whether a volume with a
+    /// low fraction is actually in trouble. Both halves come off one `statfs`,
+    /// so they have to describe the same mount at the same instant.
+    #[test]
+    fn free_reports_bytes_beside_the_fraction() {
+        let d = dir("freebytes");
+        let (f, bytes) = free(&d).unwrap();
+        assert_eq!(f, free_fraction(&d).unwrap(), "the same fraction");
+        // A temp dir on a mount with no room at all is not a machine that can
+        // run this suite, so a positive count is safe to assert.
+        assert!(bytes > 0, "a real mount has some bytes free");
+        // The two agree on scale: bytes / fraction is the volume, which has to
+        // be at least as large as what is free on it.
+        assert!(
+            (bytes as f64 / f) >= bytes as f64,
+            "{bytes} bytes at {f} free implies a volume smaller than its free space"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
