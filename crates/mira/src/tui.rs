@@ -2996,6 +2996,35 @@ mod tests {
         assert!(map(&[], &[]).rows.is_empty());
     }
 
+    /// The cursor's row is drawn in reverse, so the error count on it is not
+    /// also red: red under a reverse is the one combination that comes back
+    /// unreadable on a terminal honouring both, and the count is what the row
+    /// is being looked at for.
+    #[test]
+    fn the_selected_service_drops_the_red_its_highlight_would_fight() {
+        let doc = crate::api::parse(
+            r#"{"nodes":[{"key":"1","name":"checkout","spans":4,"errors":2,
+                          "avg_nano":"22000000"}],
+                "edges":[{"from":"entry","to":"1","calls":4}],"unresolved":0}"#,
+        )
+        .unwrap();
+        let mut app = App::new(Source::Local("/nonexistent".into()));
+        app.map = Some(MapView::new(&doc));
+        app.mode = Mode::Map;
+
+        let errors = |app: &App| {
+            app.map_pane(80, 10)
+                .into_iter()
+                .find(|l| strip(l).contains("2 errors"))
+                .expect("the service with errors is on screen")
+        };
+        // `entry` is row 0, so the service is the unselected one here.
+        app.psel = 0;
+        assert!(errors(&app).contains("\x1b[31m"), "{:?}", errors(&app));
+        app.psel = 1;
+        assert!(!errors(&app).contains("\x1b[31m"), "{:?}", errors(&app));
+    }
+
     /// What the two new panes do with Enter. Everything either pane offers has
     /// to land back in an ordinary query — that is the point of the algebra's
     /// closure, and a selection that goes nowhere is the way to lose it.

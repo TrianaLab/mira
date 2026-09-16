@@ -319,11 +319,14 @@ pub fn detail(row: &Yaml, w: usize) -> Vec<String> {
 
     let mut out = Vec::new();
     for (label, rows) in groups {
-        if !label.is_empty() {
-            out.push(rule(w, label));
-        }
+        // Nothing under it is nothing to announce. A metrics row is attributes
+        // and points, both of which are drawn elsewhere, so its field section
+        // is empty — and the rule would be a heading over blank space.
         if rows.is_empty() {
             continue;
+        }
+        if !label.is_empty() {
+            out.push(rule(w, label));
         }
         let table: Vec<Row> = rows
             .iter()
@@ -375,5 +378,23 @@ mod tests {
             line.contains("name  prod") || line.contains("name prod"),
             "key and value must not run together: {line:?}"
         );
+    }
+
+    /// A section with no rows draws neither the rows nor the rule over them.
+    ///
+    /// Both halves are reachable: a metrics row is `attributes` and `points`,
+    /// so every field is filtered and the first section is empty, and an event
+    /// carrying nothing but an empty attribute map empties a labelled one.
+    #[test]
+    fn an_empty_section_is_not_a_heading_over_nothing() {
+        let y = yaml_rust2::YamlLoader::load_from_str(
+            "attributes:\n  service.name: api\npoints:\n  - 1\nevents:\n  - attributes: {}\n",
+        )
+        .unwrap()
+        .remove(0);
+        let out: Vec<String> = detail(&y, 80).iter().map(|l| strip(l)).collect();
+        assert!(out[0].contains("attributes"), "{out:?}");
+        assert!(out.iter().any(|l| l.contains("api")), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("events")), "{out:?}");
     }
 }
