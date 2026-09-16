@@ -81,7 +81,7 @@ kind: MiraCluster
 metadata:
   name: telemetry
 spec:
-  image: ghcr.io/trianalab/mira:0.0.4
+  image: ghcr.io/trianalab/mira:0.1.0
   replicas: 1          # floor
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage:
