@@ -1,8 +1,8 @@
 //! A terminal, hand-rolled on `libc`.
 //!
 //! ratatui is the obvious answer, and adding it to this workspace resolves 35
-//! crates that are not already here — a 30% increase on a tree whose size (117
-//! crates, 5.76 MiB) is a stated property of the product.
+//! crates that are not already here — a 29% increase on a tree whose size (122
+//! crates, 6.06 MiB) is a stated property of the product.
 //! What it buys over this file is a constraint-solving layout engine and a
 //! damage-tracked cell buffer; the TUI here has fixed panes and redraws one
 //! screenful per keystroke. So: `termios` for raw mode, `TIOCGWINSZ` for the

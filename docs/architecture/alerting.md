@@ -87,7 +87,7 @@ A direct `https://` target costs eleven crates and brings `ring`, which is C and
 assembly. "The tree is N crates" and "`zstd-sys` is the only C dependency" are
 both stated product properties (section 11, README), so HTTPS is `--features
 webhook-tls`: 120 crates by default, 131 with it. Those two are `cargo tree`
-counts including the three workspace members; the 117 in section 11 and the
+counts including the three workspace members; the 122 in section 11 and the
 README is the same tree without them. The default build refuses an `https://`
 URL when the rules file is *loaded* — at boot, with the process exiting —
 rather than at the first page, because the first page is when nobody is reading

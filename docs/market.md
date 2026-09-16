@@ -92,19 +92,19 @@ are unpacked figures; the vendors' zips, tarballs and image layers all move
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 | --- | --- | --- | --- | --- |
-| **Mira** | **5.76 MiB** (arm64 macOS) | 1.0x | 117 crates | — |
-| VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.8x | 98 Go packages | yes |
-| VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.6x | — | yes |
-| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 16.3x | 425 modules | yes |
-| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 17.9x | — | yes |
-| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 18.2x | 331 modules | yes |
-| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 24.0x | 407 modules | yes |
-| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 25.1x | 1,171 lock entries | yes |
-| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 26.5x | 462 crates | yes |
-| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 26.7x | — | yes |
+| **Mira** | **6.06 MiB** (arm64 macOS) | 1.0x | 122 crates | — |
+| VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.7x | 98 Go packages | yes |
+| VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.4x | — | yes |
+| Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 15.5x | 425 modules | yes |
+| otel-arrow OTAP [^b3] | 103.35 MiB (arm64 Linux) | 17.1x | — | yes |
+| Grafana Mimir 3.2.1 [^b4] | 104.67 MiB (arm64 macOS) | 17.3x | 331 modules | yes |
+| Grafana Loki 3.7.7 [^b5] | 138.34 MiB (arm64 macOS) | 22.8x | 407 modules | yes |
+| Quickwit 0.9.0 [^b6] | 144.29 MiB (arm64 macOS) | 23.8x | 1,171 lock entries | yes |
+| Parseable 3.2.0 [^b7] | 152.44 MiB (arm64 macOS) | 25.2x | 462 crates | yes |
+| ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 25.4x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
-The dependency column is directional: VictoriaLogs' 98 against Mira's 117
+The dependency column is directional: VictoriaLogs' 98 against Mira's 122
 external crates is parity, and it has one C dependency (`gozstd`) as Mira does.
 
 ## Compression
@@ -159,7 +159,7 @@ Mira publishes no dollar figure, so there is no Mira row.
 
 ## Where Mira is ahead
 
-**1. Artifact size.** 5.76 MiB stripped, against 94–153 MiB for everything else
+**1. Artifact size.** 6.06 MiB stripped, against 94–153 MiB for everything else
 surveyed.
 
 **2. Resident set at the operating point.** 232 MiB at 629,384 records/s against
@@ -168,7 +168,7 @@ peers who publish theirs at 10,000–20,000.
 **3. Pruned-query latency.** 2.56 ms for an attribute value in none of 137 blocks
 against VictoriaLogs at 266 ms over 300 GB.
 
-**4. Supply-chain surface.** 117 crates on `cargo tree --edges normal`;
+**4. Supply-chain surface.** 122 crates on `cargo tree --edges normal`;
 Parseable under the identical command is 462.
 
 ## Where Mira is not ahead
@@ -306,7 +306,7 @@ Each refusal with the sentence a user gets.
 | Refused | What the user is told |
 | --- | --- |
 | **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice.** |
-| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 5.76 MiB. |
+| **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 6.06 MiB. |
 | **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
 | **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
 | **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
@@ -316,7 +316,7 @@ Each refusal with the sentence a user gets.
 | **Prometheus `remote_read`** | It would make Mira a dumb sample pipe streaming raw points to a Prometheus that evaluates locally — the worst possible shape for a columnar store, and it forfeits every pushdown the engine exists to do. |
 | **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no Resource, no Scope and no semconv; every synthesised series lands in the no-identity bucket. Keep the lossy hop outside Mira. |
 | **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | "There is one flag and it is an address: `--offload <uri>`." Now shipped, and still one flag: the period is `storage.retention`, because the block leaving the disk *is* the event, and there is no cache to size because reads never consult the store — `mira offload restore` is the whole retrieval path. Every competitor's tiering config is a documented foot-gun. |
-| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 117-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
+| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 122-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
 | **Per-record deletion (GDPR erasure)** | This one hurts: it breaks block immutability, which is what reader safety rests on. The answer is tenant-as-path-prefix so deletion stays an unlink of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
 | **SAML** | "Put an OIDC bridge in front of Mira." SAML needs a certificate and a metadata store; OIDC needs a JWKS fetch. |
 | **A Kubernetes operator / CRDs** | Was refused — "a controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile." Now shipped, because the refusal named the wrong subject: scaling the tier *in* has state — which replica is draining, whether its volume has been archived — and `mira-operator` is a separate binary holding it. Mira itself still coordinates nothing, and `spec.replicas` is a floor rather than a desired count, so the controller can permit a drain and never order one. |

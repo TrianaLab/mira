@@ -51,14 +51,19 @@ fn the_command_line_answers_before_it_starts_a_server() {
     for flag in ["-h", "--help"] {
         let (code, out, _) = mira(&[flag]);
         assert_eq!(code, Some(0), "{flag}");
-        assert!(out.contains("mira mira"), "{flag}: {out:?}");
+        assert!(out.contains("Usage: mira"), "{flag}: {out:?}");
     }
 
-    // `mira: ` and nothing on stdout. Returning the error from `main` instead
-    // would print it with `Debug`, which is a struct dump.
+    // `mira: ` and nothing on stdout, and exit 1 rather than the 2 clap would
+    // take on its own. Returning the error from `main` instead would print it
+    // with `Debug`, which is a struct dump; letting clap exit would give a
+    // supervisor a different code depending on which layer refused.
     let (code, out, err) = mira(&["--nope"]);
     assert_eq!(code, Some(1));
-    assert!(err.starts_with("mira: unknown flag --nope"), "{err:?}");
+    assert!(
+        err.starts_with("mira: unexpected argument '--nope'"),
+        "{err:?}"
+    );
     assert_eq!(out, "");
 
     // The TUI arm takes its own --help and reaches neither the tracing
@@ -66,7 +71,7 @@ fn the_command_line_answers_before_it_starts_a_server() {
     // take over, and one stray line lands in the middle of a frame.
     let (code, out, _) = mira(&["mira", "--help"]);
     assert_eq!(code, Some(0));
-    assert!(out.contains("mira tui"), "{out:?}");
+    assert!(out.contains("Usage: mira mira"), "{out:?}");
 
     // `tui` is the alias, and it refuses a stdin that is not a terminal rather
     // than spraying escape codes down whatever pipe it was given.
@@ -74,11 +79,11 @@ fn the_command_line_answers_before_it_starts_a_server() {
     assert_eq!(code, Some(1));
     assert!(err.contains("needs stdin and stdout on a tty"), "{err:?}");
 
-    // A bad flag on that arm is reported by the arm, not by the server parser
-    // it never reaches.
-    let (code, _, err) = mira(&["mira", "--nope"]);
+    // A bad flag on that arm is reported against that arm's flag set, not the
+    // server's: `--grpc` is a real flag of the binary and not of this mode.
+    let (code, _, err) = mira(&["mira", "--grpc", "127.0.0.1:0"]);
     assert_eq!(code, Some(1));
-    assert!(err.contains("unknown flag --nope"), "{err:?}");
+    assert!(err.contains("unexpected argument '--grpc'"), "{err:?}");
 
     // Every subcommand, not just the bare binary. `proxy` and `offload` reach
     // the config parser, which knows nothing about `--help` and reported it as
@@ -88,23 +93,50 @@ fn the_command_line_answers_before_it_starts_a_server() {
         for flag in ["-h", "--help"] {
             let (code, out, err) = mira(&[cmd, flag]);
             assert_eq!((code, err.as_str()), (Some(0), ""), "mira {cmd} {flag}");
-            assert!(out.contains("mira mira"), "mira {cmd} {flag}: {out:?}");
+            assert!(
+                out.contains(&format!("Usage: mira {cmd}")),
+                "mira {cmd} {flag}: {out:?}"
+            );
         }
-        let (code, out, _) = mira(&[cmd, "-V"]);
-        assert_eq!(code, Some(0), "mira {cmd} -V");
-        assert_eq!(out.trim(), format!("mira {}", env!("CARGO_PKG_VERSION")));
     }
 
-    // `update` keeps both for itself: it prints its own usage, and its
-    // `--version` *takes a value* — the tag to install. A general version flag
-    // hoisted above it would turn `mira update --version v0.1.0` into a print
-    // of this binary's version and an exit.
+    // `offload` on its own is the whole verb list rather than a bare error,
+    // because the thing somebody typing it does not know is which verbs exist.
+    let (code, out, err) = mira(&["offload"]);
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    for verb in ["list", "restore", "push"] {
+        assert!(err.contains(verb), "mira offload: {err:?}");
+    }
+
+    // With a verb, past clap and into the verb itself — the one refusal of the
+    // four that is still `offload_cmd`'s, and the only way to reach the dispatch
+    // in `run` that hands it the two halves clap split off.
+    let (code, out, err) = mira(&["offload", "list"]);
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(
+        err.starts_with("mira: ") && err.contains("--offload"),
+        "{err:?}"
+    );
+
+    // `update` keeps `--version` for itself: it *takes a value*, the tag to
+    // install. The root's version flag is not propagated into a subcommand that
+    // declares its own, which is what stops `mira update --version v0.1.0`
+    // being a print of this binary's version and an exit.
     let (code, out, _) = mira(&["update", "--help"]);
     assert_eq!(code, Some(0));
-    assert!(out.contains("mira update ["), "{out:?}");
+    assert!(out.contains("Usage: mira update"), "{out:?}");
     let (code, out, _) = mira(&["update", "--version", "v0.1.0", "--dry-run"]);
     assert_eq!(code, Some(0));
     assert!(out.contains("v0.1.0"), "{out:?}");
+
+    // And `mira completion <shell>` is a script for that shell, off the same
+    // tree — so a flag added above is completable without a second edit here.
+    let (code, out, err) = mira(&["completion", "bash"]);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert!(out.contains("--self-telemetry"), "{out:?}");
+    let (code, _, err) = mira(&["completion", "tcsh"]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("invalid value 'tcsh'"), "{err:?}");
 }
 
 /// A SIGTERM is a rolling restart, not a crash.
@@ -181,9 +213,23 @@ fn a_sigterm_stops_the_server_with_the_data_on_disk() {
 fn the_proxy_subcommand_serves_the_node_behind_it_and_the_node_refuses_to_be_one() {
     // The likely typo, and the reason `proxy.replicas` is checked on both sides:
     // a storage node that quietly ignored it would look like a running proxy.
+    // The flag is refused by the tree — `--replica` is `mira proxy`'s and the
+    // server does not declare it — and the key by the server, which is the case
+    // that survives one config file being shared by both deployments.
     let (code, out, err) = mira(&["--replica", "http://127.0.0.1:4318"]);
     assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(err.contains("unexpected argument '--replica'"), "{err:?}");
+
+    let shared = std::env::temp_dir().join(format!("mira-cli-shared-{}.yaml", std::process::id()));
+    std::fs::write(
+        &shared,
+        "{ proxy: { replicas: \"http://127.0.0.1:4318\" } }",
+    )
+    .unwrap();
+    let (code, out, err) = mira(&["--config", shared.to_str().unwrap()]);
+    assert_eq!((code, out.as_str()), (Some(1), ""));
     assert!(err.contains("is read by `mira proxy`"), "{err:?}");
+    let _ = std::fs::remove_file(&shared);
 
     // And a proxy with nothing to proxy fails before it binds, with the usage,
     // rather than serving 502s to whoever finds it.
@@ -191,13 +237,16 @@ fn the_proxy_subcommand_serves_the_node_behind_it_and_the_node_refuses_to_be_one
     assert_eq!(code, Some(1));
     assert!(err.contains("--replica"), "{err:?}");
 
-    // A flag the config layer rejects, which is a different refusal from the
-    // one above: that one is the proxy saying it has no replicas, this one is
-    // the shared parser, and `mira proxy` has to carry its errors out too
-    // rather than start on a default the operator did not ask for.
+    // A value the parser rejects, which is a different refusal from the one
+    // above: that one is the proxy saying it has no replicas after it parsed,
+    // this one is the shared `--http`, and `mira proxy` has to carry its errors
+    // out too rather than start on a default the operator did not ask for.
     let (code, _, err) = mira(&["proxy", "--http", "not-an-address"]);
     assert_eq!(code, Some(1));
-    assert!(err.contains("--http: invalid socket address"), "{err:?}");
+    assert!(
+        err.contains("invalid value 'not-an-address' for '--http <ADDR>'"),
+        "{err:?}"
+    );
 
     let dir = std::env::temp_dir().join(format!("mira-cli-proxy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

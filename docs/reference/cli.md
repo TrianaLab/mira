@@ -11,54 +11,189 @@ is no daemon, agent or sidecar to run alongside any of them.
 
 ```console
 $ mira --help
-mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION] [--offload URI]
-     [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
-     [--self-telemetry] [--telemetry-interval DURATION]
-     [--alerts FILE] [--version]
+OTLP in, immutable Arrow blocks out, one binary.
 
-mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
-mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
-             --replica http://HOST:PORT [--replica ...]
-mira offload list    [--config FILE] --offload URI
-mira offload restore [--config FILE] --offload URI [--data-dir PATH]
-mira offload push    [--config FILE] --offload URI [--data-dir PATH]
-mira update  [--version VERSION] [--dry-run]
+Usage: mira [OPTIONS] [COMMAND]
 
-Flags override the config file, which overrides the defaults. Every value can
-also come from the file via ${env:VAR} — see https://miradb.dev/config/.
+Commands:
+  mira        open the terminal UI over the same blocks [alias: tui]
+  proxy       one OTLP and query surface in front of N storage nodes
+  offload     move blocks between a data directory and an object store
+  update      replace this binary with a release from GitHub
+  completion  print a shell completion script
+  help        Print this message or the help of the given subcommand(s)
 
-`mira mira` opens the terminal UI. With --data-dir it reads a block directory
-in-process and needs no server running; with --addr it queries one over HTTP.
-`mira tui` is the same thing, for anyone who guesses that first.
+Options:
+      --config <FILE>                  KYAML configuration file; flags override what it sets
+      --node <NAME>                    this replica's name, hashed into its block directory names
+      --grpc <ADDR>                    where OTLP/gRPC listens
+      --http <ADDR>                    where OTLP/HTTP, the query API, MCP and the UI listen
+      --data-dir <PATH>                the block directory, which is the whole manifest
+      --retention <DURATION>           how long a block is kept before it is deleted
+      --offload <URI>                  where a block goes before retention unlinks it
+      --max-request-bytes <SIZE>       the largest export either listener will decode
+      --queue <N>                      exports queued for one signal before the next has to wait
+      --shards <N>                     flushers per signal, or 0 for one per two cores
+      --telemetry-interval <DURATION>  how often --self-telemetry samples this node's counters
+      --alerts <FILE>                  KYAML alerting rules; absent means alerting is off
+      --wal                            acknowledge on the write-ahead log rather than on the block
+      --self-telemetry                 store this node's own counters in this node
+  -h, --help                           Print help
+  -V, --version                        Print version
 
---offload sends a block to an object store just before retention deletes it,
-under the same directory name it had locally — so the store's own listing is
-the catalog and there is nothing else to keep in sync. `mira offload list`
-reads that listing; `mira offload restore` copies every block in it that is not
-already local back into --data-dir, and is safe to re-run.
+Flags override the config file, which overrides the defaults. Every value
+can also come from the file via ${env:VAR} — see https://miradb.dev/config/.
+```
 
-`mira offload push` is the same copy in the other direction and deletes
-nothing. It is how a volume a scale-down left behind is re-homed: push it, then
-restore it into a node that is still running. Give it a URI of its own —
-`file:///archive/${node}` — so the restore pulls back one node's blocks rather
-than the whole archive.
+```console
+$ mira mira --help
+open the terminal UI over the same blocks
 
-`mira proxy` is one OTLP and query surface in front of N storage nodes. It
-stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
-is answered by merging every replica's page on the cursor order. The reads it
-cannot merge — correlate, map, metrics and entities — answer 501 naming
-themselves rather than returning one node's share of the answer.
+Usage: mira mira [OPTIONS]
 
-`mira update` replaces this binary with the latest GitHub release, using the
-same installer as the curl one-liner at https://miradb.dev/install/.
+Options:
+      --config <FILE>       KYAML configuration file; flags override what it sets
+      --data-dir <PATH>     the block directory, which is the whole manifest
+      --addr <HOST[:PORT]>  query a running node instead of reading a directory
+  -h, --help                Print help
+
+With --data-dir it reads a block directory in-process and needs no
+server running; with --addr it queries one over HTTP.
+```
+
+```console
+$ mira proxy --help
+one OTLP and query surface in front of N storage nodes
+
+Usage: mira proxy [OPTIONS]
+
+Options:
+      --config <FILE>             KYAML configuration file; flags override what it sets
+      --http <ADDR>               where OTLP/HTTP, the query API, MCP and the UI listen
+      --max-request-bytes <SIZE>  the largest export either listener will decode
+      --replica <URL>             a storage node to forward to; repeatable
+  -h, --help                      Print help
+
+It stores nothing: exports are split by entity and forwarded, and
+/api/v1/query is answered by merging every replica's page on the
+cursor order. The reads it cannot merge — correlate, map, metrics
+and entities — answer 501 naming themselves rather than returning
+one node's share of the answer.
+```
+
+```console
+$ mira offload --help
+move blocks between a data directory and an object store
+
+Usage: mira offload <COMMAND>
+
+Commands:
+  list     list what the store holds
+  restore  copy every block the store has and this node does not into --data-dir
+  push     copy this node's blocks into the store
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+--offload sends a block to an object store just before retention
+deletes it, under the same directory name it had locally — so the
+store's own listing is the catalog and there is nothing else to keep
+in sync.
+
+`push` is the same copy in the other direction and deletes nothing.
+It is how a volume a scale-down left behind is re-homed: push it,
+then restore it into a node that is still running. Give it a URI of
+its own — file:///archive/${node} — so the restore pulls back one
+node's blocks rather than the whole archive.
+```
+
+```console
+$ mira offload list --help
+list what the store holds
+
+Usage: mira offload list [OPTIONS]
+
+Options:
+      --config <FILE>  KYAML configuration file; flags override what it sets
+      --offload <URI>  where a block goes before retention unlinks it
+  -h, --help           Print help
+```
+
+```console
+$ mira offload restore --help
+copy every block the store has and this node does not into --data-dir
+
+Usage: mira offload restore [OPTIONS]
+
+Options:
+      --config <FILE>    KYAML configuration file; flags override what it sets
+      --offload <URI>    where a block goes before retention unlinks it
+      --data-dir <PATH>  the block directory, which is the whole manifest
+  -h, --help             Print help
+```
+
+```console
+$ mira offload push --help
+copy this node's blocks into the store
+
+Usage: mira offload push [OPTIONS]
+
+Options:
+      --config <FILE>    KYAML configuration file; flags override what it sets
+      --offload <URI>    where a block goes before retention unlinks it
+      --data-dir <PATH>  the block directory, which is the whole manifest
+  -h, --help             Print help
+```
+
+```console
+$ mira update --help
+replace this binary with a release from GitHub
+
+Usage: mira update [OPTIONS]
+
+Options:
+  -v, --version <VERSION>  install this tag instead of the latest (e.g. v0.1.0)
+      --dry-run            print the command that would run, and stop
+  -h, --help               Print help
+
+Runs the same installer as
+  curl -fsSL https://miradb.dev/install.sh | bash
+
+Installs over this binary's own directory, not /usr/local/bin, unless
+MIRA_INSTALL_DIR says otherwise. Nothing happens if the running version
+is already the one that would be installed.
+
+Needs bash and either curl or wget, because it runs the installer rather
+than carrying an HTTPS client. The container image has none of them;
+upgrade that by pulling a newer tag.
+```
+
+```console
+$ mira completion --help
+print a shell completion script
+
+Usage: mira completion <SHELL>
+
+Arguments:
+  <SHELL>  [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -h, --help  Print help
+
+The script is generated from this binary's own command tree, so it
+completes exactly the flags this version accepts:
+
+  mira completion bash > /etc/bash_completion.d/mira
+  mira completion zsh  > "${fpath[1]}/_mira"
+  mira completion fish > ~/.config/fish/completions/mira.fish
 ```
 
 Every flag on the server line is also a config-file key:
 [Configuration](../config.md) is the table, with the type, the
-default and what each one sets. Four here are not, because there is
-nothing for them to persist: `--config` names the file itself,
-`--version` exits, and `--addr` and `--dry-run` belong to `mira mira`
-and `mira update` rather than to the server. The config file is a
-closed set, so writing one of them into it is an `unknown key` at
-boot rather than a setting that is quietly ignored.
+default and what each one sets. The rest are not, because there is
+nothing for them to persist: `--config` names the file itself, a bare
+`--version` exits, and `--addr`, `--dry-run` and `mira update
+--version` belong to a subcommand rather than to the server. The
+config file is a closed set, so writing one of them into it is an
+`unknown key` at boot rather than a setting that is quietly ignored.

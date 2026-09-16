@@ -17,103 +17,338 @@ mod ui;
 mod update;
 
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::Duration;
 
 use axum::Router;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use clap::{Arg, ArgAction, ArgMatches, value_parser};
 
 use config::Config;
 
-const USAGE: &str = "mira [--config FILE] [--node NAME] [--grpc ADDR] [--http ADDR]
-     [--data-dir PATH] [--retention DURATION] [--offload URI]
-     [--max-request-bytes SIZE] [--queue N] [--shards N] [--wal]
-     [--self-telemetry] [--telemetry-interval DURATION]
-     [--alerts FILE] [--version]
-
-mira mira    [--config FILE] [--data-dir PATH] [--addr HOST[:PORT]]
-mira proxy   [--config FILE] [--http ADDR] [--max-request-bytes SIZE]
-             --replica http://HOST:PORT [--replica ...]
-mira offload list    [--config FILE] --offload URI
-mira offload restore [--config FILE] --offload URI [--data-dir PATH]
-mira offload push    [--config FILE] --offload URI [--data-dir PATH]
-mira update  [--version VERSION] [--dry-run]
-
-Flags override the config file, which overrides the defaults. Every value can
-also come from the file via ${env:VAR} — see https://miradb.dev/config/.
-
-`mira mira` opens the terminal UI. With --data-dir it reads a block directory
-in-process and needs no server running; with --addr it queries one over HTTP.
-`mira tui` is the same thing, for anyone who guesses that first.
-
---offload sends a block to an object store just before retention deletes it,
-under the same directory name it had locally — so the store's own listing is
-the catalog and there is nothing else to keep in sync. `mira offload list`
-reads that listing; `mira offload restore` copies every block in it that is not
-already local back into --data-dir, and is safe to re-run.
-
-`mira offload push` is the same copy in the other direction and deletes
-nothing. It is how a volume a scale-down left behind is re-homed: push it, then
-restore it into a node that is still running. Give it a URI of its own —
-`file:///archive/${node}` — so the restore pulls back one node's blocks rather
-than the whole archive.
-
-`mira proxy` is one OTLP and query surface in front of N storage nodes. It
-stores nothing: exports are split by entity and forwarded, and `/api/v1/query`
-is answered by merging every replica's page on the cursor order. The reads it
-cannot merge — correlate, map, metrics and entities — answer 501 naming
-themselves rather than returning one node's share of the answer.
-
-`mira update` replaces this binary with the latest GitHub release, using the
-same installer as the curl one-liner at https://miradb.dev/install/.";
-
-/// Precedence is flag > file > default. Hand-rolled: the flag set exists only to
-/// override the file, so a parser crate would be more code than the thing it
-/// parses.
+/// The whole command tree, in one place.
 ///
-/// `-h` and `-V` are not here. They belong to every subcommand, not just the
-/// server, and this is reached by only two of them — see [`run`].
-fn load_from(argv: Vec<String>) -> Result<Config, String> {
-    // The file has to be read first so flags can override it.
-    let mut cfg = match argv.iter().position(|a| a == "--config") {
-        Some(i) => Config::load(Path::new(argv.get(i + 1).ok_or("--config needs a value")?))?,
+/// This was a `const USAGE` and a flat `match` per mode, on the argument that a
+/// parser crate is more code than the flag set it parses. That was true of the
+/// parsing and false of everything around it: the usage text, the generated CLI
+/// page and — once shell completion was asked for — a script per shell all
+/// restate the same flags, with nothing holding them together. One tree is what
+/// `--help`, `mira completion` and the parser now all read, so a flag is
+/// accepted, documented and completed in the same edit.
+///
+/// Five crates against a tree of 122: `clap`, `clap_builder`, `clap_lex`,
+/// `anstyle` and `clap_complete`. `derive` is off because it costs `syn` and
+/// its tree to generate a struct this file would rather write out, and `color`
+/// is off because everything else this binary prints already decides its own
+/// colour from `is_terminal`.
+fn cli() -> clap::Command {
+    clap::Command::new("mira")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("OTLP in, immutable Arrow blocks out, one binary.")
+        .after_help(
+            "Flags override the config file, which overrides the defaults. Every value\n\
+             can also come from the file via ${env:VAR} — see https://miradb.dev/config/.",
+        )
+        // The bare command is the storage node, so it carries the server's flags
+        // itself rather than behind a `serve` verb nobody had to type before.
+        .arg(config_arg())
+        .arg(
+            Arg::new("node")
+                .long("node")
+                .value_name("NAME")
+                .help("this replica's name, hashed into its block directory names"),
+        )
+        .arg(
+            Arg::new("grpc")
+                .long("grpc")
+                .value_name("ADDR")
+                .value_parser(value_parser!(SocketAddr))
+                .help("where OTLP/gRPC listens"),
+        )
+        .arg(http_arg())
+        .arg(data_dir_arg())
+        .arg(
+            Arg::new("retention")
+                .long("retention")
+                .value_name("DURATION")
+                .value_parser(config::duration)
+                .help("how long a block is kept before it is deleted"),
+        )
+        .arg(offload_arg())
+        .arg(max_request_bytes_arg())
+        .arg(
+            Arg::new("queue")
+                .long("queue")
+                .value_name("N")
+                .value_parser(config::positive)
+                .help("exports queued for one signal before the next has to wait"),
+        )
+        .arg(
+            Arg::new("shards")
+                .long("shards")
+                .value_name("N")
+                .value_parser(config::whole)
+                .help("flushers per signal, or 0 for one per two cores"),
+        )
+        .arg(
+            Arg::new("telemetry-interval")
+                .long("telemetry-interval")
+                .value_name("DURATION")
+                .value_parser(config::duration)
+                .help("how often --self-telemetry samples this node's counters"),
+        )
+        .arg(
+            Arg::new("alerts")
+                .long("alerts")
+                .value_name("FILE")
+                .value_parser(value_parser!(PathBuf))
+                .help("KYAML alerting rules; absent means alerting is off"),
+        )
+        .arg(
+            Arg::new("wal")
+                .long("wal")
+                .action(ArgAction::SetTrue)
+                .help("acknowledge on the write-ahead log rather than on the block"),
+        )
+        .arg(
+            Arg::new("self-telemetry")
+                .long("self-telemetry")
+                .action(ArgAction::SetTrue)
+                .help("store this node's own counters in this node"),
+        )
+        .subcommand(
+            clap::Command::new("mira")
+                // `tui` stays because it is what someone types when they have
+                // not read the usage, and answering that is cheaper than a "no
+                // such subcommand" they have to think about.
+                .visible_alias("tui")
+                .about("open the terminal UI over the same blocks")
+                .after_help(
+                    "With --data-dir it reads a block directory in-process and needs no\n\
+                     server running; with --addr it queries one over HTTP.",
+                )
+                .arg(config_arg())
+                .arg(data_dir_arg())
+                .arg(
+                    Arg::new("addr")
+                        .long("addr")
+                        .value_name("HOST[:PORT]")
+                        .value_parser(tui::parse_addr)
+                        .help("query a running node instead of reading a directory"),
+                ),
+        )
+        .subcommand(
+            clap::Command::new("proxy")
+                .about("one OTLP and query surface in front of N storage nodes")
+                .after_help(
+                    "It stores nothing: exports are split by entity and forwarded, and\n\
+                     /api/v1/query is answered by merging every replica's page on the\n\
+                     cursor order. The reads it cannot merge — correlate, map, metrics\n\
+                     and entities — answer 501 naming themselves rather than returning\n\
+                     one node's share of the answer.",
+                )
+                .arg(config_arg())
+                .arg(http_arg())
+                .arg(max_request_bytes_arg())
+                .arg(
+                    Arg::new("replica")
+                        .long("replica")
+                        .value_name("URL")
+                        // Repeatable, unlike every other flag here, because the
+                        // value is a list and `--replica a --replica b` is what
+                        // a process manager's args array already looks like. The
+                        // file form is one comma-separated string; see
+                        // `config::replicas`.
+                        .action(ArgAction::Append)
+                        .value_parser(config::replicas)
+                        .help("a storage node to forward to; repeatable"),
+                ),
+        )
+        .subcommand(
+            clap::Command::new("offload")
+                .about("move blocks between a data directory and an object store")
+                .after_help(
+                    "--offload sends a block to an object store just before retention\n\
+                     deletes it, under the same directory name it had locally — so the\n\
+                     store's own listing is the catalog and there is nothing else to keep\n\
+                     in sync.\n\n\
+                     `push` is the same copy in the other direction and deletes nothing.\n\
+                     It is how a volume a scale-down left behind is re-homed: push it,\n\
+                     then restore it into a node that is still running. Give it a URI of\n\
+                     its own — file:///archive/${node} — so the restore pulls back one\n\
+                     node's blocks rather than the whole archive.",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(offload_verb("list", "list what the store holds"))
+                .subcommand(
+                    offload_verb(
+                        "restore",
+                        "copy every block the store has and this node does not into --data-dir",
+                    )
+                    .arg(data_dir_arg()),
+                )
+                .subcommand(
+                    offload_verb("push", "copy this node's blocks into the store")
+                        .arg(data_dir_arg()),
+                ),
+        )
+        .subcommand(update::cli())
+        .subcommand(
+            clap::Command::new("completion")
+                .about("print a shell completion script")
+                .after_help(
+                    "The script is generated from this binary's own command tree, so it\n\
+                     completes exactly the flags this version accepts:\n\n  \
+                     mira completion bash > /etc/bash_completion.d/mira\n  \
+                     mira completion zsh  > \"${fpath[1]}/_mira\"\n  \
+                     mira completion fish > ~/.config/fish/completions/mira.fish",
+                )
+                .arg(
+                    Arg::new("shell")
+                        .required(true)
+                        .value_name("SHELL")
+                        .value_parser(value_parser!(clap_complete::Shell)),
+                ),
+        )
+}
+
+/// The five flags more than one mode takes, written once.
+///
+/// A subcommand that shares a flag has to share its spelling, its value name and
+/// its help line too, or `mira --help` and `mira proxy --help` describe the same
+/// thing two ways.
+fn config_arg() -> Arg {
+    Arg::new("config")
+        .long("config")
+        .value_name("FILE")
+        .value_parser(value_parser!(PathBuf))
+        .help("KYAML configuration file; flags override what it sets")
+}
+
+fn data_dir_arg() -> Arg {
+    Arg::new("data-dir")
+        .long("data-dir")
+        .value_name("PATH")
+        .value_parser(value_parser!(PathBuf))
+        .help("the block directory, which is the whole manifest")
+}
+
+fn http_arg() -> Arg {
+    Arg::new("http")
+        .long("http")
+        .value_name("ADDR")
+        .value_parser(value_parser!(SocketAddr))
+        .help("where OTLP/HTTP, the query API, MCP and the UI listen")
+}
+
+fn max_request_bytes_arg() -> Arg {
+    Arg::new("max-request-bytes")
+        .long("max-request-bytes")
+        .value_name("SIZE")
+        .value_parser(config::bytes)
+        .help("the largest export either listener will decode")
+}
+
+fn offload_arg() -> Arg {
+    Arg::new("offload")
+        .long("offload")
+        .value_name("URI")
+        .help("where a block goes before retention unlinks it")
+}
+
+/// The three `offload` verbs, which differ only in direction.
+///
+/// `--data-dir` is added by the two that copy rather than here: `list` reads the
+/// store's own listing and never touches a local directory, and a flag that does
+/// nothing is what `config::check_keys` exists to prevent.
+fn offload_verb(name: &'static str, about: &'static str) -> clap::Command {
+    clap::Command::new(name)
+        .about(about)
+        .arg(config_arg())
+        .arg(offload_arg())
+}
+
+/// One getter for a value that may not have been given *or* may not exist here.
+///
+/// `ArgMatches::get_one` panics on an id the matched subcommand does not
+/// declare, and one [`Config`] is built for the server, the proxy and the three
+/// `offload` verbs, which declare three different subsets of the same flags.
+/// "Not given" and "not a flag of this mode" are the same answer to
+/// [`load_from`], so they are the same answer here.
+fn opt<T: Clone + Send + Sync + 'static>(m: &ArgMatches, id: &str) -> Option<T> {
+    m.try_get_one::<T>(id).ok().flatten().cloned()
+}
+
+/// [`opt`] for a repeatable flag, flattened.
+///
+/// Twice, because each `--replica` already parses to a comma-separated list:
+/// once over the occurrences and once over what each one held.
+fn many(m: &ArgMatches, id: &str) -> Vec<String> {
+    m.try_get_many::<Vec<String>>(id)
+        .ok()
+        .flatten()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// Precedence is flag > file > default.
+///
+/// The file is read first and anything clap actually saw then overwrites it. No
+/// flag carries a `default_value`, which is what keeps "not given" distinct from
+/// "given the same value the default has" — `--retention 7d` has to win over a
+/// file that says an hour even when 7d is also the built-in.
+fn load_from(m: &ArgMatches) -> Result<Config, String> {
+    let mut cfg = match opt::<PathBuf>(m, "config") {
+        Some(p) => Config::load(&p)?,
         None => Config::default(),
     };
-
-    let mut it = argv.into_iter();
-    while let Some(flag) = it.next() {
-        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
-        match flag.as_str() {
-            "--config" => {
-                value()?;
-            }
-            "--node" => cfg.node = value()?,
-            "--grpc" => cfg.grpc = value()?.parse().map_err(|e| format!("--grpc: {e}"))?,
-            "--http" => cfg.http = value()?.parse().map_err(|e| format!("--http: {e}"))?,
-            "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
-            "--retention" => cfg.retention = config::duration(&value()?)?,
-            "--offload" => cfg.offload = Some(value()?),
-            "--max-request-bytes" => cfg.max_request_bytes = config::bytes(&value()?)?,
-            "--queue" => cfg.queue = config::positive(&value()?)?,
-            "--shards" => cfg.shards = config::whole(&value()?)?,
-            "--telemetry-interval" => cfg.telemetry_interval = config::duration(&value()?)?,
-            "--alerts" => cfg.alerts = Some(PathBuf::from(value()?)),
-            // Repeatable, unlike every other flag here, because the value is a
-            // list and `--replica a --replica b` is what a process manager's
-            // args array already looks like. The file form is one
-            // comma-separated string; see `config::replicas`.
-            "--replica" => cfg.replicas.extend(config::replicas(&value()?)?),
-            // These two take no value, unlike every other flag here. They are
-            // the settings whose file form has to be able to say `false` — to
-            // turn off what an inherited config turned on — and whose flag form
-            // never does, because a flag is only ever typed to enable something
-            // the file did not.
-            "--wal" => cfg.wal = true,
-            "--self-telemetry" => cfg.self_telemetry = true,
-            other => return Err(format!("unknown flag {other}\n\n{USAGE}")),
-        }
+    if let Some(v) = opt::<String>(m, "node") {
+        cfg.node = v;
     }
+    if let Some(v) = opt::<SocketAddr>(m, "grpc") {
+        cfg.grpc = v;
+    }
+    if let Some(v) = opt::<SocketAddr>(m, "http") {
+        cfg.http = v;
+    }
+    if let Some(v) = opt::<PathBuf>(m, "data-dir") {
+        cfg.data_dir = v;
+    }
+    if let Some(v) = opt::<Duration>(m, "retention") {
+        cfg.retention = v;
+    }
+    if let Some(v) = opt::<String>(m, "offload") {
+        cfg.offload = Some(v);
+    }
+    if let Some(v) = opt::<usize>(m, "max-request-bytes") {
+        cfg.max_request_bytes = v;
+    }
+    if let Some(v) = opt::<usize>(m, "queue") {
+        cfg.queue = v;
+    }
+    if let Some(v) = opt::<usize>(m, "shards") {
+        cfg.shards = v;
+    }
+    if let Some(v) = opt::<Duration>(m, "telemetry-interval") {
+        cfg.telemetry_interval = v;
+    }
+    if let Some(v) = opt::<PathBuf>(m, "alerts") {
+        cfg.alerts = Some(v);
+    }
+    cfg.replicas.extend(many(m, "replica"));
+    // These two take no value. They are the settings whose file form has to be
+    // able to say `false` — to turn off what an inherited config turned on — and
+    // whose flag form never does, because a flag is only ever typed to enable
+    // something the file did not. So they are an or, not an assignment.
+    cfg.wal |= opt::<bool>(m, "wal").unwrap_or_default();
+    cfg.self_telemetry |= opt::<bool>(m, "self-telemetry").unwrap_or_default();
     Ok(cfg)
 }
 
@@ -141,18 +376,15 @@ fn load_from(argv: Vec<String>) -> Result<Config, String> {
 /// be copied mid-rewrite. It is meant for a volume whose server is stopped,
 /// which is the case it was asked for; holding it against a running one needs
 /// the compaction lock this module deliberately does not have.
-fn offload_cmd(argv: &[String]) -> Result<(), String> {
-    let verb = argv.first().map(String::as_str).unwrap_or("");
-    if !matches!(verb, "list" | "restore" | "push") {
-        return Err(format!(
-            "mira offload takes `list`, `restore` or `push`\n\n{USAGE}"
-        ));
-    }
-    let cfg = load_from(argv[1..].to_vec())?;
+fn offload_cmd(verb: &str, m: &ArgMatches) -> Result<(), String> {
+    let cfg = load_from(m)?;
+    // Not `required(true)` on the flag, because `storage.offload` in --config is
+    // the other way to say it and a node that already has one in its file should
+    // not have to repeat it here.
     let uri = cfg
         .offload
         .as_deref()
-        .ok_or_else(|| format!("mira offload needs --offload URI\n\n{USAGE}"))?;
+        .ok_or("mira offload needs --offload URI, or storage.offload in --config")?;
     let target = mira_core::offload::Target::parse(uri).map_err(|e| e.to_string())?;
     let node = mira_core::block::node_id(&cfg.node);
     if verb == "restore" {
@@ -251,27 +483,14 @@ fn spawn_probes() {
 /// `--addr` wins if given; otherwise the same `data_dir` the server would use,
 /// so `mira mira --config mira.yaml` looks at exactly the directory that config
 /// writes to.
-fn tui_source(argv: &[String]) -> Result<tui::Source, String> {
-    let mut cfg = match argv.iter().position(|a| a == "--config") {
-        Some(i) => Config::load(Path::new(argv.get(i + 1).ok_or("--config needs a value")?))?,
+fn tui_source(m: &ArgMatches) -> Result<tui::Source, String> {
+    let cfg = match opt::<PathBuf>(m, "config") {
+        Some(p) => Config::load(&p)?,
         None => Config::default(),
     };
-    let mut addr = None;
-    let mut it = argv.iter().cloned();
-    while let Some(flag) = it.next() {
-        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
-        match flag.as_str() {
-            "--config" => {
-                value()?;
-            }
-            "--data-dir" => cfg.data_dir = PathBuf::from(value()?),
-            "--addr" => addr = Some(tui::parse_addr(&value()?)?),
-            other => return Err(format!("unknown flag {other}\n\n{USAGE}")),
-        }
-    }
-    Ok(match addr {
+    Ok(match opt::<String>(m, "addr") {
         Some(a) => tui::Source::Remote(a),
-        None => tui::Source::Local(cfg.data_dir),
+        None => tui::Source::Local(opt::<PathBuf>(m, "data-dir").unwrap_or(cfg.data_dir)),
     })
 }
 
@@ -340,42 +559,57 @@ fn main() {
     }
 }
 
+/// A refusal from the parser, as an error from this binary.
+///
+/// `-h` and `-V` come through here too and are not refusals: clap prints them
+/// on stdout and exits 0, which is what `mira -h | less` needs, so they take
+/// its exit rather than this one. Everything else would take clap's other exit
+/// — its own `error:` prefix, on stderr, code 2 — and this binary's contract is
+/// `mira: <sentence>` and code 1 for anything a supervisor might read. The
+/// sentence is clap's; only the prefix and the code are ours.
+fn clap_error(e: &clap::Error) -> Box<dyn std::error::Error> {
+    if !e.use_stderr() {
+        e.exit();
+    }
+    e.to_string()
+        .trim_start_matches("error: ")
+        .trim_end()
+        .to_owned()
+        .into()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    // `mira mira` is the name; `tui` stays because it is what someone types when
-    // they have not read the usage, and answering that is cheaper than a
-    // "no such flag" they have to think about.
-    // Before the tracing subscriber for the same reason `mira mira` is: the
-    // installer writes its own progress to this terminal, and an `info!` line
-    // interleaved with a `sudo` prompt is a prompt someone does not answer.
-    if argv.first().is_some_and(|a| a == "update") {
-        return update::run(&argv[1..]).map_err(Into::into);
-    }
+    // `-h`, `--help` and `-V` are clap's now, on every subcommand rather than
+    // only the two that used to hoist them — and `mira update --version v0.1.0`
+    // installs that tag instead of printing this binary's version, because the
+    // root's version flag is not propagated into a subcommand that declares its
+    // own. Both of those were hand-written special cases here.
+    let m = cli().try_get_matches().map_err(|e| clap_error(&e))?;
+    let string = |e: String| -> Box<dyn std::error::Error> { e.into() };
 
-    // Above every remaining arm, below `update`. Above, because the parser each
-    // arm reaches knows nothing about these two and reported them as unknown
-    // flags — so `mira proxy --help`, the usage somebody is most likely to ask
-    // for, answered with an error and exit 1. Below `update`, because that arm
-    // prints its own usage and its `--version` *takes a value*: hoisted past
-    // it, `mira update --version v0.1.0` would print this binary's version and
-    // exit instead of installing the tag.
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
+    // Before the tracing subscriber: the installer writes its own progress to
+    // this terminal, and an `info!` line interleaved with a `sudo` prompt is a
+    // prompt someone does not answer.
+    if let Some(("update", sub)) = m.subcommand() {
+        return update::run(sub).map_err(string);
+    }
+    if let Some(("completion", sub)) = m.subcommand() {
+        let shell = sub
+            .get_one::<clap_complete::Shell>("shell")
+            .copied()
+            .expect("required");
+        clap_complete::generate(shell, &mut cli(), "mira", &mut std::io::stdout());
         return Ok(());
     }
-    if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("mira {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    if let Some(("offload", sub)) = m.subcommand() {
+        let (verb, args) = sub.subcommand().expect("subcommand_required");
+        return offload_cmd(verb, args).map_err(string);
     }
-
-    if argv.first().is_some_and(|a| a == "offload") {
-        return offload_cmd(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() });
-    }
-    if argv.first().is_some_and(|a| a == "mira" || a == "tui") {
+    if let Some(("mira", sub)) = m.subcommand() {
         // No tracing subscriber on this path, and no runtime. Both write to the
         // terminal the TUI has just taken over, and one stray `info!` in the
         // middle of a frame corrupts the whole screen.
-        let src = tui_source(&argv[1..]).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let src = tui_source(sub).map_err(string)?;
         // The same two guards `serve_with` runs, for the same reason and before
         // the same mmap — see `check_source`, which is also where the two cases
         // it has nothing to say about are written down.
@@ -399,9 +633,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     // After the subscriber and inside the runtime, unlike the three above: the
     // proxy is a server and wants both, it just has no storage under it.
-    match argv.first().is_some_and(|a| a == "proxy") {
-        true => rt.block_on(proxy_cmd(argv[1..].to_vec())),
-        false => rt.block_on(serve()),
+    match m.subcommand() {
+        Some(("proxy", sub)) => rt.block_on(proxy_cmd(sub)),
+        _ => rt.block_on(serve(&m)),
     }
 }
 
@@ -412,10 +646,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// tonic service that decodes in order to re-encode to three HTTP clients is a
 /// second transport to keep in step for a hop that is inside one deployment.
 /// Point collectors at 4318; see `docs/architecture/replicas.md` section 12.
-async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+async fn proxy_cmd(m: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load_from(m).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let p = proxy::Proxy::new(cfg.replicas.clone(), cfg.max_request_bytes)
-        .map_err(|e| -> Box<dyn std::error::Error> { format!("{e}\n\n{USAGE}").into() })?;
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let socket = tokio::net::TcpListener::bind(cfg.http).await?;
     let addr = socket.local_addr()?;
     tracing::info!(
@@ -430,9 +664,8 @@ async fn proxy_cmd(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let argv = std::env::args().skip(1).collect();
-    let cfg = load_from(argv).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+async fn serve(m: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load_from(m).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     serve_with(cfg, shutdown()).await
 }
 
@@ -447,10 +680,9 @@ async fn serve_with(
     // The likely typo is `mira --replica ...` for `mira proxy --replica ...`,
     // which would otherwise start a storage node that looks like a proxy.
     if !cfg.replicas.is_empty() {
-        return Err(format!(
-            "--replica / proxy.replicas is read by `mira proxy`; this is a storage node\n\n{USAGE}"
-        )
-        .into());
+        return Err(
+            "--replica / proxy.replicas is read by `mira proxy`; this is a storage node".into(),
+        );
     }
 
     // First, because a rules file that does not parse is a deployment that
@@ -1159,8 +1391,35 @@ async fn shutdown() {
 mod tests {
     use super::*;
 
-    fn argv(s: &str) -> Vec<String> {
-        s.split_whitespace().map(str::to_owned).collect()
+    /// A command line, through the real tree.
+    ///
+    /// Whitespace-split, so no test here can pass a value with a space in it —
+    /// which is what the `--version` charset test in `update.rs` is for.
+    fn argv(s: &str) -> Result<ArgMatches, String> {
+        cli()
+            .try_get_matches_from(std::iter::once("mira").chain(s.split_whitespace()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// The server's `Config` from a command line, with clap's refusals and the
+    /// config file's flattened into the one `String` the caller asserts on.
+    fn load(s: &str) -> Result<Config, String> {
+        load_from(&argv(s)?)
+    }
+
+    /// `mira offload <verb> …`, reached the way [`run`] reaches it.
+    ///
+    /// Going through the tree rather than calling [`offload_cmd`] with a verb
+    /// name directly is what keeps the two refusals that are now clap's — a
+    /// missing verb and an unknown one — inside the same assertion table as the
+    /// two that are still this file's.
+    fn offload(s: &str) -> Result<(), String> {
+        let m = argv(&format!("offload {s}"))?;
+        let (verb, sub) = m
+            .subcommand_matches("offload")
+            .and_then(ArgMatches::subcommand)
+            .expect("subcommand_required");
+        offload_cmd(verb, sub)
     }
 
     fn tmp(name: &str) -> PathBuf {
@@ -1253,24 +1512,24 @@ mod tests {
         // does not implement. All four are refused before anything is opened.
         for (args, want) in [
             ("", "list"),
-            ("sync --offload file:///x", "restore"),
+            ("sync --offload file:///x", "unrecognized subcommand 'sync'"),
             ("list", "--offload"),
             ("list --offload s3://bucket", "s3://bucket"),
         ] {
-            let e = offload_cmd(&argv(args)).unwrap_err();
+            let e = offload(args).unwrap_err();
             assert!(e.contains(want), "`mira offload {args}` said: {e}");
         }
 
         // An empty store is an empty catalog, not an error: there is no index
         // whose absence could mean something different.
-        offload_cmd(&argv(&format!("list --offload {uri}"))).unwrap();
+        offload(&format!("list --offload {uri}")).unwrap();
 
         let name = format!("{:020}-{:020}-{:08x}-{:012}-{:020}", 1_000, 2_000, 7, 1, 0);
         let block = store.join("logs").join("p=0").join(&name);
         std::fs::create_dir_all(&block).unwrap();
         std::fs::write(block.join("logs.arrow"), b"bytes").unwrap();
 
-        offload_cmd(&argv(&format!("list --offload {uri}"))).unwrap();
+        offload(&format!("list --offload {uri}")).unwrap();
         assert_eq!(
             std::fs::read_dir(&data).unwrap().count(),
             0,
@@ -1278,14 +1537,14 @@ mod tests {
         );
 
         let restore = format!("restore --offload {uri} --data-dir {}", data.display());
-        offload_cmd(&argv(&restore)).unwrap();
+        offload(&restore).unwrap();
         let local = data.join("logs").join("p=0").join(&name);
         assert_eq!(std::fs::read(local.join("logs.arrow")).unwrap(), b"bytes");
 
         // Re-runnable, which is what makes it usable from a script that does
         // not track what it has already fetched.
         std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
-        offload_cmd(&argv(&restore)).unwrap();
+        offload(&restore).unwrap();
         assert_eq!(
             std::fs::read(local.join("logs.arrow")).unwrap(),
             b"local edit",
@@ -1316,20 +1575,20 @@ mod tests {
         std::fs::write(local.join("logs.arrow"), b"bytes").unwrap();
 
         let push = format!("push --offload {uri} --data-dir {}", data.display());
-        offload_cmd(&argv(&push)).unwrap();
+        offload(&push).unwrap();
         let remote = store.join("logs").join("p=0").join(&name);
         assert_eq!(std::fs::read(remote.join("logs.arrow")).unwrap(), b"bytes");
         assert!(local.exists(), "push copies the block, it does not move it");
 
         // The same block again: already archived, so a no-op rather than a
         // re-copy, and the verb still succeeds.
-        offload_cmd(&argv(&push)).unwrap();
+        offload(&push).unwrap();
 
         // Different bytes under the same name is the collision, not a no-op —
         // reporting it as archived is what would let a scale-in delete the
         // volume holding the only copy.
         std::fs::write(local.join("logs.arrow"), b"local edit").unwrap();
-        offload_cmd(&argv(&push)).unwrap_err();
+        offload(&push).unwrap_err();
         assert_eq!(
             std::fs::read(remote.join("logs.arrow")).unwrap(),
             b"bytes",
@@ -1340,9 +1599,13 @@ mod tests {
 
     /// Flag > file > default, and every flag lands in the field it names.
     ///
-    /// This parser is hand-rolled, and the failure it can produce is the quiet
-    /// kind: a flag written into the wrong field starts a server that looks
-    /// exactly right until someone reads a block from the wrong directory.
+    /// clap parses; [`load_from`] still decides which field each value reaches,
+    /// and the failure that can produce is the quiet kind: a flag written into
+    /// the wrong field starts a server that looks exactly right until someone
+    /// reads a block from the wrong directory. It is also what holds the arg ids
+    /// to the fields — [`opt`] answers `None` for an id no subcommand declares,
+    /// so a typo here would be a flag that parses and then does nothing, and the
+    /// assertions below are what catch it.
     #[test]
     fn flags_override_the_file_which_overrides_the_defaults() {
         let dir = tmp("load");
@@ -1357,20 +1620,18 @@ mod tests {
         .unwrap();
         let f = file.display();
 
-        let c = load_from(argv(&format!("--config {f}"))).unwrap();
+        let c = load(&format!("--config {f}")).unwrap();
         assert_eq!(c.node, "from-file");
         assert_eq!(c.data_dir, PathBuf::from("/from/file"));
         assert_eq!(c.retention, std::time::Duration::from_secs(3 * 3600));
         assert_eq!(c.max_request_bytes, 1 << 20);
         assert_eq!(c.http.port(), 2);
 
-        // The same file, every value overridden. `--config` is seen twice — once
-        // to find the file and once by the loop, which must consume its value
-        // rather than read it as a flag.
-        let c = load_from(argv(&format!(
+        // The same file, every value overridden.
+        let c = load(&format!(
             "--config {f} --node cli --grpc 127.0.0.1:3 --http 127.0.0.1:4 \
              --data-dir /from/cli --retention 30s --max-request-bytes 2MiB"
-        )))
+        ))
         .unwrap();
         assert_eq!(c.node, "cli");
         assert_eq!(c.grpc.port(), 3);
@@ -1379,51 +1640,56 @@ mod tests {
         assert_eq!(c.retention, std::time::Duration::from_secs(30));
         assert_eq!(c.max_request_bytes, 2 << 20);
 
-        // The three that take no value and the two that were added with them.
-        // `--self-telemetry` is here rather than above because a boolean flag
-        // that silently swallowed the next argument would still pass every
-        // assertion in that block.
-        let c = load_from(argv(
-            "--queue 4096 --self-telemetry --telemetry-interval 1m --wal",
-        ))
+        // Everything the file above does not set, including the two that take
+        // no value. Those two are interleaved with the rest rather than listed
+        // apart, because a boolean flag that silently swallowed the next
+        // argument would still pass every assertion in a block of its own.
+        let c = load(
+            "--queue 4096 --shards 8 --wal --alerts /from/cli.kyaml \
+             --self-telemetry --telemetry-interval 1m",
+        )
         .unwrap();
         assert_eq!(c.queue, 4096);
+        assert_eq!(c.shards, 8);
+        assert_eq!(c.alerts, Some(PathBuf::from("/from/cli.kyaml")));
         assert!(c.self_telemetry);
         assert!(c.wal);
         assert_eq!(c.telemetry_interval, std::time::Duration::from_secs(60));
 
         // A URI is a string here; the scheme is refused where it is parsed.
-        let c = load_from(argv("--offload file:///srv/cold")).unwrap();
+        let c = load("--offload file:///srv/cold").unwrap();
         assert_eq!(c.offload.as_deref(), Some("file:///srv/cold"));
 
         // No arguments at all is the shipped configuration.
-        let d = load_from(vec![]).unwrap();
+        let d = load("").unwrap();
         assert_eq!(d.node, Config::default().node);
         assert!(!d.self_telemetry, "self-telemetry is opt-in");
 
         for (args, want) in [
-            ("--nope", "unknown flag --nope"),
+            ("--nope", "unexpected argument '--nope'"),
             // Deleted along with the fan-out that never existed. It is an
             // unknown flag now, which is the whole point of deleting it.
-            ("--peers a:1", "unknown flag --peers"),
-            ("--node", "--node needs a value"),
-            ("--config", "--config needs a value"),
-            ("--grpc nope", "--grpc:"),
-            ("--http nope", "--http:"),
+            ("--peers a:1", "unexpected argument '--peers'"),
+            ("--node", "a value is required for '--node <NAME>'"),
+            ("--config", "a value is required for '--config <FILE>'"),
+            ("--grpc nope", "invalid value 'nope' for '--grpc <ADDR>'"),
+            ("--http nope", "invalid value 'nope' for '--http <ADDR>'"),
             ("--retention nope", "not a duration"),
             ("--max-request-bytes nope", "not a size"),
             ("--queue nope", "not a whole number"),
             ("--queue 0", "at least 1"),
             // `--shards 0` is *not* here: zero is the documented auto value.
-            // A negative is rejected rather than wrapped — `usize::from_str`
-            // has no sign to lose, so `-1` cannot arrive as 18 quintillion
-            // shards that `clamp` then silently turns into 16.
+            // A negative is rejected rather than wrapped, which is what keeps
+            // `-1` from arriving as 18 quintillion shards that `clamp` then
+            // silently turns into 16. It is refused a step earlier than the
+            // rest of this table — `allow_negative_numbers` is off, so `-1`
+            // reads as a flag and never reaches `config::whole`.
             ("--shards nope", "not a whole number"),
-            ("--shards -1", "not a whole number"),
+            ("--shards -1", "unexpected argument '-1'"),
             ("--telemetry-interval nope", "not a duration"),
             ("--config /no/such/file.yaml", "/no/such/file.yaml"),
         ] {
-            let e = load_from(argv(args)).unwrap_err();
+            let e = load(args).unwrap_err();
             assert!(e.contains(want), "{args:?} said {e:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1441,13 +1707,18 @@ mod tests {
         // Rendered rather than matched, so a wrong *variant* is a diff on the
         // left of the assertion instead of a panic in a `let ... else`: which
         // of the three answers came back is exactly what is under test.
-        let src = |a: &str| match tui_source(&argv(a)) {
-            Ok(tui::Source::Local(p)) => format!("local {}", p.display()),
-            Ok(tui::Source::Remote(a)) => format!("remote {a}"),
-            // First line only: a flag error carries the whole usage text after
-            // a blank line, which is `USAGE`'s contract to assert, not this
-            // one's.
-            Err(e) => format!("error {}", e.lines().next().unwrap_or_default()),
+        let src = |a: &str| {
+            let out = argv(&format!("mira {a}")).and_then(|m| {
+                tui_source(m.subcommand_matches("mira").expect("the tui subcommand"))
+            });
+            match out {
+                Ok(tui::Source::Local(p)) => format!("local {}", p.display()),
+                Ok(tui::Source::Remote(a)) => format!("remote {a}"),
+                // First line only: clap's refusals carry the whole usage after a
+                // blank line, which is the tree's contract to render, not this
+                // test's to assert.
+                Err(e) => format!("error {}", e.lines().next().unwrap_or_default()),
+            }
         };
         let default_dir = Config::default().data_dir;
         for (args, want) in [
@@ -1459,12 +1730,20 @@ mod tests {
             (String::new(), format!("local {}", default_dir.display())),
             // `--addr` wins outright: a remote source has no directory to read.
             ("--addr host:9999".into(), "remote host:9999".to_owned()),
-            ("--nope".into(), "error unknown flag --nope".to_owned()),
+            (
+                "--nope".into(),
+                "error error: unexpected argument '--nope' found".to_owned(),
+            ),
             (
                 "--data-dir".into(),
-                "error --data-dir needs a value".to_owned(),
+                "error error: a value is required for '--data-dir <PATH>' but none was supplied"
+                    .to_owned(),
             ),
-            ("--config".into(), "error --config needs a value".to_owned()),
+            (
+                "--config".into(),
+                "error error: a value is required for '--config <FILE>' but none was supplied"
+                    .to_owned(),
+            ),
         ] {
             assert_eq!(src(&args), want, "{args:?}");
         }

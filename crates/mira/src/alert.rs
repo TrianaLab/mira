@@ -52,7 +52,7 @@
 //! # Why HTTPS is a Cargo feature
 //!
 //! Slack, Discord and PagerDuty are all HTTPS, and in-process TLS costs eleven
-//! crates against a tree of 117 — `ring` among them, which would be the second
+//! crates against a tree of 122 — `ring` among them, which would be the second
 //! C dependency in a binary whose README states it has one. Both of those are
 //! published product properties (section 11), so the default build posts over HTTP and
 //! refuses an `https://` target at load time, naming the feature. Build with
