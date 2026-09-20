@@ -211,6 +211,7 @@ cosign verify \
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | affinity | object | `{}` | Affinity. |
+| clusterEvents.endpoint | string | `""` | Ship Kubernetes Events and container state changes to a Mira as OTLP logs, so an agent writing an RCA can see an `OOMKilled` or a `FailedScheduling` on the same timeline as the telemetry. An OTLP/HTTP base URL — `http://my-mira-proxy.mira.svc:4318` — and empty is off.  This one value is the whole switch: it sets the operator's endpoint *and* creates the read-only Role below. Two switches would mean an endpoint without the Role, which is an operator taking 403s in a loop.  Note what the Role grants: `get`/`list`/`watch` on pods cluster-wide, which includes `spec.containers[].env` and so any secret inlined there. The exporter reads only `status` and never emits a spec field, but the permission is wider than the use — scope it with `rbac.namespaces` if that matters in your cluster. |
 | fullnameOverride | string | `""` | Overrides the full generated resource name. |
 | image.pullPolicy | string | `"IfNotPresent"` | Pull policy. |
 | image.repository | string | `"ghcr.io/trianalab/mira-operator"` | Operator image repository. |

@@ -652,7 +652,7 @@ pub fn error_policy(_: Arc<MiraCluster>, e: &Error, _: Arc<Ctx>) -> Action {
 /// takes a 403, backs off, retries, and the tier it was installed to manage is
 /// never reconciled. Empty entries are dropped so a trailing comma is not a
 /// watch on `""`, which the API server reads as every namespace.
-fn namespaces(raw: Option<&str>) -> Option<Vec<String>> {
+pub(crate) fn namespaces(raw: Option<&str>) -> Option<Vec<String>> {
     let list: Vec<String> = raw?
         .split(',')
         .map(str::trim)
@@ -663,7 +663,11 @@ fn namespaces(raw: Option<&str>) -> Option<Vec<String>> {
 }
 
 /// An `Api` over one namespace, or over all of them.
-fn scoped<K>(client: Client, ns: Option<&str>) -> Api<K>
+///
+/// Shared with `events.rs`, which has to scope its Event and pod watches to the
+/// same namespaces for the same reason: a `Role` can only authorise a
+/// namespaced LIST.
+pub(crate) fn scoped<K>(client: Client, ns: Option<&str>) -> Api<K>
 where
     K: Resource<Scope = kube::core::NamespaceResourceScope>,
     K::DynamicType: Default,

@@ -81,6 +81,11 @@ link back to this section:
 - **Resource exhaustion the operator asked for.** An unfiltered query over the
   whole of retention is slow by construction; the README says how slow. Tune
   retention, or put a proxy in front.
+- **The breadth of the operator's cluster-event Role.** `get`/`list`/`watch` on
+  pods is wider than the `status` the exporter reads. Documented, off by
+  default, scoped with `rbac.namespaces`:
+  [section 14.7](https://miradb.dev/architecture/kubernetes-context/#147-one-chart-value-because-two-would-disagree).
+  A pod *spec* field reaching a block is a defect, and in scope.
 - **Upstream advisories.** Report them upstream. Tell us too, so `make audit`
   and the pin move.
 

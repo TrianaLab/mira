@@ -220,6 +220,8 @@ nav:
           - 12. Multiple active replicas: architecture/replicas.md
           - "12. — scaling and the coordinator": architecture/replicas-scaling.md
           - 13. Alerting: architecture/alerting.md
+          - 14. Cluster context: architecture/kubernetes-context.md
+          - 15. The write-up: architecture/rca.md
       - Testing architecture: internals/testing.md
       - End-to-end testing: internals/e2e.md
       - Measurement contract: internals/measurement.md

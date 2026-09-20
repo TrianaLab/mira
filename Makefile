@@ -969,12 +969,17 @@ helm-template: ## Render the chart across the permutations that change its shape
 	@# file asserts whitespace. This gate answers the other question: does every
 	@# combination that adds or removes a resource still render at all? The
 	@# axes: the default cluster-wide install, the scoped one where the
-	@# ClusterRole becomes a Role per namespace, and the two opt-outs that leave
-	@# the controller with no permissions and no account of its own.
+	@# ClusterRole becomes a Role per namespace, the two opt-outs that leave the
+	@# controller with no permissions and no account of its own, and the
+	@# exporter, which adds a rule and an env var from one value — and does it
+	@# in both RBAC modes, which is the combination that has two branches to get
+	@# wrong rather than one.
 	helm template mira-operator $(CHART) --debug >/dev/null
 	helm template mira-operator $(CHART) --set 'rbac.namespaces={alpha,beta}' >/dev/null
 	helm template mira-operator $(CHART) --set rbac.create=false >/dev/null
 	helm template mira-operator $(CHART) --set serviceAccount.create=false --set serviceAccount.name=existing >/dev/null
+	helm template mira-operator $(CHART) --set clusterEvents.endpoint=http://mira:4318 >/dev/null
+	helm template mira-operator $(CHART) --set clusterEvents.endpoint=http://mira:4318 --set 'rbac.namespaces={alpha}' >/dev/null
 
 .PHONY: helm-unittest
 helm-unittest: ## The chart's own test suites

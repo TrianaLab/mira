@@ -51,3 +51,5 @@ formats, and re-proposing one of them is the most common way to waste a day.
 | [12. Multiple active replicas](replicas.md) | ingest without coordination, and the query proxy |
 | [… scaling and the coordinator](replicas-scaling.md) | discovery, what scaling buys, and why the controller is a second binary |
 | [13. Alerting](alerting.md) | the rules, and where they run |
+| [14. Cluster context](kubernetes-context.md) | what Kubernetes knows about a pod, on the same timeline, as logs |
+| [15. The write-up](rca.md) | `render_rca`, and the citations it re-runs before it renders |

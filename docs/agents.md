@@ -1,5 +1,5 @@
 ---
-description: Point an agent at Mira over MCP — client configuration, the eight tools, and a worked root-cause investigation from a firing alert to the failing dependency.
+description: Point an agent at Mira over MCP — client configuration, the nine tools, a worked root-cause investigation from a firing alert to the failing dependency, and the RCA it writes at the end.
 ---
 
 # Connect an agent
@@ -9,8 +9,8 @@ something they wrote themselves.
 
 Mira speaks the [Model Context Protocol](https://modelcontextprotocol.io) natively on
 `POST /mcp`, on the same port as the UI and the query API. There is no gateway to run, no
-exporter to configure and no second read path: the eight tools are the eight questions
-the browser UI asks, over the same code.
+exporter to configure and no second read path: eight of the nine tools are the eight
+questions the browser UI asks, over the same code. The ninth writes the RCA.
 
 Everything below assumes a Mira with data in it. `make demo` gives you one in a single
 command — 45 minutes of a four-service shop, one of which is failing.
@@ -52,7 +52,7 @@ mid-conversation loses nothing.
 Bind it to localhost for a local agent, and put a proxy or a network policy in front of
 anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 
-## The eight tools
+## The nine tools
 
 | tool | answers |
 | --- | --- |
@@ -64,6 +64,11 @@ anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 | `service_map` | who calls whom, with call, error and latency counts per edge |
 | `list_services` | which services emitted anything, and their entity keys |
 | `list_alerts` | every rule this node evaluates, and what it is doing now |
+| `render_rca` | the findings, as a root-cause analysis in markdown ([section 15](architecture/rca.md)) |
+
+None of them writes to anything but Mira, and there is no tenth that changes a
+cluster — see [architecture section 14.6](architecture/kubernetes-context.md#146-read-only-and-not-by-omission)
+for why that is a decision rather than a gap.
 
 Three properties matter more than the list:
 

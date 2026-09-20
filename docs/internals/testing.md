@@ -3,8 +3,8 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 432 cargo tests — 372 across levels 1–5, plus 60 in `xtask` that test
-the gates rather than the engine — 22 UI tests, 26 chart tests, and 74 more in
+Mira has 439 cargo tests — 379 across levels 1–5, plus 60 in `xtask` that test
+the gates rather than the engine — 22 UI tests, 30 chart tests, and 92 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
 both targets are in [Contributing](../contributing.md).
@@ -16,13 +16,13 @@ the industry's least agreed label, so it is absent.
 
 | # | Level | Count | Lives in | Runs from |
 | --- | --- | --- | --- | --- |
-| 1 | Unit, in-source | 146 core + 185 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 146 core + 191 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
-| 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
+| 3 | In-process end-to-end | 38 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
-| 7 | Chart rendering | 26 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
+| 7 | Chart rendering | 30 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
 | 8 | Against a real API server | 5 | `integrations/kubernetes/tests/apiserver.rs` | `make operator-apiserver` |
 | 9 | Live, on a real cluster | asserted, not counted | `integrations/kubernetes/e2e/run.sh` | `make operator-e2e` |
 
@@ -133,7 +133,7 @@ one.
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it. `make operator` is its
-whole gate — fmt, clippy, 69 unit tests, a coverage floor and the CRD drift
+whole gate — fmt, clippy, 87 unit tests, a coverage floor and the CRD drift
 check — and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
 deliberately not in it.
 
@@ -141,10 +141,18 @@ The separation is not about testing: kube-rs declares Rust 1.89 against the
 engine's 1.88 floor and brings ~160 crates and a TLS stack, against a README
 crate count that is a published product property.
 
-Its 69 unit tests are level 1 in shape and almost all about **arithmetic that
+Its 87 unit tests are level 1 in shape and almost all about **arithmetic that
 decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
 a spec whose thresholds would oscillate.
+
+`events::*` is the exception and only in its fixtures: the objects are the API
+server's own wire JSON rather than a `Default` plus thirty assignments, and two
+of them POST a real batch at a one-shot `TcpListener` — the exporter's HTTP
+client is a concrete type with nothing to substitute, and a loopback socket is
+smaller than the `hyper/server` dev-dependency the alternative would add. The
+watch loop itself is not reachable without an API server; like `main.rs`, it is
+covered at level 8.
 
 **`operator-crd-check` is the gate that matters most here** and it is not a test.
 `make operator-crd` regenerates `charts/mira-operator/crds/miraclusters.yaml`

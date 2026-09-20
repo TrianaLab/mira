@@ -241,6 +241,10 @@ fn wire_with(name: &str, wal: bool) -> (receiver::Receivers, api::Api, std::path
         // No rules file: `/api/v1/alerts` answers with an empty list, which is
         // the shape a node without `alerts.rules` serves.
         alerts: Arc::default(),
+        // The same handle the receiver writes through, so `render_rca`'s `emit`
+        // lands in the same blocks an export would and can be read back by the
+        // query path in the same test.
+        logs: Some(recv.logs.clone()),
     };
     (recv, api, root)
 }
@@ -1400,6 +1404,85 @@ async fn an_mcp_client_can_list_the_tools_and_call_them() {
     assert_eq!(trace.matches("GET /pay/").count(), 3, "{trace}");
 }
 
+/// The write-up, end to end: telemetry in, an RCA citing it out, and the RCA
+/// back in as a log record that the query path can find.
+///
+/// Three things are being asserted and only the third is about markdown. The
+/// first is the verification loop — a citation that matches nothing fails the
+/// call rather than rendering a document nobody can check. The second is that
+/// `emit` goes through the same ingest as an OTLP export, which is what makes
+/// the incident record free: no second store, no index, no separate expiry
+/// (principle 4). The third is that the rendered document is read back out of
+/// Mira by exactly the tool an agent already has.
+#[tokio::test]
+async fn an_agent_can_write_an_rca_from_its_evidence_and_store_it_in_mira() {
+    let (app, _root) = boot("rca");
+    let rpc = async |body: &str| {
+        let (status, out) = post(&app, "/mcp", "application/json", body.into()).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        out
+    };
+    let call = |args: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call",
+                 "params":{{"name":"render_rca","arguments":{args}}}}}"#
+        )
+    };
+
+    otlp(&app, "/v1/logs", logs_export("checkout", 1_000, 4)).await;
+
+    // A claim with nothing behind it does not become a document. The reason
+    // names the claim, because "one of your citations is wrong" is not
+    // something a model can act on.
+    let dead = rpc(&call(
+        r#"{"title":"t","summary":"s","root_cause":"r","from":0,"to":100000,
+            "evidence":[{"claim":"the cache was cold","query":{"where":[
+              {"attr":"service.name","eq":"cache"}]}}]}"#,
+    ))
+    .await;
+    assert!(dead.contains(r#""isError":true"#), "{dead}");
+    assert!(dead.contains("the cache was cold"), "{dead}");
+    assert!(dead.contains("nothing was stored"), "{dead}");
+
+    let out = rpc(&call(
+        r#"{"title":"Checkout 5xx","summary":"Checkout failed for two seconds.",
+            "from":0,"to":100000,
+            "impact":["2 of 4 records were errors"],
+            "timeline":[{"at":1000,"what":"first error"}],
+            "root_cause":"The 1.4.0 image raised the pool ceiling.",
+            "evidence":[{"claim":"checkout logged errors","query":{"where":[
+                          {"attr":"service.name","eq":"checkout"},
+                          {"field":"severity_text","eq":"ERROR"}]}}],
+            "remediation":["Roll back to 1.3.9."],
+            "prevention":{"name":"checkout-5xx","over":"5m","when":"count > 20",
+                          "query":{"signal":"logs","where":[
+                            {"field":"severity_text","eq":"ERROR"}]}},
+            "emit":true}"#,
+    ))
+    .await;
+    assert!(out.contains(r#""isError":false"#), "{out}");
+    // Two of the four fixture records are errors, and the count in the document
+    // is the one the scan just produced rather than one the model asserted.
+    assert!(out.contains(", 2 records"), "{out}");
+    // The sentence that is the whole of Mira's remediation posture, in the
+    // document itself and not only in the docs.
+    assert!(out.contains("Mira did not apply any of this"), "{out}");
+    assert!(
+        out.contains(r#"rules:\n  - \"name\": \"checkout-5xx\""#),
+        "{out}"
+    );
+
+    // And back out again, through the tool an agent already has. `emit` is a
+    // log record: there is nothing else to query and nothing else to expire.
+    let found = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+             "name":"query_records","arguments":{"from":"-1h","to":"now",
+               "where":[{"attr":"rca.title","eq":"Checkout 5xx"}]}}}"#)
+    .await;
+    assert!(found.contains(r#""isError":false"#), "{found}");
+    assert_eq!(found.matches("## Root cause").count(), 1, "{found}");
+    assert!(found.contains(r#"\"event_name\":\"rca\""#), "{found}");
+}
+
 /// OTLP/HTTP with a JSON body.
 ///
 /// The point of this test is the places OTLP JSON is *not* canonical protobuf
@@ -2250,6 +2333,7 @@ async fn restart_with(cfg: pipeline::Config) -> Node {
         data_dir: Arc::new(root),
         open: [o_logs, o_traces, o_metrics],
         alerts: Arc::default(),
+        logs: Some(recv.logs.clone()),
     };
     Node {
         app: router_for(recv, api.clone()),
