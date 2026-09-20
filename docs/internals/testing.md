@@ -58,9 +58,9 @@ MIRA_DIFF_SEED=12858170866899772564 cargo test -p miradb-core --test differentia
 OTLP protobuf in one end and query JSON out the other. Only this test catches a
 receiver wired to the wrong flusher, or an acknowledgement returned before the
 data is findable. Almost all of it reaches the router through `oneshot`; the two
-tests that need a real socket — the TUI's blocking `std::net::TcpStream`, and
-`mira proxy` in front of two storage nodes — end with `forget_open_blocks`,
-because `axum::serve` holds a router clone for the life of the process.
+that need a real socket — the TUI, and `mira proxy` over two nodes — end with
+`forget_open_blocks`, because `axum::serve` holds a router clone for the life of
+the process.
 
 **Nothing in it sleeps.** A 200 on `/v1/logs` is a read-your-writes promise, so
 the next query already sees the data through the open-block read path
@@ -70,10 +70,9 @@ new behaviour should land at.
 ### 4. Subprocess CLI, for what only a process has
 
 `main`, `run` and `shutdown` are reachable only by exec'ing the binary: a
-unit test in the bin crate never calls its own `main`, `-h` and `-V` end the
-process, and a signal handler needs a process to signal. Three tests, argv in and
-exit code out, with a SIGTERM in the middle; the third puts a real proxy in front
-of a real node.
+unit test never calls its own `main`, `-h` and `-V` end the process, and a signal
+handler needs a process to signal. Three tests, argv in and exit code out, with a
+SIGTERM in the middle; the third fronts a real node with a real proxy.
 
 ### 5. The generator's own invariants
 
@@ -81,7 +80,7 @@ of a real node.
 target defaults to `test = false`. loadgen's invariants — a trace that crosses a
 service boundary, histogram buckets that sum to their count, exemplars naming
 traces that exist — therefore ride behind `--selftest`, which `make test` invokes
-as a second command.
+separately.
 
 ### 6. UI, without a browser
 
@@ -93,8 +92,8 @@ binary.
 
 ### 7. The chart, rendered
 
-`helm-unittest` over two suites, against `charts/mira-operator`. They assert
-rendering decisions invisible until something is deployed: the image tag defaults
+`helm-unittest` over two suites, against `charts/mira-operator`. They assert what is
+invisible until something is deployed: the image tag defaults
 to the chart's `appVersion`, the operator learns its own pod name from the
 downward API, `rbac.namespaces` turns one `ClusterRole` into a `Role` per
 namespace, and the rule list is exactly the rule list. `helm-lint`, `helm-template`, `helm-schema`
@@ -108,10 +107,10 @@ path: rules`, and the same mutation fails it.
 ### 8. Against a real API server
 
 `make operator-apiserver` runs `integrations/kubernetes/tests/apiserver.rs`
-against whatever cluster the current kubeconfig context points at. The target sets
-`MIRA_OPERATOR_APISERVER` itself and a bare `cargo test` does not, so every test
+against whatever cluster the current kubeconfig points at. The target sets
+`MIRA_OPERATOR_APISERVER` and a bare `cargo test` does not, so every test
 in the file returns immediately and `make operator` stays a gate a laptop with no
-cluster can pass. `make operator-e2e` runs this leg first, against the Kind
+cluster can pass. `make operator-e2e` runs it first, against the Kind
 cluster it just created, because a fake client cannot see:
 
 | | |
@@ -144,15 +143,8 @@ crate count that is a published product property.
 Its 87 unit tests are level 1 in shape and almost all about **arithmetic that
 decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
-a spec whose thresholds would oscillate.
-
-`events::*` is the exception and only in its fixtures: the objects are the API
-server's own wire JSON rather than a `Default` plus thirty assignments, and two
-of them POST a real batch at a one-shot `TcpListener` — the exporter's HTTP
-client is a concrete type with nothing to substitute, and a loopback socket is
-smaller than the `hyper/server` dev-dependency the alternative would add. The
-watch loop itself is not reachable without an API server; like `main.rs`, it is
-covered at level 8.
+a spec whose thresholds would oscillate. `events::*` check the records the
+exporter builds from the API server's own wire JSON.
 
 **`operator-crd-check` is the gate that matters most here** and it is not a test.
 `make operator-crd` regenerates `charts/mira-operator/crds/miraclusters.yaml`
@@ -190,9 +182,9 @@ pass.
 
 ## Coverage is a ratchet
 
-`COVERAGE_MIN` in the Makefile is line coverage, and it is the coverage that
-existed when that line was last edited. It may only go up: raise it in the same
-diff that raises coverage, and never lower it to make a red build green.
+`COVERAGE_MIN` in the Makefile is line coverage: the coverage that existed when
+that line was last edited. It may only go up — raise it in the diff that raises
+coverage, never lower it to make a red build green.
 
 Coverage runs take the same target-dir lock as a normal build, so give them
 their own:
