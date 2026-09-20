@@ -18,7 +18,7 @@ SLSA provenance before moving the binary into place.
 
 | | |
 | --- | --- |
-| `--version v0.4.0` | a specific release instead of the latest |
+| `--version v0.4.1` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the attestation check (the checksum is still enforced) |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
@@ -32,7 +32,7 @@ script, it *is* the script.
 ```sh
 mira update              # to the latest release
 mira update --dry-run    # print the command it would run, and stop
-mira update --version v0.4.0
+mira update --version v0.4.1
 ```
 
 This runs the installer above, so the checksum and the attestation take the same
@@ -77,7 +77,7 @@ and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one SLSA provenance attestation
 covering every file in it.
 
 ```sh
-V=0.4.0; T=x86_64-unknown-linux-gnu
+V=0.4.1; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
@@ -166,7 +166,7 @@ metadata:
   name: telemetry
   namespace: observability
 spec:
-  image: ghcr.io/trianalab/mira:0.4.0
+  image: ghcr.io/trianalab/mira:0.4.1
   replicas: 1          # floor
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage: { size: 50Gi, className: gp3 }
