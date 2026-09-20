@@ -21,6 +21,17 @@ screens of real output — an error log, the trace behind it, the service map, a
 metric with its exemplars, a firing alert, and what the whole run cost in
 memory and disk.
 
+![Mira's terminal UI recorded end to end. The log list over the last hour, then
+a filter typed live — severity_text=ERROR, narrowing 14,371 records to 824 in
+7.3ms. Then the service map, where errors propagate frontend to checkout to
+payments while inventory stays clean. Then the trace under the failure: eight
+spans over 76.08ms, with a retry and an exception marked on the
+timeline.](assets/tui/investigation.gif)
+
+Four keystrokes, one binary, no server. Every footer in that recording is the
+run's own query plan and wall clock — rows scanned, rows matched, blocks
+touched — which is the same line the browser and the MCP tools return.
+
 ## What makes it different
 
 Other backends treat OTLP as an ingestion format and transform it into something

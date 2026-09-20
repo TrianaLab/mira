@@ -9,6 +9,24 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **The README and the landing page open on the terminal UI, recorded.** One
+  GIF: the log list, a filter typed live, the service map, then the trace under
+  the failure. A second one, in the README and `docs/agents.md`, is the other
+  half of the story on the other surface: `render_rca` over `POST /mcp`,
+  refusing a citation it cannot re-prove before it writes a word, then rendering
+  the document with the record count beside every claim. Both are recordings
+  rather than mock-ups — `scripts/tui-cast.py` drives the real thing on a pty
+  against a running node and reads the capture back, so every number in them is
+  that run's own. `make tui-cast` regenerates them.
+- **The wordmark closes up.** The `a` read as a separate word: below the arm an
+  `r` is only its stem, so the pair had a hole in it. The arm is shorter, the
+  bowl is tucked under it, the scanline grid no longer cuts through the round
+  terminals, and the tittle is the block cursor the hero already ends on. The
+  docs favicon is now the same rust badge the web UI ships, so a tab from
+  miradb.dev and a tab from a running instance carry one icon.
+
 ## [0.4.0] - 2026-09-20
 
 ### Added

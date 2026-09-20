@@ -30,7 +30,10 @@ theme:
   # page instead. Orange on both the white and near-black header, so no per-scheme
   # swap is needed.
   logo: assets/mira-mark.svg
-  favicon: assets/mira-mark.svg
+  # Not the same file: a tab strip is 16px of somebody else's chrome, and a bare
+  # orange `m` on it is a smudge. assets/mira-badge.svg reverses the mark out of a
+  # rust tile — the icon the web UI already ships — so both tabs match.
+  favicon: assets/mira-badge.svg
   font:
     # Space Grotesk has the squared shoulders and single-storey geometry the
     # wordmark is drawn from; JetBrains Mono keeps the terminal register in code.

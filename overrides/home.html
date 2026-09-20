@@ -38,23 +38,38 @@
         {# The wordmark inline rather than <img>, so the stroke can be currentColor and
            follow the scheme instead of staying one fixed orange on both. The horizontal
            bars are the mask that cuts the scanlines — the 80s register the mark is drawn
-           in. Geometry is identical to docs/assets/mira-wordmark.svg; change both. #}
+           in. Geometry is identical to docs/assets/mira-wordmark.svg; change both.
+
+           Three things about that geometry are deliberate and easy to undo by accident:
+
+           - The scanline grid runs 32/45/58/71, not 22/…/80. A bar laid across the
+             baseline bisects the round terminals and leaves a four-unit crumb floating
+             under every stem, which reads as a rendering fault rather than as a CRT.
+             The grid therefore stops clear of both rows of caps.
+           - The `a` sits at x=189 and the `r`'s arm stops at x=145. Drawn on the same
+             sidebearing as the rest, `ra` opens a void: below the arm the `r` is only its
+             stem, so there is nothing for thirty units and the `a` reads as a separate
+             word. The pair is kerned instead — the arm shortened, the bowl tucked under
+             it — which is what the pair wants in any typeface.
+           - The `i`'s tittle is a square, not the round dot the rest of the letterforms
+             imply. It is the block cursor: the same shape as .mira-hero__caret at the end
+             of the headline, and the only hard corner in the mark. #}
         <svg class="mira-hero__wordmark" xmlns="http://www.w3.org/2000/svg"
-             viewBox="-10.4 5 222.7 83" role="img" aria-label="Mira">
+             viewBox="-10.4 3 204.4 85" role="img" aria-label="Mira">
           <mask id="mira-hero-scanlines">
             <rect x="-80" y="-40" width="600" height="220" fill="#fff"/>
             <g fill="#000">
-              <rect y="28" width="600" height="4"/>
-              <rect y="41" width="600" height="4"/>
-              <rect y="54" width="600" height="4"/>
-              <rect y="67" width="600" height="4"/>
-              <rect y="80" width="600" height="4"/>
+              <rect y="32" width="600" height="4"/>
+              <rect y="45" width="600" height="4"/>
+              <rect y="58" width="600" height="4"/>
+              <rect y="71" width="600" height="4"/>
             </g>
           </mask>
-          <g transform="skewX(-8)">
-            <path d="M10 80V46Q10 30 17 30H37Q44 30 44 46V80M44 46Q44 30 51 30H71Q78 30 78 46V80M102 80V30M102 13v0M128 80V46Q128 30 135 30H149M205 30V80M205 30A29.24 25 0 1 0 205 80"
+          <g transform="skewX(-8)" mask="url(#mira-hero-scanlines)">
+            <path d="M10 80V46Q10 30 17 30H37Q44 30 44 46V80M44 46Q44 30 51 30H71Q78 30 78 46V80M102 80V30M128 80V46Q128 30 135 30H145M189 30V80M189 30A29.24 25 0 1 0 189 80"
                   fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"
-                  stroke-linejoin="round" mask="url(#mira-hero-scanlines)"/>
+                  stroke-linejoin="round"/>
+            <rect x="94" y="3" width="16" height="16" fill="currentColor"/>
           </g>
         </svg>
         {# The categorising noun, and the only place above the fold that carries one.
