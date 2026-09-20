@@ -123,7 +123,7 @@ cluster it just created, because a fake client cannot see:
 ### 9. Live, on a real cluster
 
 `make operator-e2e` builds a Kind cluster, installs the chart as published, and
-asserts five things end to end — including that the tier keeps serving after the
+asserts six things end to end — including that the tier keeps serving after the
 operator is uninstalled, the claim principle 4 rests on.
 [End-to-end testing](e2e.md) section 5 maps what it asserts and how to debug
 one.

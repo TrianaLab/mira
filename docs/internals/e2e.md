@@ -100,7 +100,7 @@ Each route refuses keys it does not implement:
 Every response carries a `stats` object:
 
 ```json
-{"blocks_total":1,"blocks_scanned":1,"rows_scanned":15909,"rows_matched":3840,"elapsed_us":102021}
+{"blocks_total":1,"blocks_scanned":1,"rows_scanned":16005,"rows_matched":3840,"elapsed_us":31255}
 ```
 
 `blocks_scanned` well below `blocks_total` is the sidecar pruning working. A
@@ -388,15 +388,17 @@ client is a stock `otel/opentelemetry-collector-contrib`.
 | B | `integrations/kubernetes/e2e/telemetry.yaml` — the collector, config byte-for-byte from the compose scenario — plus four one-shot `telemetrygen` Jobs, and all three signals come back |
 | C | `spec.replicas: 3`, and a row written straight at `tel-2` comes back *through the proxy* |
 | D | `spec.replicas: 2`, and the drained replica's blocks are on the cold volume before its claim is deleted |
-| E | `helm uninstall` the operator, and the tier still ingests and serves |
+| E | a pod with a 16Mi limit and no instrumentation at all is OOM-killed, and both halves of the kubelet's account of it — the `OOMKilled` on the container status and the `BackOff` Event — come back out of a query |
+| F | `helm uninstall` the operator, and the tier still ingests and serves |
 
-E is the assertion the architecture rests on: principle 4 says Mira holds no
+F is the assertion the architecture rests on: principle 4 says Mira holds no
 coordination state, so a controller must not be Mira.
 
-Five non-obvious things:
+Six non-obvious things:
 
 | | |
 | --- | --- |
+| **E's pod exports nothing.** | That is what it is for. `clusterEvents.endpoint` is set on the `helm install` at the top, three phases before the Service it names exists — a batch that cannot be posted is dropped and the watches keep running — so the only path from "the kernel killed it" to a row is the operator's watch and the Role the chart created for it. Both reasons are asserted because either alone would pass a test the module's first claim would fail: `OOMKilled` is only ever on the container's status, `BackOff` only ever an Event. |
 | **The generators use three different services.** | Ingest routes on `hash(resource) % n`, so one `--service` for all four puts the entire corpus on one replica — C's merge assertion then passes against a proxy that is only forwarding, and D archives an empty volume. C's fifth generator goes straight at `tel-2.tel-headless:4317` for the same reason: a row that provably lives on exactly one replica is the only honest test of a merge. |
 | **Metrics are asked of the replicas, not of the proxy.** | `/api/v1/metrics/names` is built by walking one node's blocks and there is no cursor to merge two nodes' answers on, so a proxy answers `501` and says so. `scripts/wait-for-signals.sh 240 assert traces logs` covers the two a proxy can merge; an in-cluster Pod asks both replicas for the third. |
 | **The scale thresholds are set so `Down` always wins**, the opposite of what it looks like it should be. | `spec.replicas` is a floor: raising it grows the tier outright, lowering it only *permits* a shrink, because a drain archives a volume and then deletes it and the operator wants the replicas to agree the data fits first. So D cannot patch the floor and wait — it has to make that agreement unconditional, and `downWhenFreeAbove: 0.002` is true on any node this suite could run on at all. The scale decision itself belongs to the request-log tests; what D tests is floor, drain, archive, claim, in order. |

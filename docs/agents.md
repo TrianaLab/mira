@@ -70,6 +70,10 @@ None of them writes to anything but Mira, and there is no tenth that changes a
 cluster — see [architecture section 14.6](architecture/kubernetes-context.md#146-read-only-and-not-by-omission)
 for why that is a decision rather than a gap.
 
+With the operator's [cluster-event export](install.md#cluster-context) on, an
+`OOMKilled` is a log record carrying that pod's `k8s.pod.uid` — so it answers the
+same `query_records`, in the `correlate` frame of the spans that stopped.
+
 Three properties matter more than the list:
 
 - **Arguments are validated, not guessed.** A top-level key the tool does not implement
@@ -225,6 +229,76 @@ so the retry layers stop treating it as retryable.
 Nothing in the prompt named a service, a tool or a field. The retry event and the span
 link are OTLP structures Mira stores rather than flattens, which is why they were still
 there to be read.
+
+## The write-up
+
+The investigation above is findings in a model's context. `render_rca` turns them into
+the document — and re-runs every citation in `evidence` first, at `limit: 0`, so a claim
+that no longer matches fails the call by name instead of shipping a count that aged out
+of retention.
+
+```json
+{"name":"render_rca","arguments":{
+  "title":"Checkout 503s: a card decline mapped onto a retryable status",
+  "from":"-45m",
+  "root_cause":"payments returns 503 for payments.CardDeclined. A decline is a business outcome, not a server fault, and 503 propagates unchanged to the frontend, so both retry layers replay a call that can never succeed.",
+  "evidence":[
+    {"claim":"every failing authorize carries the same exception type",
+     "query":{"signal":"traces","where":[{"attr":"exception.type","eq":"payments.CardDeclined"}]}},
+    {"claim":"payments logged errors throughout the window",
+     "query":{"signal":"logs","where":[{"attr":"service.name","eq":"payments"},
+                                       {"field":"severity_number","gte":17}]}},
+    {"claim":"a failing checkout, end to end",
+     "trace_id":"0000000000000efb5555555555555bae"}],
+  "ruled_out":["inventory, on the same call path: 1,223 spans, zero errors"],
+  "remediation":["Return 402 for CardDeclined in payments' error mapping."],
+  "prevention":{"name":"card-declines","over":"5m","when":"count > 20","severity":"warning",
+    "query":{"signal":"traces","where":[{"attr":"exception.type","eq":"payments.CardDeclined"}]}},
+  "emit":true}}
+```
+
+`summary`, `impact`, `timeline` and `verification` take the rest of it. Back comes
+markdown, with the record count beside every claim:
+
+```markdown
+*2026-09-20T08:50:08Z → 2026-09-20T09:35:08Z (45m00s). Written by an agent against
+Mira; every citation below was re-run at render time and returned the record count
+beside it.*
+
+## Evidence
+
+- every failing authorize carries the same exception type — traces where
+  `attr:exception.type=payments.CardDeclined`, 293 records
+- payments logged errors throughout the window — logs where
+  `attr:service.name=payments field:severity_number>=17`, 293 records
+- a failing checkout, end to end — trace `0000000000000efb5555555555555bae`, 8 records
+
+## Remediation
+
+- Return 402 for CardDeclined in payments' error mapping.
+
+> Mira did not apply any of this and cannot: it has no verb that changes a cluster.
+
+## Prevention
+
+The rule that would have caught this, ready for `alerts.kyaml` — add your own
+`notify` targets:
+
+    rules:
+      - "name": "card-declines"
+        "query": {"signal":"traces","where":[{"attr":"exception.type","eq":"payments.CardDeclined"}]}
+        "over": "5m"
+        "when": "count > 20"
+        "severity": "warning"
+```
+
+The counts, the UTC window and that last line are Mira's, not the model's. `prevention`
+went through the parser that reads `alerts.kyaml` at boot, so the fence is a rule that
+will start.
+
+`"emit": true` also stores the document as a log record — `event_name: rca`,
+`service.name: mira` — so it is searchable afterwards with `{field: body, contains: …}`
+and expires with the telemetry it describes. There is no incident store to run.
 
 ## Waking the loop from an alert
 

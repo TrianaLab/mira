@@ -124,7 +124,7 @@ const TOOLS: &str = r#"[
    "emit":{"type":"boolean","description":"also store the document in Mira as a log record. Default false."}}}}
 ]"#;
 
-/// The MCP endpoint: JSON-RPC in, one of the eight tools in [`TOOLS`] out.
+/// The MCP endpoint: JSON-RPC in, one of the nine tools in [`TOOLS`] out.
 ///
 /// Streamable HTTP with no session and no SSE, because every tool here is a
 /// single request and a single response. An agent points at this URL and has

@@ -14,7 +14,7 @@ curl -fsSL https://miradb.dev/install.sh | bash
 
 It resolves the latest release, picks the tarball for your platform, checks it
 against the published `SHA256SUMS`, and — if `gh` is on the path — verifies the
-SLSA provenance attestation before moving the binary into place.
+SLSA provenance before moving the binary into place.
 
 | | |
 | --- | --- |
@@ -36,14 +36,13 @@ mira update --version v0.3.0
 ```
 
 This runs the installer above, so the checksum and the attestation take the same
-code path as a first install. It installs over **this binary's own
-directory**, not `/usr/local/bin`, so a mira in `~/.local/bin` is replaced
-rather than shadowed. `MIRA_INSTALL_DIR` still wins if it is set.
+code path as a first install — over **this binary's own directory**, not
+`/usr/local/bin`, so a mira in `~/.local/bin` is replaced rather than shadowed.
+`MIRA_INSTALL_DIR` still wins.
 
-The installer stops with `mira vX is already installed` when the running version
-is the one that would be installed. If you installed from a package manager or
-from source, keep using that: this replaces a file and does not know what put it
-there.
+It stops with `mira vX is already installed` when the running version is the one
+it would install. Installed from a package manager or from source? Keep using
+that: this replaces a file and does not know what put it there.
 
 ## With cargo
 
@@ -52,15 +51,15 @@ cargo install --locked miradb                    # -> ~/.cargo/bin/mira
 ```
 
 The crate is `miradb` and the binary it installs is `mira`: `mira` on crates.io
-is an unrelated crate from 2024. Two libraries are published beside it for
-embedding the engine — [`miradb-core`](https://docs.rs/miradb-core) is the
-encoder, block writer and mmap reader,
-[`miradb-proto`](https://docs.rs/miradb-proto) is the OTLP bindings.
+is an unrelated crate from 2024. Two libraries sit beside it for embedding the
+engine — [`miradb-core`](https://docs.rs/miradb-core), the encoder, block writer
+and mmap reader, and [`miradb-proto`](https://docs.rs/miradb-proto), the OTLP
+bindings.
 
 ## From source
 
 The prerequisites are **Rust 1.88 or newer** and a `cc`, which
-`zstd-sys` needs to compile the C source it vendors. Nothing else: no `protoc`,
+`zstd-sys` needs for the C source it vendors. Nothing else: no `protoc`,
 because the OTLP protos are compiled by `protox` in a build script, and no node
 toolchain, because the browser UI is built and committed under
 `crates/mira/ui/dist`.
@@ -87,12 +86,11 @@ gh attestation verify mira --repo TrianaLab/mira
 ```
 
 `sha256sum -c` proves the bytes are the ones the release lists; `gh attestation
-verify` proves those bytes came out of a workflow run in this repository.
+verify` proves they came out of a workflow run in this repository.
 
 The linux builds come off `ubuntu-22.04`, so the glibc floor is **2.34** — RHEL
-9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+. `make glibc-floor` reads the
-highest `GLIBC_` symbol version the binary references and fails the build above
-it. There is no musl build: it compiles, but musl's mallocng costs the
+9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+. `make glibc-floor` reads the highest
+`GLIBC_` symbol the binary references and fails the build above it. There is no musl build: it compiles, but musl's mallocng costs the
 ingest path more than the Alpine coverage is worth. On Alpine, build from source.
 
 ## Docker
@@ -137,17 +135,17 @@ livenessProbe:
 ```
 
 Neither touches the block directory, so a slow disk does not fail a probe.
-`/health` additionally reports per-signal shed and failure counts.
+`/health` also reports per-signal shed and failure counts.
 
 ## Kubernetes
 
-One Mira needs no chart. The [container above](#docker) is the whole deployment:
-one image, one volume, two ports. On Kubernetes that is a Deployment — or a
-StatefulSet, if the volume is to outlive a reschedule.
+One Mira needs no chart: the [container above](#docker) is the whole deployment —
+one image, one volume, two ports. On Kubernetes that is a Deployment, or a
+StatefulSet if the volume is to outlive a reschedule.
 
 What has no hand-written answer is a **tier**: several storage nodes, a volume
-each, a `mira proxy` in front of them, and the decision of when there should be
-one more. That is what the operator is for: the only chart here installs a
+each, a `mira proxy` in front, and when there should be one
+more. That is what the operator is for: the only chart here installs a
 **controller** rather than Mira, from the same registry as the image:
 
 ```sh
@@ -157,7 +155,7 @@ helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
 
 That is a Deployment of exactly one, a ServiceAccount, a ClusterRole with no
 wildcards, and the `MiraCluster` CRD. [See it on Kubernetes](demo-cluster.md)
-puts all of this on a laptop in one command.
+puts all of it on a laptop in one command.
 
 ### The tier
 
@@ -194,10 +192,10 @@ ConfigMaps on every reconcile, and a PodDisruptionBudget of `maxUnavailable: 1`,
 because a replica's blocks are the only copy. What to put in `resources` is
 [Configuration's sizing table](config.md#sizing).
 
-`route` adds an `HTTPRoute`, where the Gateway API CRDs exist. All it
-takes is the Gateway to attach to, because the paths are derived: ingest and the
-merged read go to the proxy, everything else to the headless Service, where the
-UI and `/mcp` are answered. Removing the field removes the route.
+`route` adds an `HTTPRoute` where the Gateway API CRDs exist. All it takes is
+the Gateway to attach to: the paths are derived — ingest and the merged read to
+the proxy, everything else to the headless Service, where the UI and `/mcp` are
+answered. Removing the field removes the route.
 
 Every pod it builds satisfies the `restricted` Pod Security Standard unmodified:
 uid 65532, `fsGroup` set, no service-account token, `seccompProfile:
@@ -209,6 +207,20 @@ probe worth five minutes, because it replays its log before it answers anything.
     Two things it could do have **no `MiraCluster` equivalent yet**: a
     ServiceAccount per tier, and arbitrary `config.*` keys. Its Ingress now has
     one in `spec.route`, on the Gateway API.
+
+### Cluster context
+
+```sh
+helm upgrade mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
+  --namespace mira-system --reuse-values \
+  --set clusterEvents.endpoint=http://telemetry-proxy.observability.svc:4318
+```
+
+| | |
+| --- | --- |
+| What it does | The operator watches Kubernetes Events and container state and ships both to that Mira as OTLP logs, keyed on `k8s.pod.uid` — an `OOMKilled` on the same timeline as the spans, for [an agent](agents.md) writing the RCA. |
+| What it grants | The same value creates the Role that reads them: `get`/`list`/`watch` on pods and events, cluster-wide unless `rbac.namespaces` scopes it. Nothing in it writes, and there is no value that makes it write. |
+| Unset | No watch is opened and no Role is created. That is the default. |
 
 ### What the chart carries
 
@@ -228,7 +240,8 @@ cosign verify \
 
 The [chart reference](reference/chart.md) has every value, how a scale-in is
 sequenced, and what the operator's lease guarantees. Every value the chart
-itself owns — `image`, `rbac`, `serviceAccount`, `replicaCount`, `logLevel` — is
+itself owns — `image`, `rbac`, `serviceAccount`, `replicaCount`, `logLevel`,
+`clusterEvents` — is
 covered by a `values.schema.json` closed at each of those levels, so `helm
 install` rejects a typo'd key. The Kubernetes
 pass-throughs (`resources`, `securityContext`, `podSecurityContext`,

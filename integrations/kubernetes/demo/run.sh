@@ -16,7 +16,9 @@
 #   4  a MiraCluster: one storage replica, one proxy
 #   5  a Gateway and an HTTPRoute in front of both
 #   6  telemetrygen, exporting into the proxy for as long as the cluster lives
-#   7  an hour of a four-service shop, seeded through the Gateway from the host
+#   7  `cart`, a pod with a memory limit too low to survive, which the operator
+#      exports as OOM kills nobody instrumented
+#   8  an hour of a four-service shop, seeded through the Gateway from the host
 #
 # `make demo` is the same product without any of this. Reach for that one first;
 # this is for seeing the operator, the proxy and a real ingress on the path.
@@ -102,11 +104,18 @@ say "operator"
 # ---------------------------------------------------------------------------
 # The chart as published. `pullPolicy: Never` because the tag only exists inside
 # Kind.
+#
+# `clusterEvents.endpoint` is off in the chart and on here: it is the half of an
+# RCA that OTLP never carried — an `OOMKilled`, a `FailedScheduling` — and the
+# demo is where it should be visible. The Service it names is three steps below
+# and does not exist yet, which costs nothing: a batch that cannot be posted is
+# dropped, and the watches keep running.
 helm --kube-context "$CTX" upgrade --install mira-operator charts/mira-operator \
 	--namespace mira-system --create-namespace \
 	--set image.repository=mira-operator \
 	--set image.tag=demo \
 	--set image.pullPolicy=Never \
+	--set "clusterEvents.endpoint=http://tel-proxy.$NS.svc:4318" \
 	--wait --timeout 180s
 
 # ---------------------------------------------------------------------------
@@ -127,6 +136,9 @@ until_ok 120 "the operator never created the tier" \
 kc -n "$NS" rollout status statefulset/tel --timeout=300s
 kc -n "$NS" rollout status deployment/tel-proxy --timeout=180s
 kc -n "$NS" apply -f "$here/telemetry.yaml"
+# The one pod here that is genuinely broken, and the only thing in the demo the
+# operator's export is the sole witness to. See `cart.yaml`.
+kc -n "$NS" apply -f "$here/cart.yaml"
 
 until_ok 180 "the Gateway never answered on $URL" \
 	curl -fs -o /dev/null --max-time 5 "$URL/readyz"
@@ -156,6 +168,8 @@ cat <<TXT
   a query       curl -s $URL/api/v1/query -H content-type:application/json \\
                   -d '{"signal":"traces","where":[{"attr":"exception.type","eq":"payments.CardDeclined"}],"limit":3}'
   what is there curl -s $URL/api/v1/stats
+  what k8s says curl -s $URL/api/v1/query -H content-type:application/json \\
+                  -d '{"signal":"logs","where":[{"attr":"otel.scope.name","eq":"mira-operator"}],"limit":5}'
   the cluster   kubectl --context $CTX -n $NS get miracluster,sts,deploy,svc,httproute
 
   telemetrygen keeps exporting into the tier, so the numbers move. Nothing

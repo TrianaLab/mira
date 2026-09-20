@@ -1722,7 +1722,11 @@ fn demo_resource(svc: &str, w: usize) -> Resource {
             kv("service.version", "2.7.0"),
             kv("service.instance.id", &format!("{svc}-{inst}")),
             kv("deployment.environment.name", "prod"),
-            kv("k8s.pod.name", &format!("{svc}-5d9f7c-{inst}")),
+            kv("k8s.pod.name", &demo_pod(svc, inst)),
+            // What the k8sattributes processor adds in a real cluster, and the
+            // only key an application shares with the kubelet: `demo_cluster`
+            // emits the same uid, so one attribute predicate spans both halves.
+            kv("k8s.pod.uid", &demo_pod_uid(svc, inst)),
             kv("k8s.namespace.name", "shop"),
             kv("telemetry.sdk.language", "go"),
             arr("process.command_args", &[&bin, "--port", "8080"]),
@@ -1731,29 +1735,181 @@ fn demo_resource(svc: &str, w: usize) -> Resource {
     }
 }
 
+fn demo_pod(svc: &str, inst: usize) -> String {
+    format!("{svc}-5d9f7c-{inst}")
+}
+
+/// A pod's uid, derived rather than random: a query written against `make demo`
+/// in the documentation has to still match after the next run.
+fn demo_pod_uid(svc: &str, inst: usize) -> String {
+    let h = svc
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |a, b| {
+            (a ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+        .wrapping_add(inst as u64);
+    format!(
+        "{:08x}-5d9f-4c2a-b1e7-{:012x}",
+        (h >> 32) as u32,
+        h & 0xffff_ffff_ffff
+    )
+}
+
 fn demo_logs(first: u64, traces: u64, t0: u64, slot: u64, w: usize) -> ExportLogsServiceRequest {
-    ExportLogsServiceRequest {
-        resource_logs: DEMO_SERVICES
-            .iter()
-            .map(|&svc| {
-                let hop = server_hop(svc);
-                let mut scope_logs = vec![ScopeLogs {
-                    scope: scope(),
-                    log_records: (0..traces)
-                        .map(|t| demo_log(svc, hop, first + t, trace_start(t0, t, traces, slot)))
-                        .collect(),
-                    ..Default::default()
-                }];
-                if svc == "frontend" {
-                    scope_logs.push(demo_assistant(first, traces, t0, slot));
-                }
-                ResourceLogs {
-                    resource: Some(demo_resource(svc, w)),
-                    scope_logs,
-                    ..Default::default()
-                }
-            })
-            .collect(),
+    let mut resource_logs: Vec<ResourceLogs> = DEMO_SERVICES
+        .iter()
+        .map(|&svc| {
+            let hop = server_hop(svc);
+            let mut scope_logs = vec![ScopeLogs {
+                scope: scope(),
+                log_records: (0..traces)
+                    .map(|t| demo_log(svc, hop, first + t, trace_start(t0, t, traces, slot)))
+                    .collect(),
+                ..Default::default()
+            }];
+            if svc == "frontend" {
+                scope_logs.push(demo_assistant(first, traces, t0, slot));
+            }
+            ResourceLogs {
+                resource: Some(demo_resource(svc, w)),
+                scope_logs,
+                ..Default::default()
+            }
+        })
+        .collect();
+    // Once per slot, which is once: slot `i` is owned by the one worker with
+    // `w == i % conns`, so this runs exactly as often as the slot does however
+    // many connections there are. The operator is one process per cluster and
+    // its account of a pod has to arrive the same way.
+    if traces > 0 {
+        resource_logs.push(demo_cluster(first, traces, t0, slot));
+    }
+    ExportLogsServiceRequest { resource_logs }
+}
+
+/// What Kubernetes did to the `payments` pod.
+///
+/// The half of an incident OTLP never carried, and the reason
+/// [the operator](https://miradb.dev/install/#cluster-context) exports it: the
+/// 503s the other three services report are the *consequence*, and no amount of
+/// application telemetry says why the process stopped. Shaped exactly like
+/// `integrations/kubernetes/src/events.rs` writes it — the `mira-operator`
+/// scope, a pod resource keyed on `k8s.pod.uid`, the reason in both
+/// `event_name` and `k8s.event.reason` — so a query written against `make demo`
+/// is the query that runs against a real cluster.
+///
+/// One kill per slot, because a memory limit that is too low is hit again on
+/// every restart; `k8s.container.restart_count` climbs with the slot, which is
+/// what makes it readable as a loop rather than as an accident.
+fn demo_cluster(first: u64, traces: u64, t0: u64, slot: u64) -> ResourceLogs {
+    // Anchored on the slot's *last* failing trace, and every record stamped
+    // before it. Two reasons, and neither is arbitrary. An RCA reads the order,
+    // so the kill has to precede a request that fails because of it — a cause
+    // filed after its effect is the one thing a timeline must not say. And the
+    // last one keeps the three records inside the slot rather than in the
+    // future, which is where `at + gap` would put them for the newest slot and
+    // out of every window the UI offers.
+    let t = (0..traces)
+        .rev()
+        .find(|t| (first + t).is_multiple_of(DEMO_BROKEN))
+        .unwrap_or(traces / 2);
+    let gap = (slot / traces).clamp(1, 400_000_000);
+    let at = trace_start(t0, t, traces, slot);
+    let restarts = (first / traces + 1).to_string();
+    let node = "ip-10-0-3-14";
+
+    ResourceLogs {
+        resource: Some(Resource {
+            // Four attributes, and no `service.name`: inventing the top rung of
+            // the identity ladder would file every object in the namespace under
+            // one entity key. Section 14.4.
+            attributes: vec![
+                kv("k8s.namespace.name", "shop"),
+                kv("k8s.object.kind", "Pod"),
+                kv("k8s.pod.name", &demo_pod("payments", 0)),
+                kv("k8s.pod.uid", &demo_pod_uid("payments", 0)),
+            ],
+            ..Default::default()
+        }),
+        scope_logs: vec![ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: "mira-operator".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
+            }),
+            log_records: vec![
+                k8s_record(
+                    at.saturating_sub(3 * gap),
+                    13,
+                    "Unhealthy",
+                    "Liveness probe failed: HTTP probe failed with statuscode: 503",
+                    vec![
+                        kv("k8s.event.reason", "Unhealthy"),
+                        kv("k8s.event.count", "3"),
+                        kv("k8s.event.reporting_controller", "kubelet"),
+                        kv("k8s.node.name", node),
+                    ],
+                ),
+                k8s_record(
+                    at.saturating_sub(2 * gap),
+                    17,
+                    "OOMKilled",
+                    "container payments last terminated: exit code 137, signal 9",
+                    vec![
+                        kv("container.image.name", "ghcr.io/shop/payments:2.7.0"),
+                        kv("k8s.container.name", "payments"),
+                        kv("k8s.container.restart_count", &restarts),
+                        kv("k8s.event.reason", "OOMKilled"),
+                        kv("k8s.pod.host_ip", "10.0.3.14"),
+                    ],
+                ),
+                // Back up, and the request at `at` still fails: a pod that has
+                // just been restarted is the commonest thing a 503 is behind,
+                // and it is the line that stops the write-up at "it recovered".
+                k8s_record(
+                    at.saturating_sub(gap),
+                    9,
+                    "Started",
+                    "Started container payments",
+                    vec![
+                        kv("k8s.event.reason", "Started"),
+                        kv("k8s.event.reporting_controller", "kubelet"),
+                        kv("k8s.node.name", node),
+                    ],
+                ),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// One operator record. No trace id anywhere on it, and that is not an omission:
+/// the kubelet has never heard of the request that was in flight. It joins on
+/// the pod and on the clock, which is what `correlate`'s frame is.
+fn k8s_record(
+    ts: u64,
+    severity: i32,
+    reason: &str,
+    body: &str,
+    attributes: Vec<KeyValue>,
+) -> LogRecord {
+    LogRecord {
+        time_unix_nano: ts,
+        // The exporter's linger: a batch waits two seconds for company, and the
+        // column exists to show exactly that kind of gap.
+        observed_time_unix_nano: ts + 2_000_000_000,
+        severity_number: severity,
+        severity_text: match severity {
+            17 => "ERROR",
+            13 => "WARN",
+            _ => "INFO",
+        }
+        .into(),
+        event_name: reason.into(),
+        body: Some(text_value(body)),
+        attributes,
+        ..Default::default()
     }
 }
 
@@ -2218,6 +2374,12 @@ fn selftest() {
     let mut nested = 0;
     for rl in &logs.resource_logs {
         let attrs = &rl.resource.as_ref().unwrap().attributes;
+        // The operator's records are the exception to both: the kubelet knows
+        // the pod, not the service, and has never heard of the request that was
+        // in flight. They are checked on their own below.
+        if attr(attrs, "k8s.object.kind") == "Pod" {
+            continue;
+        }
         assert!(
             !attr(attrs, "service.instance.id").is_empty(),
             "no service.instance.id: \"everything this pod emitted\" matches nothing"
@@ -2259,6 +2421,62 @@ fn selftest() {
         "no GenAI scope: gen_ai.input.messages is a README bullet"
     );
     assert!(nested > 0, "nothing nests two levels deep");
+
+    // --- cluster context: the kill, before the requests it explains ----------
+
+    let cluster = demo_logs(0, TRACES, T0, SLOT, 0)
+        .resource_logs
+        .into_iter()
+        .find(|rl| attr(&rl.resource.as_ref().unwrap().attributes, "k8s.object.kind") == "Pod")
+        .expect("no operator records: `make demo` cannot show a Kubernetes cause");
+    let rattrs = &cluster.resource.as_ref().unwrap().attributes;
+    // The join the feature is for: one predicate reaching the pod's own
+    // telemetry and the kubelet's account of it. `service.instance.id` means the
+    // two keep *different* entity keys, so the uid is what carries it.
+    assert_eq!(
+        attr(rattrs, "k8s.pod.uid"),
+        attr(&demo_resource("payments", 0).attributes, "k8s.pod.uid"),
+        "the operator's pod uid is not the one payments reports"
+    );
+    assert!(
+        attr(rattrs, "service.name").is_empty(),
+        "a synthesised service.name would file every object under one entity key"
+    );
+    let krecords: Vec<_> = cluster
+        .scope_logs
+        .iter()
+        .flat_map(|sl| &sl.log_records)
+        .collect();
+    let killed = krecords
+        .iter()
+        .find(|r| r.event_name == "OOMKilled")
+        .expect("no OOMKilled record");
+    let reasons: Vec<&str> = krecords.iter().map(|r| r.event_name.as_str()).collect();
+    assert_eq!(
+        reasons,
+        ["Unhealthy", "OOMKilled", "Started"],
+        "the kubelet's account is out of order"
+    );
+    assert!(
+        krecords
+            .windows(2)
+            .all(|w| w[0].time_unix_nano < w[1].time_unix_nano),
+        "two of the operator's records share an instant, or run backwards"
+    );
+    // The point of the whole feature: a cause, and an effect after it. An RCA
+    // reads the order, and a cause filed after its effect is an argument.
+    assert!(
+        logs.resource_logs
+            .iter()
+            .flat_map(|rl| &rl.scope_logs)
+            .flat_map(|sl| &sl.log_records)
+            .any(|r| r.severity_number == 17 && r.time_unix_nano > killed.time_unix_nano),
+        "nothing fails after the kill: the demo's OOM explains no request"
+    );
+    assert!(
+        krecords.iter().all(|r| r.trace_id.is_empty()),
+        "an operator record carries a trace id the kubelet cannot know"
+    );
 
     // --- metrics: honest histograms, exemplars that resolve, enough points ----
 

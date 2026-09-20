@@ -35,7 +35,7 @@ step for a field to fall out of.
 | **The filesystem is the manifest** | Blocks are named `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`, so the time index is the directory listing. No catalogue to keep in sync with the data. |
 | **No coordination state** | No Raft, no membership, no external metadata store. Two active replicas share one volume by having different `--node` names. |
 | **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 6.20 MiB stripped, 148 crates, no `protoc` and no node toolchain to build it. |
-| **Agents read, not export** | `POST /mcp` is eight tools over that read path. An agent sitting next to the data skips the protocol entirely — `mira mira --data-dir` maps the blocks with no server, no port and no serialisation. |
+| **Agents read, not export** | `POST /mcp` is nine tools over that read path — eight reads and `render_rca`, which re-runs every citation before it writes the document. An agent sitting next to the data skips the protocol entirely — `mira mira --data-dir` maps the blocks with no server, no port and no serialisation. |
 
 ## What it is deliberately not
 
@@ -65,7 +65,7 @@ step for a field to fall out of.
 | [See it on Kubernetes](demo-cluster.md) | the same run, with the operator and an ingress on the path |
 | [Install](install.md) | one script, a container, or `cargo install` |
 | [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
-| [Connect an agent](agents.md) | MCP wiring, the eight tools, a worked investigation |
+| [Connect an agent](agents.md) | MCP wiring, the nine tools, a worked investigation and its RCA |
 | [Configuration](config.md) | fourteen keys, KYAML, `${env:…}` interpolation |
 | [End-to-end testing](internals/e2e.md) | a live binary, a real collector, the load harness |
 | [Architecture](architecture/index.md) | the reasoning behind every non-obvious choice |
