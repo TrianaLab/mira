@@ -44,7 +44,7 @@ those routes rather than a restatement of this table:
 
 | Endpoint | What it answers |
 | --- | --- |
-| `POST /mcp` | The MCP endpoint: JSON-RPC in, one of the eight tools in `TOOLS` out. |
+| `POST /mcp` | The MCP endpoint: JSON-RPC in, one of the nine tools in `TOOLS` out. |
 
 ## Operate
 

@@ -82,7 +82,7 @@ Bodies are KYAML, and JSON is a subset of it, so a JSON client works unchanged:
 A top-level key the endpoint does not implement is refused by name with the keys
 that do exist listed — a `400` on the query API, a `200` carrying
 `isError: true` on `/mcp`. Every response carries a `stats` object
-(`{"blocks_total":1,"blocks_scanned":1,"rows_scanned":15909,"rows_matched":3840,"elapsed_us":102021}`),
+(`{"blocks_total":1,"blocks_scanned":1,"rows_scanned":16005,"rows_matched":3840,"elapsed_us":31255}`),
 which is the sidecar pruning made visible. A response that filled `limit` also
 carries `next`; pass it back as `after` for the following page.
 
@@ -141,14 +141,15 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
     ```
 
-    Eight tools over JSON-RPC — `query_records`, `get_trace`, `query_metric`,
-    `list_metrics`, `correlate`, `service_map`, `list_services`, `list_alerts`
-    — with no session id, so any replica can answer any call.
+    Nine tools over JSON-RPC — `query_records`, `get_trace`, `query_metric`,
+    `list_metrics`, `correlate`, `service_map`, `list_services`, `list_alerts`,
+    and `render_rca` for the write-up at the end — with no session id, so any
+    replica can answer any call.
 
 ## Next
 
-- [Connect an agent](agents.md) — the MCP wiring, the eight tools, and one
-  investigation worked end to end.
+- [Connect an agent](agents.md) — the MCP wiring, the nine tools, and one
+  investigation worked end to end, up to the RCA it writes.
 - [Configuration](config.md) — the fourteen keys, and how much machine to give it.
 - [End-to-end testing](internals/e2e.md) — a live binary, `telemetrygen`, and a stock
   Collector in front of it in Docker.

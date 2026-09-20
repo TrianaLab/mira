@@ -51,7 +51,7 @@ of them.
 | --- | --- | --- |
 | **Browser** | `http://localhost:4318/` | Served out of `include_bytes!`; the whole view lives in the URL, so an alert webhook links straight back into it. |
 | **Terminal** | `mira mira` | The same views over a running replica — or over a block directory **with no server at all**. |
-| **MCP** | `POST /mcp` | Eight tools, no session id, so any replica answers any call. |
+| **MCP** | `POST /mcp` | Nine tools, no session id, so any replica answers any call. The ninth writes the RCA. |
 | **HTTP** | `/api/v1/…` | `query`, `correlate`, `map`, `entities`, `metrics`, `alerts`. |
 
 ## See it

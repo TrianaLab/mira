@@ -4,11 +4,13 @@
 //! Mira and ask, without a translation layer in between. That is one endpoint,
 //! `POST /mcp`, speaking JSON-RPC 2.0 over Streamable HTTP.
 //!
-//! Eight tools, and they are the same eight questions the UI asks —
+//! Eight of the nine tools are the same eight questions the UI asks —
 //! deliberately. An agent and a human looking at the same incident should be
 //! reading the same numbers out of the same code path; a separate "agent API"
 //! is a second read path to keep correct, and the first thing it does is
-//! drift.
+//! drift. The ninth, `render_rca`, is the one question a UI cannot ask: it
+//! turns the eight answers into the write-up, and re-runs every citation in it
+//! before handing it back (see [`crate::rca`]).
 //!
 //! Stateless, and not by accident. Streamable HTTP lets a server hand out an
 //! `Mcp-Session-Id` and then requires every later request to carry it, which
@@ -28,7 +30,7 @@ use axum::routing::post;
 use yaml_rust2::Yaml;
 
 use mira_core::json::Json;
-use mira_core::query::{Op, Search, Signal, Target, Term, Value};
+use mira_core::query::Search;
 use mira_core::series;
 
 use crate::api::{self, Api};
@@ -98,10 +100,31 @@ const TOOLS: &str = r#"[
 
 {"name":"list_alerts",
  "description":"Every alerting rule this node evaluates and what it is currently doing: state is one of ok, pending (breaching but has not held for `for_nano` yet) and firing. `value` is the last evaluation, `threshold` and `op` are what it is compared against, and `matched`/`total` are the record counts behind it - a ratio rule counts `matched` of `total`, a count rule counts `matched`. `link` opens the same records in Mira's UI. An empty list means this node has no rules file, not that everything is healthy. `error` non-null means the rule could not be evaluated, which is not the same as not firing. Rules are static KYAML in a file, so this tool reads and never writes.",
- "inputSchema":{"type":"object","properties":{}}}
+ "inputSchema":{"type":"object","properties":{}}},
+
+{"name":"render_rca",
+ "description":"Turn an investigation into a root-cause analysis in markdown. You supply the findings as fields; Mira renders the document, and before it does it re-runs every citation in `evidence` against the store. A citation that matches no records fails the whole call and the reason names the claim - so cite something you actually found with query_records, get_trace or correlate, and if a citation fails, widen its window or drop the claim rather than rewording it. Each evidence item gives exactly one of `trace_id` or `query`; a query with no from/to inherits the incident window, which is what you want. `prevention` is an alerts.kyaml rule and is parsed by the same loader the alerting engine uses, so a rule that would not start is an error here rather than a surprise later. Mira has no tool that changes a cluster and this is not one: `remediation` is text for whoever is on call, and the rendered document says so. With `emit` the write-up is also stored as a log record, searchable afterwards as {field: body, contains: ...} or {attr: rca.title, ...}.",
+ "inputSchema":{"type":"object","required":["title","summary","root_cause"],"properties":{
+   "title":{"type":"string","description":"one line, as a ticket title"},
+   "from":{"type":"string","description":"start of the incident; same forms as query_records. Default -1h."},
+   "to":{"type":"string"},
+   "summary":{"type":"string","description":"what broke, for whom, for how long - the paragraph someone reads first"},
+   "impact":{"type":"array","description":"quantified: request counts, error rates, affected services. Numbers you read out of a tool, not adjectives.","items":{"type":"string"}},
+   "timeline":{"type":"array","description":"ordered automatically, so give entries in any order","items":{"type":"object","required":["at","what"],"properties":{"at":{"type":"string","description":"'-42m' or absolute nanoseconds"},"what":{"type":"string"}}}},
+   "root_cause":{"type":"string","description":"the mechanism, not the symptom: what made the failure inevitable"},
+   "evidence":{"type":"array","description":"cited claims. Every one is re-run before the document is rendered.","items":{"type":"object","required":["claim"],"properties":{
+     "claim":{"type":"string"},
+     "trace_id":{"type":"string","description":"32 hex characters"},
+     "query":{"type":"object","description":"a query_records document: signal, where, and optionally from/to"}}}},
+   "ruled_out":{"type":"array","description":"hypotheses you tested and eliminated, each with how. The section that stops the next person repeating the investigation.","items":{"type":"string"}},
+   "contributing":{"type":"array","items":{"type":"string"}},
+   "remediation":{"type":"array","description":"what a human or an agent with cluster access should do. Mira does none of it.","items":{"type":"string"}},
+   "verification":{"type":"array","description":"how to tell the fix worked, as things to look at in Mira","items":{"type":"string"}},
+   "prevention":{"type":"object","description":"an alerting rule that would have caught this: {name, query, when, over, for, severity}. `when` is like 'count > 20' or 'ratio > 5%'; the query may not carry its own window. No `notify` - the operator's file names the targets."},
+   "emit":{"type":"boolean","description":"also store the document in Mira as a log record. Default false."}}}}
 ]"#;
 
-/// The MCP endpoint: JSON-RPC in, one of the eight tools in [`TOOLS`] out.
+/// The MCP endpoint: JSON-RPC in, one of the nine tools in [`TOOLS`] out.
 ///
 /// Streamable HTTP with no session and no SSE, because every tool here is a
 /// single request and a single response. An agent points at this URL and has
@@ -216,6 +239,7 @@ async fn call(api: Api, id: &Yaml, params: &Yaml) -> Response {
             Ok(()) => Ok(api.alerts.json()),
             Err(e) => Err(e),
         },
+        "render_rca" => render_rca(&api, args, now).await,
         other => Err(format!("unknown tool {other:?}")),
     };
 
@@ -239,6 +263,61 @@ async fn call(api: Api, id: &Yaml, params: &Yaml) -> Response {
     result(id, &j.into_string())
 }
 
+/// The one tool that reads in order to write.
+///
+/// The loop is the point: parse, re-run every citation, and only render if all
+/// of them still hold. A model that has been reasoning for twenty minutes has
+/// usually accumulated one claim it can no longer support, and this is the pass
+/// that finds it — before the document is pasted into a ticket rather than
+/// after.
+///
+/// The scans go through `api::scan` like every other read here, so an RCA's
+/// citations queue behind the same permit as a browser's queries rather than
+/// getting a pool of their own.
+async fn render_rca(api: &Api, args: &Yaml, now: i64) -> Result<String, String> {
+    let mut doc = crate::rca::doc(args, now)?;
+    for f in &mut doc.evidence {
+        let q = f.cite.clone();
+        let dir = api.data_dir.clone();
+        let open = api.open(q.signal.dir()).await;
+        // A read that failed and a read that matched nothing are the same
+        // answer to the only question being asked — "can this document stand
+        // up?" — so both collapse to `None` here, and `Rca::dead` tells them
+        // apart in the message.
+        let rows = api::scan(move || mira_core::query::search_open(&dir, &q, &open))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|r| r.stats.rows_matched);
+        f.seen(rows);
+    }
+    if let Some(dead) = doc.dead() {
+        return Err(dead);
+    }
+    let md = doc.render();
+    if doc.emit {
+        // `Api::logs` is `None` on a node with no pipeline behind it, which in
+        // practice is a unit test. The document is still the answer; it just
+        // did not get stored, and saying which of those happened is the whole
+        // reason this is not a silent success.
+        let logs = api.logs.as_ref().ok_or(
+            "the document was rendered but `emit` could not store it: this process \
+             has no ingest pipeline. Take the markdown from a call without `emit`.",
+        )?;
+        // One message for all four refusals. They differ in whether a retry
+        // would work, which is a distinction the OTLP receivers turn into
+        // distinct status codes because an exporter acts on it — but the agent
+        // holding this document does the same thing either way, and it is the
+        // thing the sentence says.
+        logs.submit(doc.export(&md, now)).await.map_err(|_| {
+            "the document was rendered but the ingest pipeline refused to store it. \
+             Take the markdown from a call without `emit`."
+                .to_owned()
+        })?;
+    }
+    Ok(md)
+}
+
 /// "Every span of this trace", which is the one query with no useful time
 /// bound: you look a trace up because you do not know when it happened. The
 /// window is therefore all of it, and the block-level trace-id filter is what
@@ -250,31 +329,15 @@ fn trace_search(args: &Yaml) -> Result<Search, String> {
     api::known(args, &["trace_id", "limit"])?;
     let id = args["trace_id"]
         .as_str()
-        .ok_or("trace_id is required, as 32 hex characters")?
-        .trim();
-    if mira_core::query::unhex(id).is_none_or(|b| b.len() != 16) {
-        return Err(format!("{id:?} is not a 16-byte hex trace id"));
-    }
+        .ok_or("trace_id is required, as 32 hex characters")?;
     let limit = match &args["limit"] {
-        Yaml::Integer(n) if *n > 0 => (*n as usize).min(10_000),
-        _ => 1_000,
-    };
-    Ok(Search {
-        signal: Signal::Traces,
-        from: 0,
-        to: i64::MAX,
-        terms: vec![Term {
-            target: Target::Field("trace_id".into()),
-            op: Op::Eq,
-            value: Value::Str(id.to_owned()),
-        }],
-        limit,
         // A trace is one page or it is a broken trace. 10,000 spans is already
         // past what any waterfall can show, and an agent handed "here is a
         // third of a trace, ask again" will reason about the third.
-        after: None,
-        cursors: false,
-    })
+        Yaml::Integer(n) if *n > 0 => (*n as usize).min(10_000),
+        _ => 1_000,
+    };
+    crate::rca::trace_query(id, limit)
 }
 
 /// Same rule as the HTTP API, through the same door: a cold mmap fault stalls
@@ -404,6 +467,14 @@ mod tests {
             ("service_map", r#"{"max_spans":100}"#),
             ("list_services", "{}"),
             ("list_alerts", "{}"),
+            // The fixture block is `service.name: checkout`, so this citation
+            // is one that holds — which is the only way the document renders.
+            (
+                "render_rca",
+                r#"{"title":"t","summary":"s","root_cause":"r","evidence":[
+                    {"claim":"checkout was logging","query":{"where":[
+                      {"attr":"service.name","eq":"checkout"}]}}]}"#,
+            ),
         ];
         for (name, args) in ok {
             let (s, body) = rpc(&api, &call(name, args)).await;
@@ -447,6 +518,26 @@ mod tests {
                 "get_trace",
                 r#"{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","limitt":5}"#,
                 "unknown query key",
+            ),
+            // The write-up's own failure modes, through the same door as every
+            // other tool's: a missing section, a citation that does not hold,
+            // and a store this process cannot write to.
+            (
+                "render_rca",
+                r#"{"title":"t","root_cause":"r"}"#,
+                "`summary`",
+            ),
+            (
+                "render_rca",
+                r#"{"title":"t","summary":"s","root_cause":"r","evidence":[
+                    {"claim":"ghosts","query":{"where":[
+                      {"attr":"service.name","eq":"nobody"}]}}]}"#,
+                "matches no records",
+            ),
+            (
+                "render_rca",
+                r#"{"title":"t","summary":"s","root_cause":"r","emit":true}"#,
+                "no ingest pipeline",
             ),
         ];
         for (name, args, want) in bad {
@@ -514,6 +605,7 @@ mod tests {
             "correlate",
             "service_map",
             "list_services",
+            "render_rca",
         ] {
             assert!(body.contains(tool), "{tool} missing from tools/list");
         }
@@ -560,7 +652,7 @@ mod tests {
     fn a_trace_lookup_insists_on_a_whole_trace_id() {
         let doc = |s: &str| api::parse(s).unwrap();
         let q = trace_search(&doc(r#"{"trace_id":" 4BF92F3577B34DA6A3CE929D0E0E4736 "}"#)).unwrap();
-        assert_eq!(q.signal, Signal::Traces);
+        assert_eq!(q.signal, mira_core::query::Signal::Traces);
         assert_eq!((q.from, q.to), (0, i64::MAX));
         assert_eq!(q.limit, 1_000);
         assert!(q.after.is_none());

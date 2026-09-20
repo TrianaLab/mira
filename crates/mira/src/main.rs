@@ -9,6 +9,7 @@ mod json;
 mod mcp;
 mod pipeline;
 mod proxy;
+mod rca;
 mod receiver;
 mod telemetry;
 mod term;
@@ -850,11 +851,24 @@ async fn serve_with(
         data_dir: std::sync::Arc::clone(&data_dir),
         open: open_blocks,
         alerts: std::sync::Arc::new(alert::Engine::new(rules)),
+        // Cloned from the receiver rather than kept back from `spawn`, so there
+        // is visibly one handle and the router is what holds it: every copy of
+        // `Api` here lives in the served router and is dropped with it, which
+        // is what lets the logs flusher finish.
+        logs: Some(recv.logs.clone()),
     };
     // Always routed, even with no rules: `/api/v1/alerts` answering `[]` is how
     // the UI, the TUI and an agent learn that alerting is off, and a 404 is
     // indistinguishable from an old build.
-    alert::spawn(api.clone());
+    //
+    // Without the ingest handle, and that is not tidiness: the evaluator's task
+    // never returns, so an `Ingest` clone in it is one the flusher never sees
+    // dropped and every shutdown on an alerting node would sit out the full
+    // `DRAIN_GRACE`. The evaluator only ever reads.
+    alert::spawn(api::Api {
+        logs: None,
+        ..api.clone()
+    });
     // The two tasks `mira_core::diag` needs to be readable, spawned only when
     // someone has asked to read it. The probes in `submit` and in the log are
     // always on and cost ~150 ns an export; these two are a 20 Hz wakeup and a

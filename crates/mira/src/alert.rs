@@ -65,7 +65,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use mira_core::json::Json;
-use mira_core::query::{self, Op, Search, Signal, Target, Value};
+use mira_core::query::{self, Op, Search, Signal, Target, Term, Value};
 use yaml_rust2::Yaml;
 
 use crate::api::{self, Api};
@@ -345,7 +345,7 @@ fn target(y: &Yaml) -> Result<Target_, String> {
     })
 }
 
-fn rule(y: &Yaml, targets: &[Target_]) -> Result<Rule, String> {
+pub(crate) fn rule(y: &Yaml, targets: &[Target_]) -> Result<Rule, String> {
     api::known(
         y,
         &[
@@ -587,7 +587,7 @@ impl Engine {
                         // The predicate, not just a link to it: a reader with no
                         // browser — the TUI, an agent — needs the terms.
                         j.key("filter");
-                        j.str(&filter_of(r));
+                        j.str(&filter_of(&r.query.terms));
                         j.key("link");
                         j.str(&link(&self.rules.link_base, r));
                         j.key("error");
@@ -665,7 +665,7 @@ fn link(base: &str, r: &Rule) -> String {
     format!(
         "{base}/#/{}?q={}&range={range}",
         signal_name(r),
-        urlencode(&filter_of(r))
+        urlencode(&filter_of(&r.query.terms))
     )
 }
 
@@ -683,10 +683,8 @@ fn signal_name(r: &Rule) -> &'static str {
 /// fire" wants the predicate rather than a link it cannot click. Both surfaces
 /// paste this straight into a filter box, so the alert and the query it came
 /// from cannot drift into two different spellings.
-fn filter_of(r: &Rule) -> String {
-    let q: Vec<String> = r
-        .query
-        .terms
+pub(crate) fn filter_of(terms: &[Term]) -> String {
+    let q: Vec<String> = terms
         .iter()
         .map(|t| {
             let (kind, key) = match &t.target {
@@ -1039,7 +1037,7 @@ mod tests {
         // they are the contract with a parser in another language: the browser's
         // `parseFilter` has a test over these same four strings, so a change to
         // `filter_of` that the JS tokeniser cannot read fails on this side first.
-        let filters: Vec<String> = r.rules.iter().map(filter_of).collect();
+        let filters: Vec<String> = r.rules.iter().map(|r| filter_of(&r.query.terms)).collect();
         assert_eq!(
             filters,
             [
@@ -1108,7 +1106,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            filter_of(&r.rules[0]),
+            filter_of(&r.rules[0].query.terms),
             "attr:service.name!=checkout field:severity_number<17 \
              field:severity_number<=16 attr:http.route~/api attr:sampling.ratio=0.25 \
              attr:deployment.canary=true attr:http.target=\"GET /a b\" attr:empty=\"\""

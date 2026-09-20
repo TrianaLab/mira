@@ -15,7 +15,7 @@
 // here: `mod controller;` in a bin that also has a `[lib]` compiles the whole
 // crate a second time, and `cargo test` then runs every unit test twice under
 // two target names. Same binary, half the build.
-use mira_operator::{controller, lease};
+use mira_operator::{controller, events, lease};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l = lease::Lease::new(&client, &ns, lease::identity());
     l.hold().await?;
     tokio::spawn(l.renew_forever());
+
+    // Behind the lease with the controller, and not beside it. Two operators
+    // both exporting would write every Event twice, and Mira has no dedup key
+    // — the duplicate would be indistinguishable from a real repeat in an RCA's
+    // timeline. Detached rather than awaited: it is evidence collection, and a
+    // Mira it cannot reach must not stop the tier being reconciled.
+    tokio::spawn(events::export(client.clone()));
 
     tracing::info!("mira-operator watching MiraCluster resources");
     controller::run(client).await?;

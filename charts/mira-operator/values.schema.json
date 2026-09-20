@@ -52,6 +52,17 @@
       }
     },
     "logLevel": { "type": "string", "minLength": 1 },
+    "clusterEvents": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "OTLP/HTTP base URL for Kubernetes Events and container state, or empty for off. http only: the exporter shares stats.rs's plain-HTTP client, on the same argument the engine's proxy makes for its replica list — this is one deployment's own service on its own network. An https:// value would be accepted here and then fail every export, so it is refused at install time instead.",
+          "pattern": "^$|^http://[^ ]+$"
+        }
+      }
+    },
     "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
     "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
     "podSecurityContext": { "type": "object" },

@@ -17,9 +17,12 @@
 #   C  the tier follows `spec.replicas` up
 #   D  and down, through the five-step drain: Draining, Job, archive, the claim,
 #      and then the Job again — a completed pod pins the claim it mounted
-#   E  deleting the operator does not stop the tier serving
+#   E  a pod dies of its memory limit and the kubelet's account of it — the
+#      Event and the container status, neither of them ever on the OTLP wire —
+#      comes back out of a query
+#   F  deleting the operator does not stop the tier serving
 #
-# E is the assertion the architecture rests on. Principle 4 says Mira holds no
+# F is the assertion the architecture rests on. Principle 4 says Mira holds no
 # coordination state, and the defence of shipping a controller at all is that a
 # controller is not Mira. That is a testable claim, so it is tested.
 set -euo pipefail
@@ -196,11 +199,17 @@ say "operator"
 # in somebody's cluster. `pullPolicy: Never` because the tag only exists inside
 # Kind; IfNotPresent would also work and would silently reach for the registry
 # the day the local image is missing.
+#
+# `clusterEvents.endpoint` names a Service three phases away that does not
+# exist yet, which costs nothing — a batch that cannot be posted is dropped and
+# the watches keep running — and it is set here rather than upgraded in later
+# because the RBAC it creates is what phase E is a test of.
 helm upgrade --install mira-operator charts/mira-operator \
 	--namespace mira-system --create-namespace \
 	--set image.repository=mira-operator \
 	--set image.tag=e2e \
 	--set image.pullPolicy=Never \
+	--set "clusterEvents.endpoint=http://tel-proxy.$NS.svc:4318" \
 	--wait --timeout 120s
 
 # The lease, with the real RBAC and the real downward API behind it. The
@@ -414,7 +423,53 @@ kubectl -n "$NS" logs cold-check
 echo "ok: claim gone, archive present under /cold/tel-2"
 
 # ---------------------------------------------------------------------------
-say "E — deleting the operator does not stop the tier"
+say "E — what the kubelet knows arrives as logs"
+# ---------------------------------------------------------------------------
+# A pod with a memory limit it cannot survive, and no instrumentation of any
+# kind. The only path from "the kernel killed it" to a row in Mira is the
+# operator's watch, `clusterEvents.endpoint` on the install above, and the RBAC
+# the chart created for it — so this fails if any one of the three is wrong.
+kubectl -n "$NS" apply -f - <<-'YAML'
+	apiVersion: apps/v1
+	kind: Deployment
+	metadata:
+	  name: oom
+	spec:
+	  replicas: 1
+	  selector: {matchLabels: {app: oom}}
+	  template:
+	    metadata:
+	      labels: {app: oom}
+	    spec:
+	      containers:
+	        - name: oom
+	          image: busybox:1.37
+	          # `tail` buffers what it reads and /dev/zero never ends.
+	          command: ["sh", "-c", "tail /dev/zero"]
+	          resources:
+	            limits: {memory: 16Mi}
+YAML
+# The kill itself, from the object the operator reads. Waiting on this first
+# means a failure below is about the export and not about a pod that was still
+# starting.
+until_ok 180 "the pod never OOMed, so there is nothing to export" \
+	"kubectl -n $NS get pod -l app=oom \
+		-o jsonpath='{.items[*].status.containerStatuses[*].lastState.terminated.reason}' \
+		| grep -q OOMKilled"
+
+proxy_up
+# Both sources, because either one alone would pass a test the module's first
+# claim would fail: `OOMKilled` is only on the container's status, and `BackOff`
+# is only an Event.
+until_ok 180 "the container status never reached Mira" \
+	"query_has '{signal: logs, where: [{attr: k8s.event.reason, eq: OOMKilled}], limit: 1}' 137"
+until_ok 180 "the kubelet's Events never reached Mira" \
+	"query_has '{signal: logs, where: [{attr: k8s.event.reason, eq: BackOff}], limit: 1}' k8s.pod.uid"
+proxy_down
+echo "ok: an OOM kill and a BackOff Event, queryable, from a pod with no SDK"
+
+# ---------------------------------------------------------------------------
+say "F — deleting the operator does not stop the tier"
 # ---------------------------------------------------------------------------
 # The delete-test for principle 4. If this fails, a Mira pod is asking the
 # operator something, and the argument for shipping a controller at all is
@@ -426,4 +481,4 @@ proxy_down
 metrics_check tel-0 tel-1
 echo "ok: the tier still ingests and serves with no controller in the cluster"
 
-say "all five passed"
+say "all six passed"

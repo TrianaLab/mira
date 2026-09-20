@@ -132,6 +132,63 @@ tests:
       - matchSnapshot:
           path: rules
 
+  # The RCA exporter's grant, and the default that matters more than it does.
+  # Reading pods cluster-wide exposes `spec.containers[].env`, so an install
+  # that never points the operator at a Mira must not have the permission at
+  # all — "the code only reads status" is not a thing an auditor can check, and
+  # a granted-but-unused verb is one controller bug away from being used.
+  - it: grants no pod or event read unless an endpoint is configured
+    documentIndex: 2
+    asserts:
+      - notMatchRegexRaw:
+          pattern: "pods"
+      - notMatchRegexRaw:
+          pattern: "events"
+
+  - it: grants pods and events read-only once an endpoint is configured
+    set:
+      clusterEvents:
+        endpoint: http://mira-proxy.mira.svc:4318
+    documentIndex: 2
+    asserts:
+      - equal:
+          path: rules[9].resources
+          value: [pods, events]
+      # The whole feature is read-only. Any verb beyond these three would make
+      # the operator something that can change a cluster, which architecture
+      # section 14 says it is not.
+      - equal:
+          path: rules[9].verbs
+          value: [get, list, watch]
+
+  # The same freeze as the default case. Without it the rule above could gain a
+  # verb and every assertion here would still pass.
+  - it: grants exactly this list and nothing more, with the exporter on
+    set:
+      clusterEvents:
+        endpoint: http://mira-proxy.mira.svc:4318
+    documentIndex: 2
+    asserts:
+      - matchSnapshot:
+          path: rules
+
+  # The scoped install has to carry the grant too, or the exporter watches
+  # nothing under namespaced RBAC — the same 403-in-a-loop the WATCH_NAMESPACES
+  # comment in deployment.yaml describes for the controller.
+  - it: carries the exporter grant into namespaced mode
+    set:
+      clusterEvents:
+        endpoint: http://mira-proxy.mira.svc:4318
+      rbac:
+        namespaces: [alpha]
+    documentIndex: 2
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: rules[9].resources
+          value: [pods, events]
+
   - it: is a ClusterRole when no namespaces are listed
     documentIndex: 2
     asserts:

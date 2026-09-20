@@ -9,6 +9,7 @@
 
 pub mod controller;
 pub mod crd;
+pub mod events;
 #[cfg(test)]
 mod fake;
 pub mod lease;

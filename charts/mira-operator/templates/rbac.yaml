@@ -55,6 +55,24 @@ and a bug that reached for delete should fail with a 403 rather than succeed.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{/*
+Evidence for an RCA: Events and container state, shipped to Mira as OTLP logs
+by `events.rs`. Read-only, and unlike every other block here it is conditional
+rather than granted unconditionally.
+
+The HTTPRoute argument above — "a rule naming a resource the cluster does not
+have is inert" — does not transfer, because pods exist in every cluster. Reading
+them is a real grant: `spec.containers[].env` carries whatever was inlined
+there. So it follows `clusterEvents.endpoint` instead, which keeps it one switch
+without granting it to installs that never turn the exporter on. The exporter
+reads `status` only and emits no spec field, but the permission is the thing an
+auditor sees, so it is the thing that is scoped.
+*/}}
+{{- if .Values.clusterEvents.endpoint }}
+- apiGroups: [""]
+  resources: ["pods", "events"]
+  verbs: ["get", "list", "watch"]
+{{- end }}
 {{- end }}
 {{/*
 One writer. The operator holds a Lease in the *release* namespace for as long

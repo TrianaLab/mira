@@ -1,5 +1,5 @@
 ---
-description: One command, then real output from both surfaces — an error log, the trace behind it, the service map, a metric with its exemplars, a firing alert, and what the whole thing cost in memory and disk.
+description: One command, then real output from both surfaces — an error log, the OOM kill behind it, the trace, the service map, a metric with its exemplars, a firing alert, and what the whole thing cost in memory and disk.
 ---
 
 # See it work
@@ -12,14 +12,14 @@ make demo
 ```
 
 It builds the binary, starts it on a scratch directory, generates 45 minutes of
-backdated telemetry for a four-service shop — 15,909 logs, 30,720 spans, 4,608
+backdated telemetry for a four-service shop — 16,005 logs, 30,720 spans, 4,608
 metric points — and waits for the first block of each signal to seal. Ctrl-C
 stops it; `make demo-clean` deletes the directory, which is the entire uninstall.
 
-Everything below is that run — most of it twice, first as the terminal capture
-from `mira mira --addr localhost:4318` and then as the browser at
-`http://localhost:4318/`. One binary, one set of blocks, one query path, read by
-both surfaces rather than copied into each.
+Everything below is that run — most of it twice: the terminal capture from
+`mira mira --addr localhost:4318`, then the browser at `http://localhost:4318/`.
+One binary, one set of blocks, one query path, read by both rather than copied
+into each.
 
 !!! tip "Or click through it now, without installing anything"
 
@@ -28,8 +28,8 @@ both surfaces rather than copied into each.
     generator. Every part of the interface is live: tables, waterfall, service
     map, chart, alerts, paging, routing. What is recorded is the *query* —
     typing a filter re-renders the captured rows rather than reading blocks,
-    because there are no blocks in a browser tab. The page says so in a banner,
-    and its timings are the ones the real instance measured at snapshot time.
+    because there are no blocks in a browser tab, and a banner says so. The
+    timings are the ones the real instance measured at snapshot time.
 
 ## 1. Find the errors
 
@@ -38,44 +38,85 @@ both surfaces rather than copied into each.
 ```text
  mira   1 logs    2 traces    3 metrics                                                           http localhost:4318
  filter  severity_text=ERROR                                                                       last 1h  limit 200
- 09:56:05.839 ERROR  frontend         POST /checkout failed: upstream returned 503 after 76ms
- 09:56:05.835 ERROR  checkout         POST /pay failed: upstream returned 503 after 49ms
- 09:56:05.832 ERROR  payments         POST /authorize failed: upstream returned 503 after 31ms
- 09:55:56.716 ERROR  frontend         POST /checkout failed: upstream returned 503 after 93ms
- 09:55:56.711 ERROR  checkout         POST /pay failed: upstream returned 503 after 60ms
- 09:55:56.707 ERROR  payments         POST /authorize failed: upstream returned 503 after 38ms
- 09:55:47.592 ERROR  frontend         POST /checkout failed: upstream returned 503 after 110ms
- 09:55:47.586 ERROR  checkout         POST /pay failed: upstream returned 503 after 72ms
- 09:55:47.581 ERROR  payments         POST /authorize failed: upstream returned 503 after 45ms
-── record 1 of 200 ────────────────────────────────────────────────────────────────────────────────────────────────
-  time_unix_nano            2026-09-11 09:56:05.839
-  severity_number           17
-  severity_text             ERROR
-  event_name                http.server.request
-  body                      POST /checkout failed: upstream returned 503 after 76ms
-  trace_id                  0000000000000efb5555555555555bae
-  span_id                   90c7dd5e0d0ce971
- 1/1 blocks · 15909 rows scanned · 888 matched · 12.7ms
+ 12:32:18.378 ERROR  frontend         POST /checkout failed: upstream returned 503 after 76ms                        █
+ 12:32:18.374 ERROR  checkout         POST /pay failed: upstream returned 503 after 49ms                             ║
+ 12:32:18.371 ERROR  payments         POST /authorize failed: upstream returned 503 after 31ms                       ║
+ 12:32:17.502 ERROR  -                container payments last terminated: exit code 137, signal 9                    ║
+ 12:32:09.255 ERROR  frontend         POST /checkout failed: upstream returned 503 after 93ms                        ║
+ 12:32:09.250 ERROR  checkout         POST /pay failed: upstream returned 503 after 60ms                             ║
+ 12:32:09.246 ERROR  payments         POST /authorize failed: upstream returned 503 after 38ms                       ║
+ 12:32:00.132 ERROR  frontend         POST /checkout failed: upstream returned 503 after 110ms                       ║
+ 12:32:00.126 ERROR  checkout         POST /pay failed: upstream returned 503 after 72ms                             ║
+ 12:32:00.121 ERROR  payments         POST /authorize failed: upstream returned 503 after 45ms                       ║
+ 12:31:50.953 ERROR  frontend         POST /checkout failed: upstream returned 503 after 72ms                        ║
+ 12:31:50.949 ERROR  checkout         POST /pay failed: upstream returned 503 after 47ms                             ║
+ 12:31:50.946 ERROR  payments         POST /authorize failed: upstream returned 503 after 29ms                       ║
+── record 1 of 200 ───────────────────────────────────────────────────────────────────────────────────────────────────
+  time_unix_nano               2026-09-20 12:32:18.378
+  observed_time_unix_nano      2026-09-20 12:32:18.380
+  severity_number              17
+  severity_text                ERROR
+  event_name                   http.server.request
+  body                         POST /checkout failed: upstream returned 503 after 76ms
+ 1/1 blocks · 16005 rows scanned · 920 matched · 20.4ms
  ↑↓ move  enter detail  t trace  c frame  ·  m map  a alerts  d node  ·  / filter  f follow  ? help  q quit
 ```
 
-15,909 rows scanned to 888 matches in **12.7 ms**, over a block the process never
+16,005 rows scanned to 920 matches in **20.4 ms**, over a block the process never
 copied — the Arrow buffers are read where `mmap` put them.
 
 ![The same filter in the browser: severity_text=ERROR in the query box, twenty
-ERROR rows from frontend, checkout and payments, and a header reading 888
-matched / 15909 scanned, 1 of 1 blocks, 37.6 ms.](assets/ui/logs.png)
+ERROR rows from frontend, checkout and payments, and a header reading 920
+matched / 16005 scanned, 1 of 1 blocks, 6.7 ms.](assets/ui/logs.png)
 
-Same 888, from the same block. The header is the query plan: rows scanned, rows
+Same 920, from the same block. The header is the query plan: rows scanned, rows
 matched, blocks touched, wall clock — on every screen, never behind a toggle.
 
-## 2. Follow one to its trace
+## 2. The row with no service
 
-`t` on that row. No trace-id copy-paste, no second tab.
+Nothing exported that fourth line. The generator also lays down what the
+operator's [cluster-event export](install.md#cluster-context) ships from a real
+cluster — Kubernetes Events and container state, as OTLP logs — so the kill
+behind the 503s is in the same block, found by the same filter.
+
+```text
+ mira   1 logs    2 traces    3 metrics                                                           http localhost:4318
+ filter  k8s.event.reason=OOMKilled                                                                last 1h  limit 200
+  time_unix_nano               2026-09-20 12:32:17.502
+  observed_time_unix_nano      2026-09-20 12:32:19.502
+  severity_number              17
+  severity_text                ERROR
+  event_name                   OOMKilled
+  body                         container payments last terminated: exit code 137, signal 9
+  flags                        0
+  dropped_attributes_count     0
+── attributes ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  container.image.name         ghcr.io/shop/payments:2.7.0
+  k8s.container.name           payments
+  k8s.container.restart_count  32
+  k8s.event.reason             OOMKilled
+  k8s.namespace.name           shop
+  k8s.object.kind              Pod
+  k8s.pod.host_ip              10.0.3.14
+  k8s.pod.name                 payments-5d9f7c-0
+  k8s.pod.uid                  e17ac568-5d9f-4c2a-b1e7-c5686623db26
+  otel.scope.name              mira-operator
+  otel.scope.version           0.3.0
+ 1/1 blocks · 16005 rows scanned · 32 matched · 10.2ms
+```
+
+`k8s.pod.uid` is the whole join, and it is the attribute the k8sattributes
+processor already puts on application telemetry: one predicate on that value
+returns 1,536 log records and 3,840 spans for `payments-5d9f7c-0`, both halves
+of the story on one timeline. Nothing was correlated at write time.
+
+## 3. Follow one to its trace
+
+`t` on one of those 503s. No trace-id copy-paste, no second tab.
 
 ```text
  trace 0000000000000efb5555555555555bae  ·  8 spans  ·  76.08ms
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  POST /checkout                         frontend          █████████████████████████████████████████████████   76.08ms
   ↗ trace 0000000000000efa5555555555555baf
   GET /items                            frontend           ███████████                                        17.37ms
@@ -87,7 +128,7 @@ matched, blocks touched, wall clock — on every screen, never behind a toggle.
      ● retry  +47.41ms
      POST /authorize                    payments                                 ████████████████████         31.43ms
       ● exception  +65.50ms
- 1/1 blocks · 30720 rows scanned · 8 matched · 7.0ms
+ 1/1 blocks · 30720 rows scanned · 8 matched · 5.8ms
  esc → logs  ↑↓ span  enter detail
 ```
 
@@ -102,20 +143,20 @@ ticks on both /authorize spans.](assets/ui/trace.png)
 Red is `status_code=2`; the amber ticks are those same span events, at the
 offset they happened.
 
-## 3. See the shape of the system
+## 4. See the shape of the system
 
 `m`. The service map is computed from the spans at read time — there is no
 pre-aggregation job, and nothing to be stale.
 
 ```text
  map 4 services
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  entry
    frontend                                 11520 spans    592 errors    58.29ms avg
      checkout                               11520 spans    592 errors    37.31ms avg
        payments                              3840 spans    296 errors    37.97ms avg
      inventory                               3840 spans      -           17.99ms avg
- 1/1 blocks · 30720 rows scanned · 4 matched · 6.1ms
+ 1/1 blocks · 30720 rows scanned · 4 matched · 20.2ms
  esc → logs  ↑↓ move  enter filter on this service
 ```
 
@@ -124,9 +165,9 @@ checkout and inventory, checkout feeding payments, with per-service span and
 error counts and red edges where errors flow.](assets/ui/map.png)
 
 Clicking a service takes you to its logs: from "checkout is red" to the lines
-that say why, without composing a second query.
+that say why, with no second query to compose.
 
-## 4. A metric, and the traces underneath it
+## 5. A metric, and the traces underneath it
 
 `http.server.request.duration` is a histogram, so it arrives as two derived
 series, `.count` and `.sum`. A sum thirty times larger than its count flattens
@@ -138,11 +179,11 @@ a rug of coloured exemplar diamonds along both baselines.](assets/ui/metrics.png
 
 The rug along each baseline is exemplars — one diamond per request the SDK
 sampled and stamped with a trace id. Clicking one opens that trace: the
-metric-to-trace edge OTLP defines, in one click. It sits on the baseline rather
-than at its value because an exemplar is one 50ms request and the line above is
-a count of seven hundred: they share a time axis and nothing else.
+metric-to-trace edge OTLP defines, in one click. It sits on the baseline and not
+at its value because an exemplar is one 50ms request and the line above is a
+count of seven hundred: they share a time axis and nothing else.
 
-## 5. Alerting, evaluated in-process
+## 6. Alerting, evaluated in-process
 
 `a`. Rules are a KYAML file (`--alerts docs/e2e/alerts.kyaml`); each is the same
 filter language the query API takes. `enter` on a firing rule opens the records
@@ -150,16 +191,16 @@ that fired it.
 
 ```text
  alerts 4 rules  ·  1 firing
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ○      ok      shop-error-rate             0.00% > 2.00%   0 of 0
           field:status_code=2  ·  over 1m00s
-  ○      ok      checkout-p95-latency        0.00% > 5.00%   0 of 972
+  ○      ok      checkout-p95-latency        0.00% > 5.00%   0 of 834
           attr:service.name=checkout field:duration_nano>250000000  ·  over 5m00s
-  ●      firing  card-declines               25 > 20   25 records
+  ●      firing  card-declines               22 > 20   22 records
           attr:exception.type=payments.CardDeclined  ·  over 5m00s
   ○      ok      inventory-outage            0 >= 1   0 records
           attr:service.name=inventory field:severity_number>=21  ·  over 1m00s
- 1.7ms
+ 2.2ms
  esc → logs  ↑↓ move  enter show the records that fired  a reload
 ```
 
@@ -170,45 +211,45 @@ of 20, the other three green.](assets/ui/alerts.png)
 No Alertmanager, no rule-evaluation sidecar, no second store: the rule is the
 query, run on the same blocks the screen above reads.
 
-## 6. What it cost
+## 7. What it cost
 
-`d`. Everything a node knows about itself, with no exporter, no sidecar and no
+`d`. Everything a node knows about itself — no exporter, no sidecar, no
 `/metrics` scrape.
 
 ```text
- node up 1m 05s  ·  peak rss 65.0 MiB  ·  disk 10% free
-── queries ──────────────────────────────────────────────────────────────────────────────────────────────────────────
-  served          17
-  mean            6.12 ms
-  max             57.28 ms
-── logs ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  rows written    15.9k
+ node up 2m 42s  ·  peak rss 71.8 MiB  ·  disk 14% free
+── queries ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+  served          19
+  mean            11.49 ms
+  max             89.54 ms
+── logs ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  rows written    16.0k
   blocks          1 on disk  ·  1 published
-  bytes on disk   4.6 MiB  ·  305 B/row
+  bytes on disk   4.7 MiB  ·  305 B/row
   rejected        0 shed  ·  0 failed  ·  0 refused
-── traces ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+── traces ────────────────────────────────────────────────────────────────────────────────────────────────────────────
   rows written    30.7k
   blocks          1 on disk  ·  1 published
   bytes on disk   9.1 MiB  ·  310 B/row
   rejected        0 shed  ·  0 failed  ·  0 refused
-── metrics ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+── metrics ───────────────────────────────────────────────────────────────────────────────────────────────────────────
   rows written    4608
   blocks          1 on disk  ·  1 published
-  bytes on disk   895.6 KiB  ·  199 B/row
+  bytes on disk   896.4 KiB  ·  199 B/row
   rejected        0 shed  ·  0 failed  ·  0 refused
 ```
 
-**65 MiB peak resident** for 51,237 records ingested and 17 queries served, in a
+**72 MiB peak resident** for 51,333 records ingested and 19 queries served, in a
 6.20 MiB binary that also contains the web UI, the terminal UI and the MCP
 server. That peak is a transient: `--demo` delivers the whole 45-minute window
-in one burst at over a million records a second, and the process settles back to
-about 13 MiB once the blocks are sealed. Eleven runs of this exact scenario
-spanned 53.7 to 67.6 MiB with a median of 63.1 — read it as "tens of megabytes",
-not as a number that reproduces to a decimal place. The 57 ms maximum is the
-first query of the process: it faults the block in from disk, and every query
-after it is served from the page cache at the 6 ms mean.
+in one burst at over a million records a second, and the process settles back
+under 9 MiB once the blocks are sealed. A dozen runs spanned 53.7 to 71.8 MiB —
+read it as "tens of megabytes", not a number that reproduces to a decimal place.
+The 90 ms maximum is a cold read: the query that first touches a block pays the
+page faults, and the ones behind it come from the page cache, at the 11 ms
+mean.
 
-## 7. Hand it to an agent
+## 8. Hand it to an agent
 
 One line, and the blocks above answer an LLM instead of you:
 
@@ -217,7 +258,7 @@ claude mcp add --transport http mira http://localhost:4318/mcp
 ```
 
 Asked why checkout is returning 503s, Claude starts at the alert that is firing
-in section 5, walks the service map to `payments`, opens the trace and names the
+in section 6, walks the service map to `payments`, opens the trace and names the
 exception behind it — seven calls, 136 ms of query time. The prompt, every call
 and the answer: [Connect an agent](agents.md).
 
@@ -272,12 +313,11 @@ The same object comes back unwrapped from `POST /api/v1/query`.
 }
 ```
 
-That is the same trace the waterfall above opened, reached from the other
-direction, and `stats` tells the model what the answer cost, so it can widen or
-narrow the next question instead of guessing. An unknown argument is refused by
-name rather than ignored, so a model that invents a field is told so instead of
-handed plausible rows. Wiring, the other seven tools and a worked investigation:
-[Connect an agent](agents.md).
+That is the trace the waterfall opened, from the other direction, and `stats`
+tells the model what the answer cost, so it can widen or narrow the next question
+instead of guessing. An unknown argument is refused by name, so a model that
+invents a field is told so instead of handed plausible rows. Wiring, the other
+eight tools and a worked investigation: [Connect an agent](agents.md).
 
 ## Next
 

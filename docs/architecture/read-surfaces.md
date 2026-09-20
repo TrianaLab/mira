@@ -11,9 +11,10 @@ the whole window for a key it does not implement: a wrong answer that looks righ
 ## 8.1 Agentic surface
 
 **Built**: `POST /mcp` on the same listener, JSON-RPC 2.0 over Streamable HTTP,
-eight tools — `query_records`, `get_trace`, `query_metric` and `list_metrics` over
-the query document, three more over the frame algebra (section 7.3), and
-`list_alerts` over the alert evaluator (section 13). Hand-rolled rather than
+nine tools — `query_records`, `get_trace`, `query_metric` and `list_metrics` over
+the query document, three more over the frame algebra (section 7.3),
+`list_alerts` over the alert evaluator (section 13), and `render_rca` over both
+(section 15). Hand-rolled rather than
 `rmcp`: at this scope the protocol is a method dispatch over a JSON document,
 which we already parse (section 1, KYAML), and the SDK's session model is the
 thing we do not want.

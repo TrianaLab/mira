@@ -46,6 +46,11 @@ path = "src/crdgen.rs"
 
 [dependencies]
 futures = "0.3.34"
+# The request builder, and only that. `events.rs` POSTs to Mira's OTLP receiver
+# and hyper-util's client takes an `http::Request`; naming `hyper` instead would
+# be a direct edge on a crate this tree deliberately reaches only through
+# hyper-util. Already in the lockfile under kube, so it costs no crate.
+http = "1.5.0"
 http-body-util = "0.1.5"
 # No direct `hyper`. `stats.rs` talks to it only through `hyper-util`'s legacy
 # client, and `client-legacy` already turns on the `hyper/client` and
@@ -69,8 +74,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # has no envtest, and the alternative is that every function in `controller.rs`
 # that issues an API call stays untested.
 [dev-dependencies]
-http = "1.5.0"
 # `start_paused`, so a test of the standby poll loop advances tokio's clock
-# instead of sleeping through it. Feature-only on a crate already here.
-tokio = { version = "1.53.1", features = ["test-util"] }
+# instead of sleeping through it. `net` and `io-util` are the one-shot HTTP
+# server `events.rs` posts a batch at — the operator reaches hyper only through
+# hyper-util's client, so asserting the request would otherwise mean a
+# dev-dependency on `hyper/server`. All three are features on a crate already
+# here, so the tree is unchanged.
+tokio = { version = "1.53.1", features = ["test-util", "net", "io-util"] }
 tower = "0.5.3"

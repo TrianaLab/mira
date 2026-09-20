@@ -65,6 +65,14 @@ spec:
             - name: WATCH_NAMESPACES
               value: {{ join "," . | quote }}
             {{- end }}
+            {{- with .Values.clusterEvents.endpoint }}
+            # Where Kubernetes Events and container state go. Unset, the
+            # operator opens no watch for them and the Role in rbac.yaml is not
+            # created either — the same value gates both, so the two cannot
+            # disagree.
+            - name: MIRA_OTLP_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:

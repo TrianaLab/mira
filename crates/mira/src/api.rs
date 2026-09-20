@@ -52,6 +52,16 @@ pub struct Api {
     /// [`crate::alert`] is that they are looking at one object. The default is
     /// an engine with no rules, which answers "alerting is off".
     pub alerts: Arc<crate::alert::Engine>,
+    /// The logs write handle, for the one tool that writes: `render_rca`'s
+    /// `emit` (see [`crate::rca`]). `None` means the document is rendered and
+    /// not stored, which is what a unit test's `Api` gets.
+    ///
+    /// Also `None` in the alert evaluator's copy, deliberately — see the
+    /// construction in `main`. That task never returns, so an [`pipeline::Ingest`]
+    /// clone inside it is one the logs flusher never sees dropped, and every
+    /// shutdown would sit out the full drain grace waiting on a channel that
+    /// cannot close.
+    pub logs: Option<pipeline::Ingest<mira_proto::collector::logs::v1::ExportLogsServiceRequest>>,
 }
 
 impl Api {
@@ -787,7 +797,7 @@ fn scalar(y: &Yaml) -> Result<Value, String> {
 /// that survives being pasted into a chat and run an hour later. Absolute
 /// nanoseconds are the form the API returns, so a value from a result can be
 /// fed straight back in.
-fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
+pub(crate) fn time_field(y: &Yaml, now: i64, default: i64) -> Result<i64, String> {
     match y {
         Yaml::BadValue | Yaml::Null => Ok(default),
         Yaml::Integer(n) => Ok(*n),

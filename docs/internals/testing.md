@@ -3,8 +3,8 @@
 **For:** contributors deciding where a new test belongs. For *reproducing the
 published numbers*, see [End-to-end testing](e2e.md).
 
-Mira has 432 cargo tests — 372 across levels 1–5, plus 60 in `xtask` that test
-the gates rather than the engine — 22 UI tests, 26 chart tests, and 74 more in
+Mira has 439 cargo tests — 379 across levels 1–5, plus 60 in `xtask` that test
+the gates rather than the engine — 22 UI tests, 30 chart tests, and 92 more in
 the operator's [second workspace](#the-operator-in-a-workspace-of-its-own), where
 levels 8 and 9 live too. Every one runs from a `make` target CI also calls, and
 both targets are in [Contributing](../contributing.md).
@@ -16,13 +16,13 @@ the industry's least agreed label, so it is absent.
 
 | # | Level | Count | Lives in | Runs from |
 | --- | --- | --- | --- | --- |
-| 1 | Unit, in-source | 146 core + 185 bin | `#[cfg(test)]` in the module under test | `make test` |
+| 1 | Unit, in-source | 146 core + 191 bin | `#[cfg(test)]` in the module under test | `make test` |
 | 2 | Differential vs a reference model | 1 test, thousands of queries | `crates/mira-core/tests/differential.rs` | `make test` |
-| 3 | In-process end-to-end | 37 | `crates/mira/src/e2e.rs` | `make test` |
+| 3 | In-process end-to-end | 38 | `crates/mira/src/e2e.rs` | `make test` |
 | 4 | Subprocess CLI | 3 | `crates/mira/tests/cli.rs` | `make test` |
 | 5 | Generator self-check | 1 binary flag | `crates/mira/examples/loadgen.rs` | `make test` |
 | 6 | Browser-free UI | 22 | `crates/mira/ui/src/lib/*.test.js` | `make ui-check` |
-| 7 | Chart rendering | 26 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
+| 7 | Chart rendering | 30 in 2 suites | `charts/mira-operator/tests/*_test.yaml` | `make helm-unittest` |
 | 8 | Against a real API server | 5 | `integrations/kubernetes/tests/apiserver.rs` | `make operator-apiserver` |
 | 9 | Live, on a real cluster | asserted, not counted | `integrations/kubernetes/e2e/run.sh` | `make operator-e2e` |
 
@@ -58,9 +58,9 @@ MIRA_DIFF_SEED=12858170866899772564 cargo test -p miradb-core --test differentia
 OTLP protobuf in one end and query JSON out the other. Only this test catches a
 receiver wired to the wrong flusher, or an acknowledgement returned before the
 data is findable. Almost all of it reaches the router through `oneshot`; the two
-tests that need a real socket — the TUI's blocking `std::net::TcpStream`, and
-`mira proxy` in front of two storage nodes — end with `forget_open_blocks`,
-because `axum::serve` holds a router clone for the life of the process.
+that need a real socket — the TUI, and `mira proxy` over two nodes — end with
+`forget_open_blocks`, because `axum::serve` holds a router clone for the life of
+the process.
 
 **Nothing in it sleeps.** A 200 on `/v1/logs` is a read-your-writes promise, so
 the next query already sees the data through the open-block read path
@@ -70,10 +70,9 @@ new behaviour should land at.
 ### 4. Subprocess CLI, for what only a process has
 
 `main`, `run` and `shutdown` are reachable only by exec'ing the binary: a
-unit test in the bin crate never calls its own `main`, `-h` and `-V` end the
-process, and a signal handler needs a process to signal. Three tests, argv in and
-exit code out, with a SIGTERM in the middle; the third puts a real proxy in front
-of a real node.
+unit test never calls its own `main`, `-h` and `-V` end the process, and a signal
+handler needs a process to signal. Three tests, argv in and exit code out, with a
+SIGTERM in the middle; the third fronts a real node with a real proxy.
 
 ### 5. The generator's own invariants
 
@@ -81,7 +80,7 @@ of a real node.
 target defaults to `test = false`. loadgen's invariants — a trace that crosses a
 service boundary, histogram buckets that sum to their count, exemplars naming
 traces that exist — therefore ride behind `--selftest`, which `make test` invokes
-as a second command.
+separately.
 
 ### 6. UI, without a browser
 
@@ -93,8 +92,8 @@ binary.
 
 ### 7. The chart, rendered
 
-`helm-unittest` over two suites, against `charts/mira-operator`. They assert
-rendering decisions invisible until something is deployed: the image tag defaults
+`helm-unittest` over two suites, against `charts/mira-operator`. They assert what is
+invisible until something is deployed: the image tag defaults
 to the chart's `appVersion`, the operator learns its own pod name from the
 downward API, `rbac.namespaces` turns one `ClusterRole` into a `Role` per
 namespace, and the rule list is exactly the rule list. `helm-lint`, `helm-template`, `helm-schema`
@@ -108,10 +107,10 @@ path: rules`, and the same mutation fails it.
 ### 8. Against a real API server
 
 `make operator-apiserver` runs `integrations/kubernetes/tests/apiserver.rs`
-against whatever cluster the current kubeconfig context points at. The target sets
-`MIRA_OPERATOR_APISERVER` itself and a bare `cargo test` does not, so every test
+against whatever cluster the current kubeconfig points at. The target sets
+`MIRA_OPERATOR_APISERVER` and a bare `cargo test` does not, so every test
 in the file returns immediately and `make operator` stays a gate a laptop with no
-cluster can pass. `make operator-e2e` runs this leg first, against the Kind
+cluster can pass. `make operator-e2e` runs it first, against the Kind
 cluster it just created, because a fake client cannot see:
 
 | | |
@@ -124,7 +123,7 @@ cluster it just created, because a fake client cannot see:
 ### 9. Live, on a real cluster
 
 `make operator-e2e` builds a Kind cluster, installs the chart as published, and
-asserts five things end to end — including that the tier keeps serving after the
+asserts six things end to end — including that the tier keeps serving after the
 operator is uninstalled, the claim principle 4 rests on.
 [End-to-end testing](e2e.md) section 5 maps what it asserts and how to debug
 one.
@@ -133,7 +132,7 @@ one.
 
 `integrations/kubernetes` is a second Cargo workspace with its own `Cargo.lock`,
 so `cargo test --workspace` in the root cannot reach it. `make operator` is its
-whole gate — fmt, clippy, 69 unit tests, a coverage floor and the CRD drift
+whole gate — fmt, clippy, 87 unit tests, a coverage floor and the CRD drift
 check — and has to pass on a laptop with no kubeconfig, so levels 8 and 9 are
 deliberately not in it.
 
@@ -141,10 +140,11 @@ The separation is not about testing: kube-rs declares Rust 1.89 against the
 engine's 1.88 floor and brings ~160 crates and a TLS stack, against a README
 crate count that is a published product property.
 
-Its 69 unit tests are level 1 in shape and almost all about **arithmetic that
+Its 87 unit tests are level 1 in shape and almost all about **arithmetic that
 decides to delete a volume**: `stats::decide` returns `Up`/`Down`/`Hold` from a slice of
 readings, `resources::*` assert the fields a typo drops silently, `crd::*` refuse
-a spec whose thresholds would oscillate.
+a spec whose thresholds would oscillate. `events::*` check the records the
+exporter builds from the API server's own wire JSON.
 
 **`operator-crd-check` is the gate that matters most here** and it is not a test.
 `make operator-crd` regenerates `charts/mira-operator/crds/miraclusters.yaml`
@@ -168,7 +168,7 @@ These are the other half of `make check`.
 | `docs-check` | Markup markdownlint refuses, a word Vale refuses, a page past a structural limit, or a cross-reference outside `docs/` resolving to nothing — `make docs` covers the ones inside it |
 | `ui-check` | A `.svelte` change whose rebuilt bundle was not committed |
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
-| `deps` | An advisory, licence, ban or source `cargo-deny` refuses, or a dependency nothing imports |
+| `deps` | An advisory, licence, ban or source `cargo-deny` refuses, a dependency nothing imports, a crate in the lockfile no audit covers, or a direct dependency behind its latest release |
 | `drift` | The README's crate count or binary size no longer matching the tree that builds |
 | `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
 | `install-script` | The published one-liner no longer parsing, linting or running |
@@ -182,9 +182,9 @@ pass.
 
 ## Coverage is a ratchet
 
-`COVERAGE_MIN` in the Makefile is line coverage, and it is the coverage that
-existed when that line was last edited. It may only go up: raise it in the same
-diff that raises coverage, and never lower it to make a red build green.
+`COVERAGE_MIN` in the Makefile is line coverage: the coverage that existed when
+that line was last edited. It may only go up — raise it in the diff that raises
+coverage, never lower it to make a red build green.
 
 Coverage runs take the same target-dir lock as a normal build, so give them
 their own:

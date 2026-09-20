@@ -9,6 +9,30 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Added
+
+- **`render_rca`**, the ninth MCP tool: the agent hands over its findings —
+  summary, impact, timeline, root cause, evidence, what it ruled out,
+  remediation, verification, a proposed alerting rule — and gets back markdown.
+  Two things make it more than a template. Every evidence item carries a
+  `trace_id` or a `query`, and Mira **re-runs it** with `limit: 0` before
+  rendering, putting the row count beside the claim; a citation that matches
+  nothing fails the call, naming the claim, and nothing is rendered or stored.
+  And `prevention` is parsed by the same loader that reads `alerts.kyaml` at
+  boot, so the rule in the document is one that will start. With `emit`, the
+  write-up is ingested back into Mira as a log record with `event_name: rca` —
+  searchable with `query_records`, framed by `correlate`, expired by the same
+  retention. There is no incident store and no new dependency.
+- **The operator exports Kubernetes Events and pod state to Mira as OTLP
+  logs**, when `clusterEvents.endpoint` is set. `OOMKilled`, `ImagePullBackOff`
+  and `FailedScheduling` are facts the kubelet holds and OTLP has never carried,
+  so an RCA written from telemetry alone names the exception and misses the
+  kill thirty seconds earlier that explains it. They land in the same blocks,
+  keyed by `k8s.pod.uid` so they join the telemetry, and the one chart value
+  creates the Role and sets the endpoint together. Off by default, read-only,
+  and no counterpart that writes: Mira has no verb that changes a cluster, by
+  decision rather than omission.
+
 ## [0.3.0] - 2026-09-16
 
 ### Added
