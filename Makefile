@@ -465,8 +465,45 @@ unused-deps: ## cargo-machete: dependencies declared but never used
 	$(call need,cargo-machete)
 	cargo machete --with-metadata
 
+# There is no `make audit` for RUSTSEC in a second tool: cargo-deny reads the
+# same advisory database cargo-audit does, and `yanked = "deny"` on top of it.
+# Two tools asking one question is two things to keep pinned.
+.PHONY: vet
+vet: ## cargo-vet: nothing enters the lockfile that nobody has looked at
+	$(call need,cargo-vet)
+	@# `--locked` so the gate reads supply-chain/imports.lock instead of
+	@# refreshing it: a check whose criteria move under it is not a check.
+	@# A new or upgraded crate fails here until it is covered by an audit we
+	@# import, one we write with `cargo vet certify`, or an exemption. The
+	@# exemptions in supply-chain/config.toml are the tree as it stood when the
+	@# store was created — a floor like the coverage ratchet, and `cargo vet
+	@# suggest` plus `cargo vet prune` is how it comes down.
+	cargo vet --locked
+
+# Direct dependencies only. Full depth is permanently red and a permanently red
+# gate is a gate someone switches off: the MSRV holds two dozen transitive
+# crates a release back on purpose, and which of those the lockfile picks is
+# cargo's business, not a reviewer's. A direct dependency that genuinely cannot
+# move goes here, with the reason, so the gate stays on while it waits.
+OUTDATED_IGNORE :=
+
+.PHONY: outdated
+outdated: ## cargo-outdated: a direct dependency with a release we are not on
+	$(call need,cargo-outdated)
+	cargo outdated --workspace --root-deps-only --exit-code 1 \
+	  $(if $(OUTDATED_IGNORE),--ignore $(OUTDATED_IGNORE))
+
+.PHONY: deps-upgrade
+deps-upgrade: ## cargo-edit: do what `make outdated` is asking (APPLY=1 writes)
+	$(call need_bin,cargo-upgrade,$(CARGO) install --locked cargo-edit)
+	@# Two halves: `cargo upgrade` moves the requirement in Cargo.toml, `cargo
+	@# update` moves the lockfile within it, and `make outdated` goes red for
+	@# either. Dry by default — this one edits manifests.
+	cargo upgrade --incompatible $(if $(APPLY),,--dry-run)
+	$(CARGO) update $(if $(APPLY),,--dry-run)
+
 .PHONY: deps
-deps: audit unused-deps ## All supply-chain checks
+deps: audit unused-deps vet outdated ## All supply-chain checks
 
 .PHONY: sbom
 sbom: build ## CycloneDX SBOM, one <crate>.cdx.json beside each Cargo.toml
@@ -1045,7 +1082,8 @@ check: section fmt-check lint features test doc reference-check market-check mea
 
 .PHONY: tools
 tools: ## Install the cargo subcommands the gates need
-	$(CARGO) install --locked cargo-deny cargo-machete cargo-llvm-cov cargo-cyclonedx
+	$(CARGO) install --locked cargo-deny cargo-machete cargo-llvm-cov cargo-cyclonedx \
+	  cargo-vet cargo-outdated cargo-edit
 
 .PHONY: clean
 clean: ## Remove build output and the docs virtualenv

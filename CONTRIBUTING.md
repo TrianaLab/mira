@@ -45,7 +45,10 @@ make test        # unit tests plus the in-process end-to-end suite
 make ui          # rebuild the committed Svelte bundle
 make coverage    # line coverage against the ratchet
 make audit       # cargo-deny: advisories, licences, bans, sources
-make deps        # audit, plus cargo-machete for crates declared and never used
+make vet         # cargo-vet: every crate in the lockfile audited or exempted
+make outdated    # cargo-outdated: a direct dependency behind its latest release
+make deps        # all three, plus cargo-machete for crates declared and never used
+make deps-upgrade # cargo-edit: what `make outdated` wants (APPLY=1 writes it)
 make drift       # the numbers the README promises, against the tree that ships
 make docs        # the docs site, --strict, so a dead link is a failure
 make msrv        # compile with exactly the declared MSRV

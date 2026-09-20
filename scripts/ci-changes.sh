@@ -32,7 +32,7 @@ else
   # about a CI edit is the leg you did not think it touched. `ci.mk` is in the
   # same clause for the same reason: it *is* the workflow now.
   W='|^\.github/workflows/|^ci\.mk$'
-  code=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|deny\.toml\$|Makefile\$|scripts/)${W}")
+  code=$(m "^(crates/|Cargo\.(toml|lock)\$|rust-toolchain\.toml\$|deny\.toml\$|supply-chain/|Makefile\$|scripts/)${W}")
   # `overrides/` is the mkdocs theme override directory — one file, the landing
   # hero — and a Jinja error in it fails `mkdocs build --strict` like any page
   # would.

@@ -91,16 +91,16 @@ link back to this section:
 
 ## What is already gated
 
-- `make audit` runs `cargo deny check` — advisories, licences, bans, sources —
-  and CI runs the same target, so a `RUSTSEC` advisory against anything in the
-  tree fails the build.
+- `make deps`, which CI runs: `cargo deny check` for a `RUSTSEC` advisory, a
+  licence, a ban or a source; `cargo vet --locked` for a version no audit in
+  `supply-chain/` covers; `cargo outdated` for a direct dependency behind its
+  latest release.
 - `make scan-image` runs `trivy image --severity HIGH,CRITICAL --ignore-unfixed
   --exit-code 1` against the container image, on every pull request that touches
   the binary or the `Dockerfile`. `cargo deny` covers the crates we chose and
   Trivy the base image underneath — neither sees the other's half.
-- Both hang off a **`security-required`** status context separate from
-  `required`: the two answer different questions, "does it work" and "is it safe
-  to ship".
+- These hang off a **`security-required`** status context separate from
+  `required`: two questions, "does it work" and "is it safe to ship".
 - **Nothing runs on a schedule alone.** A weekly `cron` re-runs the same gates,
   so an advisory published against an unchanged tree surfaces anyway.
 - `Cargo.lock` is committed and the install path is `cargo install --locked`,
@@ -110,9 +110,9 @@ link back to this section:
   in `uses:` is arbitrary code execution holding a token with `packages: write`.
 - The release path is rehearsed on every pull request: `release-dry-run` runs the
   same `make dist` that a tag runs.
-- The dependency budget is a stated product property, and a security property by
-  accident: the crate count in the README is also the number of crates whose
-  advisories we inherit, and `zstd-sys` is the only C in the tree.
+- The dependency budget is a security property by accident: the README's crate
+  count is the number of crates whose advisories we inherit, and `zstd-sys` is
+  the only C in the tree.
 
 ## Verifying a release
 

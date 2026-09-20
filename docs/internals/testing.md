@@ -168,7 +168,7 @@ These are the other half of `make check`.
 | `docs-check` | Markup markdownlint refuses, a word Vale refuses, a page past a structural limit, or a cross-reference outside `docs/` resolving to nothing — `make docs` covers the ones inside it |
 | `ui-check` | A `.svelte` change whose rebuilt bundle was not committed |
 | `ui-demo` | The `/play` snapshot bundle going stale the same way |
-| `deps` | An advisory, licence, ban or source `cargo-deny` refuses, or a dependency nothing imports |
+| `deps` | An advisory, licence, ban or source `cargo-deny` refuses, a dependency nothing imports, a crate in the lockfile no audit covers, or a direct dependency behind its latest release |
 | `drift` | The README's crate count or binary size no longer matching the tree that builds |
 | `workflows` | A CI job that cannot block a merge, an unpinned action, a missing `permissions:`, a `run:` step that is not a `make ci-*` call |
 | `install-script` | The published one-liner no longer parsing, linting or running |
