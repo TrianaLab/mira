@@ -1082,8 +1082,12 @@ check: section fmt-check lint features test doc reference-check market-check mea
 
 .PHONY: tools
 tools: ## Install the cargo subcommands the gates need
+	@# cargo-vet is pinned to the version CI installs, and for once that is not
+	@# pedantry: 0.10.1 changed the escaping in supply-chain/imports.lock, so a
+	@# newer one here rewrites the store and the runner then rejects it as a
+	@# consistency error. The pin lives in .github/workflows/ci.yml too.
 	$(CARGO) install --locked cargo-deny cargo-machete cargo-llvm-cov cargo-cyclonedx \
-	  cargo-vet cargo-outdated cargo-edit
+	  cargo-vet@0.10.0 cargo-outdated cargo-edit
 
 .PHONY: clean
 clean: ## Remove build output and the docs virtualenv

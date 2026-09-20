@@ -217,11 +217,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
+          # cargo-vet is pinned because the version that writes
+          # supply-chain/imports.lock has to be the version that reads it:
+          # 0.10.1 changed how the store is escaped, so a laptop one patch
+          # ahead reformats the file and the runner rejects it as a
+          # consistency error. `make tools` installs the same pin.
           # cargo-outdated is the one this action has no manifest for, so it
           # comes down through the cargo-binstall fallback rather than being
           # built here — a `cargo install` in this leg costs more than the
           # checks do.
-          tool: cargo-deny,cargo-machete,cargo-vet,cargo-outdated
+          tool: cargo-deny,cargo-machete,cargo-vet@0.10.0,cargo-outdated@0.19.0
       # Advisories, licences, duplicate versions, and the ban on new C-backed
       # crates that keeps zstd-sys the only one (see deny.toml); then every
       # crate in the lockfile having been looked at by somebody, and every
