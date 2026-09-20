@@ -23,7 +23,7 @@ name = "mira-operator"
 # to anyone debugging a cluster. `make version` writes it from an
 # `"@mira/operator"` changeset and `make drift` checks it — see
 # `operator_sites()` in crates/xtask/src/release.rs.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # kube 4.x floor. Deliberately not the engine's 1.88: a user compiling Mira is
 # not compiling this.

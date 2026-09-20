@@ -1,6 +1,6 @@
 # mira-operator
 
-![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.2.0](https://img.shields.io/badge/AppVersion-0.2.0-informational?style=flat-square)
+![Version: 0.3.0](https://img.shields.io/badge/Version-0.3.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.3.0](https://img.shields.io/badge/AppVersion-0.3.0-informational?style=flat-square)
 
 <!--
 Links to the repository listing, not to /packages/helm/mira/mira-operator —
@@ -49,7 +49,7 @@ engine already makes to the platform for pod identity and volume lifecycle.
 
 ```bash
 helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --namespace mira-system --create-namespace
 ```
 
@@ -63,13 +63,13 @@ first, or pull it out of the chart you are about to install:
 
 ```bash
 helm pull oci://ghcr.io/trianalab/charts/mira-operator \
-  --version 0.2.0 --untar
+  --version 0.3.0 --untar
 kubectl apply -f mira-operator/crds/miraclusters.yaml
 ```
 
 Not a `raw.githubusercontent.com` URL at a tag, which is the obvious thing to
 write and would 404: the chart is versioned independently of the engine and
-there is no `v0.2.0` tag on the repository. `helm
+there is no `v0.3.0` tag on the repository. `helm
 pull` also gets you the CRD from the exact artifact you are installing rather
 than from whatever the branch says today.
 
@@ -81,7 +81,7 @@ kind: MiraCluster
 metadata:
   name: telemetry
 spec:
-  image: ghcr.io/trianalab/mira:0.3.0
+  image: ghcr.io/trianalab/mira:0.4.0
   replicas: 1          # floor
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage:
@@ -203,7 +203,7 @@ cosign verify \
   --new-bundle-format=false \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'github.com/TrianaLab/mira/.github/workflows/release.yml' \
-  ghcr.io/trianalab/charts/mira-operator:0.2.0
+  ghcr.io/trianalab/charts/mira-operator:0.3.0
 ```
 
 ## Values
