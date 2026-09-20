@@ -9,6 +9,8 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-20
+
 ### Changed
 
 - **The README and the landing page open on the terminal UI, recorded.** One
@@ -646,7 +648,8 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/TrianaLab/mira/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/TrianaLab/mira/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/TrianaLab/mira/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/TrianaLab/mira/compare/v0.1.1...v0.2.0
