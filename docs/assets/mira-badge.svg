@@ -1,0 +1,10 @@
+<!-- The favicon, and only the favicon. The bare mark is right in the header, where
+     it sits on the page's own background at 24px; in a browser tab it is a thin
+     orange glyph on whatever colour the tab strip happens to be, and it disappears.
+     The badge is the same `m` reversed out of a rust tile, which is what the web UI
+     already ships as its own favicon — same geometry, same transform, so a tab from
+     miradb.dev and a tab from a running instance carry one icon rather than two.
+     Source of truth for the path is mira-mark.svg; the placement numbers centre the
+     skewed glyph in the 32-unit tile and are checked by eye, not derived.
+     Change here and in crates/mira/ui/index.html together. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Mira"><rect width="32" height="32" rx="7" fill="#F74C00"/><g transform="translate(7.141 2.559) scale(0.244)"><g transform="skewX(-8)"><path d="M10 80V46Q10 30 17 30H37Q44 30 44 46V80M44 46Q44 30 51 30H71Q78 30 78 46V80" fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/></g></g></svg>

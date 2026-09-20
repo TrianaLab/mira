@@ -237,6 +237,10 @@ the document — and re-runs every citation in `evidence` first, at `limit: 0`, 
 that no longer matches fails the call by name instead of shipping a count that aged out
 of retention.
 
+![A recorded terminal session: three claims go in, one does not hold, and the call
+fails naming it. Corrected, it renders a 59-line document carrying the record count
+beside every claim.](assets/tui/write-up.gif)
+
 ```json
 {"name":"render_rca","arguments":{
   "title":"Checkout 503s: a card decline mapped onto a retryable status",
@@ -296,9 +300,9 @@ The counts, the UTC window and that last line are Mira's, not the model's. `prev
 went through the parser that reads `alerts.kyaml` at boot, so the fence is a rule that
 will start.
 
-`"emit": true` also stores the document as a log record — `event_name: rca`,
-`service.name: mira` — so it is searchable afterwards with `{field: body, contains: …}`
-and expires with the telemetry it describes. There is no incident store to run.
+`"emit": true` stores the document as a log record — `event_name: rca`,
+`service.name: mira` — searchable with `{field: body, contains: …}` and expiring with
+the telemetry it describes. There is no incident store to run.
 
 ## Waking the loop from an alert
 

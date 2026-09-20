@@ -20,7 +20,10 @@ Point any OTLP exporter at gRPC `4317` or HTTP `4318`, open
 `http://localhost:4318/`, or point an agent at `POST /mcp`. The block directory
 is the only state there is.
 
-<img src="docs/assets/ui/trace.png" alt="A trace waterfall in Mira's web UI: eight nested spans over 76.08ms across frontend, inventory, checkout and payments, the five failed ones in red, with the query cost in the header — 8 matched of 30,720 scanned, 1 block, 47.5ms.">
+<img src="docs/assets/tui/investigation.gif" alt="A recording of Mira's terminal UI. The log list over the last hour; a filter typed live, severity_text=ERROR, narrowing 14,371 records to 824 in 7.3ms; the service map, where errors propagate frontend to checkout to payments while inventory stays clean; then the trace under the failure — eight spans over 76.08ms, with a retry and an exception marked on the timeline.">
+
+`mira mira`, recorded against a running node. Not a mock-up: the footers are
+that run's own query plans and wall clocks.
 
 ## The numbers
 
@@ -54,10 +57,24 @@ of them.
 | **MCP** | `POST /mcp` | Nine tools, no session id, so any replica answers any call. The ninth writes the RCA. |
 | **HTTP** | `/api/v1/…` | `query`, `correlate`, `map`, `entities`, `metrics`, `alerts`. |
 
+The ninth tool is the one to look at. An agent hands over its findings and gets
+back a root-cause document — but `render_rca` re-runs every citation against the
+store first, so a claim it cannot re-prove fails the call by name and nothing is
+written:
+
+<img src="docs/assets/tui/write-up.gif" alt="A recorded terminal session. An agent's three claims are listed, then render_rca refuses them: nothing was rendered and nothing was stored, 1 of 3 citations do not hold against this store, naming the claim and the filter that matched no records. The claim is corrected and the call returns a 59-line document whose evidence section carries the record count beside every claim — 229, 229, and 8 for the trace. A last query finds the write-up itself stored as a log record.">
+
+There is no incident store: `emit` writes the document back as an ordinary log
+record, so it is searchable by the same query path and expires with the
+telemetry it describes. The worked investigation behind it is in
+**[docs/agents.md](docs/agents.md)**.
+
 ## See it
 
 **[miradb.dev/demo](https://miradb.dev/demo/)** — one command, then six screens
 of both UIs, from data you generated a minute earlier.
+
+<img src="docs/assets/ui/trace.png" alt="The same trace in Mira's web UI: eight nested spans over 76.08ms across frontend, inventory, checkout and payments, the five failed ones in red, with the query cost in the header — 8 matched of 30,720 scanned, 1 block, 47.5ms.">
 
 ```sh
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
