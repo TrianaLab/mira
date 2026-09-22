@@ -1,6 +1,6 @@
 {
   "name": "@mira/engine",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Not a package. The engine's version line, in the one file `changeset version` knows how to write. Cargo.toml's [workspace.package] version is the source of truth; `make version` copies this number into it, and `make drift` fails while they disagree."
 }

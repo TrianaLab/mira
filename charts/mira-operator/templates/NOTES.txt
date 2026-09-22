@@ -13,7 +13,7 @@ It is watching for MiraCluster resources and has created nothing yet. Create one
     number, the two lines are deliberately uncoupled, and the tag it rendered
     had never been published. `make bump` rewrites this one — see
     version_sites() in crates/xtask/src/drift.rs. */}}
-    image: ghcr.io/trianalab/mira:0.4.1
+    image: ghcr.io/trianalab/mira:0.4.2
     replicas: 1
     maxReplicas: 5
     storage:
