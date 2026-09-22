@@ -3,7 +3,7 @@
 //! The syscall half only. ratatui draws every row (see `tui::rata`),
 //! but none of its backends are linked: `CrosstermBackend` would add crossterm,
 //! mio, signal-hook and parking_lot to do what is already here, on a tree whose
-//! size (148 crates, 6.20 MiB) is a stated property of the product. So
+//! size (149 crates, 6.20 MiB) is a stated property of the product. So
 //! `termios` for raw mode, `TIOCGWINSZ` for the size, `poll(2)` for input,
 //! three `sigaction`s to survive a resize and a `kill`, and `Term::draw` to put
 //! the rows on the screen. `libc` is already in the tree for `statfs`.
