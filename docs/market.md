@@ -92,7 +92,7 @@ are unpacked figures; the vendors' zips, tarballs and image layers all move
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 | --- | --- | --- | --- | --- |
-| **Mira** | **6.20 MiB** (arm64 macOS) | 1.0x | 148 crates | — |
+| **Mira** | **6.20 MiB** (arm64 macOS) | 1.0x | 149 crates | — |
 | VictoriaLogs 1.52 [^b1] | 16.26 MiB (amd64 Linux) | 2.6x | 98 Go packages | yes |
 | VictoriaLogs + Traces [^b1] | 32.44 MiB, two binaries | 5.2x | — | yes |
 | Grafana Tempo 3.0.3 [^b2] | 93.94 MiB (arm64 Linux) | 15.2x | 425 modules | yes |
@@ -104,7 +104,7 @@ are unpacked figures; the vendors' zips, tarballs and image layers all move
 | ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 24.8x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
-The dependency column is directional: VictoriaLogs' 98 against Mira's 148
+The dependency column is directional: VictoriaLogs' 98 against Mira's 149
 external crates is the same order, and it has one C dependency (`gozstd`) as
 Mira does.
 
@@ -169,7 +169,7 @@ peers who publish theirs at 10,000–20,000.
 **3. Pruned-query latency.** 2.56 ms for an attribute value in none of 137 blocks
 against VictoriaLogs at 266 ms over 300 GB.
 
-**4. Supply-chain surface.** 148 crates on `cargo tree --edges normal`;
+**4. Supply-chain surface.** 149 crates on `cargo tree --edges normal`;
 Parseable under the identical command is 462.
 
 ## Where Mira is not ahead
@@ -317,7 +317,7 @@ Each refusal with the sentence a user gets.
 | **Prometheus `remote_read`** | It would make Mira a dumb sample pipe streaming raw points to a Prometheus that evaluates locally — the worst possible shape for a columnar store, and it forfeits every pushdown the engine exists to do. |
 | **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no Resource, no Scope and no semconv; every synthesised series lands in the no-identity bucket. Keep the lossy hop outside Mira. |
 | **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | "There is one flag and it is an address: `--offload <uri>`." Now shipped, and still one flag: the period is `storage.retention`, because the block leaving the disk *is* the event, and there is no cache to size because reads never consult the store — `mira offload restore` is the whole retrieval path. Every competitor's tiering config is a documented foot-gun. |
-| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 148-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
+| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 149-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
 | **Per-record deletion (GDPR erasure)** | This one hurts: it breaks block immutability, which is what reader safety rests on. The answer is tenant-as-path-prefix so deletion stays an unlink of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
 | **SAML** | "Put an OIDC bridge in front of Mira." SAML needs a certificate and a metadata store; OIDC needs a JWKS fetch. |
 | **A Kubernetes operator / CRDs** | Was refused — "a controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile." Now shipped, because the refusal named the wrong subject: scaling the tier *in* has state — which replica is draining, whether its volume has been archived — and `mira-operator` is a separate binary holding it. Mira itself still coordinates nothing, and `spec.replicas` is a floor rather than a desired count, so the controller can permit a drain and never order one. |

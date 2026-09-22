@@ -14,7 +14,9 @@ the config keys, the `/mcp` tool set.
 - **The week's dependency bumps, landed as one.** Arrow 59.3 → 60.0 across the
   workspace pin — `arrow-select` included, which the bot's own PR left behind
   on 59.3 and which is exactly the two-majors-of-`RecordBatch` break the pin
-  exists to stop. With it come `arrow-cmp` and zstd 0.13 → 0.14. Also tonic,
+  exists to stop. With it come `arrow-cmp` and zstd 0.13 → 0.14, which takes
+  the dependency graph from 148 crates to 149 everywhere it is published. Also
+  tonic,
   tonic-prost and tonic-types 0.14.5 → 0.14.6, crc32fast 1.5.1 → 1.5.2, and
   the pinned action SHAs in CI, docs and release. Nothing in the on-disk
   format or the query surface moves; `supply-chain/config.toml` carries the
