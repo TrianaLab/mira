@@ -9,6 +9,8 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-22
+
 ### Changed
 
 - **The week's dependency bumps, landed as one.** Arrow 59.3 → 60.0 across the
@@ -661,7 +663,8 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/TrianaLab/mira/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/TrianaLab/mira/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/TrianaLab/mira/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/TrianaLab/mira/compare/v0.2.0...v0.3.0
