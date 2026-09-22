@@ -80,15 +80,15 @@ mira-proto = { package = "miradb-proto", path = "crates/mira-proto", version = "
 # Arrow. Pinned as one version across the workspace: arrow_array::RecordBatch
 # from two different major versions is two different types, and the error you
 # get is unreadable. See docs/architecture/workspace.md "Arrow version pin".
-arrow-array = "59.3"
-arrow-buffer = "59.3"
+arrow-array = "60.0"
+arrow-buffer = "60.0"
 # `zstd` for the cold tier (section 11). Hot blocks stay uncompressed so they can be
 # read out of the mapping with no copy; a compressed buffer has to be
 # decompressed into a fresh allocation, which is a trade only worth making once
 # a block has stopped being queried.
-arrow-ipc = { version = "59.3", default-features = false, features = ["zstd", "lz4"] }
-arrow-schema = "59.3"
-arrow-select = "59.3"
+arrow-ipc = { version = "60.0", default-features = false, features = ["zstd", "lz4"] }
+arrow-schema = "60.0"
+arrow-select = "60.0"
 
 prost = "0.14"
 # `gzip` because the OTLP spec makes it a MUST for every server component and

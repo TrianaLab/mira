@@ -57,27 +57,31 @@ version = "0.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-array]]
-version = "59.3.0"
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-buffer]]
-version = "59.3.0"
+version = "60.0.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.arrow-cmp]]
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-data]]
-version = "59.3.0"
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-ipc]]
-version = "59.3.0"
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-schema]]
-version = "59.3.0"
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.arrow-select]]
-version = "59.3.0"
+version = "60.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-trait]]
@@ -161,7 +165,7 @@ version = "0.1.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
-version = "1.5.1"
+version = "1.5.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling]]
@@ -410,18 +414,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
 version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.miradb]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.miradb-core]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.miradb-proto]]
-version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.multimap]]
@@ -709,11 +701,7 @@ version = "0.7.19"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic]]
-version = "0.14.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-build]]
-version = "0.14.5"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-build]]
@@ -721,11 +709,7 @@ version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-prost]]
-version = "0.14.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-prost-build]]
-version = "0.14.5"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-prost-build]]
@@ -733,7 +717,7 @@ version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-types]]
-version = "0.14.5"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower]]
@@ -917,11 +901,11 @@ version = "0.6.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.zstd]]
-version = "0.13.3"
+version = "0.14.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zstd-safe]]
-version = "7.3.0"
+version = "8.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zstd-sys]]
