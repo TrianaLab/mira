@@ -1,41 +1,41 @@
 ---
-description: Mira against Loki, Tempo, VictoriaLogs, Quickwit, ClickHouse, SigNoz and the SaaS vendors — six axes, four where Mira is ahead, seven where it is not.
+description: How Mira compares with Loki, Tempo, VictoriaLogs, Quickwit, ClickHouse, SigNoz and the paid services — four things it does better, eight it does not.
 ---
 
 # Market position
 
 **For:** anyone comparing Mira against something they already run.
 
-**How to read this.** Every competitor number is published by its vendor or a
-third party, on *their* hardware and *their* workload. Mira's own are
-single-machine measurements on one Apple M3 Pro (12 cores, 18 GiB), reproducible
-with [the load harness](internals/e2e.md#3-the-load-harness) and
-[the measurement contract](internals/measurement.md).
+Every competitor figure here was published by its vendor or by a third party, on
+their hardware and their workload. Mira's own were measured on one laptop — an
+Apple M3 Pro, 12 cores, 18 GiB — and you can re-run them with
+[the load harness](internals/e2e.md#3-the-load-harness);
+[the measurement contract](internals/measurement.md) says what each one counts.
 
-The `=` column says whether a claim can sit beside Mira's.
+The `=` column says whether a figure can honestly sit beside Mira's.
 <!-- BEGIN GENERATED: market-claim-tally -->
 Across the six tables that carry one there are 62 marked rows. 13 are Mira's own
 and take `—`; of the 49 competitor claims, **38 are `no`**, 10 are `yes` and one
 is `~`.
 <!-- END GENERATED: market-claim-tally -->
-The only fair reading of a row marked `no` is an ordering, not a ratio.
+A row marked `no` tells you which number is larger. It does not give you a ratio.
 
 ## Who else is in this space
 
-| Class | Who | The structural weakness — one that follows from a commitment they cannot reverse |
+| Class | Who | Where they are stuck — a weakness that follows from a choice they cannot undo |
 | --- | --- | --- |
-| **Composed OSS stack** | Grafana LGTM, kube-prometheus-stack | Loki's index is a label index; [its own docs](https://grafana.com/docs/loki/latest/get-started/labels/) concede it "was not designed to support high cardinality label values". The failure mode is an ingester OOM during an incident. Operationally, 20+ pods across three upgrade paths. |
-| **OTel-native single binary** | SigNoz, OpenObserve, Uptrace, ClickStack, Coroot, Dash0 | "Single binary" with ClickHouse or DataFusion + S3 inside — a real dependency and a real tuning surface. OpenObserve ships ~450 `ZO_*` environment variables while marketing simplicity. |
-| **Log specialists** | VictoriaLogs, Parseable, Quickwit | Genuinely fast and genuinely simple. Single-signal, non-OTLP-native data models, own DSLs. The hardest class to beat and the least worth attacking on tuning-free, which is parity. |
-| **Commercial SaaS** | Datadog, Honeycomb, New Relic, Dynatrace, Chronosphere, Grafana Cloud | Per-GB and per-host billing makes the customer's own cost control the product, and the agent surface is metered too. An agent that wants to fire 400 exploratory queries cannot afford to on any of them. |
+| **Composed OSS stack** | Grafana LGTM, kube-prometheus-stack | Loki's index is a label index; [its own docs](https://grafana.com/docs/loki/latest/get-started/labels/) concede it "was not designed to support high cardinality label values". The failure mode is an ingester running out of memory during an incident. Operationally, 20+ pods across three upgrade paths. |
+| **OTel-native single binary** | SigNoz, OpenObserve, Uptrace, ClickStack, Coroot, Dash0 | "Single binary" with ClickHouse or DataFusion and S3 inside — a real dependency and a real thing to tune. OpenObserve ships ~450 `ZO_*` environment variables while marketing simplicity. |
+| **Log specialists** | VictoriaLogs, Parseable, Quickwit | Genuinely fast and genuinely simple. One signal each, their own data model rather than OpenTelemetry's, their own query language. The hardest class to beat, and no use attacking on "nothing to tune": that one is a draw. |
+| **Commercial SaaS** | Datadog, Honeycomb, New Relic, Dynatrace, Chronosphere, Grafana Cloud | Billing per GB and per host makes your own cost control their product, and queries are metered too. An agent that wants to fire 400 exploratory queries cannot afford to on any of them. |
 | **Warehouse-backed** | ClickHouse direct, Databricks, Snowflake + OTel | General, and you own the schema, the ingestion, the retention and the query language. Mira should not contest the "we already have a data team" segment. |
 
 ## Ingest, one node
 
-Mira's row is a **consumed-CPU** measurement and most others are
-**provisioned-CPU** ones — a purchase order against a meter reading. Loki's 2.75
-and Quickwit's 2.2 [^q2] are the only figures of the same kind, and that run is
-unsaturated at 17% CPU.
+Mira's row counts the CPU the process actually burned. Almost every other row
+counts the CPU the machine was given, busy or not. Only Loki's 2.75 and
+Quickwit's 2.2 [^q2] are measured the way Mira's is, and that run sat at 17% CPU,
+so nothing in it was pushed to its limit.
 
 | Engine | Published | Their hardware | = | Reason |
 | --- | --- | --- | --- | --- |
@@ -57,10 +57,11 @@ unsaturated at 17% CPU.
 | Jaeger + Scylla [^j1] | ~8,000 spans/s | ~20 backend cores | no | backend only, nodes unstated |
 | Elastic APM [^ea] | 127,000 events/s | Elastic Cloud 32 GB | no | undefined events, no storage |
 
-On the basis the peers publish, 176.5 MiB/s across twelve provisioned cores is
-14.7 MiB/s per core, against Quickwit's 6.75 MB/s/vCPU [^q1] and Parseable's
-~8.3 MiB/s/vCPU [^p1]. On consumed CPU it is 100.9 MiB/s per core, which should
-not be quoted against these rows: only the [^q2] pair report utilisation.
+Counted the way the others count — 176.5 MiB/s spread over all twelve cores —
+Mira is 14.7 MiB/s per core, against Quickwit's 6.75 MB/s/vCPU [^q1] and
+Parseable's ~8.3 MiB/s/vCPU [^p1]. Per core actually used it is 100.9 MiB/s, and
+that figure should not be quoted against these rows: only the [^q2] pair say how
+busy their machines were.
 
 ## Resident set
 
@@ -68,27 +69,24 @@ not be quoted against these rows: only the [^q2] pair report utilisation.
 | --- | --- | --- | --- | --- |
 | **Mira** | **232 MiB peak** | 629k rec/s, whole process | — | ps-sampled, includes both UIs |
 | GreptimeDB 0.12 [^g2] | 408 MB | 20,000 rows/s, c5d.2xlarge | no | 18x lower offered rate |
-| ClickHouse [^v2] | 1.12 GiB | 10,000 spans/s, 4 vCPU | no | cgroup budget, capped rate |
-| VictoriaLogs [^v2] | 1.15 GiB | 10,000 spans/s, same box | no | cgroup budget, capped rate |
-| Grafana Tempo [^v2] | 4.26 GiB, then OOM | 10,000 spans/s, same box | no | cgroup budget, capped |
+| ClickHouse [^v2] | 1.12 GiB | 10,000 spans/s, 4 vCPU | no | memory limit, capped rate |
+| VictoriaLogs [^v2] | 1.15 GiB | 10,000 spans/s, same box | no | memory limit, capped rate |
+| Grafana Tempo [^v2] | 4.26 GiB, then OOM | 10,000 spans/s, same box | no | memory limit, capped |
 | Quickwit indexer [^q3] | 4.9 GB avg, 6.8 peak | c5.xlarge, 1 of 24 | no | heap knob, indexing only |
 | SigNoz stack [^s1] | ~6 GB | 55,000 logs/s, c6a.4xlarge | no | whole VM, several processes |
 | vlagent forwarder [^vl] | 27.91 MiB | 10,000 logs/s, 1-core cap | no | forwards, stores nothing |
 
-Every peer is measured inside a memory cgroup, so each is a budget partly
-consumed rather than a floor; Mira's is an uncapped laptop process. The
-load-bearing column is the rate.
-
-Every peer is measured inside a memory cgroup, so each number is a budget partly
-consumed; Mira's is an uncapped laptop process.
-RSS is **not flat in connection count**: the same process reaches 689 MiB at four
-connections and 1,648 MiB at ninety-six, above ClickHouse's 1.12 GiB.
+Every peer was measured inside a memory limit, so each figure is a budget partly
+spent rather than a floor; Mira's is a laptop process with no limit on it. The
+column that matters is the rate. And Mira's own memory grows with connections:
+the same process reaches 689 MiB at four and 1,648 MiB at ninety-six, above
+ClickHouse's 1.12 GiB.
 
 ## Artifact — stripped binary
 
-The one like-for-like axis: a byte count has no hardware and no workload. These
-are unpacked figures; the vendors' zips, tarballs and image layers all move
-**up**.
+The one fair comparison on the page: a byte count has no hardware and no workload
+behind it. These are unpacked sizes, and every vendor's zip, tarball and image
+layer is larger again.
 
 | Artifact | Stripped binary | vs Mira | Deps | = |
 | --- | --- | --- | --- | --- |
@@ -104,13 +102,12 @@ are unpacked figures; the vendors' zips, tarballs and image layers all move
 | ClickHouse 26.3 [^b8] | 153.80 MiB (arm64 macOS) | 24.8x | — | yes |
 | ClickStack all-in-one [^b9] | 486.67 MiB image (arm64) | — | 4 processes | no |
 
-The dependency column is directional: VictoriaLogs' 98 against Mira's 149
-external crates is the same order, and it has one C dependency (`gozstd`) as
-Mira does.
+Read the dependency column as a direction, not a score: VictoriaLogs' 98 against
+Mira's 149 is the same order, and it has one C dependency (`gozstd`) as Mira does.
 
 ## Compression
 
-Two denominators are in circulation and mixing them is the common error.
+Everyone divides by something different, and mixing the two is the usual mistake.
 
 | Engine | Ratio | Denominator | = |
 | --- | --- | --- | --- |
@@ -124,8 +121,8 @@ Two denominators are in circulation and mixing them is the common error.
 | Quickwit [^q4] | 3.7x | raw input bytes | no |
 | Elasticsearch LogsDB [^el] | 1.8x | Elasticsearch standard mode | no |
 
-The 2.14x row shares Mira's 0.14 B/B denominator, but it is a deliberately
-untuned ClickHouse schema run by a competitor: a floor, not a result.
+The 2.14x row divides by the same thing Mira's 0.14 B/B does, but it is a
+deliberately untuned ClickHouse schema run by a competitor: a floor, not a result.
 
 ## Query
 
@@ -160,108 +157,52 @@ Mira publishes no dollar figure, so there is no Mira row.
 
 ## Where Mira is ahead
 
-**1. Artifact size.** 6.20 MiB stripped, against 94–153 MiB for everything else
-surveyed.
-
-**2. Resident set at the operating point.** 232 MiB at 629,384 records/s against
-peers who publish theirs at 10,000–20,000.
-
-**3. Pruned-query latency.** 2.56 ms for an attribute value in none of 137 blocks
-against VictoriaLogs at 266 ms over 300 GB.
-
-**4. Supply-chain surface.** 149 crates on `cargo tree --edges normal`;
-Parseable under the identical command is 462.
+| | |
+| --- | --- |
+| **Size of the thing you install** | 6.20 MiB stripped; the artifact table above has everything else surveyed. |
+| **Memory at the working rate** | 232 MiB while taking 629,384 records/s. The peers publish theirs at 10,000 to 20,000 records/s. |
+| **Queries that can skip files** | 2.56 ms to show an attribute value is in none of 137 blocks, against VictoriaLogs at 266 ms over 300 GB. |
+| **Code you inherit** | 149 crates on `cargo tree --edges normal`; Parseable under the identical command is 462. |
 
 ## Where Mira is not ahead
 
-Seven rows, in two groups.
-
 ### Gaps with a cause and a path
 
-#### Ingest throughput
-
-1,350,502 records/s against GreptimeDB's 621,367. The curve used to fall to 55%
-of the four-connection rate by 96 connections, the cause being one flusher task
-*per signal*; sharded within a signal it **now holds 84.2% of that rate and
-73.9% of peak**, nothing shed, ack p99 2,661 ms against 55 ms at four. **The 26%
-fall from 32 to 96 connections that the table publishes did not reproduce on the
-day the diagnosis was measured: the fall was 5%.**
-
-#### What set the ceiling
-
-The write-ahead log's single mutex, held across the `write(2)`. **An earlier
-ceiling of 1.7 to 2.6 M records/s at any connection count, read off the largest
-term in that budget, is withdrawn**: a queue forms at whatever is slowest to
-*acquire*. Both fixes it named are rejected — one log per signal splits the sign
-on records/s, `wal.lock_wait` falling 0.63–0.795x while `wal.write` takes it back
-at 1.94x and 2.39x, and a RAM disk is worth **1.096x at thirty-two connections
-and 1.005x with signs split at ninety-six**. With the log free, `submit.admit` is
-92% of submit time: the constraint is block seal and publish.
-
-#### Query at scale
-
-The 175 ms over 24.0M rows, 137M rows/s this row used to carry **does not
-reproduce**. An unpruned scan is 885 ms steady over 27,066,368 rows and 1,441 ms
-on the first call after a restart, bound by whether the corpus fits page cache.
-**The 1.55x median once published for the checksum's share is withdrawn** in
-favour of a quarter to two fifths of the read path, and **the `series` slowdown
-reported here as a regression is withdrawn too**. Opening the root tables alone
-and the attribute tables on demand is **1.8x and 2.6x** against 0.0.3. When
-pruning does not fire Mira does not win.
+| Gap | Where it stands |
+| --- | --- |
+| **Ingest throughput** | 1,350,502 records/s against GreptimeDB's 621,367, and the rate used to sag as connections piled up, because one task flushed each signal: by ninety-six connections it was down to just over half the four-connection rate. Split within a signal, it now holds 84.2% of the four-connection rate and 73.9% of peak at ninety-six connections, nothing shed, acknowledgements at p99 2,661 ms against 55 ms at four. The 26% fall from 32 to 96 connections in the table above did not reproduce on the day the cause was measured: that day it was 5%. |
+| **What sets the ceiling** | One lock on the write-ahead log, held while the log writes. Both obvious fixes are rejected: a log per signal moves the wait onto the device — time spent waiting for the lock falls to 0.63–0.795x while time spent writing climbs 1.94x and 2.39x — and its own records/s came back with the repeated runs disagreeing about which way it went, so no throughput figure from it would be honest; and a RAM disk is worth 1.096x at thirty-two connections and 1.005x at ninety-six, where again the runs disagreed about the direction. With the log out of the way, 92% of the time between a batch arriving and its acknowledgement goes on waiting for room to put it, so what actually limits it is sealing and publishing a block. |
+| **Queries that cannot skip files** | A scan of everything is 885 ms over 27,066,368 rows once warm, and 1,441 ms on the first call after a restart, depending on whether the data still sits in the operating system's file cache. Opening the main tables up front and the attribute tables only when a query asks for them is 1.8x and 2.6x faster than 0.0.3. When Mira cannot skip files, it does not win. |
 
 ### Gaps that are what the design costs
 
-#### Compression, on the denominator everyone else publishes
+| Gap | Where it stands |
+| --- | --- |
+| **Compression, on everyone else's denominator** | 8.8x on logs and 7.9x on traces against ClickHouse's 14.1x and VictoriaLogs' 11.2x. Rows are compressed in the order they arrive; ClickHouse sorts first, which hands its compressor long runs of one value. Every sort key tried here came out at or below the unsorted ratio. |
+| **Full-text search** | There is none, so no row against Quickwit's 0.6 s word search over 212 GB. The reader Mira is built for arrives with a structured guess to narrow on, not a word to rank. |
+| **Running across machines** | A node answers only from its own files, and nothing is copied to a second node: lose a node and you lose its data. Cold data has a way out — `--offload <uri>` copies a sealed file to an object store before retention deletes it, and the store's own listing is the catalogue: 14.2 s to upload 3.35 GiB, a median 16.6 s to fetch it back [^m4]. Hot data has `mira proxy`, which merges reads across nodes and keeps nothing itself. Its cost is measured and the case for it is not: ingest through it runs at 0.767x a single node at four connections, and a wide unfiltered read takes 3.89x as long [^m5]. The [operator](install.md#kubernetes) adds a replica when the fullest one runs out of room and archives a drained one on the way out — room to grow, not redundancy. Nothing moves data that is already written. |
+| **Cost per GB** | No measured dollar figure, only bytes on disk. Quickwit's $8.4 per ingested TB per month is out of reach for anything serving reads off local disk, where the gp3 figure is ~$29.2. That gap is object storage, not tuning. |
+| **Acknowledgement latency with the log off** | p50 657 ms, p99 2.6 s, spent waiting for a block to be sealed. Nobody else publishes an acknowledgement latency, and it is why the write-ahead log is [on by default](config.md#ingestwal): with it on, p50 8.5 ms and p99 55 ms at four connections. |
 
-Mira is 8.8x on logs and 7.9x on traces against ClickHouse's 14.1x and
-VictoriaLogs' 11.2x. Rows land and compress in arrival order, where ClickHouse's
-`ORDER BY` hands its codec long runs of one value; every sort key tried came out
-at or below the unsorted ratio.
+### Numbers this page has withdrawn
 
-#### Full-text search
+Five figures this page once carried are gone, so anyone who remembers one can
+see what happened to it.
 
-No inverted index, so no term query and no row: Quickwit's 0.6 s term across
-212 GB has no Mira counterpart. An agent arrives with a structured hypothesis to
-prune with, not a word to rank.
-
-#### Horizontal scale
-
-A storage node answers only from its own blocks, and the replication factor is
-one.
-
-The cold half is closed: `--offload <uri>` copies a sealed block to an object
-store before retention unlinks it, so the store's list API is the catalogue:
-14.2 s to upload 3.35 GiB, a median 16.6 s to restore [^m4]. **An earlier claim
-that the two directions agreed within 6% is withdrawn.**
-
-The hot half is `mira proxy`, a stateless merging proxy whose cost is measured
-and whose case is not: ingest through it runs at **0.767x** the single node at
-four connections and a wide unfiltered read costs **3.89x** its `elapsed_us`
-[^m5].
-
-The [operator](install.md#kubernetes) adds a replica when the fullest one runs
-out of room and archives a drained one on the way out. That is elasticity, not
-redundancy: the first sentence of this row still stands, nothing rebalances what
-is already written, and a lost node is lost blocks.
-
-#### Cost per GB
-
-No measured dollar figure, only bytes on disk. Quickwit's $8.4 per ingested TB
-per month is unreachable for any engine *serving reads* off local block storage,
-where the gp3 figure is ~$29.2: object storage, not tuning.
-
-#### Ack latency with the log off
-
-p50 657 ms, p99 2.6 s, block-seal-bound. Nobody else publishes an ack latency,
-but it is why the write-ahead log is [the default](config.md#ingestwal): with it
-on, p50 8.5 ms and p99 55 ms at four connections.
+| Withdrawn | Why |
+| --- | --- |
+| A ceiling of 1.7 to 2.6 M records/s at any connection count | Read off the largest term in the log's time budget. Put the log on a RAM disk and the queue re-forms on admission instead, so that arithmetic was never the ceiling. |
+| 175 ms over 24.0M rows, 137M rows/s, for a scan of everything | Does not reproduce. The 885 ms row in the query table above is the current figure. |
+| A 1.55x median for the checksum cache's share of the read path | The per-pass readings spread far too wide to support one median, and the cache and the loading of attribute tables on demand cannot be separated by this harness. |
+| A `series` slowdown, reported here as a regression | The metrics query code is byte-identical across the change and the two binaries differ in both directions. What moved was the mix of queries, not the route. |
+| Upload and restore "agreeing within 6%" | Two samples agreeing by luck. Restore ranges 176.1 to 268.5 MiB/s across three runs; the 16.6 s above is the median of them. |
 
 ## Claims rejected
 
-Rejected does not mean wrong: the claim cannot sit in a row without misleading
-someone.
+Rejected does not mean wrong. It means the claim cannot sit in a row without
+misleading someone.
 
-**Vendor scale claims with no methodology.**
+**Vendor scale claims with no method behind them.**
 
 | Claim | Why it cannot sit in a row |
 | --- | --- |
@@ -296,31 +237,31 @@ someone.
 | TrueFoundry's Loki [^v1] | Reported at "4 vCPUs (100% throttled)" against a 65 MB/s generator, so the two systems did not store the same bytes. |
 | Elastic's own 220,000 docs/s [^e1] | Pure indexing, zero query load; the same post drops to 173,000 under 1,000 ops/s of search. |
 
-**Wrong artifact.** Rejected as published, corrected and kept: Loki's zip is
-40.6 MiB against a 138.34 MiB binary, and every correction moves the number away
-from Mira.
+**Wrong artifact.** Loki publishes a 40.6 MiB zip and the binary inside it is
+138.34 MiB. Figures like that are corrected and kept, and every correction so far
+has made the competitor's number larger, not smaller.
 
 ## Where the line is
 
-Each refusal with the sentence a user gets.
+What Mira will not do, and the answer you get when you ask for it.
 
 | Refused | What the user is told |
 | --- | --- |
-| **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the query surface is a closed set of operations with no parser, planner or optimiser, and that is the only thing bounding the schedule against DataFusion. **The day SQL is promised, DataFusion becomes the correct choice.** |
+| **SQL** | "Read the blocks with pyarrow or polars, and hand the table to DuckDB." Load-bearing, not stylistic: the read surface is a closed set of operations with no parser, planner or optimiser, and that closedness is the only thing keeping DataFusion out. **The day SQL is promised, DataFusion becomes the correct choice.** |
 | **DataFusion** | 47 direct dependencies, ~1.5M SLoC transitive, 50.0 MiB binary, against 6.20 MiB. |
-| **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." A replication factor above one requires a placement decision, and placement *is* coordination state. |
-| **Separation of storage and compute** | Needs a scheduler, a metadata service and membership. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
-| **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard must survive a restart and agree across replicas, which is exactly the coordination state principle 4 refuses — and it would be the first mutable row in the system. |
-| **A Grafana datasource plugin** | "Install nothing. Mira ships the UI, and `POST /api/v1/query` is the whole read surface." A signed plugin is a second artifact in a second language with a third-party review and a signing subscription, and there is no version of that where "one binary" is literally true. Nor is there a plugin-free route: Mira serves no Loki `query_range` and no Tempo `/api/traces`, so the built-in datasources have nothing to point at, and adding those two APIs would be two more query dialects on a surface whose closedness is the thing bounding it against DataFusion — the SQL row above. |
+| **Replication of your data** | "A lost disk is lost data for that node's share. Export to two replicas from your Collector." Keeping a second copy means deciding where it lives, and that decision is state the nodes would have to agree on. |
+| **Separation of storage and compute** | Needs a scheduler, a metadata service and a membership list. Scale by adding independent replicas behind an L4 balancer; retention is the rebalancer. |
+| **Stored dashboards, saved views, user preferences** | "The link *is* the saved view; curated dashboards are files you commit." A saved dashboard has to survive a restart and agree across replicas — exactly the shared state principle 4 refuses — and it would be the first thing in the system that changes after it is written. |
+| **A Grafana datasource plugin** | "Install nothing. Mira ships the UI." A signed plugin is a second artifact in a second language, with a third-party review and a signing subscription, and no version of that leaves "one binary" literally true. Nor is there a plugin-free route: Mira serves no Loki `query_range` and no Tempo `/api/traces`, so the built-in datasources have nothing to point at, and adding them would put two more query dialects on the surface whose smallness is what keeps DataFusion out. |
 | **Ingest-side shaping: drop rules, sampling, transforms** | "Shaping belongs in the Collector, and here is a reference `otelcol` config." Shaping rules are a filter graph and the Collector already is one. The buyer's real question is "who is costing me money", which is cost *attribution*, not a quota. |
 | **Loki's cardinality guards** (`max_streams_per_user`, `max_label_names_per_series: 15`) | "Those exist to protect Loki's index. Mira has no such index." Refusing them is a feature claim, not a gap. |
-| **Prometheus `remote_read`** | It would make Mira a dumb sample pipe streaming raw points to a Prometheus that evaluates locally — the worst possible shape for a columnar store, and it forfeits every pushdown the engine exists to do. |
-| **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no Resource, no Scope and no semconv; every synthesised series lands in the no-identity bucket. Keep the lossy hop outside Mira. |
-| **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | "There is one flag and it is an address: `--offload <uri>`." Now shipped, and still one flag: the period is `storage.retention`, because the block leaving the disk *is* the event, and there is no cache to size because reads never consult the store — `mira offload restore` is the whole retrieval path. Every competitor's tiering config is a documented foot-gun. |
-| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 149-crate graph this page publishes, and that count is a product property. A bad scheme is refused at startup, not at the first sweep. |
-| **Per-record deletion (GDPR erasure)** | This one hurts: it breaks block immutability, which is what reader safety rests on. The answer is tenant-as-path-prefix so deletion stays an unlink of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
+| **Prometheus `remote_read`** | It would make Mira a dumb sample pipe, streaming raw points to a Prometheus that does the work itself — the worst possible shape for a columnar store, and it throws away every filter the engine exists to apply before reading. |
+| **Prometheus `remote_write` receiver** | "Run the Collector's `prometheusreceiver` and export OTLP." Flat label sets carry no resource, no scope and no OpenTelemetry conventions, so every series they make lands with no identity attached. Keep the lossy hop outside Mira. |
+| **Tiering knobs** (`offloadPeriod`, cache path, cache size, eviction policy) | "There is one flag and it is an address: `--offload <uri>`." Shipped, and still one flag: the period is `storage.retention`, because the block leaving the disk *is* the event, and there is no cache to size because reads never consult the object store — `mira offload restore` is the whole retrieval path. Every competitor's tiering config is a documented foot-gun. |
+| **`s3://`, and every other scheme** | "Mount the bucket. Everything after `file://` is a path, so `file:///srv/cold` and a mounted bucket are the same thing." Signing a request needs HMAC-SHA256 and reading a listing needs an XML parser; neither is in the 149-crate graph this page publishes, and that count is a product property. A scheme Mira does not know is refused at startup, not at the first sweep. |
+| **Per-record deletion (GDPR erasure)** | This one hurts: it would mean rewriting a sealed file, and readers are safe only because sealed files never change. The answer is a directory per tenant, so deletion stays the removal of whole directories, plus short retention. Regulated buyers should be told no explicitly rather than find out at audit. |
 | **SAML** | "Put an OIDC bridge in front of Mira." SAML needs a certificate and a metadata store; OIDC needs a JWKS fetch. |
-| **A Kubernetes operator / CRDs** | Was refused — "a controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile." Now shipped, because the refusal named the wrong subject: scaling the tier *in* has state — which replica is draining, whether its volume has been archived — and `mira-operator` is a separate binary holding it. Mira itself still coordinates nothing, and `spec.replicas` is a floor rather than a desired count, so the controller can permit a drain and never order one. |
+| **A Kubernetes operator / CRDs** | Was refused — "a controller reconciling a stateless single binary is a second process managing a thing with no state to reconcile." Now shipped, because the refusal named the wrong subject: scaling *in* has state — which replica is draining, whether its volume has been archived — and `mira-operator` is a separate binary holding it. Mira itself still coordinates nothing, and `spec.replicas` is a floor rather than a desired count, so the controller can permit a drain and never order one. |
 | **Iceberg / a catalog** | Catalog, manifests and snapshots are coordination state and a second product. Parquet *export* is revisited when someone names Athena or Trino with a workload attached; it costs ~20 crates. |
 | **Profiles as a fourth signal** | Deferred, not refused, and the gate is external: the signal is Alpha and the proto is still removing fields. No placeholder table in the schema. |
 

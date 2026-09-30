@@ -1,19 +1,25 @@
 ---
-description: Point an agent at Mira over MCP — client configuration, the nine tools, a worked root-cause investigation from a firing alert to the failing dependency, and the RCA it writes at the end.
+# `4.7 ms` and `27.1M` in "The failing hop" are pinned in measurements.kyaml —
+# grep this path there before touching them or the words around them.
+description: Point an AI agent at your logs, traces and metrics. How to connect one, the nine things it can ask for, and a worked investigation that ends in a written root-cause report with every piece of cited evidence re-run.
 ---
 
 # Connect an agent
 
-**For:** anyone wiring an LLM agent to their telemetry — Claude Code, Cursor, or
-something they wrote themselves.
+**For:** anyone pointing an LLM agent at their telemetry — Claude Code, Cursor,
+or their own.
 
-Mira speaks the [Model Context Protocol](https://modelcontextprotocol.io) natively on
-`POST /mcp`, on the same port as the UI and the query API. There is no gateway to run, no
-exporter to configure and no second read path: eight of the nine tools are the eight
-questions the browser UI asks, over the same code. The ninth writes the RCA.
+Give an agent one URL and it can search your logs and spans, pull a whole trace,
+read a metric, see which service calls which, and check what your alerts are
+doing. At the end it can write the incident up, and Mira re-runs every piece of
+cited evidence in that write-up against the stored data before it hands it back.
 
-Everything below assumes a Mira with data in it. `make demo` gives you one in a single
-command — 45 minutes of a four-service shop, one of which is failing.
+Mira serves these as [Model Context Protocol](https://modelcontextprotocol.io)
+tools on `POST /mcp`, the same port as the UI and the query API. Nothing else to
+install or run.
+
+Everything below assumes a Mira with data in it. `make demo` gives you one in a
+single command: 45 minutes of a four-service shop, one of which is failing.
 
 ## Wire it up
 
@@ -43,13 +49,13 @@ command — 45 minutes of a four-service shop, one of which is failing.
       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
     ```
 
-**No session id.** Streamable HTTP lets a server issue an `Mcp-Session-Id` and require it
-on every later request; Mira issues none. Every request carries everything it needs, so
-any replica can answer any call, a load balancer needs no affinity, and killing a replica
-mid-conversation loses nothing.
+**Nothing to set up first.** Streamable HTTP lets a server issue an
+`Mcp-Session-Id` and require it on every later request; Mira issues none. Every
+request carries all it needs, so any copy of Mira can answer any call, a load
+balancer needs no stickiness, and killing one mid-conversation loses nothing.
 
-**No authentication either** — see the [security policy](security.md).
-Bind it to localhost for a local agent, and put a proxy or a network policy in front of
+**No authentication** — see the [security policy](security.md). Bind it to
+localhost for a local agent and put a proxy or a network policy in front of
 anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 
 ## The nine tools
@@ -66,37 +72,35 @@ anything else. `--http 127.0.0.1:4318` is the whole of the local case.
 | `list_alerts` | every rule this node evaluates, and what it is doing now |
 | `render_rca` | the findings, as a root-cause analysis in markdown ([section 15](architecture/rca.md)) |
 
-None of them writes to anything but Mira, and there is no tenth that changes a
-cluster — see [architecture section 14.6](architecture/kubernetes-context.md#146-read-only-and-not-by-omission)
-for why that is a decision rather than a gap.
+Eight of them are the questions the browser UI asks, over the same code. The
+ninth writes the report.
+
+None of them changes anything outside Mira, and there is no tenth that restarts
+a pod or edits a cluster. That is a decision, not a gap:
+[architecture section 14.6](architecture/kubernetes-context.md#146-read-only-and-not-by-omission).
 
 With the operator's [cluster-event export](install.md#cluster-context) on, an
-`OOMKilled` is a log record carrying that pod's `k8s.pod.uid` — so it answers the
-same `query_records`, in the `correlate` frame of the spans that stopped.
+`OOMKilled` arrives as an ordinary log record carrying the dead pod's
+`k8s.pod.uid` — so `query_records` finds it, beside the spans that stopped.
 
-Three properties matter more than the list:
+Three things matter more than the list:
 
-- **Arguments are validated, not guessed.** A top-level key the tool does not implement
-  is refused *by name*. `{"signal":"logs","filters":[…]}` comes back as an error naming
-  `filters`, not as a confident answer over the unfiltered window.
-- **A tool that cannot answer returns `isError` inside a 200.** "No rows for that service"
-  and "malformed request" are different facts, and a model that receives both as a
-  transport failure learns nothing from either.
-- **Every field of every answer is an input to another call.** A trace id goes to
-  `get_trace`, a service name goes to `query_records` as `{attr: service.name, eq: …}`,
-  and `from`/`to` go to anything. `truncated: true` means the answer is a sample and the
-  model should narrow rather than conclude.
+| | |
+| --- | --- |
+| **A wrong argument is refused by name** | Send a key a tool does not support and the error names it. You never get a confident answer over the wrong window instead. |
+| **"Nothing matched" and "bad request" stay apart** | A tool that cannot answer says so with `isError` in the body of a `200`. A model that saw both as a network failure would learn nothing from either. |
+| **Every field you get back is an input to the next call** | Trace ids go to `get_trace`, a service name goes to `query_records` as `{attr: service.name, eq: …}`, and `from`/`to` go anywhere. `truncated: true` means you have a sample, so narrow rather than conclude. |
 
-Every response that scans blocks also carries `stats` — `blocks_total`,
-`blocks_scanned`, `rows_scanned`, `rows_matched`, `elapsed_us`. That is the agent's own
-cost signal: `rows_matched` above `limit` means it is looking at a page, and
-`blocks_scanned` well below `blocks_total` means the pruning did its job. `list_alerts`
-is the one tool without it, because it reads in-memory rule state and scans nothing.
+Every answer that reads files also carries `stats`: files on disk
+(`blocks_total`), files opened (`blocks_scanned`), rows read (`rows_scanned`),
+rows matched (`rows_matched`), microseconds (`elapsed_us`). That is the agent's own cost signal, and
+how it knows it is on the first page of something much bigger. `list_alerts` is
+the exception — it reads rule state from memory and opens nothing.
 
 ## A root-cause investigation, end to end
 
-The wiring above, a Mira holding `make demo`, and one prompt. No system prompt, no tool
-list in the question, nothing else in the project directory.
+The wiring above, a Mira holding `make demo`, and one prompt. No system prompt,
+no tool list in the question, nothing else in the project directory.
 
 ```console
 $ claude -p "Checkout is throwing 503s. Use the mira MCP server to find the root
@@ -104,8 +108,8 @@ $ claude -p "Checkout is throwing 503s. Use the mira MCP server to find the root
   failing operation and the exception behind it. Show me the trace id you used."
 ```
 
-Seven calls and 136 ms of query time, inside 40 s of wall clock — the rest is the model
-reading. Below is that session, abridged to the calls and what it said between them.
+Seven calls and 136 ms of query time, inside 40 s of wall clock — the rest is
+the model reading. Here is that session, cut down to the calls.
 
 ### 1. Start where the alert is
 
@@ -123,10 +127,10 @@ reading. Below is that session, abridged to the calls and what it said between t
 > Two alerts of interest: `shop-error-rate` (pending, 5.4% error) and `card-declines`
 > (firing). Digging into the error spans.
 
-`state` is `ok`, `pending` (breaching, but not yet for `for_nano`) or `firing`, and
-`filter` is the rule's own query — the search the threshold was counting, so the model
-copies it instead of inventing one. `link` opens the same records in the UI, which is
-what to hand a human at the end.
+`state` is `ok`, `pending` (over the line, but not for long enough yet) or
+`firing`. `filter` is the rule's own search — the one the threshold was
+counting, so the model copies it instead of inventing one. `link` opens the same
+records in the UI, which is what to hand a human at the end.
 
 ### 2. Two questions in one turn
 
@@ -143,11 +147,11 @@ what to hand a human at the end.
           {"name":"inventory","spans":1223,"errors":0}]}
 ```
 
-Both at once, because no call depends on a session the other opened. `field` is a column
-of the record — `status_code`, `severity_number`, `duration_nano`; `attr` searches the
-record, resource and scope levels together, so the model need not know where the SDK put
-`service.name`. Errors run down one path and stop: `inventory` takes the same 1,223 calls
-with none.
+Both at once, because neither call depends on the other. `field` is a column of
+the record — `status_code`, `severity_number`, `duration_nano`. `attr` searches
+every level at once, so the model need not know which level `service.name` was
+set at. The errors run down one path and stop: `inventory` takes the
+same 1,223 calls with none.
 
 ### 3. The failing hop, and the exception under it
 
@@ -165,10 +169,11 @@ with none.
    "exception.stacktrace":"payments/authorize.go:118 Authorize\npayments/handler.go:64  (*Server).Pay"}}]}
 ```
 
-Eight spans in 6.4 ms, `parent_span_id` linking them into a tree. `get_trace` rather than
-`query_records` with a trace-id filter: blocks carry a trace-id index and this is the call
-that uses it — 4.7 ms against 27.1M spans in [the query benchmark](market.md#query),
-because the cost is the blocks the Bloom sidecar could not rule out.
+Eight spans in 6.4 ms, each naming its parent, so they arrive as a tree.
+`get_trace` rather than a trace-id filter on `query_records`: every file carries
+a trace-id index and this is the call that uses it —
+4.7 ms against 27.1M spans in [the query benchmark](market.md#query), because
+almost every file can be skipped without opening it.
 
 ### 4. A wrong turn, and the field that corrects it
 
@@ -184,9 +189,10 @@ because the cost is the blocks the Bloom sidecar could not rule out.
 
 > Correlate was too broad. Narrowing to payments error logs.
 
-Every payments log, not the failing ones: 17,214 rows and a frame of a thousand traces.
-`truncated: true` says that is a sample rather than the answer, and the model narrowed on
-it — which is the whole reason the field is there.
+That asked for every payments log, not the failing ones: 17,214 rows and a
+thousand traces around them. `truncated: true` said it was a sample rather than
+the answer, and the model narrowed on it. That is the whole reason the field is
+there.
 
 ### 5. The service's own words, then the falsification
 
@@ -199,9 +205,9 @@ it — which is the whole reason the field is there.
            {"attr":"exception.type","ne":"payments.CardDeclined"}]}}
 ```
 
-93 error logs in 1.0 ms, and then zero rows in 3.2 ms: no payments error carries any other
-exception type. One failure mode, established by asking for the counter-example rather
-than by reading five rows that agreed.
+93 error logs in 1.0 ms, then zero rows in 3.2 ms: no payments error carries any
+other exception type. One failure mode, settled by asking for the
+counter-example instead of reading five rows that agreed.
 
 ### The answer
 
@@ -226,16 +232,19 @@ Fix is in payments' error mapping, not in checkout: return 402 for CardDeclined
 so the retry layers stop treating it as retryable.
 ```
 
-Nothing in the prompt named a service, a tool or a field. The retry event and the span
-link are OTLP structures Mira stores rather than flattens, which is why they were still
-there to be read.
+Nothing in the prompt named a service, a tool or a field. The retry event and
+the span link survived because Mira stores what your service sent, whole, rather than
+flattening it into rows.
 
 ## The write-up
 
-The investigation above is findings in a model's context. `render_rca` turns them into
-the document — and re-runs every citation in `evidence` first, at `limit: 0`, so a claim
-that no longer matches fails the call by name instead of shipping a count that aged out
-of retention.
+So far the findings only exist in the model's context. `render_rca` turns them
+into a document, and first re-runs every query in `evidence` at `limit: 0` —
+counting the rows without reading any, so writing the report never re-reads the
+corpus. A claim that no longer holds fails the call by name rather than
+shipping a count that aged out of retention. Only the citations are re-run —
+anything you cannot back with a query belongs in `root_cause` or
+`contributing`, which Mira takes as written.
 
 ![A recorded terminal session: three claims go in, one does not hold, and the call
 fails naming it. Corrected, it renders a 59-line document carrying the record count
@@ -261,8 +270,8 @@ beside every claim.](assets/tui/write-up.gif)
   "emit":true}}
 ```
 
-`summary`, `impact`, `timeline` and `verification` take the rest of it. Back comes
-markdown, with the record count beside every claim:
+`summary`, `impact`, `timeline` and `verification` take the rest of it. Back
+comes markdown, with the record count beside every claim:
 
 ```markdown
 *2026-09-20T08:50:08Z → 2026-09-20T09:35:08Z (45m00s). Written by an agent against
@@ -296,19 +305,20 @@ The rule that would have caught this, ready for `alerts.kyaml` — add your own
         "severity": "warning"
 ```
 
-The counts, the UTC window and that last line are Mira's, not the model's. `prevention`
-went through the parser that reads `alerts.kyaml` at boot, so the fence is a rule that
-will start.
+The counts, the UTC window and that last line are Mira's, not the model's. The
+alert rule went through the same parser that reads `alerts.kyaml` at boot, so it
+is a rule that will start.
 
-`"emit": true` stores the document as a log record — `event_name: rca`,
-`service.name: mira` — searchable with `{field: body, contains: …}` and expiring with
-the telemetry it describes. There is no incident store to run.
+`"emit": true` stores the document as an ordinary log record — `event_name:
+rca`, `service.name: mira`. You search for it with `{field: body, contains: …}`
+like anything else, and it expires with the telemetry it describes. There is no
+incident database to run.
 
 ## Waking the loop from an alert
 
-Mira's alerting is static KYAML rules evaluated in-process
-([Configuration](config.md)). A `json` target POSTs the rule's whole state, which is
-enough to start an investigation without a first query:
+Mira evaluates static alert rules itself, from KYAML
+([Configuration](config.md)). A `json` target POSTs the rule's whole state, which
+is enough for an agent to start without a first query:
 
 ```json
 {"rule":"card-declines","state":"firing","severity":"warning",
@@ -324,21 +334,21 @@ notify: [
 ]
 ```
 
-`state` is `firing` or `resolved`, so the same endpoint closes the loop it opened. There
-is no retry: a webhook that is down stays down for longer than the evaluation period, and
-the state machine re-pages on the next transition anyway.
+`state` is `firing` or `resolved`, so the same endpoint closes the loop it
+opened. There is no retry: a webhook that is down stays down for longer than the
+evaluation period, and the next state change pages again anyway.
 
 ## No server at all
 
-An agent running beside the data does not need the protocol. The block directory is the
-whole of Mira's state, blocks are immutable once published, and the reader is a library —
-so a second process can map the same directory read-only while the writer keeps writing:
+An agent sitting beside the data does not need the protocol. Mira keeps nothing
+but the directory of files you gave it, and the files it queries are never
+edited once written — so a second process can map the same directory read-only
+while the first keeps writing to it:
 
 ```sh
 mira mira --data-dir ./data     # the same views, no server, no port, no serialisation
 ```
 
-That is [architecture section 8.4](architecture/read-surfaces.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free),
-and it is why the co-located case is a different primitive from a managed backend rather
-than a cheaper one. Sandbox, edge node or the pod next door: if the agent can see the
-directory, it can read the memory.
+Sandbox, edge node, or the pod next door: if the agent can see the directory, it
+can read the data. That is
+[architecture section 8.4](architecture/read-surfaces.md#84-the-in-process-read-path-and-why-a-local-agent-gets-it-for-free).

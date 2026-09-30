@@ -1,5 +1,5 @@
 ---
-description: One command from a fresh clone to a UI full of realistic telemetry, then the manual path — run Mira, fill it, and read it back over the query API, the browser UI, the terminal UI and MCP.
+description: Get data into Mira and read it back. One command for a demo with realistic data, then the manual path — run it, fill it, and query it from curl, a browser, your terminal or an AI agent.
 ---
 
 # Quickstart
@@ -13,11 +13,14 @@ description: One command from a fresh clone to a UI full of realistic telemetry,
 make demo
 ```
 
-Builds the binary and the generator, starts Mira on a scratch directory, lays
-down 45 minutes of backdated telemetry for a four-service shop, waits for the
-first block of each signal to seal, and prints where to look. Ctrl-C stops it;
-`make demo-clean` deletes the directory. No Docker, no second terminal, nothing
-to install beyond a Rust toolchain. [See it work](demo.md) is what comes out.
+It builds Mira and the data generator, starts Mira on a scratch directory,
+writes 45 minutes of backdated telemetry for a shop with four services, waits
+for the first block of each signal — logs, traces and metrics — to seal, and
+prints where to look. Mira stores data as blocks: sealed files it never
+rewrites. Ctrl-C stops it; `make demo-clean` deletes the directory.
+You need a Rust toolchain and nothing else — no Docker, no second terminal.
+[See it work](demo.md) is what comes out.
+
 The rest of this page is the manual path: your own data, and the query API.
 
 ## Run it
@@ -26,35 +29,35 @@ The rest of this page is the manual path: your own data, and the query API.
 mira --data-dir ./data
 ```
 
-That is the whole configuration. OTLP/gRPC on `4317`, OTLP/HTTP on `4318`, and
-`4318` also serves the query API, MCP and the UI. Point any OTLP exporter at it
-— protobuf or JSON, plain or gzipped. There is no Mira-specific collector
-component.
+That is the whole configuration. It accepts OpenTelemetry on `4317` over gRPC
+and on `4318` over HTTP, and `4318` also serves the query API, the browser UI
+and the agent tools. Point any OpenTelemetry exporter at it — protobuf or JSON,
+plain or gzipped. There is nothing Mira-specific to add to your collector.
 
 ```text
---data-dir PATH            where blocks go            (./mira-data)
+--data-dir PATH            where the blocks go        (./mira-data)
 --grpc ADDR --http ADDR    listen addresses           (0.0.0.0:4317 / :4318)
---retention DURATION       TTL: 7d, 12h, 30m, 500ms   (7d)
---node NAME                this replica's identity    (mira)
+--retention DURATION       how long to keep data      (7d; 12h, 30m, 500ms)
+--node NAME                this copy's identity       (mira)
 --alerts FILE              alert rules; off if unset
---config FILE              KYAML; flags override it
+--config FILE              KYAML config; flags override it
 ```
 
 [Configuration](config.md) is every key.
 
 ### Fill it
 
-`cargo build --release` does not build examples, so name it:
+`cargo build --release` skips examples, so name the one you want:
 
 ```sh
 cargo build --release --bin mira --example loadgen
 ./target/release/examples/loadgen --demo --for 45m
 ```
 
-`--demo` is the four-service shop, backdated over the window `--for` names.
-Without it `loadgen` is the load harness — a flat deterministic firehose aimed
-at the ingest path, which is [what section 3 of the testing guide
-measures](internals/e2e.md#3-the-load-harness).
+`--demo` writes the four-service shop, backdated across the window `--for`
+names. Without it, `loadgen` sends the same deterministic record shape as fast
+as it can, to measure how much the write path can take — [what section 3 of the
+testing guide measures](internals/e2e.md#3-the-load-harness).
 
 ## Read it back
 
@@ -63,7 +66,8 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
   -d '{"signal":"logs","where":[{"attr":"service.name","eq":"checkout"}],"limit":5}'
 ```
 
-Bodies are KYAML, and JSON is a subset of it, so a JSON client works unchanged:
+Request bodies are KYAML. JSON is a subset of KYAML, so a JSON client works
+unchanged:
 
 ```yaml
 {
@@ -79,12 +83,14 @@ Bodies are KYAML, and JSON is a subset of it, so a JSON client works unchanged:
 }
 ```
 
-A top-level key the endpoint does not implement is refused by name with the keys
-that do exist listed — a `400` on the query API, a `200` carrying
-`isError: true` on `/mcp`. Every response carries a `stats` object
-(`{"blocks_total":1,"blocks_scanned":1,"rows_scanned":16005,"rows_matched":3840,"elapsed_us":31255}`),
-which is the sidecar pruning made visible. A response that filled `limit` also
-carries `next`; pass it back as `after` for the following page.
+You do not have to learn the whole shape first. A top-level key the endpoint
+does not implement is refused by name, and the error lists the keys that do
+exist — a `400` on the query API, a `200` carrying `isError: true` on `/mcp`.
+
+Every response also carries a `stats` object saying what the query cost:
+`{"blocks_total":1,"blocks_scanned":1,"rows_scanned":16005,"rows_matched":3840,"elapsed_us":31255}`.
+`blocks_scanned` counts the blocks the scan read. A response that filled
+`limit` carries `next`; send it back as `after` for the following page.
 
 | endpoint | what it answers |
 | --- | --- |
@@ -103,9 +109,9 @@ Every one of those, with its request and response shape in full, is the
 [HTTP API reference](reference/http.md) — generated from the source, so it
 cannot drift from what the binary serves.
 
-An `attr` term matches a span's own attributes *or* an attribute on one of its
-events or links, so the demo's exceptions are one query away and come back with
-the event attached:
+An `attr` filter matches an attribute on the span itself *or* on one of its
+events or links. So the demo's exceptions are one query away, and come back
+with the event attached:
 
 ```sh
 curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
@@ -121,18 +127,19 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
     ```
 
     Records, trace waterfalls, metric charts, the service map, alert rules and
-    a live tail, served out of the binary by `include_bytes!`.
+    a live tail. The whole UI is inside the binary; there is nothing to serve
+    separately.
 
 === "Terminal UI"
 
     ```sh
-    mira mira --data-dir ./data        # read a block directory in-process
-    mira mira --addr localhost:4318    # or a running replica
+    mira mira --data-dir ./data        # read a directory of blocks directly
+    mira mira --addr localhost:4318    # or a running copy
     ```
 
-    The same views over `termios` raw mode and ANSI — no TUI framework, zero
-    crates added. The `--data-dir` form needs no server: a detached PVC or a
-    dead pod's volume is still readable with nothing running.
+    The same views, drawn straight to the terminal with ratatui. The
+    `--data-dir` form needs no server: a detached volume, or the disk of a pod
+    that has died, is still readable with nothing running.
 
 === "MCP"
 
@@ -141,10 +148,11 @@ curl -s localhost:4318/api/v1/query -H 'content-type: application/json' \
       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
     ```
 
-    Nine tools over JSON-RPC — `query_records`, `get_trace`, `query_metric`,
+    Nine tools for an agent, over the Model Context Protocol (MCP), which
+    speaks JSON-RPC — `query_records`, `get_trace`, `query_metric`,
     `list_metrics`, `correlate`, `service_map`, `list_services`, `list_alerts`,
-    and `render_rca` for the write-up at the end — with no session id, so any
-    replica can answer any call.
+    and `render_rca` for the write-up at the end. There is no session to set
+    up, so any copy can answer any call.
 
 ## Next
 

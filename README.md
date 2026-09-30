@@ -8,17 +8,18 @@
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://github.com/TrianaLab/mira/blob/main/Cargo.toml)
 [![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
 
-**Logs, traces and metrics in. A web UI, a terminal UI and an MCP server out.
-One binary, no cluster, no sidecar, no database beside it.**
+**Store your logs, traces and metrics in one small binary. Read them back in a
+browser, in your terminal, or straight from an AI agent. No cluster, no
+sidecar, no database beside it.**
 
 ```sh
 curl -fsSL https://miradb.dev/install.sh | bash
 mira --data-dir ./data
 ```
 
-Point any OTLP exporter at gRPC `4317` or HTTP `4318`, open
-`http://localhost:4318/`, or point an agent at `POST /mcp`. The block directory
-is the only state there is.
+Send data with any OpenTelemetry exporter — gRPC on `4317`, HTTP on `4318`.
+Then open `http://localhost:4318/`, or point an agent at `POST /mcp`. The only
+thing Mira keeps is the directory of files you gave it.
 
 <img src="docs/assets/tui/investigation.gif" alt="A recording of Mira's terminal UI. The log list over the last hour; a filter typed live, severity_text=ERROR, narrowing 14,371 records to 824 in 7.3ms; the service map, where errors propagate frontend to checkout to payments while inventory stays clean; then the trace under the failure — eight spans over 76.08ms, with a retry and an exception marked on the timeline.">
 
@@ -36,38 +37,38 @@ that run's own query plans and wall clocks.
 | **0.14** | bytes on disk per byte on the wire, once compacted |
 | **6.20 MiB stripped, 149 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
-Apple M3 Pro, one process, reproducible with the load harness in this repository.
-What each number measures — the numerator, the denominator, and what is outside
-the measurement — is **[the measurement contract](docs/internals/measurement.md)**,
-which also carries every published figure in one generated table. The full sweep:
-**[end-to-end testing](docs/internals/e2e.md)**. Why they land there:
-**[architecture section 11](docs/architecture/performance.md)**. How
-they read against the market, including where Mira is behind:
+One process on an Apple M3 Pro, measured with the load harness in this
+repository. Exactly what each number counts, and what it leaves out, is
+**[the measurement contract](docs/internals/measurement.md)** — which also
+lists every figure Mira publishes in one table. Run the sweep yourself:
+**[end-to-end testing](docs/internals/e2e.md)**. Why the numbers land where
+they do: **[architecture section 11](docs/architecture/performance.md)**. How
+they compare to other tools, including where Mira loses:
 **[docs/market.md](docs/market.md)**.
 
-## Four surfaces, one read path
+## Four ways to read it
 
-Same data, same filter grammar, same code underneath. Nothing to deploy for any
-of them.
+Same data, same filters, same code underneath. There is nothing extra to
+install for any of them.
 
 | | | |
 | --- | --- | --- |
-| **Browser** | `http://localhost:4318/` | Served out of `include_bytes!`; the whole view lives in the URL, so an alert webhook links straight back into it. |
-| **Terminal** | `mira mira` | The same views over a running replica — or over a block directory **with no server at all**. |
-| **MCP** | `POST /mcp` | Nine tools, no session id, so any replica answers any call. The ninth writes the RCA. |
+| **Browser** | `http://localhost:4318/` | Baked into the binary. The whole view is in the URL, so an alert webhook can link you straight back to what fired. |
+| **Terminal** | `mira mira` | The same views against a running copy — or against a directory of files **with nothing running at all**. |
+| **MCP** | `POST /mcp` | Nine tools for agents. No session to set up, so any copy can answer any call. The ninth writes the incident report. |
 | **HTTP** | `/api/v1/…` | `query`, `correlate`, `map`, `entities`, `metrics`, `alerts`. |
 
-The ninth tool is the one to look at. An agent hands over its findings and gets
-back a root-cause document — but `render_rca` re-runs every citation against the
-store first, so a claim it cannot re-prove fails the call by name and nothing is
-written:
+The ninth tool is the interesting one. An agent hands over what it found and
+gets back a written root-cause report — but first `render_rca` re-runs every
+piece of cited evidence against the stored data. A citation it cannot reproduce
+fails the call by name, and nothing gets written:
 
 <img src="docs/assets/tui/write-up.gif" alt="A recorded terminal session. An agent's three claims are listed, then render_rca refuses them: nothing was rendered and nothing was stored, 1 of 3 citations do not hold against this store, naming the claim and the filter that matched no records. The claim is corrected and the call returns a 59-line document whose evidence section carries the record count beside every claim — 229, 229, and 8 for the trace. A last query finds the write-up itself stored as a log record.">
 
-There is no incident store: `emit` writes the document back as an ordinary log
-record, so it is searchable by the same query path and expires with the
-telemetry it describes. The worked investigation behind it is in
-**[docs/agents.md](docs/agents.md)**.
+There is no separate incident database. `emit` writes the report back as an
+ordinary log record, so you search for it the same way you search for anything
+else, and it expires alongside the data it describes. The full worked
+investigation is in **[docs/agents.md](docs/agents.md)**.
 
 ## See it
 
@@ -99,11 +100,11 @@ a cosign signature and a SLSA provenance attestation.
 
 ## Scope
 
-Mira is pre-1.0 and says so. Ingestion is allocation-lean rather than zero-copy
-(*queries* are zero-copy); a storage node answers only from its own blocks, and
-the cross-replica merge lives in `mira proxy` rather than in the node, which
-merges record search and refuses correlate, map, metrics and entities; there is
-no entity predicate and no block cache. The full list, with the reasoning, is
+Mira is pre-1.0 and says so. Writing data copies it once; reading copies
+nothing. One process only ever answers from its own files — to read across
+several, put `mira proxy` in front, and it merges record search but not
+correlate, map, metrics or entities. There is no entity filter and no block
+cache yet. The full list, with the reasoning behind each one, is
 [architecture section 0.1](docs/architecture/corrections.md#01-what-is-not-true-yet).
 
 ## Contributing

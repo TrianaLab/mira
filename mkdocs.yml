@@ -1,8 +1,10 @@
 site_name: Mira
 # With no social-cards plugin and no og:image, this string is the whole of the
-# shared-link preview. It states the mechanism rather than a category, because
-# "telemetry backend" is the part that is not distinguishing.
-site_description: An OTLP-native telemetry storage engine and short-term memory layer for AI agents. One binary — logs, traces and metrics in; a web UI, a terminal UI and an MCP server out, all reading the same mmapped blocks.
+# shared-link preview. It has to land on someone who has never heard of OTLP or
+# Arrow, so it says what a reader gets rather than what the thing is built from.
+# The distinguishing part is not "telemetry backend", it is that there is
+# nothing else to run.
+site_description: One small binary that stores your logs, traces and metrics. Read them back in a browser, in your terminal, or straight from an AI agent. No cluster, no database, nothing else to run.
 site_url: https://miradb.dev/
 repo_url: https://github.com/TrianaLab/mira
 repo_name: TrianaLab/mira
