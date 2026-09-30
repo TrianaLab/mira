@@ -594,6 +594,65 @@ fn unwind_staging(tmp: &Path) {
 ///
 /// Split out of [`publish`] only so that the failure of any step in it has one
 /// place to be cleaned up from.
+/// Drop an attribute table's trailing all-null value columns before it is
+/// written.
+///
+/// [`crate::schema::ATTRS`] carries a column per `AnyValue` variant and a row
+/// fills exactly one of them, so the other five are null down the whole block.
+/// Arrow IPC does not elide those: an all-null `Binary` column still writes a
+/// full offsets buffer and its validity bitmap, 4.125 bytes a row, and a
+/// corpus of ordinary string attributes spends 8.25 of its 36.26 bytes a row
+/// on the two that are almost never used — `bytes` holds `BytesValue` and
+/// `ser` holds slices and maps, and most telemetry emits neither.
+///
+/// Only a *suffix* is dropped, and only ever down to [`ATTR_UNGUARDED_COLS`].
+/// That is the whole reason this costs no reader a line: every surviving
+/// column keeps the position the read path indexes it by, which is part of the
+/// on-disk format (see the field order note above `FORMAT_VERSION`), and the
+/// two columns that can go are the only ones no reader touches unconditionally.
+///
+/// Here rather than in the builder or in [`Sealed::with`] on purpose: the
+/// bloom filter and the zone map select attribute tables with
+/// `Arc::ptr_eq(&schema, &ATTRS)`, so a projection upstream would silently
+/// leave them out of both indexes — and a key missing from the zone map reads
+/// as *this block has no such value*, which prunes blocks that do hold
+/// matches. By the time `stage` runs, both sidecars are built.
+///
+/// Not a format break, and no `FORMAT_VERSION` bump: the reader already has to
+/// treat an absent table as empty, because that is how a block written before
+/// a table existed reads back, and a short attribute table is the same
+/// tolerance one column at a time. Nothing else is trimmed — another table's
+/// trailing column may carry meaning this cannot see.
+fn trim_attr_tail(batch: &RecordBatch) -> Result<std::borrow::Cow<'_, RecordBatch>> {
+    use std::borrow::Cow;
+    if !Arc::ptr_eq(&batch.schema(), &crate::schema::ATTRS) {
+        return Ok(Cow::Borrowed(batch));
+    }
+    let live = (0..batch.num_columns())
+        .rposition(|i| batch.column(i).null_count() < batch.num_rows())
+        .map_or(0, |i| i + 1);
+    let keep = live.max(ATTR_UNGUARDED_COLS);
+    if keep >= batch.num_columns() {
+        return Ok(Cow::Borrowed(batch));
+    }
+    Ok(Cow::Owned(batch.project(&(0..keep).collect::<Vec<_>>())?))
+}
+
+/// How many of [`crate::schema::ATTRS`]' columns a reader may take without
+/// first asking whether they are there — and so the floor [`trim_attr_tail`]
+/// will not trim below.
+///
+/// Seven: `AttrPred::new` in `query.rs` reads `str`, `int`, `double` and
+/// `bool` — columns 3 to 6 — on every attribute batch it is handed, before any
+/// type byte is consulted. `RecordBatch::column` panics past the end, and
+/// `as_primitive_opt` guards a wrong type rather than a missing column, so
+/// trimming a column out from under it is a panic in a scan thread and not a
+/// null. Only `bytes` and `ser` sit above the line: the sole sites that reach
+/// them are `emit_attr`'s `BYTES` and `SLICE | MAP` arms, and a row arrives
+/// there only when its own stored type byte says so — which cannot happen in a
+/// table where those columns held nothing.
+const ATTR_UNGUARDED_COLS: usize = 7;
+
 fn stage(tmp: &Path, sealed: &Sealed) -> Result<()> {
     // An empty table is not written. Arrow IPC framing for a zero-row table is
     // ~1 KB for three columns and ~2.5 KB for nine (measured), which is nothing
@@ -610,7 +669,8 @@ fn stage(tmp: &Path, sealed: &Sealed) -> Result<()> {
     // have the table reads back.
     for (name, batch) in &sealed.tables {
         if batch.num_rows() > 0 {
-            write_table(&tmp.join(format!("{name}.arrow")), batch)?;
+            let batch = trim_attr_tail(batch)?;
+            write_table(&tmp.join(format!("{name}.arrow")), &batch)?;
         }
     }
     // Sidecars are written with the same durability as the tables: a block that
@@ -2160,6 +2220,83 @@ mod tests {
              with the wrong ones. Bump FORMAT_VERSION (currently {FORMAT_VERSION}), \
              put the compatibility branch for the old layout next to `check_format`, \
              and update this list."
+        );
+    }
+
+    /// The trim drops the tail and only the tail, so the positions the pin test
+    /// above guards stay where the readers index them.
+    ///
+    /// The three cases are the three that matter: a block of ordinary string
+    /// attributes gives up both `Binary` columns, one `ser` value anywhere in
+    /// the block keeps *both* — because `bytes` is no longer trailing — and a
+    /// table that is not an attribute table is never touched however null its
+    /// last column is.
+    #[test]
+    fn the_trim_takes_the_null_tail_and_never_a_column_a_reader_indexes() {
+        use crate::attrs::AttrsBuilder;
+        use mira_proto::common::v1::{AnyValue, any_value::Value};
+
+        let built = |vals: &[Option<Value>]| {
+            let mut b = AttrsBuilder::new("log_attrs.key");
+            for (i, v) in vals.iter().enumerate() {
+                let v = v.clone().map(|value| AnyValue { value: Some(value) });
+                b.append(i as u32, "k", v.as_ref()).expect("append");
+            }
+            b.finish().expect("finish")
+        };
+
+        // Strings and an int. `double`, `bool`, `bytes` and `ser` are all null,
+        // but the trim stops at seven: `AttrPred::new` reads columns 3 to 6
+        // before it looks at a type byte, so taking `double` and `bool` here
+        // would be a panic in a scan thread rather than a null.
+        let plain = built(&[
+            Some(Value::StringValue("a".into())),
+            Some(Value::IntValue(1)),
+        ]);
+        let got = trim_attr_tail(&plain).expect("trim");
+        assert_eq!(
+            got.num_columns(),
+            ATTR_UNGUARDED_COLS,
+            "bytes and ser are dead here, and they are the only two that may go"
+        );
+        for i in 0..got.num_columns() {
+            assert_eq!(
+                got.schema().field(i).name(),
+                plain.schema().field(i).name(),
+                "column {i} moved"
+            );
+            assert_eq!(got.column(i), plain.column(i), "column {i} changed");
+        }
+
+        // One serialized value and the tail is one column long, so `bytes`
+        // survives on position rather than on content.
+        let nested = built(&[
+            Some(Value::StringValue("a".into())),
+            Some(Value::ArrayValue(Default::default())),
+        ]);
+        assert_eq!(
+            trim_attr_tail(&nested).expect("trim").num_columns(),
+            9,
+            "`ser` is live, so `bytes` may not be dropped out from under it"
+        );
+
+        // Some other table, entirely null in its last column, keeps it.
+        let other = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt32, false),
+                Field::new("body", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![None as Option<&str>, None])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            trim_attr_tail(&other).expect("trim").num_columns(),
+            2,
+            "only the attribute table is trimmed — another table's trailing \
+             column may carry meaning this cannot see"
         );
     }
 

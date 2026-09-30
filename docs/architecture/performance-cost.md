@@ -120,9 +120,9 @@ hits is a straight loss.
 
 ### Sorting a block by a low-cardinality column before sealing — rejected
 
-The standard columnar trick, and every key tried came out at or below the
-unsorted ratio. Like with like, dictionaries decoded so the sort is not fighting
-the encoding:
+The standard columnar trick, and the best key tried gained 1.4% on logs and
+0.2% on traces — inside the noise, and every other key lost. Like with like,
+dictionaries decoded so the sort is not fighting the encoding:
 
 | table | unsorted | best sort key tried | worst |
 | --- | --- | --- | --- |

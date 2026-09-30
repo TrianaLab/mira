@@ -110,13 +110,13 @@ concurrent-appender control. **What is settled is the envelope: anything spent o
 the log's mutex is spent inside 10%**, so the next measurement belongs on the
 flusher.
 
-## What did land on the log, which is little
+## The publish barrier, and what did land on the log
 
-`Wal::sync()` takes its `F_FULLFSYNC` outside the lock rather than inside it:
-structurally right given the 4,230 µs section 10 already publishes for that
-call, and **not measured to move any number in the table above**: at 4,230 µs on
-a 250 ms period it is a ~2% duty cycle, landing on whichever exports are
-unlucky.
+Of the two candidates above, the volume is the one the engine can stop paying
+for: a published block costs eleven `F_FULLFSYNC`, and priced end to end they
+are an ack-latency cost and not a throughput one —
+[what the publish barrier is worth](performance-barrier.md), which also covers
+the one change that did land on the log.
 
 ## The box, and a number withdrawn
 

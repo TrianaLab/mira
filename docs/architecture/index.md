@@ -45,6 +45,7 @@ formats, and re-proposing one of them is the most common way to waste a day.
 | [10. What is deliberately not here](not-here.md) | the refusals, each with its reason |
 | [11. Performance model](performance.md) | the corpora, the four axes, how to read the table |
 | [… the ingest plateau](performance-ingest.md) | one mutex, and the two fixes that were priced and rejected |
+| [… the publish barrier](performance-barrier.md) | eleven `F_FULLFSYNC` a block, priced: ack latency, not throughput |
 | [… verification and restart](performance-durability.md) | what a query pays to trust a block, and what a restart replays |
 | [… query cost](performance-query.md) | the block is the unit, and the two levers that moved it |
 | [… cost per GB](performance-cost.md) | hot and compacted, and what compresses |

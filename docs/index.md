@@ -5,21 +5,24 @@
 # wordmark, headline, tagline and the three buttons all live there. The <h1 hidden>
 # below suppresses the "<h1>Home</h1>" Material injects into any page whose markdown
 # has no h1; the hero carries the real one.
+#
+# The description is the shared-link preview and the search snippet. It says what a
+# reader gets, not what the thing is built from: someone who has never heard of OTLP
+# or Arrow has to be able to act on it. The mechanism is two paragraphs down.
 template: home.html
-description: An OTLP-native telemetry storage engine and short-term memory layer for AI agents. OTLP in, immutable Arrow IPC blocks out, queried straight from mmap or over MCP.
+description: One small binary that stores your logs, traces and metrics. Read them back in a browser, in your terminal, or straight from an AI agent. No cluster, no database, nothing else to run.
 ---
 
 <h1 hidden>Short-term memory for autonomous systems</h1>
 
 ```sh
-mira --data-dir ./data          # OTLP/gRPC 4317, OTLP/HTTP + UI + MCP 4318
-mira mira --data-dir ./data     # the same views in the terminal, no server needed
+mira --data-dir ./data          # your services and agents send here
+mira mira --data-dir ./data     # read it back in the terminal, no server needed
 ```
 
-That is the whole of it. [**See it work**](demo.md) is one command and six
-screens of real output — an error log, the trace behind it, the service map, a
-metric with its exemplars, a firing alert, and what the whole run cost in
-memory and disk.
+That is the whole setup. [**See it work**](demo.md) is one command and six
+screens of real output: an error log, the trace behind it, the service map, a
+metric, a firing alert, and what the run cost in memory and disk.
 
 ![Mira's terminal UI recorded end to end. The log list over the last hour, then
 a filter typed live — severity_text=ERROR, narrowing 14,371 records to 824 in
@@ -28,45 +31,42 @@ payments while inventory stays clean. Then the trace under the failure: eight
 spans over 76.08ms, with a retry and an exception marked on the
 timeline.](assets/tui/investigation.gif)
 
-Four keystrokes, one binary, no server. Every footer in that recording is the
-run's own query plan and wall clock — rows scanned, rows matched, blocks
-touched — which is the same line the browser and the MCP tools return.
+Nothing in that recording is a mock-up. Every footer is that run's own cost —
+rows read, rows matched, files touched, milliseconds.
 
-## What makes it different
-
-Other backends treat OTLP as an ingestion format and transform it into something
-else — ClickHouse rows, Parquet files, a TSDB — and every transformation is a
-place fidelity can go missing. Mira's storage layout *is* the OpenTelemetry
-Resource-Scope-Signal model in Apache Arrow IPC, so there is no transformation
-step for a field to fall out of.
+## Why you would use it
 
 | | |
 | --- | --- |
-| **Zero-copy reads** | Hot blocks are uncompressed and 64-byte aligned, so a query reads Arrow buffers straight out of the mapping. A test walks every buffer of every column and requires all of them to point inside the `mmap`. |
-| **The filesystem is the manifest** | Blocks are named `{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`, so the time index is the directory listing. No catalogue to keep in sync with the data. |
-| **No coordination state** | No Raft, no membership, no external metadata store. Two active replicas share one volume by having different `--node` names. |
-| **Four read surfaces, one binary** | Query API, MCP, browser UI and terminal UI over the same read path. 6.20 MiB stripped, 149 crates, no `protoc` and no node toolchain to build it. |
-| **Agents read, not export** | `POST /mcp` is nine tools over that read path — eight reads and `render_rca`, which re-runs every citation before it writes the document. An agent sitting next to the data skips the protocol entirely — `mira mira --data-dir` maps the blocks with no server, no port and no serialisation. |
+| **Nothing to run beside it** | No cluster, no database, no separate collector. One process, one directory. |
+| **Nothing to tune** | There is no cache size, block size or flush interval to get wrong, and there will not be one. |
+| **Queries do not unpack anything** | Recent data is read in place, straight out of the file as it sits on disk. Nothing is copied or decoded first. |
+| **No index to fall out of sync** | Each file is named after the time range inside it, so the list of files *is* the time index. There is no catalogue to rebuild. |
+| **Two copies share one disk** | Give them different `--node` names and they stay out of each other's way. No leader election, no membership, no shared metadata service. |
+| **Agents read it themselves** | `POST /mcp` gives an agent nine tools over the same data. An agent on the same machine can skip the network entirely and read the directory directly. |
 
-## What it is deliberately not
+It stays small: 6.20 MiB stripped, 149 crates, and no `protoc` or Node
+toolchain needed to build it.
 
-- **Not zero-copy *ingestion*.** `prost` memcpies every string, unconditionally;
-  that is a property of protobuf, not something to engineer around. The ingest
-  goal is allocation-lean instead — one unavoidable copy of the request body.
-- **Not a query language.** No SQL, no PromQL, no TraceQL. DataFusion would have
-  given SQL for free, at 47 direct dependencies and a 50.0 MiB binary; Mira
-  hand-rolls the ~2,000 lines of query logic it actually needs.
-- **Not clustered inside the node.** A storage node reads the block directory it
-  was pointed at and nothing scatters it — no peer list, no membership. Several
-  nodes are fronted by `mira proxy`, the same binary under a subcommand, which
-  holds the replica list and merges record search; correlate, the service map,
-  metrics and entities answer 501 there rather than a plausible subset.
-- **Not tunable.** There is no block size, flush interval or cache size to set,
-  and there will not be. The config file describes *where the process runs* —
-  fourteen keys — and the three that reach the engine do not tune it:
-  `ingest.queue` buys burst room with memory, `ingest.shards` pins a core count
-  the runtime reads wrong, and `ingest.wal` is a choice between two durability
-  promises, acked in the log or acked at block publication.
+## What keeps the data honest
+
+Most backends convert OpenTelemetry into something else — database rows,
+Parquet files, a metrics store — and every conversion is a place a field can
+quietly go missing. Mira skips it. What arrives is what is stored, in the same
+shape.
+
+## What it does not do
+
+- **No query language.** You filter with a small query document, not SQL,
+  PromQL or TraceQL. SQL off the shelf would have cost 47 extra dependencies
+  and a 50.0 MiB binary.
+- **No clustering inside the node.** One process reads one directory. Run
+  several behind `mira proxy` — the same binary — and it merges record search
+  across them. The service map, metrics, correlation and entities answer on a
+  single node only, and the proxy says so rather than returning half an answer.
+- **No tuning.** Fourteen config keys, and only three reach the engine.
+- **Writing copies once.** Reading copies nothing, but parsing incoming
+  protobuf copies every string, because that is how protobuf works.
 
 ## Where to go next
 
@@ -75,7 +75,7 @@ step for a field to fall out of.
 | [See it work](demo.md) | one command, then the screens and the numbers |
 | [See it on Kubernetes](demo-cluster.md) | the same run, with the operator and an ingress on the path |
 | [Install](install.md) | one script, a container, or `cargo install` |
-| [Quickstart](quickstart.md) | fill it, query it, and the four read surfaces |
+| [Quickstart](quickstart.md) | fill it, query it, and the four ways to read it |
 | [Connect an agent](agents.md) | MCP wiring, the nine tools, a worked investigation and its RCA |
 | [Configuration](config.md) | fourteen keys, KYAML, `${env:…}` interpolation |
 | [End-to-end testing](internals/e2e.md) | a live binary, a real collector, the load harness |

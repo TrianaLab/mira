@@ -79,6 +79,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.records_per_s.conns4
@@ -96,6 +97,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.records_per_s.conns32
@@ -115,6 +117,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.records_per_s.conns96
     value: 1136941
@@ -132,6 +135,7 @@ measurements:
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: ingest.cores.conns1
     value: 0.71
@@ -149,6 +153,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.cores.conns4
@@ -164,6 +169,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.cores.conns32
@@ -184,6 +190,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.per_core.conns1
     value: 886147
@@ -205,6 +212,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.per_core.conns96
     value: 515288
@@ -271,7 +279,7 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "2,661"
-        sites: [docs/market.md, docs/internals/e2e.md]
+        sites: [docs/market.md, docs/internals/e2e.md, overrides/home.html]
       - as: "2.7 s"
         sites: [docs/market.md]
 
@@ -329,6 +337,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: rss_mib.conns4
@@ -345,6 +354,7 @@ measurements:
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: rss_mib.conns96
     value: 1648
@@ -361,6 +371,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   # ---------------------------------------------------------------------------
@@ -426,7 +437,13 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "4.7 ms"
-        sites: [docs/architecture/performance.md, README.md, docs/agents.md]
+        sites:
+          [
+            docs/architecture/performance.md,
+            README.md,
+            docs/agents.md,
+            overrides/home.html,
+          ]
 
   - key: query.metric_names.first_ms
     value: 8.9
@@ -538,7 +555,7 @@ measurements:
         sites:
           [
             docs/architecture/not-here.md,
-            docs/architecture/performance-ingest.md,
+            docs/architecture/performance-barrier.md,
           ]
 
   # ---------------------------------------------------------------------------
@@ -691,6 +708,91 @@ measurements:
           ]
 
   # ---------------------------------------------------------------------------
+  # What the publish barrier is worth. performance-ingest.md leaves two
+  # candidates open for the flusher — its own CPU, or the volume — and these
+  # price the volume in the only form the engine can stop paying for: the eleven
+  # `F_FULLFSYNC` a published block costs. Arm B is the same tree built
+  # `--features weak-sync-ab`, which swaps every barrier for `fsync(2)`. Ratios
+  # rather than rates, eight ABBA-interleaved pairs in one sitting, both arms in
+  # every round. The first entry is the one this was run to get and it is the
+  # one that came back not quotable.
+  # ---------------------------------------------------------------------------
+
+  - key: barrier.records_per_s_ratio.conns32
+    value: 1.12
+    unit: ratio
+    measures: >
+      Records/s with every `F_FULLFSYNC` replaced by `fsync(2)`, over the
+      shipped binary, at thirty-two connections and 12M records. Median of eight
+      per-pass ratios, both arms in every pass, ABBA-interleaved. **Signs split,
+      6 of 8**, range 0.838-2.544, sign test p=0.29 — so under
+      docs/internals/measurement.md section 3 this is recorded as not quotable
+      rather than quoted, on the same rule that rejected wal-per-signal. It is
+      here because the mechanism is a standing proposal and this is the number
+      that has to be argued past. The per-round series decays — 1.640, 2.544,
+      1.435, 0.912, 1.185, 1.056, 1.019, 0.838 — with both arms converging on
+      ~1.25-1.5 M records/s from opposite directions, which is what two earlier
+      five- and thirteen-pass runs sampled to get 1.40x and 0.991x.
+    provenance: scripts/measure/ab.sh
+    quoted:
+      - as: "1.12x"
+        sites: [docs/architecture/performance-barrier.md]
+
+  - key: barrier.ack_p50_ratio.conns32
+    value: 1.651
+    unit: ratio
+    measures: >
+      Ack p50 of the shipped binary over the `fsync(2)` arm, same eight pairs —
+      84.6 ms against 48.0 ms at the medians. Agreed, 8 of 8, range 1.185-2.688,
+      sign test p=0.0078. This is the effect the barrier actually has, and it is
+      a latency one.
+    provenance: scripts/measure/ab.sh
+    quoted:
+      - as: "1.65x"
+        sites: [docs/architecture/performance-barrier.md]
+
+  - key: barrier.ack_p99_ratio.conns32
+    value: 0.565
+    unit: ratio
+    measures: >
+      Ack p99, oriented as ack_p50 above, so below 1 means the barrier-free arm
+      has the *worse* tail. Signs split, 3 of 8, range 0.269-2.737 — not
+      quotable in either direction, and recorded because the p50 win does not
+      carry to the tail and a change sold on ack latency has to say so.
+    provenance: scripts/measure/ab.sh
+    quoted:
+      - as: "3 of 8"
+        sites: [docs/architecture/performance-barrier.md]
+
+  - key: barrier.per_core_ratio.conns32
+    value: 0.976
+    unit: ratio
+    measures: >
+      Records/s per busy core, barrier-free arm over the shipped one, same eight
+      pairs — 463,025 against 467,615. Signs split, 3 of 8, and the reading is
+      the absence of an effect: removing the barrier does not make a core
+      faster. Against it, cores busy moves 2.6 to 3.0, 7 of 8 favourable. The
+      barrier gates concurrency; it is not CPU the engine spends.
+    provenance: scripts/measure/ab.sh
+    quoted:
+      - as: "0.976x"
+        sites: [docs/architecture/performance-barrier.md]
+
+  - key: barrier.publish_count
+    value: 11
+    unit: count
+    measures: >
+      `File::sync_all` calls on the path that publishes one block — five tables
+      at block.rs:280, three sidecars at :626, and the three directories at
+      :537, :544 and :628. Counted by reading the path, not sampled. Excludes
+      the cold-marker path at :1099-:1100, which the ingest plateau does not
+      reach.
+    provenance: unscripted
+    quoted:
+      - as: "eleven"
+        sites: [docs/architecture/performance-barrier.md]
+
+  # ---------------------------------------------------------------------------
   # `mira proxy` against one node. Every one of these is two replicas, a proxy
   # and the generator on the same twelve cores, so none of them is a scaling
   # number — they price the hop, and section 12.2.4 says what they do not price.
@@ -798,6 +900,7 @@ measurements:
             docs/market.md,
             docs/agents.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: corpus.records.points
     value: 39648

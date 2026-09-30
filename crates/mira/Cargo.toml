@@ -68,6 +68,9 @@ ratatui = { version = "0.30", default-features = false, features = ["std"] }
 [features]
 default = []
 webhook-tls = ["dep:hyper-rustls"]
+# Measurement arm, never a release. Forwards to mira-core; see `sync_with` in
+# mira-core/src/lib.rs for what it trades and why it is compile-time.
+weak-sync-ab = ["mira-core/weak-sync-ab"]
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

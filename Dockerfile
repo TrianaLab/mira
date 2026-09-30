@@ -31,7 +31,7 @@ COPY dist/linux/${TARGETARCH}/mira /mira
 # ---------------------------------------------------------------------------
 # compile — from source, the way the README says to
 # ---------------------------------------------------------------------------
-FROM rust:1-slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS compile
+FROM rust:1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS compile
 
 # `cc` is for zstd-sys, which vendors its own C source and is the only C
 # dependency in the tree (docs/architecture/corrections.md section 0). No protoc: protox compiles
@@ -141,7 +141,7 @@ EXPOSE 4317 4318
 # without -v, which accumulates. Mount one yourself, and make it a named volume
 # rather than a host bind mount — Mira mmaps its blocks and a bind mount on
 # Docker Desktop is FUSE, where a hiccup arrives as SIGBUS rather than an error.
-# That reasoning, and the probe configuration below, are in docs/install.md.
+# The probe configuration below is also in docs/install.md.
 
 # No HEALTHCHECK: distroless has no shell and no curl, and adding either to run
 # a probe would double the image. Point Kubernetes or compose at

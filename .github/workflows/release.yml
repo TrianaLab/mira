@@ -187,7 +187,7 @@ jobs:
       # targets, so it is generated once on the leg that has already compiled
       # rather than in a job that would compile a fifth time. `make build` from
       # the sbom target is a cache hit here.
-      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           tool: cargo-cyclonedx@0.5.9

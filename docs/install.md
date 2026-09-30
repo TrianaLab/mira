@@ -1,10 +1,13 @@
 ---
-description: Build Mira from source with cargo, or run the container. Rust 1.88 and a cc — no protoc, no node toolchain.
+description: Install Mira with one script, a container, cargo, or the Kubernetes operator. Linux and macOS, x86_64 and arm64.
 ---
 
 # Install
 
-**For:** anyone who wants the binary on their machine. Five minutes, one prerequisite.
+**For:** anyone who wants the binary on their machine.
+
+One binary, called `mira`. Linux (glibc 2.34 or newer) and macOS, on x86_64 and
+arm64.
 
 ## The one-liner
 
@@ -12,20 +15,15 @@ description: Build Mira from source with cargo, or run the container. Rust 1.88 
 curl -fsSL https://miradb.dev/install.sh | bash
 ```
 
-It resolves the latest release, picks the tarball for your platform, checks it
-against the published `SHA256SUMS`, and — if `gh` is on the path — verifies the
-SLSA provenance before moving the binary into place.
+[Read it first](https://miradb.dev/install.sh) — that URL is the script.
 
 | | |
 | --- | --- |
 | `--version v0.4.2` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
-| `--no-verify` | skip the attestation check (the checksum is still enforced) |
+| `--no-verify` | skip the provenance check — that the download came out of a build in this repository, which needs `gh`. The checksum is still enforced |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
 | `GH_TOKEN` | avoids the anonymous 60-requests-an-hour limit on the version lookup |
-
-[Read it first](https://miradb.dev/install.sh) — that URL is not a copy of the
-script, it *is* the script.
 
 ## Updating
 
@@ -35,14 +33,11 @@ mira update --dry-run    # print the command it would run, and stop
 mira update --version v0.4.2
 ```
 
-This runs the installer above, so the checksum and the attestation take the same
-code path as a first install — over **this binary's own directory**, not
-`/usr/local/bin`, so a mira in `~/.local/bin` is replaced rather than shadowed.
-`MIRA_INSTALL_DIR` still wins.
-
-It stops with `mira vX is already installed` when the running version is the one
-it would install. Installed from a package manager or from source? Keep using
-that: this replaces a file and does not know what put it there.
+It replaces **the binary that is running**, wherever that is, so a copy in
+`~/.local/bin` is replaced rather than shadowed.
+`MIRA_INSTALL_DIR` still wins, and it stops with `mira vX is already installed`
+when there is nothing to do. If a package manager or `cargo` put the binary
+there, keep updating it that way.
 
 ## With cargo
 
@@ -50,19 +45,9 @@ that: this replaces a file and does not know what put it there.
 cargo install --locked miradb                    # -> ~/.cargo/bin/mira
 ```
 
-The crate is `miradb` and the binary it installs is `mira`: `mira` on crates.io
-is an unrelated crate from 2024. Two libraries sit beside it for embedding the
-engine — [`miradb-core`](https://docs.rs/miradb-core), the encoder, block writer
-and mmap reader, and [`miradb-proto`](https://docs.rs/miradb-proto), the OTLP
-bindings.
-
 ## From source
 
-The prerequisites are **Rust 1.88 or newer** and a `cc`, which
-`zstd-sys` needs for the C source it vendors. Nothing else: no `protoc`,
-because the OTLP protos are compiled by `protox` in a build script, and no node
-toolchain, because the browser UI is built and committed under
-`crates/mira/ui/dist`.
+You need **Rust 1.88 or newer** and a C compiler.
 
 ```sh
 git clone https://github.com/TrianaLab/mira && cd mira
@@ -72,34 +57,26 @@ cargo build --release                            # or: ./target/release/mira
 
 ## From a release
 
-The release workflow publishes a stripped binary for linux and macOS on x86_64
-and arm64, a CycloneDX SBOM, a `SHA256SUMS` and one SLSA provenance attestation
-covering every file in it.
-
 ```sh
 V=0.4.2; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify mira-$V-$T.tar.gz --repo TrianaLab/mira
 tar -xzf mira-$V-$T.tar.gz --strip-components=1 mira-$V-$T/mira
-gh attestation verify mira --repo TrianaLab/mira
 ```
 
-`sha256sum -c` proves the bytes are the ones the release lists; `gh attestation
-verify` proves they came out of a workflow run in this repository.
+`gh attestation verify` needs `gh` installed. Every release carries one signed
+build record covering every file named in `SHA256SUMS` — the tarballs and the
+SBOM — so the command proves this tarball came out of a build in this
+repository. Verify the tarball, before you extract it: the binary inside is not
+a subject of its own.
 
-The linux builds come off `ubuntu-22.04`, so the glibc floor is **2.34** — RHEL
-9, Amazon Linux 2023, Debian 12, Ubuntu 22.04+. `make glibc-floor` reads the highest
-`GLIBC_` symbol the binary references and fails the build above it. There is no musl build: it compiles, but musl's mallocng costs the
-ingest path more than the Alpine coverage is worth. On Alpine, build from source.
+Linux builds are made on `ubuntu-22.04`, so they need glibc **2.34** or newer —
+RHEL 9, Amazon Linux 2023, Debian 12, Ubuntu 22.04 and up. There is no musl
+build. On Alpine, build from source.
 
 ## Docker
-
-**8.6 MB compressed** (`linux/arm64`, measured off the OCI export), of which
-2.9 MB is Mira's own layer — a 6.6 MB binary. The base is
-`distroless/base-nossl-debian12:nonroot` plus one copied `libgcc_s.so.1` — no
-OpenSSL, no libstdc++, no shell, no package manager. Published images carry the
-same bytes as the tarball rather than a second compile.
 
 ```sh
 docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data ghcr.io/trianalab/mira:latest
@@ -114,17 +91,12 @@ docker run -p 4317:4317 -p 4318:4318 -v mira-data:/data mira
 
 !!! warning "Use a named volume, not a bind mount"
 
-    Mira `mmap`s its blocks, and a bind mount on Docker Desktop is FUSE — where
-    an I/O hiccup arrives as `SIGBUS`, a signal rather than an error, with
-    nothing to catch.
-
-    The image declares no `VOLUME`: Kubernetes ignores the directive, and on
-    Docker it silently creates an anonymous volume on every `docker run`
-    without `-v`.
+    Mira reads its files by mapping them into memory. A bind mount on Docker
+    Desktop goes through FUSE, where a disk hiccup arrives as a kill signal.
 
 ### Health checks
 
-The image has no `HEALTHCHECK` — distroless carries no shell and no `curl`.
+The image has no `HEALTHCHECK`, because it carries no shell and no `curl`.
 Mira answers both probes itself on 4318:
 
 ```yaml
@@ -134,28 +106,23 @@ livenessProbe:
   httpGet: { path: /health, port: 4318 }
 ```
 
-Neither touches the block directory, so a slow disk does not fail a probe.
-`/health` also reports per-signal shed and failure counts.
-
 ## Kubernetes
 
-One Mira needs no chart: the [container above](#docker) is the whole deployment —
-one image, one volume, two ports. On Kubernetes that is a Deployment, or a
-StatefulSet if the volume is to outlive a reschedule.
+One Mira needs no chart: the [container above](#docker) is the whole deployment
+— one image, one volume, two ports. That is a Deployment, or a StatefulSet if
+the volume is to outlive a reschedule.
 
-What has no hand-written answer is a **tier**: several storage nodes, a volume
-each, a `mira proxy` in front, and when there should be one
-more. That is what the operator is for: the only chart here installs a
-**controller** rather than Mira, from the same registry as the image:
+Running **several** of them is the part worth automating: a volume each, a
+`mira proxy` in front, and a decision about when there should be one more. The
+only chart here installs that controller rather than Mira:
 
 ```sh
 helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
   --version 0.3.0 --namespace mira-system --create-namespace
 ```
 
-That is a Deployment of exactly one, a ServiceAccount, a ClusterRole with no
-wildcards, and the `MiraCluster` CRD. [See it on Kubernetes](demo-cluster.md)
-puts all of it on a laptop in one command.
+[See it on Kubernetes](demo-cluster.md) puts all of it on a laptop in one
+command.
 
 ### The tier
 
@@ -180,33 +147,13 @@ spec:
     hostnames: [mira.example.com]
 ```
 
-`offload` and `coldStorageClaim` are a pair: the operator refuses a spec with
-one and not the other, and a tier with neither still scales out, and never in.
-`file://` is the only scheme Mira's offload target parses, so the archive is a
-*mount*.
+`offload` needs `coldStorageClaim`. `file://` is the only scheme the offload
+target understands, so the archive has to be a mount.
 
-`kubectl apply` that and the operator builds a StatefulSet, a PVC per replica, a
-headless Service publishing not-ready addresses so a full replica stays
-reachable by name, a `mira proxy` Deployment behind a ClusterIP, both
-ConfigMaps on every reconcile, and a PodDisruptionBudget of `maxUnavailable: 1`,
-because a replica's blocks are the only copy. What to put in `resources` is
-[Configuration's sizing table](config.md#sizing).
+Sizes for `resources` are in [Configuration](config.md#sizing).
 
-`route` adds an `HTTPRoute` where the Gateway API CRDs exist. All it takes is
-the Gateway to attach to: the paths are derived — ingest and the merged read to
-the proxy, everything else to the headless Service, where the UI and `/mcp` are
-answered. Removing the field removes the route.
-
-Every pod it builds satisfies the `restricted` Pod Security Standard unmodified:
-uid 65532, `fsGroup` set, no service-account token, `seccompProfile:
-RuntimeDefault`. A replica gets 60 seconds to seal on SIGTERM and a startup
-probe worth five minutes, because it replays its log before it answers anything.
-
-!!! note "A chart that installed a StatefulSet used to exist"
-
-    Two things it could do have **no `MiraCluster` equivalent yet**: a
-    ServiceAccount per tier, and arbitrary `config.*` keys. Its Ingress now has
-    one in `spec.route`, on the Gateway API.
+Two things a `MiraCluster` **cannot express yet**: a ServiceAccount per tier,
+and arbitrary `config.*` keys.
 
 ### Cluster context
 
@@ -218,15 +165,12 @@ helm upgrade mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
 
 | | |
 | --- | --- |
-| What it does | The operator watches Kubernetes Events and container state and ships both to that Mira as OTLP logs, keyed on `k8s.pod.uid` — an `OOMKilled` on the same timeline as the spans, for [an agent](agents.md) writing the RCA. |
-| What it grants | The same value creates the Role that reads them: `get`/`list`/`watch` on pods and events, cluster-wide unless `rbac.namespaces` scopes it. Nothing in it writes, and there is no value that makes it write. |
-| Unset | No watch is opened and no Role is created. That is the default. |
+| What it does | The operator watches Kubernetes Events and container state and ships both to that Mira as OTLP logs, keyed on `k8s.pod.uid`. |
+| What it grants | The same value creates the Role that reads them: `get`/`list`/`watch` on pods and events, cluster-wide unless `rbac.namespaces` scopes it. Nothing in it writes. |
 
 ### What the chart carries
 
-The chart carries a cosign signature over its digest and no SLSA provenance,
-where the tarballs carry `SHA256SUMS` with one provenance attestation and no
-cosign signature
+The chart is signed with cosign and carries no build record
 ([releases.md](internals/releases.md#what-is-signed-and-what-is-not) has the
 per-artifact table):
 
@@ -238,33 +182,23 @@ cosign verify \
   ghcr.io/trianalab/charts/mira-operator:0.3.0
 ```
 
-The [chart reference](reference/chart.md) has every value, how a scale-in is
-sequenced, and what the operator's lease guarantees. Every value the chart
-itself owns — `image`, `rbac`, `serviceAccount`, `replicaCount`, `logLevel`,
-`clusterEvents` — is
-covered by a `values.schema.json` closed at each of those levels, so `helm
-install` rejects a typo'd key. The Kubernetes
-pass-throughs (`resources`, `securityContext`, `podSecurityContext`,
-`nodeSelector`, `tolerations`, `affinity`) stay open.
+The `MiraCluster` definition needs care: Kubernetes silently **drops** a field
+its schema does not name, so a stale one loses data quietly. Apply it by hand
+before any chart upgrade that changes it, because Helm installs `crds/` once
+and never upgrades it.
 
-The [`MiraCluster` fields](reference/crd.md) get the same treatment, and the
-stakes are higher: the API server **prunes** a field the CRD does not name
-rather than rejecting it, so a stale CRD is silent data loss. So the CRD is
-generated from the Rust types and `make operator-crd-check` fails the build when
-the two disagree — and a chart upgrade that changes the schema needs the CRD
-applied by hand first, since Helm installs `crds/` once and never upgrades it.
+Every value: [chart reference](reference/chart.md), which also has how a
+scale-in is sequenced. Every field: [`MiraCluster`](reference/crd.md).
 
 ## Where it will refuse to start
 
-Mira `statfs`es its data directory at startup and **refuses to start on a
-network filesystem** — NFS, SMB, CephFS and friends. The error names the
-filesystem and what to point `--data-dir` at instead.
-FUSE is a warning rather than a refusal, because the magic number cannot tell
-`gcsfuse` from a local one.
+Mira checks its data directory at startup and **refuses to start on a network
+filesystem** — NFS, SMB, CephFS and friends. The error names the filesystem and
+what to point `--data-dir` at instead. FUSE gets a warning rather than a
+refusal.
 
-That rules out an RWX PVC on Kubernetes: the operator's volume claim template is
-hard-coded to `ReadWriteOnce` with no field to change it, and
-`spec.storage.className` should name a block-backed class.
+That rules out a shared (RWX) volume on Kubernetes: the operator always asks
+for `ReadWriteOnce` and there is no field to change it.
 [Configuration](config.md) has the topology that works instead.
 
 ## Check it runs

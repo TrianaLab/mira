@@ -102,31 +102,37 @@ type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// This replica's name. Hashed into the block directory name so that
-    /// replicas sharing a volume cannot collide (see `mira_core::block`).
+    /// This replica's name. It is hashed into the name of every block
+    /// directory this node writes, so two replicas sharing a volume cannot
+    /// collide (see `mira_core::block`).
     pub node: String,
-    /// Where OTLP/gRPC listens.
+    /// The address OpenTelemetry exporters send to over gRPC.
     pub grpc: SocketAddr,
-    /// Where OTLP/HTTP, the query API, the MCP endpoint and the web UI listen —
-    /// one port, because they are one surface over one set of blocks.
+    /// The address for everything else: OpenTelemetry over HTTP, the query
+    /// API, the MCP endpoint and the web UI all answer on this one port.
     pub http: SocketAddr,
-    /// The block directory. It is the whole manifest: no catalogue, no index
-    /// file, nothing outside it to keep in sync.
+    /// Where the data goes. This directory is all the state there is: no
+    /// catalogue, no index file, nothing outside it to keep in sync.
     pub data_dir: PathBuf,
-    /// How long a block is kept. Retention is a delete of whole blocks, so the
-    /// oldest data disappears in block-sized steps rather than row by row.
+    /// How long data is kept. Deleting happens a whole block at a time, so the
+    /// oldest data goes in steps rather than row by row.
     pub retention: Duration,
-    /// Where a block goes before retention unlinks it, or `None` to unlink it
-    /// outright. Off by default: retention deleting data is the documented
-    /// behaviour, and a flag that silently started keeping everything would be
-    /// a disk bill nobody asked for. See `mira_core::offload`.
+    /// Where to copy a block before retention deletes it, or `None` to just
+    /// delete it. Off by default: deleting is the documented behaviour, and a
+    /// flag that silently started keeping everything would be a disk bill
+    /// nobody asked for.
+    ///
+    /// See `mira_core::offload`.
     pub offload: Option<String>,
-    /// The largest export either listener will decode. See
-    /// `receiver::Receivers::max_request_bytes` for why it is one number.
+    /// The largest single export either listener will accept.
+    ///
+    /// One number covers the HTTP body limit, the gRPC decode limit and the
+    /// ceiling on what a gzip body may inflate to. See
+    /// `receiver::Receivers::max_request_bytes` for why.
     pub max_request_bytes: usize,
-    /// How many exports may be queued for one signal's flusher before the next
-    /// one has to wait for a slot — and is shed with a 503 only if none frees
-    /// up within `pipeline::ADMIT_WAIT`.
+    /// How many exports may wait for a writer before the next one is held
+    /// back — and refused with a 503 only if no slot frees up within
+    /// `pipeline::ADMIT_WAIT`.
     ///
     /// The concurrency limit Mira did not used to have. It was a fixed 128 and
     /// a full queue meant an immediate 503, so a wide collector fleet spent
@@ -144,7 +150,7 @@ pub struct Config {
     /// to avoid a 503. Each slot can hold a decoded export, so the worst case is
     /// this times [`Config::max_request_bytes`] times three signals resident.
     pub queue: usize,
-    /// How many flushers a signal runs, or 0 for "one per two cores".
+    /// How many writer tasks a signal runs, or 0 for one per two cores.
     ///
     /// One shard per core is the sanctioned unit (docs/architecture/ingest.md section 4);
     /// this is only here so the number can be pinned when the machine lies
@@ -161,8 +167,8 @@ pub struct Config {
     /// Shards split `queue`, they do not multiply it: the resident worst case
     /// is the same whatever this is. Capped at `pipeline::MAX_SHARDS`.
     pub shards: usize,
-    /// Acknowledge an export once it is a frame in the write-ahead log, rather
-    /// than once the block holding it has been published.
+    /// Acknowledge an export once it has been written to the log, rather than
+    /// waiting for the block that holds it to be sealed.
     ///
     /// The one durability decision Mira does not make for the operator, and it
     /// is not the tuning knob the module docs above rule out: both settings are
@@ -200,14 +206,15 @@ pub struct Config {
     /// what an OTLP exporter is for, and Mira is not going to grow a second one
     /// pointed at itself.
     pub self_telemetry: bool,
-    /// How often [`Config::self_telemetry`] samples this node's counters.
+    /// How often self-telemetry samples this node's counters.
     ///
     /// A sample is one point per series, so this is the resolution of every
     /// chart drawn from it and also its cost. The default matches what a
     /// collector's own scrape interval usually is; below a second it is
     /// measuring the sampler.
     pub telemetry_interval: Duration,
-    /// A KYAML file of alerting rules ([`crate::alert`]), or none.
+    /// A file of alerting rules ([`crate::alert`]), or none — and none means
+    /// Mira does not alert.
     ///
     /// Deployment description rather than a knob, and the same argument as the
     /// data directory: what to page on is a thing the engine cannot know. It is
