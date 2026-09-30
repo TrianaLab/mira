@@ -92,7 +92,7 @@ fn sync_with(
 /// ponytail: measurement arm, never a release. `weak-sync-ab` replaces every
 /// barrier in the tree with a plain `fsync(2)` so the device-barrier term can
 /// be priced end to end against an otherwise identical binary
-/// (`scripts/measure/barrier-ab.sh`; the answer is in performance-barrier.md).
+/// (`scripts/measure/ab.sh`; the answer is in performance-barrier.md).
 /// It trades the power-loss guarantee `sync_all` documents, so it is a
 /// compile-time feature and not a config key or an environment variable: a
 /// released binary has no code path that reaches it, and `--features` is

@@ -809,17 +809,26 @@ pub fn spawn<B: SignalBuilder>(cfg: &Arc<Config>) -> (Ingest<B::Request>, OpenSl
 /// block (section 4), and where the last copy it produced is cached.
 ///
 /// The snapshot is taken on demand, never on a timer: an idle node with nobody
-/// querying it copies nothing. A `Mutex` around the cached `Arc` rather than an
-/// `ArcSwap` — the critical section is one pointer clone and a crate for that
-/// would be a crate for nothing.
+/// querying it copies nothing. A `Mutex` around the cached list rather than an
+/// `ArcSwap` — the critical section clones at most two pointers and a crate
+/// for that would be a crate for nothing.
 #[derive(Clone)]
 struct Shard {
-    cur: Arc<Mutex<Option<Arc<Open>>>>,
+    cur: Arc<Mutex<Snapshot>>,
     /// Handing the flusher somewhere to put an answer. Not generic in the
     /// signal's request type, which is the whole reason the read path can hold
     /// three of these in one array.
-    ask: mpsc::Sender<oneshot::Sender<Option<Arc<Open>>>>,
+    ask: mpsc::Sender<oneshot::Sender<Snapshot>>,
 }
+
+/// What one shard has open, newest sequence last.
+///
+/// Two entries and not one because a shard's block stays readable while its
+/// rename is in flight: the sealed block is not on disk yet, and the builder
+/// behind it is already taking rows. Answering with either alone would be a
+/// row vanishing under a live reader. Empty on an idle shard, one deep on a
+/// busy one, two only inside a publish.
+type Snapshot = Vec<Arc<Open>>;
 
 /// Every shard of one signal's open blocks, asked together.
 ///
@@ -874,18 +883,18 @@ impl OpenSlot {
 
 impl Shard {
     /// The last snapshot taken, without asking for a new one.
-    fn get(&self) -> Option<Arc<Open>> {
+    fn get(&self) -> Snapshot {
         self.lock().clone()
     }
 
-    fn put(&self, v: Option<Arc<Open>>) {
+    fn put(&self, v: Snapshot) {
         *self.lock() = v;
     }
 
     /// A panic in this critical section is not possible — it clones or drops an
     /// `Arc` and nothing else — so poisoning carries no information and
     /// unwrapping it would only turn an impossible bug into an outage.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<Open>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Snapshot> {
         self.cur.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -983,7 +992,7 @@ async fn wal_sweep(wal: Arc<Wal>, dir: PathBuf, truncating: bool) {
 
 async fn flusher<B: SignalBuilder>(
     mut rx: mpsc::Receiver<Job<B::Request>>,
-    mut asks: mpsc::Receiver<oneshot::Sender<Option<Arc<Open>>>>,
+    mut asks: mpsc::Receiver<oneshot::Sender<Snapshot>>,
     cfg: Arc<Config>,
     open_slot: Shard,
     shard: usize,
@@ -1026,11 +1035,20 @@ async fn flusher<B: SignalBuilder>(
     // last answer was taken at. Answered only with an empty `rx` — see
     // [`OpenSlot::fresh`] — so they survive as many loop turns as the backlog
     // takes.
-    let mut asked: Vec<oneshot::Sender<Option<Arc<Open>>>> = Vec::new();
-    let mut snapped: Option<usize> = None;
+    let mut asked: Vec<oneshot::Sender<Snapshot>> = Vec::new();
+    // The last copy of the builder taken, and the size it was taken at. One
+    // field and not two so the copy cannot outlive the size it answers for.
+    let mut snapped: Option<(usize, Arc<Open>)> = None;
+    // The block on its way to disk, if there is one. At most one: see
+    // [`InFlight`].
+    let mut in_flight: Option<InFlight> = None;
 
     // Carry outlives the channel: a request deferred by the last block still has
     // to land somewhere before the task exits.
+    // Deliberately not `|| in_flight.is_some()`: once `rx` is closed
+    // `recv_many` returns 0 without waiting, so a turn taken only to wait for
+    // a publish would spin the select rather than park in it. The drain below
+    // the loop is what that case is for.
     while open || !carry.is_empty() {
         // Before the wait, not after the work: a turn that seals parks again
         // immediately, and a reader answered only on the next arrival would
@@ -1040,6 +1058,7 @@ async fn flusher<B: SignalBuilder>(
             &mut asked,
             &mut snapped,
             !carry.is_empty() || !rx.is_empty(),
+            in_flight.as_ref().map(|f| &f.open),
             &open_slot,
             cfg.node,
             seq,
@@ -1062,6 +1081,14 @@ async fn flusher<B: SignalBuilder>(
                     if let Some(who) = who {
                         asked.push(who);
                     }
+                }
+                // The block in flight landing. Here and not only at the next
+                // seal, because its callers are waiting on an acknowledgement
+                // the device has already given: on a quiet shard the next seal
+                // is a whole `max_block_age` away.
+                res = joined(&mut in_flight) => {
+                    let f = in_flight.take().expect("joined resolves only with a block in flight");
+                    land::<B>(f, res, &cfg, &open_slot, &snapped, rejects, shard, signal);
                 }
                 _ = sleep_until(deadline) => aged = true,
             }
@@ -1202,11 +1229,20 @@ async fn flusher<B: SignalBuilder>(
                 wal_seqs.clear();
                 // Those rows are gone; a snapshot still advertising them would
                 // be the read path promising data no restart can produce.
-                open_slot.put(None);
+                snapped = None;
+                open_slot.put(in_flight.iter().map(|f| f.open.clone()).collect());
                 tracing::error!(signal = B::SIGNAL, error = %msg, "block discarded");
                 continue;
             }
         };
+
+        // The seal is done and the next block's builder is already fresh, so
+        // this is the last moment the overlap is worth anything — and the
+        // first at which a second sealed block would be resident. Waiting
+        // here, after `finish`, is what bounds it to one.
+        if let Some(f) = in_flight.take() {
+            settle::<B>(f, &cfg, &open_slot, &snapped, rejects, shard, signal).await;
+        }
 
         let dir = cfg.data_dir.clone();
         let node = cfg.node;
@@ -1221,55 +1257,174 @@ async fn flusher<B: SignalBuilder>(
             Some(w) => w.watermark_for(signal, &block_seqs),
             None => 0,
         };
-        let rows = sealed.num_rows;
-        let result = tokio::task::spawn_blocking(move || {
+        // The sealed block, in the shape the read path already understands.
+        // Publishing borrows it out of the same `Arc` the slot holds, so
+        // keeping it readable for the length of the rename costs one pointer
+        // and copies no rows.
+        let open = Arc::new(Open {
+            node,
+            seq: this_seq,
+            sealed,
+        });
+        let publishing = open.clone();
+        let task = tokio::task::spawn_blocking(move || {
             // The size is measured in the same blocking hop as the write, off
             // the runtime: it is a handful of `stat`s against pages the publish
             // just touched, and it is the only exact answer to "how much disk
             // did this node write" that does not mean walking the whole tree.
-            block::publish(&dir, B::SIGNAL, node, this_seq, block_wal_hi, &sealed)
-                .map(|b| (dir_bytes(&b.dir), b.dir))
-        })
-        .await;
-
-        // Held across the publish rather than dropped at `finish`, so the rows
-        // stay visible while the rename is in flight; the read path drops the
-        // snapshot itself the instant a block with the same `(node, seq)`
-        // appears on disk, so the overlap shows nothing twice.
-        open_slot.put(None);
+            block::publish(
+                &dir,
+                B::SIGNAL,
+                node,
+                this_seq,
+                block_wal_hi,
+                &publishing.sealed,
+            )
+            .map(|b| (dir_bytes(&b.dir), b.dir))
+        });
+        // Not awaited here, and that is the change section 11's barrier page
+        // was looking for. `publish` is eleven `F_FULLFSYNC` plus the encode's
+        // bytes, and awaiting it stopped this shard reading its channel for the
+        // whole of it — so the queue slot that `submit.admit` blocks on was not
+        // freed by a shard that had nothing to do but wait for a device. The
+        // loop now turns straight back to `recv_many` and the next block's
+        // Arrow encode runs against the current one's device time.
+        //
+        // Nothing about durability moves: the waiters below are still answered
+        // only by `settle`, after the rename. What overlaps is the encode, not
+        // the acknowledgement.
+        in_flight = Some(InFlight {
+            task,
+            waiters: std::mem::take(&mut waiters),
+            block_seqs,
+            open,
+        });
         snapped = None;
-
-        let outcome = match result {
-            Ok(Ok((bytes, path))) => {
-                if let Some(w) = &cfg.wal {
-                    w.published(signal, &block_seqs);
-                }
-                rejects.published.fetch_add(1, Relaxed);
-                rejects.rows.fetch_add(rows as u64, Relaxed);
-                rejects.bytes.fetch_add(bytes, Relaxed);
-                rejects.clear_stalled(shard);
-                tracing::info!(signal = B::SIGNAL, rows, bytes, seq = this_seq, path = %path.display(), "block published");
-                Ok(())
-            }
-            // Logged here and not only counted: a disk that filled up at 02:00
-            // is the one fact that explains every NACK the senders are about to
-            // report, and it is invisible from their side.
-            Ok(Err(e)) => {
-                rejects.mark_stalled(shard);
-                tracing::error!(signal = B::SIGNAL, seq = this_seq, error = %e, "block not published");
-                Err(e.to_string())
-            }
-            Err(e) => {
-                rejects.mark_stalled(shard);
-                Err(format!("flush task panicked: {e}"))
-            }
-        };
-        for w in waiters.drain(..) {
-            // Every failure here is the block's, not any one caller's, so they
-            // all get a retryable answer.
-            let _ = w.send(outcome.clone().map_err(Rejected::Unavailable));
-        }
         deadline = Instant::now() + cfg.max_block_age;
+    }
+    // The loop exits without waiting for a publish — see the condition — so
+    // this is where the last block of a shutting-down shard is waited for. Its
+    // callers are owed an answer: dropping the handle here would abort a
+    // publish the shutdown path exists to finish.
+    if let Some(f) = in_flight.take() {
+        settle::<B>(f, &cfg, &open_slot, &snapped, rejects, shard, signal).await;
+    }
+}
+
+/// A block on its way to disk, and everyone owed an answer when it lands.
+///
+/// The flusher keeps at most one of these so the next block's Arrow encode
+/// overlaps the current one's device time instead of queueing behind it — see
+/// the `settle` call sites. One and not more: a second in flight would be a
+/// second sealed block's worth of resident bytes per shard against the
+/// footprint axis, and the stall this removes is already gone at one.
+struct InFlight {
+    task: tokio::task::JoinHandle<mira_core::Result<(u64, PathBuf)>>,
+    /// Acknowledged only when the rename lands. Holding them here rather than
+    /// on the stack is the whole reason the loop may turn again meanwhile: the
+    /// durability contract is unchanged, it is the *waiting* that moved.
+    waiters: Vec<oneshot::Sender<Result<(), Rejected>>>,
+    /// Retired against the log only on success, exactly as before. While this
+    /// is unlanded the sequences stay in `Wal::pending`, so the next block's
+    /// `watermark_for` finds them and refuses to claim them — the overlap is
+    /// safe here by construction rather than by an added check.
+    block_seqs: Vec<u64>,
+    /// Also what the read path is served from until the rename lands, which is
+    /// why it is an `Arc` and not the bare `Sealed` the publish needs.
+    open: Arc<Open>,
+}
+
+/// The join result of a publish: the outer layer is the task's, the inner the
+/// filesystem's.
+type Published = std::result::Result<mira_core::Result<(u64, PathBuf)>, tokio::task::JoinError>;
+
+/// Resolve when the block in flight lands, leaving it in place for [`land`].
+///
+/// Pending forever when there is nothing in flight, which is what makes this a
+/// `select!` arm needing no guard. Polling a `&mut JoinHandle` and dropping it
+/// is cancel-safe, so losing the race to an arriving export costs nothing.
+async fn joined(flight: &mut Option<InFlight>) -> Published {
+    match flight {
+        Some(f) => (&mut f.task).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Await the block in flight and hand it to [`land`]. The publish half of what
+/// used to be one straight-line `.await`.
+#[allow(clippy::too_many_arguments)]
+async fn settle<B: SignalBuilder>(
+    mut flight: InFlight,
+    cfg: &Config,
+    open_slot: &Shard,
+    snapped: &Option<(usize, Arc<Open>)>,
+    rejects: &'static Rejects,
+    shard: usize,
+    signal: wal::Signal,
+) {
+    let res = (&mut flight.task).await;
+    land::<B>(flight, res, cfg, open_slot, snapped, rejects, shard, signal);
+}
+
+/// Acknowledge a landed block's waiters and retire its log sequences.
+///
+/// Synchronous, because by here the device has already answered: this is the
+/// same tail the straight-line version ran, with the `.await` lifted out so a
+/// `select!` arm can reach it too.
+#[allow(clippy::too_many_arguments)]
+fn land<B: SignalBuilder>(
+    flight: InFlight,
+    res: Published,
+    cfg: &Config,
+    open_slot: &Shard,
+    snapped: &Option<(usize, Arc<Open>)>,
+    rejects: &'static Rejects,
+    shard: usize,
+    signal: wal::Signal,
+) {
+    let InFlight {
+        task: _,
+        waiters,
+        block_seqs,
+        open,
+    } = flight;
+    let (rows, seq) = (open.sealed.num_rows, open.seq);
+    let outcome = match res {
+        Ok(Ok((bytes, path))) => {
+            if let Some(w) = &cfg.wal {
+                w.published(signal, &block_seqs);
+            }
+            rejects.published.fetch_add(1, Relaxed);
+            rejects.rows.fetch_add(rows as u64, Relaxed);
+            rejects.bytes.fetch_add(bytes, Relaxed);
+            rejects.clear_stalled(shard);
+            tracing::info!(signal = B::SIGNAL, rows, bytes, seq, path = %path.display(), "block published");
+            Ok(())
+        }
+        // Logged here and not only counted: a disk that filled up at 02:00
+        // is the one fact that explains every NACK the senders are about to
+        // report, and it is invisible from their side.
+        Ok(Err(e)) => {
+            rejects.mark_stalled(shard);
+            tracing::error!(signal = B::SIGNAL, seq, error = %e, "block not published");
+            Err(e.to_string())
+        }
+        Err(e) => {
+            rejects.mark_stalled(shard);
+            Err(format!("flush task panicked: {e}"))
+        }
+    };
+    // The rows are on disk now, so the copy the slot was serving them from can
+    // go and the builder behind it is all that is left to answer with. Dropped
+    // here rather than at `finish` so they stay visible for the length of the
+    // rename; the read path discards a snapshot the instant a block with the
+    // same `(node, seq)` appears on disk, so the overlap shows nothing twice.
+    drop(open);
+    open_slot.put(snapped.iter().map(|(_, o)| o.clone()).collect());
+    for w in waiters {
+        // Every failure here is the block's, not any one caller's, so they
+        // all get a retryable answer.
+        let _ = w.send(outcome.clone().map_err(Rejected::Unavailable));
     }
 }
 
@@ -1286,11 +1441,18 @@ async fn flusher<B: SignalBuilder>(
 /// misses the newest rows for a moment; failing the flush over it would turn a
 /// read-path nicety into an ingest outage, and the same error is about to be
 /// reported properly by the real seal.
+#[allow(clippy::too_many_arguments)]
 fn answer<B: SignalBuilder>(
     builder: &B,
-    asked: &mut Vec<oneshot::Sender<Option<Arc<Open>>>>,
-    snapped: &mut Option<usize>,
+    asked: &mut Vec<oneshot::Sender<Snapshot>>,
+    snapped: &mut Option<(usize, Arc<Open>)>,
     pending: bool,
+    // A block of this shard's between `finish` and its rename, if there is
+    // one. It is the *older* of the two — the builder behind it has already
+    // started taking rows — and it is on neither the disk nor the builder, so
+    // an answer that left it out would be a row disappearing under a reader
+    // that had already been shown it.
+    in_flight: Option<&Arc<Open>>,
     slot: &Shard,
     node: u32,
     seq: u64,
@@ -1304,19 +1466,23 @@ fn answer<B: SignalBuilder>(
     // the builder already keeps; appends only ever grow it.
     let bytes = builder.approx_bytes();
     if builder.is_empty() {
-        slot.put(None);
         *snapped = None;
-    } else if *snapped != Some(bytes) {
-        *snapped = Some(bytes);
-        match builder.snapshot() {
-            Ok(sealed) => slot.put(Some(Arc::new(Open { node, seq, sealed }))),
+    } else if snapped.as_ref().map(|(n, _)| *n) != Some(bytes) {
+        *snapped = match builder.snapshot() {
+            Ok(sealed) => Some((bytes, Arc::new(Open { node, seq, sealed }))),
             Err(e) => {
-                slot.put(None);
                 tracing::debug!(signal = B::SIGNAL, error = %e, "open block not snapshotted");
+                None
             }
-        }
+        };
     }
-    let cur = slot.get();
+    // Oldest first, which is the order the sequences are in.
+    let cur: Snapshot = in_flight
+        .into_iter()
+        .chain(snapped.as_ref().map(|(_, o)| o))
+        .cloned()
+        .collect();
+    slot.put(cur.clone());
     for who in asked.drain(..) {
         let _ = who.send(cur.clone());
     }

@@ -70,9 +70,10 @@ impl Api {
     ///
     /// Awaited before the query rather than inside it: this is where
     /// read-your-writes is bought, and paying for it here keeps the scan itself
-    /// synchronous and off the runtime. One entry per flusher shard, which is
-    /// what `search_open` takes — the plumbing was already the general one
-    /// before a signal had more than one open block at a time.
+    /// synchronous and off the runtime. One entry per flusher shard, and two
+    /// from a shard whose last block is still being renamed — `search_open`
+    /// takes a list either way, which it did before a signal had more than one
+    /// open block at a time.
     pub(crate) async fn open(&self, signal: &str) -> Vec<Arc<mira_core::signal::Open>> {
         let Some(i) = pipeline::SIGNALS.iter().position(|s| *s == signal) else {
             return Vec::new();

@@ -733,7 +733,7 @@ measurements:
       1.435, 0.912, 1.185, 1.056, 1.019, 0.838 — with both arms converging on
       ~1.25-1.5 M records/s from opposite directions, which is what two earlier
       five- and thirteen-pass runs sampled to get 1.40x and 0.991x.
-    provenance: scripts/measure/barrier-ab.sh
+    provenance: scripts/measure/ab.sh
     quoted:
       - as: "1.12x"
         sites: [docs/architecture/performance-barrier.md]
@@ -746,7 +746,7 @@ measurements:
       84.6 ms against 48.0 ms at the medians. Agreed, 8 of 8, range 1.185-2.688,
       sign test p=0.0078. This is the effect the barrier actually has, and it is
       a latency one.
-    provenance: scripts/measure/barrier-ab.sh
+    provenance: scripts/measure/ab.sh
     quoted:
       - as: "1.65x"
         sites: [docs/architecture/performance-barrier.md]
@@ -759,7 +759,7 @@ measurements:
       has the *worse* tail. Signs split, 3 of 8, range 0.269-2.737 — not
       quotable in either direction, and recorded because the p50 win does not
       carry to the tail and a change sold on ack latency has to say so.
-    provenance: scripts/measure/barrier-ab.sh
+    provenance: scripts/measure/ab.sh
     quoted:
       - as: "3 of 8"
         sites: [docs/architecture/performance-barrier.md]
@@ -773,7 +773,7 @@ measurements:
       the absence of an effect: removing the barrier does not make a core
       faster. Against it, cores busy moves 2.6 to 3.0, 7 of 8 favourable. The
       barrier gates concurrency; it is not CPU the engine spends.
-    provenance: scripts/measure/barrier-ab.sh
+    provenance: scripts/measure/ab.sh
     quoted:
       - as: "0.976x"
         sites: [docs/architecture/performance-barrier.md]
@@ -790,11 +790,7 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "eleven"
-        sites:
-          [
-            docs/architecture/performance-barrier.md,
-            scripts/measure/barrier-ab.sh,
-          ]
+        sites: [docs/architecture/performance-barrier.md]
 
   # ---------------------------------------------------------------------------
   # `mira proxy` against one node. Every one of these is two replicas, a proxy

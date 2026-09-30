@@ -11,6 +11,36 @@ the config keys, the `/mcp` tool set.
 
 ### Changed
 
+- **A shard no longer stops to watch its block reach the disk.** The flusher
+  awaited `block::publish` inline, so each shard ran fill → seal → wait out
+  eleven device barriers → fill, and for the whole of that wait it read
+  nothing from its channel and freed no queue slot — which is exactly what
+  admission blocks on. The publish now runs as one in-flight task per shard
+  and the loop turns straight back to `recv_many`, so the next block's Arrow
+  encode overlaps the current one's device time. **Durability is unchanged**:
+  waiters are still acknowledged only after the rename, and the sequences a
+  block is retiring stay in the log's pending set until then, so no sibling
+  shard's watermark can advance past a block still in flight. One in flight
+  and not more, bounded by a settle before the next publish, because a second
+  would be a second sealed block resident per shard. A shard's sealed block
+  also stays *readable* while it is renamed — it is on neither the disk nor
+  the builder — which the reader-under-a-live-writer test is what caught.
+
+- **An attribute table stops writing the value columns it never filled.**
+  `ATTRS` carries one column per `AnyValue` variant and each row fills exactly
+  one, so the rest are null down the whole block — and Arrow IPC writes an
+  all-null `Binary` column as a full offsets buffer plus its validity bitmap.
+  `bytes` and `ser` hold `BytesValue` and serialized slices and maps, which
+  most telemetry never emits, and they cost 8.25 bytes a row to say so. They
+  are dropped at stage time when the block filled neither. Only those two, and
+  only as a trailing pair: every surviving column keeps the position the read
+  path indexes it by, and they are the only ones no reader touches before
+  consulting a row's type byte. No `FORMAT_VERSION` bump and no format break —
+  a short attribute table is the tolerance the reader already needs for a
+  table that is absent entirely. It is deliberately not done in the builder:
+  the bloom filter and the zone map select attribute tables by schema
+  identity, and a projection upstream would silently leave them out of both.
+
 - **One number per quantity on the landing page, and a hero that leads with
   the job.** The page carried two ingest rates and two binary sizes: 1,537,875
   was the eight-connection peak quoted where the four-connection plateau
@@ -31,7 +61,7 @@ the config keys, the `/mcp` tool set.
   ingest plateau.** Publishing one block costs eleven device-wide cache
   barriers — five tables, three sidecars, three directories — and the plateau
   write-up left the volume open as a candidate for why the flusher is slow.
-  `scripts/measure/barrier-ab.sh` answers it: eight ABBA-interleaved pairs at
+  `scripts/measure/ab.sh` answers it: eight ABBA-interleaved pairs at
   thirty-two connections against the same tree built `--features
   weak-sync-ab`, which swaps every barrier for a plain `fsync(2)`. Throughput
   comes back a median 1.12x with the signs split 6 of 8, which under the

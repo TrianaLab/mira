@@ -12,9 +12,9 @@ wrong.
 
 ## The arm is a build, not a switch
 
-`scripts/measure/barrier-ab.sh` builds the tree twice. The second arm is
-`--features weak-sync-ab`, which replaces every barrier with a plain `fsync(2)`
-and changes nothing else. It runs eight ABBA-interleaved pairs at thirty-two
+The tree is built twice and `scripts/measure/ab.sh` is handed both binaries.
+The second arm is `--features weak-sync-ab`, which replaces every barrier with
+a plain `fsync(2)` and changes nothing else. It runs eight ABBA-interleaved pairs at thirty-two
 connections and 12M records, both arms in every round, zero shed — strong first
 on even rounds and weak first on odd, so this box's 23% day-to-day drift
 cancels within a round rather than loading onto whichever arm ran second.
