@@ -444,7 +444,7 @@
   pointer-events: none;
 }
 /* ---- Axis tabs ------------------------------------------------------------
-   Three radios, three labels, three panels, no script. The radios stay in the
+   Two radios, two labels, two panels, no script. The radios stay in the
    accessibility tree and stay focusable — `opacity: 0`, not `display: none`,
    because a hidden-by-display input cannot be tabbed to and the whole set
    would be keyboard-dead. They are the first children of the figure so that
@@ -480,10 +480,11 @@
   border-color: var(--mira-chart-dim);
 }
 /* One pair of rules per axis, spelled out rather than generated: `:checked ~`
-   cannot carry the id along, so the label has to be named. Adding a fourth
-   axis means adding it here as well as in overrides/home.html. */
+   cannot carry the id along, so the label has to be named. Adding a third axis
+   means adding it here as well as in overrides/home.html. There was a `binary`
+   axis until the figure stopped carrying other vendors' numbers: one bar is not
+   a chart, and the binary size is in the hero's own sentence instead. */
 #mira-axis-ingest:checked ~ .mira-chart__tabs label[for="mira-axis-ingest"],
-#mira-axis-binary:checked ~ .mira-chart__tabs label[for="mira-axis-binary"],
 #mira-axis-memory:checked ~ .mira-chart__tabs label[for="mira-axis-memory"] {
   color: var(--mira-chart-bg);
   background: var(--mira-chart-accent);
@@ -492,7 +493,6 @@
 /* The focus ring belongs on the label, since the input it is really on is a
    1px transparent square in the corner of the panel. */
 #mira-axis-ingest:focus-visible ~ .mira-chart__tabs label[for="mira-axis-ingest"],
-#mira-axis-binary:focus-visible ~ .mira-chart__tabs label[for="mira-axis-binary"],
 #mira-axis-memory:focus-visible ~ .mira-chart__tabs label[for="mira-axis-memory"] {
   outline: 2px solid var(--mira-chart-accent);
   outline-offset: 2px;
@@ -501,7 +501,6 @@
   display: none;
 }
 #mira-axis-ingest:checked ~ .mira-chart__panel--ingest,
-#mira-axis-binary:checked ~ .mira-chart__panel--binary,
 #mira-axis-memory:checked ~ .mira-chart__panel--memory {
   display: block;
 }
@@ -540,7 +539,8 @@
 }
 /* Second in the source, not third: grid auto-placement is sequential, and the
    full-width track between the name and the figure would put the figure on a
-   row of its own. Reading order gains from it too — "Mira, 1,458,967". */
+   row of its own. Reading order gains from it too — "4 connections, then its
+   rate", rather than the rate stranded on a line of its own. */
 .mira-chart__val {
   font-family: var(--mira-pixel-font);
   font-size: 0.54rem;
@@ -548,6 +548,10 @@
   text-align: right;
   color: var(--mira-chart-dim);
 }
+/* The accent row. Named `--mira` from when the figure held other vendors; every
+   row is Mira's now, so it marks the *headline* shape — the four-connection row,
+   which is the one the sentence above the figure quotes. One accent row per
+   panel, or the tie to the prose is gone. */
 .mira-chart__row--mira .mira-chart__name,
 .mira-chart__row--mira .mira-chart__val {
   color: var(--mira-chart-accent);

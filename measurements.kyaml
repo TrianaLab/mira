@@ -79,6 +79,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.records_per_s.conns4
@@ -96,6 +97,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.records_per_s.conns32
@@ -115,6 +117,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.records_per_s.conns96
     value: 1136941
@@ -132,6 +135,7 @@ measurements:
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: ingest.cores.conns1
     value: 0.71
@@ -149,6 +153,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.cores.conns4
@@ -164,6 +169,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: ingest.cores.conns32
@@ -184,6 +190,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.per_core.conns1
     value: 886147
@@ -205,6 +212,7 @@ measurements:
             README.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
   - key: ingest.per_core.conns96
     value: 515288
@@ -271,7 +279,7 @@ measurements:
     provenance: scripts/measure/conn-sweep.sh
     quoted:
       - as: "2,661"
-        sites: [docs/market.md, docs/internals/e2e.md]
+        sites: [docs/market.md, docs/internals/e2e.md, overrides/home.html]
       - as: "2.7 s"
         sites: [docs/market.md]
 
@@ -329,6 +337,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   - key: rss_mib.conns4
@@ -345,6 +354,7 @@ measurements:
             docs/market.md,
             docs/internals/e2e.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: rss_mib.conns96
     value: 1648
@@ -361,6 +371,7 @@ measurements:
             docs/architecture/performance.md,
             docs/market.md,
             docs/internals/e2e.md,
+            overrides/home.html,
           ]
 
   # ---------------------------------------------------------------------------
@@ -426,7 +437,13 @@ measurements:
     provenance: unscripted
     quoted:
       - as: "4.7 ms"
-        sites: [docs/architecture/performance.md, README.md, docs/agents.md]
+        sites:
+          [
+            docs/architecture/performance.md,
+            README.md,
+            docs/agents.md,
+            overrides/home.html,
+          ]
 
   - key: query.metric_names.first_ms
     value: 8.9
@@ -798,6 +815,7 @@ measurements:
             docs/market.md,
             docs/agents.md,
             CHANGELOG.md,
+            overrides/home.html,
           ]
   - key: corpus.records.points
     value: 39648

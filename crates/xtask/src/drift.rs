@@ -87,13 +87,19 @@ const CRATE_COUNT_SITES: [&str; 7] = [
 ];
 
 /// Every file that quotes the binary size. See [`CRATE_COUNT_SITES`].
-const BINARY_SIZE_SITES: [&str; 6] = [
+///
+/// `overrides/home.html` is the landing hero, and it is here because it was not:
+/// it went on saying 6.06 MiB for two releases while the other six moved
+/// together, which is exactly the drift this list exists to catch and the only
+/// site that was outside it.
+const BINARY_SIZE_SITES: [&str; 7] = [
     "README.md",
     "docs/architecture/performance.md",
     "docs/architecture/principles.md",
     "docs/market.md",
     "docs/index.md",
     "crates/mira/src/term.rs",
+    "overrides/home.html",
 ];
 
 /// Every page that quotes how many configuration keys there are.
