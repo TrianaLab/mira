@@ -55,6 +55,17 @@ the config keys, the `/mcp` tool set.
   attached. What is left is Mira's own connection sweep. The subtitle now says
   what you run and what you get before it says what shape the bytes are in.
 
+- **The week's dependency bumps ship as one release, and one override dies
+  with them.** Six Dependabot PRs folded in together: the cargo patch group
+  (`hyper-rustls`, `hyper-util`, `thiserror`), `taiki-e/install-action` across
+  all three workflows, the `rust:1-slim-bookworm` digest, the Svelte and Vite
+  toolchain, and `markdownlint-cli2`. The tree is still 149 crates and the
+  binary still 6.12 MiB, so none of it touches what ships. The one change
+  worth naming is that `markdownlint-cli2` 0.23.3 moved off `smol-toml`
+  1.7.0 — the version GHSA-7w5x-hrqm-74c2 is open against — so the root
+  `overrides` block that had been holding `smol-toml` at 1.7.1+ by hand is
+  gone, and npm resolves it the ordinary way.
+
 ### Added
 
 - **`block::publish`'s eleven `F_FULLFSYNC` are priced, and they are not the
