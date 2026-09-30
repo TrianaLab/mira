@@ -38,18 +38,13 @@ that run's own query plans and wall clocks.
 | **6.20 MiB stripped, 149 crates** | `zstd-sys` is the only C dependency, and it vendors its source |
 
 One process on an Apple M3 Pro, measured with the load harness in this
-repository. Exactly what each number counts, and what it leaves out, is
-**[the measurement contract](docs/internals/measurement.md)** — which also
-lists every figure Mira publishes in one table. Run the sweep yourself:
-**[end-to-end testing](docs/internals/e2e.md)**. Why the numbers land where
-they do: **[architecture section 11](docs/architecture/performance.md)**. How
-they compare to other tools, including where Mira loses:
-**[docs/market.md](docs/market.md)**.
+repository. What each number counts and what it leaves out is
+**[the measurement contract](docs/internals/measurement.md)**; how they compare
+to other tools, including where Mira loses, is **[docs/market.md](docs/market.md)**.
 
 ## Four ways to read it
 
-Same data, same filters, same code underneath. There is nothing extra to
-install for any of them.
+Same data, same filters, same code underneath.
 
 | | | |
 | --- | --- | --- |
@@ -65,10 +60,9 @@ fails the call by name, and nothing gets written:
 
 <img src="docs/assets/tui/write-up.gif" alt="A recorded terminal session. An agent's three claims are listed, then render_rca refuses them: nothing was rendered and nothing was stored, 1 of 3 citations do not hold against this store, naming the claim and the filter that matched no records. The claim is corrected and the call returns a 59-line document whose evidence section carries the record count beside every claim — 229, 229, and 8 for the trace. A last query finds the write-up itself stored as a log record.">
 
-There is no separate incident database. `emit` writes the report back as an
-ordinary log record, so you search for it the same way you search for anything
-else, and it expires alongside the data it describes. The full worked
-investigation is in **[docs/agents.md](docs/agents.md)**.
+The report is written back as an ordinary log record, so you search for it the
+same way you search for anything else. Worked example:
+**[docs/agents.md](docs/agents.md)**.
 
 ## See it
 
@@ -84,8 +78,8 @@ helm install mira-operator oci://ghcr.io/trianalab/charts/mira-operator \
 ```
 
 Linux glibc >= 2.34 and macOS, x86_64 and arm64. `--version v0.4.2` pins the
-installer to a release; every one of them ships a CycloneDX SBOM, `SHA256SUMS`,
-a cosign signature and a SLSA provenance attestation.
+installer to a release; every one ships an SBOM, `SHA256SUMS`, a cosign
+signature and a SLSA provenance attestation.
 
 ## Where to go next
 
@@ -100,11 +94,10 @@ a cosign signature and a SLSA provenance attestation.
 
 ## Scope
 
-Mira is pre-1.0 and says so. Writing data copies it once; reading copies
-nothing. One process only ever answers from its own files — to read across
-several, put `mira proxy` in front, and it merges record search but not
+Mira is pre-1.0. One process only ever answers from its own files — to read
+across several, put `mira proxy` in front, and it merges record search but not
 correlate, map, metrics or entities. There is no entity filter and no block
-cache yet. The full list, with the reasoning behind each one, is
+cache yet. The full list is
 [architecture section 0.1](docs/architecture/corrections.md#01-what-is-not-true-yet).
 
 ## Contributing
@@ -117,12 +110,10 @@ make            # the target list
 make check      # fmt, clippy, tests, rustdoc, UI, supply chain, drift, docs, coverage
 ```
 
-Read [architecture section 0](docs/architecture/corrections.md)
-first if the change is structural — it lists the mechanisms that do not survive
-contact with the formats. [CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough,
-with [the test levels](docs/internals/testing.md) and
-[how a release is cut](docs/internals/releases.md) behind it. Vulnerabilities go
-to [SECURITY.md](SECURITY.md), not to an issue.
+[CONTRIBUTING.md](CONTRIBUTING.md) is the walkthrough. If the change is
+structural, read [architecture section 0](docs/architecture/corrections.md)
+first — it lists the mechanisms that do not survive contact with the formats.
+Vulnerabilities go to [SECURITY.md](SECURITY.md), not to an issue.
 
 ## Licence
 

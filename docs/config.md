@@ -13,15 +13,13 @@ default, and there are
 <!-- BEGIN GENERATED: count -->
 14
 <!-- END GENERATED: count -->
-keys in all. The file exists for what a flag cannot write, chiefly values
-pulled in from the environment. The flag spellings are in the
+keys in all. The flag spellings are in the
 [CLI reference](reference/cli.md).
 
 ## Every key
 
 Anything not on this list stops the process at startup, naming the outermost
-key it does not know. An empty section counts, so `{ "cluster": {} }` is
-`unknown key "cluster"`.
+key it does not know.
 
 <!-- BEGIN GENERATED: keys -->
 | Key | Flag | Type | Default | What it sets |
@@ -48,8 +46,7 @@ key it does not know. An empty section counts, so `{ "cluster": {} }` is
 | **Sizes** | `b`, `k`/`kb`/`kib`, `m`/`mb`/`mib`, `g`/`gb`/`gib`, case-insensitive; a bare number is bytes, and units are binary throughout, so `MB` means `MiB` |
 
 There is no block size, flush interval, cache size or compaction threshold, and
-there will not be: picking those is Mira's job, not yours
-([principle 2](architecture/principles.md)).
+there will not be ([principle 2](architecture/principles.md)).
 
 ## The file
 
@@ -77,11 +74,6 @@ written out, every string is double-quoted, and indentation carries no meaning.
     "wal": "true",
   },
 
-  "telemetry": {
-    "self": "false",
-    "interval": "15s",
-  },
-
   "alerts": {
     "rules": "/etc/mira/alerts.kyaml",
   },
@@ -94,32 +86,24 @@ type is a startup error:
 | written | what happens |
 | --- | --- |
 | `node: 0x1f` | refused — YAML resolved it to `31`, and coercing back would be a different name |
-| `node: False` | refused — coerced back it would be `"false"`, a different case |
-| `"storage": { "dir": {} }` | `storage.dir: expected a string, found a map` — quoting does not fix a shape |
-| `"listen": "0.0.0.0:4317"` | `listen: expected a map of settings, found a value` |
 | `node: null` | treated as absent; the default is used. So is `"listen": null`, at every level — which is how a templating layer writes "not set" |
 
 ## Interpolation
 
-`${env:…}` fills a value in from the environment, `${dotted.path}` from another
-key in the same file.
-
 | syntax | meaning |
 | --- | --- |
 | `${env:NAME}` | environment variable; **missing is a startup error**, not an empty string |
-| `${env:NAME,default}` | everything after the first comma is the default — untrimmed, later commas included, and itself expanded. Defaults nest: `${env:A,${env:B,fallback}}` finds the *matching* `}`, not the first one |
+| `${env:NAME,default}` | everything after the first comma is the default — untrimmed, later commas included, and itself expanded |
 | `${dotted.path}` | another key in this file, resolved recursively |
 | `$${` | a literal `${` |
 
 An unbalanced `${` is a startup error, and so is a loop
-(`reference cycle: node -> a -> node`). Resolution is lazy, so a broken
-reference in a key nothing uses does not stop the boot.
+(`reference cycle: node -> a -> node`).
 
 ## `storage.offload`
 
 Unset by default, so retention means delete. Set it and each expiring block is
-copied to that location before the local one goes — two copies, then one, never
-zero.
+copied to that location before the local one goes.
 
 **A copied-out block is not queryable.** Getting it back is explicit:
 
@@ -133,15 +117,13 @@ mira offload push    --offload file:///backup/mira --data-dir ./mira-data
 `push` sends the other way and **deletes nothing**; run it against a stopped
 server.
 
-**`file://` is the only scheme**: a mounted bucket (`s3fs`, `gcsfuse`,
-`rclone mount`), an NFS export, a second disk. A native `s3://` is refused at
-startup
+**`file://` is the only scheme**: a mounted bucket, an NFS export, a second
+disk. A native `s3://` is refused at startup
 ([Architecture section 6.1](architecture/retention.md#61-offload-a-copy-before-the-unlink)).
 
 ## `ingest.wal`
 
-The one durability choice Mira does not make for you. `"true"` or `"false"`,
-and nothing else — no `yes`, no `on`, no `1`.
+`"true"` or `"false"`, and nothing else — no `yes`, no `on`, no `1`.
 
 | | On (the default) | Off |
 | --- | --- | --- |
@@ -155,35 +137,32 @@ and nothing else — no `yes`, no `on`, no `1`.
 Unset by default, so alerting is off: `/api/v1/alerts` answering an empty list
 means *nobody is watching here*, not *everything is healthy*. Nothing picks an
 evaluator for you, so in a fleet exactly one replica is given the key and it
-pages. A rules file that does not parse stops the process at startup.
+pages.
 
 ### The schema
 
-[`e2e/alerts.kyaml`](e2e/alerts.kyaml) is the worked example. In outline:
+[`e2e/alerts.kyaml`](e2e/alerts.kyaml) is the worked example. The file has four
+keys:
 
-```yaml
-{
-  every: 15s,                             # evaluation interval; default 15s
-  link_base: "https://mira.example.com",  # where an alert's link points
-  notify: [
-    { name: oncall, url: "http://...", format: slack },   # slack | discord
-    { name: pager,  url: "http://...", format: pagerduty, # | pagerduty | json
-      key: "${env:PD_ROUTING_KEY}" },
-  ],
-  rules: [
-    {
-      name: shop-error-rate,              # unique; the dedup key in every payload
-      query: { signal: traces, where: [ { field: status_code, eq: 2 } ] },
-      of:    { signal: traces },          # the denominator; omit for a count rule
-      over:  1m,                          # the window each evaluation counts over
-      when:  "ratio > 2%",                # count | ratio, then > >= < <=
-      for:   30s,                         # how long it must hold before firing
-      severity: critical,                 # free text; PagerDuty maps four of them
-      notify: [ oncall ],                 # default: every target
-    },
-  ],
-}
-```
+| Key | What it is |
+| --- | --- |
+| `every` | How often every rule is evaluated. Default `15s` |
+| `link_base` | Prefix for the link in a notification, e.g. `https://mira.example.com`. Unset means the payloads carry no link |
+| `notify` | The webhook targets: `name`, `url`, `format` (`slack`, `discord`, `pagerduty` or `json`, default `json`), and `key` for PagerDuty's Events v2 routing key |
+| `rules` | The rules |
+
+And each rule:
+
+| Key | What it is |
+| --- | --- |
+| `name` | Unique in the file; the dedup key in every payload |
+| `query` | What the rule counts — and the numerator, if it is a `ratio` |
+| `of` | The denominator, for a `ratio`. A `count` rule must leave it out |
+| `over` | The window each evaluation counts over. Default `1m` |
+| `when` | `count` or `ratio`, then `>`, `>=`, `<` or `<=`, then the number — `ratio > 2%` |
+| `for` | How long it must hold before firing. Default `0s`, which fires on the first breach |
+| `severity` | Free text, default `warning`. PagerDuty takes only `critical`, `error`, `warning`, `info`; anything else goes as `warning` |
+| `notify` | Target names. Default none — the rule evaluates and shows in `/api/v1/alerts`, but pages nobody |
 
 `query` and `of` are `/api/v1/query` documents, verbatim, and neither may set
 `from`, `to`, `limit` or `after`: `over` is the window.
@@ -191,10 +170,8 @@ pages. A rules file that does not parse stops the process at startup.
 ### Webhooks
 
 One JSON POST per target when a rule starts firing and one when it stops, with
-a 10-second timeout and no retry. Slack, Discord, PagerDuty (Events v2) and
-`json` each get their own body shape. An `https://` target needs a build with
-`--features webhook-tls`, and is refused when the rules file is *loaded*, not
-at the first page.
+a 10-second timeout and no retry. An `https://` target needs a build with
+`--features webhook-tls`.
 
 ```sh
 cargo install --locked --path crates/mira --features webhook-tls
@@ -204,9 +181,9 @@ cargo install --locked --path crates/mira --features webhook-tls
 
 | Key | What it costs you |
 | --- | --- |
-| `ingest.max_request_bytes` | One number for three things: the body limit on 4318, the decode limit on 4317, and the ceiling on what a gzip body may inflate to. Too low and you lose data rather than throughput — 4318 answers `413`, which OTLP classes as permanent, so the exporter drops the batch instead of retrying. |
-| `ingest.queue` | Burst room, not throughput. Full does not mean refused: the next export waits for a slot (`pipeline::ADMIT_WAIT`), and only gets a `503` — which OTLP classes as retryable — if none frees up. Each slot holds one decoded export, so the worst case resident is `queue * max_request_bytes * 3`, 6 GiB at the defaults. Raise it when a wide collector fleet shows up as `shed` in `/health`; lower it when memory is the binding constraint. |
-| `ingest.shards` | `0` means one writer task per two cores the process can see, capped at 16 (`pipeline::MAX_SHARDS`). That count honours a cgroup CPU quota, so a container with one set needs no help here. Set it by hand when the count is a lie: a CPU *share* or *weight* rather than a quota reads as the whole machine, a shared host often sets no quota at all, a non-Linux container runtime leaves nothing to read, and hyperthreads count as cores. `1` is the pre-sharding behaviour, exactly. Shards **split** `ingest.queue` — each gets `queue / shards` slots. |
+| `ingest.max_request_bytes` | One number for three things: the body limit on 4318, the decode limit on 4317, and the ceiling on what a gzip body may inflate to. Too low and you lose data rather than throughput — 4318 answers `413`, which OTLP classes as permanent. |
+| `ingest.queue` | Burst room, not throughput. Each slot holds one decoded export, so the worst case resident is `queue * max_request_bytes * 3`. |
+| `ingest.shards` | `0` means one writer task per two cores the process can see, capped at 16 (`pipeline::MAX_SHARDS`). That count honours a cgroup CPU quota, so a container with one needs no help. Set it by hand when the count is a lie: a CPU *share* or *weight* reads as the whole machine, a shared host often sets no quota, a non-Linux runtime leaves nothing to read, and hyperthreads count as cores. Shards **split** `ingest.queue` — each gets `queue / shards` slots. |
 
 ## `telemetry.self`
 
@@ -224,8 +201,9 @@ per signal: mira.ingest.rows .bytes .blocks .shed .failed .refused .open_block.a
 ## Sizing
 
 Every row is anchored to a measured point in
-[End-to-end testing section 3](internals/e2e.md#3-the-load-harness), the median
-of three passes on a 12-core M3 Pro; between the anchors, linear interpolation.
+[End-to-end testing section 4](internals/e2e.md#4-what-the-harness-measured) —
+the log on, the median of three passes on a 12-core M3 Pro. Between the anchors
+it is linear interpolation, and the CPU cells are M3 Pro cores.
 
 | Workload | Ingest | Exporters | CPU | Memory | Disk/day |
 | --- | --- | --- | --- | --- | --- |
@@ -238,24 +216,13 @@ of three passes on a 12-core M3 Pro; between the anchors, linear interpolation.
 Multiply the last column by `storage.retention` for the volume. `records/s` is
 logs plus spans plus data points, which is what `/api/v1/stats` reports.
 
-### CPU
-
-**Budget 500k records/s per core.** The engine's own rate is 886k records/s per
-core at one exporter and falls to 515k at 96.
-
-### Memory
-
-**Memory follows the exporter count, not the rate.** Peak goes 232 MiB at one
-exporter, 314 at two, 689 at four, 1,243 at eight, and then flattens: 1,575 MiB
-at 16, 1,495 at 32, 1,648 at 96. Setting a memory *limit* is safe here: Mira
-reads files by mapping them, and those pages can be dropped and re-read under
-pressure rather than getting the process killed.
-
-### Disk
+**Budget 500k records/s per core** — the per-core rate falls from 886k at one
+exporter to 515k at ninety-six, so size for the bottom of that range.
+**Memory follows the exporter count, not the rate.**
 
 **Disk has two costs, and the cutover is a rate, not an age.** A fresh block
 costs 164 bytes on disk per 137-byte wire record; an hour later compaction
-rewrites it with ZSTD at 8.38x, taking the same record to about 20 bytes. But
+rewrites it with ZSTD at 8.36x, taking the same record to about 20 bytes. But
 the sweep compacts at most 8 blocks per signal per minute
 (`block::MAX_COMPACT_PER_SWEEP`) — **about 27k records/s** per signal, about
 55k in total. Below that, size the volume at 20 B/record; above it, compaction
@@ -263,10 +230,9 @@ is permanently behind and the cost stays at 164.
 
 ## Several replicas
 
-`node` is hashed into the name of every block directory a node writes
-(`{min_ts}-{max_ts}-{node}-{seq}-{wal_hi}`, where `{node}` is that hash in hex,
-not the name you set), so several active replicas can write to one volume
-without coordinating. The name and its hash are both logged at startup:
+`node` is hashed into the name of every block directory a node writes, so
+several active replicas can write to one volume without coordinating. The name
+and its hash are both logged at startup:
 
 ```text
 INFO mira: mira listening grpc=… http=… node=mira-1 node_id="a2c1d111"
@@ -274,26 +240,8 @@ INFO mira: mira listening grpc=… http=… node=mira-1 node_id="a2c1d111"
 
 Two replicas sharing a volume with the same `node_id` would share one
 write-ahead log, and a log has one writer: the second refuses to start. Give
-each a distinct `--node`. On Kubernetes, one volume per replica, and `HOSTNAME`
-names both:
-
-```yaml
-{
-  "node": "${env:HOSTNAME}",
-  "storage": {
-    "dir": "/data",                             # where the PVC is mounted
-    "retention": "${env:MIRA_RETENTION,7d}",
-  },
-}
-```
-
-```yaml
-volumeClaimTemplates:                           # StatefulSet.spec
-  - metadata: { name: data }
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources: { requests: { storage: 100Gi } }
-```
+each a distinct `--node`. On Kubernetes, one volume per replica, and
+`"node": "${env:HOSTNAME}"` names both.
 
 Any replica accepts any export, so ingest can go through one Service. **A query
 cannot**: a node only ever answers from its own blocks. Address a specific pod,
@@ -313,5 +261,4 @@ merging `/api/v1/query` across every replica
 
 Several pods sharing one `/data` is not deployable on Kubernetes today: Mira
 refuses to start on every filesystem an RWX volume is in practice
-(`block::fs_type`), because mapping a file over a network filesystem can kill
-the process with no way to recover.
+(`block::fs_type`).

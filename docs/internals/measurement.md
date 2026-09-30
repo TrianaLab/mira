@@ -171,8 +171,8 @@ row gets `no`:
 | 1 | **Provisioned CPU against consumed CPU.** The commonest one. Their vCPU column is a purchase order; Mira's core count is a meter reading. A run that is explicitly unsaturated — 17% CPU — has a denominator measuring an offered load rather than a ceiling. |
 | 2 | **Offered load against a ceiling.** "X records/s at 4 vCPU" usually means the generator was configured to send X and the engine kept up. It is an upper bound on nothing. |
 | 3 | **Cluster sums.** Four nodes and twelve generators produce a number that is not a per-node figure and does not divide into one, because the network and the coordination are in it. |
-| 4 | **A different record.** 137 bytes against 872 against 1.2 KiB. Record size moves a records/s figure by an order of magnitude and moves a MiB/s figure the other way. Compare one or the other, having checked both. |
-| 5 | **A different amount of engine.** Transport-only, collector-plus-store, indexing-only, whole-VM. Several published figures include no storage at all and several include three processes. |
+| 4 | **A different record.** Record size moves a records/s figure by an order of magnitude and moves a MiB/s figure the other way. Compare one or the other, having checked both. |
+| 5 | **A different amount of engine.** Transport-only, collector-plus-store, indexing-only, whole-VM. A published figure may include no storage at all, or three processes. |
 
 The only fair reading of a row marked `no` is order-of-magnitude.
 

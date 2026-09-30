@@ -92,12 +92,13 @@ const CRATE_COUNT_SITES: [&str; 7] = [
 /// it went on saying 6.06 MiB for two releases while the other six moved
 /// together, which is exactly the drift this list exists to catch and the only
 /// site that was outside it.
-const BINARY_SIZE_SITES: [&str; 7] = [
+const BINARY_SIZE_SITES: [&str; 8] = [
     "README.md",
     "docs/architecture/performance.md",
     "docs/architecture/principles.md",
     "docs/market.md",
     "docs/index.md",
+    "docs/demo.md",
     "crates/mira/src/term.rs",
     "overrides/home.html",
 ];

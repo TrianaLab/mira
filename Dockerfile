@@ -141,7 +141,7 @@ EXPOSE 4317 4318
 # without -v, which accumulates. Mount one yourself, and make it a named volume
 # rather than a host bind mount — Mira mmaps its blocks and a bind mount on
 # Docker Desktop is FUSE, where a hiccup arrives as SIGBUS rather than an error.
-# That reasoning, and the probe configuration below, are in docs/install.md.
+# The probe configuration below is also in docs/install.md.
 
 # No HEALTHCHECK: distroless has no shell and no curl, and adding either to run
 # a probe would double the image. Point Kubernetes or compose at

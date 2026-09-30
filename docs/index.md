@@ -32,8 +32,7 @@ spans over 76.08ms, with a retry and an exception marked on the
 timeline.](assets/tui/investigation.gif)
 
 Nothing in that recording is a mock-up. Every footer is that run's own cost —
-rows read, rows matched, files touched, milliseconds — and the browser and the
-agent tools hand back the same line.
+rows read, rows matched, files touched, milliseconds.
 
 ## Why you would use it
 
@@ -51,26 +50,21 @@ toolchain needed to build it.
 
 ## What keeps the data honest
 
-Most backends treat OpenTelemetry as a wire format and convert it into
-something else — database rows, Parquet files, a metrics store. Every
-conversion is a place a field can quietly go missing.
-
-Mira skips the conversion. What arrives is what is stored, in the same shape,
-so there is no step for anything to fall out of.
+Most backends convert OpenTelemetry into something else — database rows,
+Parquet files, a metrics store — and every conversion is a place a field can
+quietly go missing. Mira skips it. What arrives is what is stored, in the same
+shape.
 
 ## What it does not do
 
 - **No query language.** You filter with a small query document, not SQL,
-  PromQL or TraceQL. SQL was available off the shelf and would have cost 47
-  extra dependencies and a 50.0 MiB binary.
-- **No clustering inside the node.** One process reads one directory and knows
-  about nothing else. Run several behind `mira proxy` — the same binary — which
-  merges record search across them. The service map, metrics, correlation and
-  entities answer on a single node only, and the proxy says so rather than
-  returning half an answer.
-- **No tuning.** The config file has fourteen keys and they describe *where the
-  process runs*. The three that reach the engine trade memory for burst room,
-  pin a core count, or pick which of two durability promises you want.
+  PromQL or TraceQL. SQL off the shelf would have cost 47 extra dependencies
+  and a 50.0 MiB binary.
+- **No clustering inside the node.** One process reads one directory. Run
+  several behind `mira proxy` — the same binary — and it merges record search
+  across them. The service map, metrics, correlation and entities answer on a
+  single node only, and the proxy says so rather than returning half an answer.
+- **No tuning.** Fourteen config keys, and only three reach the engine.
 - **Writing copies once.** Reading copies nothing, but parsing incoming
   protobuf copies every string, because that is how protobuf works.
 
