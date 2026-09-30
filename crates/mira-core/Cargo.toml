@@ -32,6 +32,13 @@ crc32fast.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Off by default and never enabled in a release. See `sync_with` in lib.rs: it
+# swaps the F_FULLFSYNC barrier for a plain fsync(2) so the barrier term can be
+# priced end to end. A feature rather than a runtime switch so that a shipped
+# binary has no reachable path to it.
+weak-sync-ab = []
+
 [dev-dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true

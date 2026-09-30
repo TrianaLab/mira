@@ -78,6 +78,7 @@ pub fn sync_data(file: &std::fs::File) -> std::io::Result<()> {
 /// The seam the two above share, and the one a test can drive: `strong` is the
 /// barrier that might not be supported, and there is no way to make a real
 /// filesystem refuse `F_FULLFSYNC` on demand inside a unit test.
+#[cfg(not(all(target_vendor = "apple", feature = "weak-sync-ab")))]
 fn sync_with(
     file: &std::fs::File,
     strong: impl Fn(&std::fs::File) -> std::io::Result<()>,
@@ -88,7 +89,28 @@ fn sync_with(
     }
 }
 
-#[cfg(target_vendor = "apple")]
+/// ponytail: measurement arm, never a release. `weak-sync-ab` replaces every
+/// barrier in the tree with a plain `fsync(2)` so the device-barrier term can
+/// be priced end to end against an otherwise identical binary
+/// (`scripts/measure/barrier-ab.sh`; the answer is in performance-barrier.md).
+/// It trades the power-loss guarantee `sync_all` documents, so it is a
+/// compile-time feature and not a config key or an environment variable: a
+/// released binary has no code path that reaches it, and `--features` is
+/// visible in the build line of whoever measured.
+#[cfg(all(target_vendor = "apple", feature = "weak-sync-ab"))]
+fn sync_with(
+    file: &std::fs::File,
+    _strong: impl Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` owns the descriptor and outlives the call.
+    match unsafe { libc::fsync(file.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(all(target_vendor = "apple", not(feature = "weak-sync-ab")))]
 fn degrade(file: &std::fs::File, e: std::io::Error) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     if !matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) {
@@ -109,7 +131,8 @@ fn degrade(_file: &std::fs::File, e: std::io::Error) -> std::io::Result<()> {
     Err(e)
 }
 
-#[cfg(test)]
+// Not under `weak-sync-ab`: that arm deletes the barrier these assert on.
+#[cfg(all(test, not(feature = "weak-sync-ab")))]
 mod sync_tests {
     use super::*;
     use std::io::Error;

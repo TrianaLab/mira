@@ -955,6 +955,13 @@ async fn wal_sweep(wal: Arc<Wal>, dir: PathBuf, truncating: bool) {
         // frames for all three, so it can only go once the last of them has
         // claimed everything in it. Scoped to this log's own writer, because
         // what is about to happen to the segments below `covered` is `unlink`.
+        //
+        // This read happens *after* the `sync` above, so a block renamed
+        // between the two is counted as covered by a sync that predates it.
+        // Safe only because `block::publish` barriers a block durable before
+        // its rename — take those barriers out (performance-barrier.md prices
+        // them) and this is a data-loss path. Reorder to watermarks, sync,
+        // truncate at the same time, not afterwards.
         let covered = block::wal_watermarks(&dir, wal.node())?
             .into_iter()
             .min()

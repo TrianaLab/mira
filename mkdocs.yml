@@ -217,6 +217,7 @@ nav:
           - 10. What is deliberately not here: architecture/not-here.md
           - 11. Performance model: architecture/performance.md
           - "11. — the ingest plateau": architecture/performance-ingest.md
+          - "11. — the publish barrier": architecture/performance-barrier.md
           - "11. — verification and restart": architecture/performance-durability.md
           - "11. — query cost": architecture/performance-query.md
           - "11. — cost per GB": architecture/performance-cost.md

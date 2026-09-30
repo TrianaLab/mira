@@ -9,6 +9,40 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **One number per quantity on the landing page, and a hero that leads with
+  the job.** The page carried two ingest rates and two binary sizes: 1,537,875
+  was the eight-connection peak quoted where the four-connection plateau
+  figure belonged, and 6.06 MiB had been stale for two releases while the
+  other six sites moved together — because `overrides/home.html` was the one
+  binary-size site outside `BINARY_SIZE_SITES` in `xtask drift`. It is in the
+  list now, which is the part that stops it recurring, and every figure the
+  hero carries is registered in `measurements.kyaml` beside the sites that
+  quote it. The vendor comparison chart is gone from the front page rather
+  than re-captioned — it mixed hardware and record sizes across rows, and
+  `docs/market.md` is where a cross-vendor claim belongs with its conditions
+  attached. What is left is Mira's own connection sweep. The subtitle now says
+  what you run and what you get before it says what shape the bytes are in.
+
+### Added
+
+- **`block::publish`'s eleven `F_FULLFSYNC` are priced, and they are not the
+  ingest plateau.** Publishing one block costs eleven device-wide cache
+  barriers — five tables, three sidecars, three directories — and the plateau
+  write-up left the volume open as a candidate for why the flusher is slow.
+  `scripts/measure/barrier-ab.sh` answers it: eight ABBA-interleaved pairs at
+  thirty-two connections against the same tree built `--features
+  weak-sync-ab`, which swaps every barrier for a plain `fsync(2)`. Throughput
+  comes back a median 1.12x with the signs split 6 of 8, which under the
+  measurement contract is **not quotable**; ack p50 comes back 1.65x on 8 of 8
+  while the per-core rate does not move and cores busy goes 2.6 to 3.0. The
+  barrier gates concurrency rather than costing CPU, so collapsing it is an
+  ack-latency change and cannot carry a throughput argument — and the p50 win
+  does not reach the tail. `docs/architecture/performance-barrier.md` is the
+  write-up. The measurement arm is a compile-time feature, never a config key,
+  because it trades the power-loss guarantee `sync_all` documents.
+
 ## [0.4.2] - 2026-09-22
 
 ### Changed
