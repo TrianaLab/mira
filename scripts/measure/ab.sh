@@ -79,8 +79,8 @@ PY
 i=0
 while [ "$i" -lt "$ROUNDS" ]; do
   if [ $((i % 2)) -eq 0 ]; then first=$A; second=$B; else first=$B; second=$A; fi
-  a=$(one $first);  sleep "$SETTLE"
-  b=$(one $second); sleep "$SETTLE"
+  a=$(one "$first");  sleep "$SETTLE"
+  b=$(one "$second"); sleep "$SETTLE"
   printf '%s\t%s\t%s\n' "$first"  "$i" "$a" >>"$OUT"
   printf '%s\t%s\t%s\n' "$second" "$i" "$b" >>"$OUT"
   echo "round $i done" >&2
