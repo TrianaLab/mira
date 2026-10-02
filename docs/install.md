@@ -19,7 +19,7 @@ curl -fsSL https://miradb.dev/install.sh | bash
 
 | | |
 | --- | --- |
-| `--version v0.4.2` | a specific release instead of the latest |
+| `--version v0.4.3` | a specific release instead of the latest |
 | `--no-sudo` | never escalate; fails instead if the directory is not writable |
 | `--no-verify` | skip the provenance check — that the download came out of a build in this repository, which needs `gh`. The checksum is still enforced |
 | `MIRA_INSTALL_DIR` | where it lands; default `/usr/local/bin`, and it must already exist |
@@ -30,7 +30,7 @@ curl -fsSL https://miradb.dev/install.sh | bash
 ```sh
 mira update              # to the latest release
 mira update --dry-run    # print the command it would run, and stop
-mira update --version v0.4.2
+mira update --version v0.4.3
 ```
 
 It replaces **the binary that is running**, wherever that is, so a copy in
@@ -58,7 +58,7 @@ cargo build --release                            # or: ./target/release/mira
 ## From a release
 
 ```sh
-V=0.4.2; T=x86_64-unknown-linux-gnu
+V=0.4.3; T=x86_64-unknown-linux-gnu
 base=https://github.com/TrianaLab/mira/releases/download/v$V
 curl -sSLO $base/mira-$V-$T.tar.gz -O $base/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
@@ -133,7 +133,7 @@ metadata:
   name: telemetry
   namespace: observability
 spec:
-  image: ghcr.io/trianalab/mira:0.4.2
+  image: ghcr.io/trianalab/mira:0.4.3
   replicas: 1          # floor
   maxReplicas: 5       # ceiling; there is no "unbounded"
   storage: { size: 50Gi, className: gp3 }

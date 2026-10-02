@@ -9,6 +9,8 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-30
+
 ### Changed
 
 - **A shard no longer stops to watch its block reach the disk.** The flusher
@@ -738,7 +740,8 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/TrianaLab/mira/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/TrianaLab/mira/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/TrianaLab/mira/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/TrianaLab/mira/compare/v0.3.0...v0.4.0
