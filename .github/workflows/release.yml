@@ -187,7 +187,7 @@ jobs:
       # targets, so it is generated once on the leg that has already compiled
       # rather than in a job that would compile a fifth time. `make build` from
       # the sbom target is a cache hit here.
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           tool: cargo-cyclonedx@0.5.9
@@ -692,7 +692,7 @@ jobs:
             --use-signing-config=false \
             "${CHARTS}/mira-operator@${DIGEST}"
 
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
 
       # The ownership handshake. An OCI repository has no `index.yaml` to carry
       # `artifacthub-repo.yml` beside, so Artifact Hub looks for it under a
@@ -1026,7 +1026,7 @@ jobs:
             | tr -d '"' | grep -qF "image: ${OPERATOR_IMAGE}:${VERSION}"
           echo "the published chart installs the published image"
 
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      - uses: oras-project/setup-oras@005458ad77f1c8facd38a094e4af2e69e5607ff4 # v2.0.2
 
       - name: the Artifact Hub ownership metadata came back
         run: |
