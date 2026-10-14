@@ -104,10 +104,6 @@ criteria = "safe-to-deploy"
 version = "0.5.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.beef]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.bitflags]]
 version = "2.13.1"
 criteria = "safe-to-deploy"
@@ -273,7 +269,7 @@ version = "1.10.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
-version = "1.11.1"
+version = "1.12.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-rustls]]
@@ -329,7 +325,7 @@ version = "0.4.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
-version = "0.2.189"
+version = "0.2.190"
 criteria = "safe-to-deploy"
 
 [[exemptions.libm]]
@@ -349,23 +345,11 @@ version = "0.4.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.logos]]
-version = "0.15.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.logos]]
 version = "0.16.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.logos-codegen]]
-version = "0.15.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.logos-codegen]]
 version = "0.16.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.logos-derive]]
-version = "0.15.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.logos-derive]]
@@ -517,11 +501,11 @@ version = "0.14.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.protox]]
-version = "0.9.1"
+version = "0.10.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.protox-parse]]
-version = "0.9.0"
+version = "0.10.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.pulldown-cmark]]
@@ -681,7 +665,7 @@ version = "2.0.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.53.1"
+version = "1.53.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
@@ -781,7 +765,7 @@ version = "0.9.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.want]]
-version = "0.3.1"
+version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]

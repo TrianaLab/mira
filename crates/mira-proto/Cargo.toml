@@ -25,7 +25,7 @@ tonic-prost.workspace = true
 bytes.workspace = true
 
 [build-dependencies]
-protox = "0.9"
+protox = "0.10"
 prost-build = "0.14"
 tonic-prost-build = "0.14"
 

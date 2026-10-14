@@ -9,6 +9,18 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **The week's dependency bumps, landed as one.** tokio 1.53.1 → 1.53.3,
+  hyper 1.11.1 → 1.12.0, libc 0.2.189 → 0.2.190; svelte 5.57.1 → 5.57.2,
+  vite 8.3.1 → 8.3.4 and devalue 5.9.2 → 5.9.4 in the UI, whose bundle is
+  rebuilt to match; shell-quote 1.10.0 → 1.12.0 and the pinned action SHAs.
+  protox 0.9 → 0.10 comes along because it shipped after main last went green
+  and `make outdated` would otherwise fail every PR. It also dedupes logos to
+  0.16, which takes five exemptions out of `supply-chain/config.toml` (the
+  rest move forward, the imported audits stay alone). Nothing in the on-disk
+  format or the query surface moves.
+
 ## [0.4.3] - 2026-09-30
 
 ### Changed
