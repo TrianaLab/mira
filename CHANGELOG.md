@@ -21,6 +21,13 @@ the config keys, the `/mcp` tool set.
   rest move forward, the imported audits stay alone). Nothing in the on-disk
   format or the query surface moves.
 
+### Security
+
+- **rustls 0.23.45 → 0.23.46** for RUSTSEC-2026-0346 (`Debug` on client
+  session values printed TLS secrets) and RUSTSEC-2026-0347 (buffered data
+  sent to the outer server after an ECH rejection). Both landed the day the
+  roundup merged and turned `cargo deny` red on main.
+
 ## [0.4.3] - 2026-09-30
 
 ### Changed
