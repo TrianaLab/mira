@@ -101,7 +101,7 @@ jobs:
       # that happened to produce one" is a lookup with no correct answer.
       #
       # After `make site`, never before: mkdocs empties the output directory.
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov
       - run: make ci-coverage-json
