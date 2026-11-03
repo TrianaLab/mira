@@ -9,6 +9,8 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-03
+
 ### Changed
 
 - **Dependency bumps, landed as one.** arrow 60.0.0 → 60.1.0, tonic and
@@ -777,7 +779,8 @@ list.
 - No authentication, authorisation or TLS. Mira expects to sit behind something
   that has them.
 
-[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/TrianaLab/mira/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/TrianaLab/mira/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/TrianaLab/mira/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/TrianaLab/mira/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/TrianaLab/mira/compare/v0.4.1...v0.4.2
