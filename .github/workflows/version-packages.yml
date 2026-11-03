@@ -44,6 +44,11 @@ jobs:
       # `make version` regenerates the chart README, because the Version PR has
       # to pass `make helm-docs-check` like any other PR. Same target the helm
       # leg uses, so the two pinned versions cannot drift apart.
+      # Helm pinned like the helm leg: the runner image now ships Helm 4, whose
+      # `helm plugin install` refuses helm-unittest without --verify=false.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.0
       - run: make ci-tool-chart
 
       - uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
