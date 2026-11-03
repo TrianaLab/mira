@@ -9,6 +9,22 @@ the config keys, the `/mcp` tool set.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency bumps, landed as one.** arrow 60.0.0 → 60.1.0, tonic and
+  friends 0.14.6 → 0.14.9, tokio 1.53.3 → 1.54.1, libc 0.2.190 → 0.2.191,
+  memmap2 0.9.11 → 0.9.12, crc32fast 1.5.2 → 1.5.3; svelte 5.57.3 and
+  vite 8.3.5 in the UI, whose bundle is rebuilt to match; mkdocs-material
+  9.8.0 and the pinned action SHAs. Nothing in the on-disk format or the query
+  surface moves.
+
+### Security
+
+- **zstd 0.14.3, zstd-safe 8.2.0, zstd-sys 2.1.2** for RUSTSEC-2026-0391,
+  -0398, -0403 and -0410; **rustls-webpki 0.103.16** and **webpki-roots
+  1.0.11** for RUSTSEC-2026-0382 and -0381; **pulldown-cmark 0.13.6** for
+  RUSTSEC-2026-0414 and -0433. All of them turned `cargo deny` red.
+
 ## [0.4.4] - 2026-10-15
 
 ### Changed

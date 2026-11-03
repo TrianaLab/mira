@@ -6,4 +6,4 @@
 # No `mike`: this is a single unversioned site. Adding mike means a gh-pages
 # branch, a version selector and an alias policy, none of which exist.
 mkdocs==1.6.1
-mkdocs-material==9.7.7
+mkdocs-material==9.8.0
