@@ -187,7 +187,7 @@ jobs:
       # targets, so it is generated once on the leg that has already compiled
       # rather than in a job that would compile a fifth time. `make build` from
       # the sbom target is a cache hit here.
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           tool: cargo-cyclonedx@0.5.9
@@ -294,7 +294,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: needs.meta.outputs.publish == 'true'
         with:
           registry: ghcr.io
@@ -365,7 +365,7 @@ jobs:
       # controller, Kyverno, Connaisseur) and Artifact Hub already speak. An
       # artifact only one of the two audiences can check is an artifact half the
       # world treats as unsigned.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         if: needs.meta.outputs.publish == 'true'
 
       - name: sign the image
@@ -485,7 +485,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: needs.meta.outputs.publish == 'true'
         with:
           registry: ghcr.io
@@ -542,7 +542,7 @@ jobs:
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -599,7 +599,7 @@ jobs:
           subject-digest: ${{ steps.join.outputs.digest }}
           push-to-registry: true
 
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         if: steps.free.outputs.free == 'true'
 
       - name: sign the operator image
@@ -639,9 +639,9 @@ jobs:
         with:
           version: v3.22.0
 
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -844,7 +844,7 @@ jobs:
       # Rekor transparency log and Fulcio's roots, and needs no identity of its
       # own — a verifier that has to authenticate is a verifier nobody runs.
     steps:
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.22.0
@@ -902,7 +902,7 @@ jobs:
       # one, and deliberately authenticates: whether a signature verifies must
       # not depend on a visibility setting. The step above is what holds the
       # setting.
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
